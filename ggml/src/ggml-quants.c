@@ -401,44 +401,10 @@ void dequantize_row_q1_0_g128(const block_q1_0_g128 * GGML_RESTRICT x, float * G
 
     const int nb = k / qk;
 
-#if defined(__ARM_NEON)
-    for (int i = 0; i < nb; i++) {
-        const float d = GGML_FP16_TO_FP32(x[i].d);
-        const float32x4_t vd = vdupq_n_f32(d);
-        const float32x4_t vnd = vdupq_n_f32(-d);
-
-        float * GGML_RESTRICT yptr = y + i * qk;
-
-        // Process 16 bytes (128 bits) at a time
-        for (int b = 0; b < 16; b++) {
-            const uint8_t byte = x[i].qs[b];
-
-            // Expand each bit to a float: bit=1 -> +d, bit=0 -> -d
-            // Process 8 bits from this byte
-            for (int bit = 0; bit < 8; bit += 4) {
-                // Extract 4 bits and create mask
-                const uint32_t b0 = (byte >> (bit + 0)) & 1;
-                const uint32_t b1 = (byte >> (bit + 1)) & 1;
-                const uint32_t b2 = (byte >> (bit + 2)) & 1;
-                const uint32_t b3 = (byte >> (bit + 3)) & 1;
-
-                // Use bit select: if bit=1 select d, else select -d
-                float32x4_t result;
-                result = vsetq_lane_f32(b0 ? d : -d, result, 0);
-                result = vsetq_lane_f32(b1 ? d : -d, result, 1);
-                result = vsetq_lane_f32(b2 ? d : -d, result, 2);
-                result = vsetq_lane_f32(b3 ? d : -d, result, 3);
-
-                vst1q_f32(yptr + b * 8 + bit, result);
-            }
-        }
-    }
-#else
     for (int i = 0; i < nb; i++) {
         const float d = GGML_FP16_TO_FP32(x[i].d);
         const float neg_d = -d;
 
-        // Simple bit unpacking
         for (int j = 0; j < qk; ++j) {
             const int byte_index = j / 8;
             const int bit_offset = j % 8;
@@ -446,7 +412,6 @@ void dequantize_row_q1_0_g128(const block_q1_0_g128 * GGML_RESTRICT x, float * G
             y[i*qk + j] = bit ? d : neg_d;
         }
     }
-#endif
 }
 
 
