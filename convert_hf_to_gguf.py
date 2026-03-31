@@ -742,10 +742,11 @@ class ModelBase:
 
     def prepare_tensors(self):
         # detect NVFP4 quantization (ModelOpt and Compressed-tensors formats)
-        quant_algo = (self.hparams.get("quantization_config") or {}).get("quant_algo")
-        quant_method = (self.hparams.get("quantization_config") or {}).get("quant_method")
-        quant_format = (self.hparams.get("quantization_config") or {}).get("format")
-        quant_layers = (self.hparams.get("quantization_config") or {}).get("quantized_layers") or {}
+        quantization_config = self.hparams.get("quantization_config") or {}
+        quant_algo = quantization_config.get("quant_algo")
+        quant_method = quantization_config.get("quant_method")
+        quant_format = quantization_config.get("format")
+        quant_layers = quantization_config.get("quantized_layers") or {}
         quant_config_file = self.dir_model / "hf_quant_config.json"
 
         if (not quant_algo or not quant_layers) and quant_config_file.is_file():
