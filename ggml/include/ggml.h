@@ -430,7 +430,9 @@ extern "C" {
         // 40 is GGML_TYPE_NVFP4 in upstream llama.cpp
         GGML_TYPE_Q1_0_g128 = 41,
         GGML_TYPE_Q1_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_TBQ3_0  = 43,
+        GGML_TYPE_TBQ4_0  = 44,
+        GGML_TYPE_COUNT   = 45,
     };
 
     // precision

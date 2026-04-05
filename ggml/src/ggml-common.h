@@ -121,6 +121,9 @@ typedef sycl::half2 ggml_half2;
 #define QI8_1 (QK8_1 / (4 * QR8_1))
 #define QR8_1 1
 
+#define QR_TBQ3 2
+#define QR_TBQ4 2
+
 #define QI2_K (QK_K / (4*QR2_K))
 #define QR2_K 4
 
@@ -243,6 +246,19 @@ typedef struct {
     int8_t  qs[QK8_0]; // quants
 } block_q8_0;
 static_assert(sizeof(block_q8_0) == sizeof(ggml_half) + QK8_0, "wrong q8_0 block size/padding");
+
+#define QK_TBQ 32
+typedef struct {
+    ggml_half d;              // block RMS after TurboQuant preconditioning
+    uint8_t qs[QK_TBQ * 3/8]; // 3-bit codes, 3.5 bpw effective with the scale
+} block_tbq3_0;
+static_assert(sizeof(block_tbq3_0) == sizeof(ggml_half) + QK_TBQ * 3/8, "wrong tbq3_0 block size/padding");
+
+typedef struct {
+    ggml_half d;          // block RMS after TurboQuant preconditioning
+    uint8_t qs[QK_TBQ/2]; // 4-bit codes packed like q4_0
+} block_tbq4_0;
+static_assert(sizeof(block_tbq4_0) == sizeof(ggml_half) + QK_TBQ/2, "wrong tbq4_0 block size/padding");
 
 #define QK8_1 32
 typedef struct {
