@@ -215,6 +215,15 @@ if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
     add_subdirectory(tools)
 endif()
 
+# Standalone libmtmd build (e.g. for Apple XCFramework packaging) without pulling
+# in the rest of the tools/ tree. When the full tools build is already enabled,
+# mtmd is built by the tools/ subdirectory above; this hook only fires when
+# LLAMA_BUILD_TOOLS is OFF to avoid double-adding the target.
+option(LLAMA_BUILD_MTMD "llama: build tools/mtmd library standalone" OFF)
+if (LLAMA_BUILD_MTMD AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
+    add_subdirectory(tools/mtmd)
+endif()
+
 # Automatically add all files from the 'licenses' directory
 file(GLOB EXTRA_LICENSES "${CMAKE_SOURCE_DIR}/licenses/LICENSE-*")
 
