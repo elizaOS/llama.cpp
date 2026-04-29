@@ -1456,6 +1456,9 @@ class TextModel(ModelBase):
         if chkhsh == "bc5108ee1eb6a3d600cadd065f63190fbd0554dbc9e4bbd6a0d977970afc8d2a":
             # ref: https://huggingface.co/inceptionai/Jais-2-8B-Chat
             res = "jais-2"
+        if chkhsh == "f728162c1315c26e40249849799b4ba3fe584c32084b4795b03eb295e63cb5af":
+            # ref: https://huggingface.co/lewtun/talkie-1930-13b-it-hf
+            res = "talkie"
         if chkhsh == "7b3e7548e4308f52a76e8229e4e6cc831195d0d1df43aed21ac6c93da05fec5f":
             # ref: https://huggingface.co/WisdomShell/CodeShell-7B
             res = "codeshell"
@@ -2369,6 +2372,40 @@ class GPTNeoXModel(TextModel):
                 dim=0,
             )
             logger.info("re-format attention.linear_qkv.bias")
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("TalkieForCausalLM")
+class TalkieModel(TextModel):
+    model_arch = gguf.MODEL_ARCH.TALKIE
+
+    _gain_tensors = {
+        "lm_head": "lm_head_gain.w_g",
+        "attn.attn_resid.weight": "attn_gain.a_g",
+        "mlp.mlp_resid.weight": "mlp_gain.a_g",
+    }
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        # Talkie used F.rms_norm without an explicit eps
+        self.gguf_writer.add_layer_norm_rms_eps(torch.finfo(torch.float32).eps)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        prefix = f"model.blocks.{bid}." if bid is not None else ""
+        suffix = name.removeprefix(prefix)
+
+        if suffix in self._gain_tensors.values():
+            return
+
+        if suffix in self._gain_tensors:
+            data_torch = data_torch * self.model_tensors[prefix + self._gain_tensors[suffix]]().float()
+        elif suffix == "attn.head_gain.head_g":
+            head_dim = self.hparams["head_dim"]
+            data_torch = data_torch.unsqueeze(-1).expand(-1, head_dim).contiguous()
+
+        if not name.endswith((".weight", ".bias")):
+            name += ".weight"
 
         yield from super().modify_tensors(data_torch, name, bid)
 
