@@ -426,22 +426,78 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
                     std::string tool_use_id = json_value(block, "tool_use_id", std::string());
 
                     auto result_content = json_value(block, "content", json());
-                    std::string result_text;
                     if (result_content.is_string()) {
-                        result_text = result_content.get<std::string>();
+                        tool_results.push_back({
+                            {"role", "tool"},
+                            {"tool_call_id", tool_use_id},
+                            {"content", result_content.get<std::string>()}
+                        });
                     } else if (result_content.is_array()) {
+                        // Check if any image blocks are present
+                        bool has_images = false;
                         for (const auto & c : result_content) {
-                            if (json_value(c, "type", std::string()) == "text") {
-                                result_text += json_value(c, "text", std::string());
+                            if (json_value(c, "type", std::string()) == "image") {
+                                has_images = true;
+                                break;
                             }
                         }
-                    }
 
-                    tool_results.push_back({
-                        {"role", "tool"},
-                        {"tool_call_id", tool_use_id},
-                        {"content", result_text}
-                    });
+                        if (!has_images) {
+                            // Text-only: collapse to a plain string for maximum compatibility
+                            std::string result_text;
+                            for (const auto & c : result_content) {
+                                if (json_value(c, "type", std::string()) == "text") {
+                                    result_text += json_value(c, "text", std::string());
+                                }
+                            }
+                            tool_results.push_back({
+                                {"role", "tool"},
+                                {"tool_call_id", tool_use_id},
+                                {"content", result_text}
+                            });
+                        } else {
+                            // Mixed or image-only: use array content parts (OpenAI multimodal tool format)
+                            json content_parts = json::array();
+                            for (const auto & c : result_content) {
+                                std::string c_type = json_value(c, "type", std::string());
+                                if (c_type == "text") {
+                                    content_parts.push_back({
+                                        {"type", "text"},
+                                        {"text", json_value(c, "text", std::string())}
+                                    });
+                                } else if (c_type == "image") {
+                                    json source = json_value(c, "source", json::object());
+                                    std::string source_type = json_value(source, "type", std::string());
+                                    if (source_type == "base64") {
+                                        std::string media_type = json_value(source, "media_type", std::string("image/jpeg"));
+                                        std::string data = json_value(source, "data", std::string());
+                                        std::ostringstream ss;
+                                        ss << "data:" << media_type << ";base64," << data;
+                                        content_parts.push_back({
+                                            {"type", "image_url"},
+                                            {"image_url", {{"url", ss.str()}}}
+                                        });
+                                    } else if (source_type == "url") {
+                                        content_parts.push_back({
+                                            {"type", "image_url"},
+                                            {"image_url", {{"url", json_value(source, "url", std::string())}}}
+                                        });
+                                    }
+                                }
+                            }
+                            tool_results.push_back({
+                                {"role", "tool"},
+                                {"tool_call_id", tool_use_id},
+                                {"content", content_parts}
+                            });
+                        }
+                    } else {
+                        tool_results.push_back({
+                            {"role", "tool"},
+                            {"tool_call_id", tool_use_id},
+                            {"content", ""}
+                        });
+                    }
                 }
             }
 
