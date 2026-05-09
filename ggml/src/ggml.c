@@ -912,14 +912,18 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
     },
     [GGML_TYPE_QJL1_256] = {
         .type_name                = "qjl1_256",
-        // Block stores the sketch dim (QK_QJL = 256) worth of signs from
-        // one cached key vector. Type-traits row-size math:
+        // QJL is asymmetric: input is 128 fp32 lanes per cached key
+        // (QJL_HEAD_DIM), output is one 34-byte block storing the bf16
+        // norm and 256 packed signs from the JL projection. We expose
+        // blck_size = 128 (the *input* dim) so the standard ggml row-size
+        // math —
         //   row_size = nrow * n_per_row * type_size / blck_size
-        // With blck_size = QK_QJL = 256, type_size = sizeof(block_qjl1_256) = 34,
-        // and n_per_row chosen by the caller as a multiple of QK_QJL,
-        // this produces 34 B per cached key vector — exactly the on-cache
-        // footprint the QJL paper specifies.
-        .blck_size                = QK_QJL,
+        // — produces 34 B per 128-float input row when n_per_row = 128
+        // (i.e. one block per token-head). This matches the K-cache
+        // shape that allocates head_dim=128 floats per (token, head)
+        // and lets ggml_row_size(QJL1_256, 128) == 34 satisfy the
+        // ggml_cpy assertion in llama-kv-cache.cpp:1090.
+        .blck_size                = 128, /* QJL_HEAD_DIM */
         .type_size                = sizeof(block_qjl1_256),
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_qjl1_256,
