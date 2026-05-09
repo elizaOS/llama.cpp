@@ -205,6 +205,7 @@ add_library(ggml-base
             ggml-threading.h
             ggml-quants.c
             ggml-quants.h
+            polar_centroids.h
             gguf.cpp)
 
 set_target_properties(ggml-base PROPERTIES
