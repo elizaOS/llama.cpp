@@ -187,7 +187,7 @@ void ggml_compute_forward_attn_score_qjl(
     GGML_ASSERT(q->type == GGML_TYPE_F32);
     GGML_ASSERT(pk->type == GGML_TYPE_QJL1_256);
     GGML_ASSERT(q->ne[0] == QK_QJL);
-    GGML_ASSERT(pk->ne[0] == QK_QJL);
+    GGML_ASSERT(pk->ne[0] == QJL_HEAD_DIM); /* head_dim, not sketch_dim */
 
     const int n_heads     = (int) q->ne[1];
     const int n_kv_heads  = ((const int32_t *) dst->op_params)[0];
@@ -201,19 +201,19 @@ void ggml_compute_forward_attn_score_qjl(
     const int64_t ne3     = q->ne[3];
     GGML_ASSERT(pk->ne[3] == ne3);
 
-    /* Strides in elements (ggml `nb` is in bytes). */
+    /* Strides in bytes — ggml `nb` is byte units. */
     const size_t q_stride_b   = q->nb[2];   /* bytes between batches in q */
     const size_t q_stride_3   = q->nb[3];
-    const size_t pk_stride_3  = pk->nb[3];
+    const size_t pk_stride_3  = pk->nb[3];  /* one full (n_kv_heads, n_kv_tokens) plane */
     const size_t s_stride_b   = dst->nb[2];
     const size_t s_stride_3   = dst->nb[3];
 
     /* The packed_k layout for one (batch,ne3) plane is contiguous over
      * (n_kv_heads, n_kv_tokens, block_qjl1_256). The score kernel expects
      * n_kv_heads first then n_tokens for indexing — that matches our
-     * pk->ne[1]=n_kv_tokens, ne[2]=n_kv_heads layout iff the stride from
-     * the head dim equals n_kv_tokens * sizeof(block). Asserting catches
-     * mis-shaped inputs early. */
+     * pk->ne[1]=n_kv_tokens, ne[2]=n_kv_heads layout iff stride from the
+     * head dim is one block (34 B) per token, and the per-head stride is
+     * n_kv_tokens * 34. Asserting catches mis-shaped inputs early. */
     GGML_ASSERT(pk->nb[1] == sizeof(block_qjl1_256));
     GGML_ASSERT(pk->nb[2] == (size_t) n_kv_tokens * sizeof(block_qjl1_256));
 

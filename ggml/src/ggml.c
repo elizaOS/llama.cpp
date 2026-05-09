@@ -5428,8 +5428,13 @@ struct ggml_tensor * ggml_attn_score_qjl(
     GGML_ASSERT(packed_k != NULL);
     GGML_ASSERT(q->type == GGML_TYPE_F32);
     GGML_ASSERT(packed_k->type == GGML_TYPE_QJL1_256);
+    // Q sketch leading dim is the JL sketch dim (256). K cache leading dim
+    // is head_dim — for QJL on the canonical paper config this is 128 and
+    // matches ggml_blck_size(QJL1_256). ne[0] for quantized tensors is in
+    // *element* units, not byte units, so this stays as 128 even though
+    // the on-cache footprint is 34 B per token.
     GGML_ASSERT(q->ne[0] == QK_QJL);
-    GGML_ASSERT(packed_k->ne[0] == QK_QJL);
+    GGML_ASSERT(packed_k->ne[0] == ggml_blck_size(GGML_TYPE_QJL1_256));
 
     const int64_t n_heads     = q->ne[1];
     const int64_t n_kv_tokens = packed_k->ne[1];
