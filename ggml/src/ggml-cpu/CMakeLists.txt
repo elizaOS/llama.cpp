@@ -52,7 +52,29 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/vec.cpp
         ggml-cpu/ops.h
         ggml-cpu/ops.cpp
+        # QJL 1-bit packed-K quant + attention-score op. Vendored from the
+        # standalone packages/native-plugins/qjl-cpu/ kernel library; the
+        # kernel files themselves carry their own SIMD guards (__AVX2__ /
+        # __ARM_NEON), so we always compile all of them and the dispatcher
+        # picks the right one at link/runtime.
+        ggml-cpu/qjl/quants-qjl.c
+        ggml-cpu/qjl/qjl_block.h
+        ggml-cpu/qjl/qjl_dispatch.c
+        ggml-cpu/qjl/qjl_projection.c
+        ggml-cpu/qjl/qjl_quantize_ref.c
+        ggml-cpu/qjl/qjl_quantize_avx2.c
+        ggml-cpu/qjl/qjl_quantize_neon.c
+        ggml-cpu/qjl/qjl_score_ref.c
+        ggml-cpu/qjl/qjl_score_avx2.c
+        ggml-cpu/qjl/qjl_score_neon.c
         )
+
+    # qjl/include lets `#include "qjl/qjl.h"` resolve to the vendored kernel
+    # public header without polluting the rest of ggml-cpu's include surface.
+    # qjl/ itself is on the include path so the kernel files reach
+    # `qjl_block.h` (their internal header) the same way they do in the
+    # standalone packages/native-plugins/qjl-cpu/ build.
+    target_include_directories(${GGML_CPU_NAME} PRIVATE ggml-cpu/qjl/include ggml-cpu/qjl)
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)

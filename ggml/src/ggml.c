@@ -910,6 +910,21 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_tbq4_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_tbq4_0_ref,
     },
+    [GGML_TYPE_QJL1_256] = {
+        .type_name                = "qjl1_256",
+        // Block stores the sketch dim (QK_QJL = 256) worth of signs from
+        // one cached key vector. Type-traits row-size math:
+        //   row_size = nrow * n_per_row * type_size / blck_size
+        // With blck_size = QK_QJL = 256, type_size = sizeof(block_qjl1_256) = 34,
+        // and n_per_row chosen by the caller as a multiple of QK_QJL,
+        // this produces 34 B per cached key vector — exactly the on-cache
+        // footprint the QJL paper specifies.
+        .blck_size                = QK_QJL,
+        .type_size                = sizeof(block_qjl1_256),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_qjl1_256,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_qjl1_256_ref,
+    },
     [36] = { // GGML_TYPE_IQ4_NL_4_4
         .type_name                = "TYPE_IQ4_NL_4_4 REMOVED, use IQ4_NL with runtime repacking",
         .blck_size                = 0,
@@ -924,6 +939,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
     },
     [38] = { // GGML_TYPE_IQ4_NL_8_8
         .type_name                = "TYPE_IQ4_NL_8_8 REMOVED, use IQ4_NL with runtime repacking",
+        .blck_size                = 0,
+        .type_size                = 0,
+        .is_quantized             = false,
+    },
+    [45] = { // RESERVED — was GGML_TYPE_COUNT pre-QJL; left as a hole so a
+             // GGUF that recorded this id under the old build is unambiguously
+             // not a QJL block at runtime.
+        .type_name                = "TYPE_45 RESERVED (pre-QJL GGML_TYPE_COUNT)",
         .blck_size                = 0,
         .type_size                = 0,
         .is_quantized             = false,
@@ -1053,6 +1076,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "FLASH_ATTN_EXT",
     "FLASH_ATTN_BACK",
+    "ATTN_SCORE_QJL",
     "SSM_CONV",
     "SSM_SCAN",
     "WIN_PART",
@@ -1080,7 +1104,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 95, "GGML_OP_COUNT != 95");
+static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1162,6 +1186,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "flash_attn_ext(x)",
     "flash_attn_back(x)",
+    "attn_score_qjl(q, packed_k)",
     "ssm_conv(x)",
     "ssm_scan(x)",
     "win_part(x)",
@@ -1189,7 +1214,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 95, "GGML_OP_COUNT != 95");
+static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5386,6 +5411,44 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
+// ggml_attn_score_qjl
+//
+// Constructor for the QJL packed-K attention-score op. See header doc
+// for shape contract; assertions here are the load-bearing ones.
+struct ggml_tensor * ggml_attn_score_qjl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * packed_k,
+        int                   n_kv_heads) {
+    GGML_ASSERT(q != NULL);
+    GGML_ASSERT(packed_k != NULL);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(packed_k->type == GGML_TYPE_QJL1_256);
+    GGML_ASSERT(q->ne[0] == QK_QJL);
+    GGML_ASSERT(packed_k->ne[0] == QK_QJL);
+
+    const int64_t n_heads     = q->ne[1];
+    const int64_t n_kv_tokens = packed_k->ne[1];
+
+    GGML_ASSERT(n_kv_heads > 0);
+    GGML_ASSERT((n_heads % n_kv_heads) == 0);
+    GGML_ASSERT(packed_k->ne[2] == (int64_t) n_kv_heads);
+    GGML_ASSERT(packed_k->ne[3] == q->ne[3]);
+
+    // Output: [n_kv_tokens, n_heads, n_batch, ne3].
+    const int64_t ne[4] = { n_kv_tokens, n_heads, q->ne[2], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    int32_t params[1] = { n_kv_heads };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_ATTN_SCORE_QJL;
+    result->src[0] = q;
+    result->src[1] = packed_k;
+
+    return result;
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(
@@ -7633,6 +7696,7 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_TQ2_0:   result = quantize_tq2_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TBQ3_0:  result = quantize_tbq3_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TBQ4_0:  result = quantize_tbq4_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_QJL1_256: result = quantize_qjl1_256(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ2_XXS: result = quantize_iq2_xxs(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ2_XS:  result = quantize_iq2_xs (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ3_XXS: result = quantize_iq3_xxs(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
