@@ -432,7 +432,8 @@ extern "C" {
         GGML_TYPE_Q1_0    = 42,
         GGML_TYPE_TBQ3_0  = 43,
         GGML_TYPE_TBQ4_0  = 44,
-        GGML_TYPE_COUNT   = 45,
+        GGML_TYPE_Q4_POLAR = 45, // PolarQuant Q4: 128-element block, fp16 norm + 4-bit Lloyd-Max codes + optional 1-bit QJL residual
+        GGML_TYPE_COUNT   = 46,
     };
 
     // precision
