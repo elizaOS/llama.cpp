@@ -2640,6 +2640,17 @@ void dequantize_row_tbq4_0(const block_tbq4_0 * GGML_RESTRICT x, float * GGML_RE
 }
 
 // ====================== PolarQuant Q4 (Q4_POLAR) reference kernels
+
+#include <stdbool.h>
+
+// Runtime toggle, see ggml-quants.h. Default false: dequantize ignores
+// the on-disk QJL byte until the loader has verified PRNG parity with
+// the sidecar that produced it.
+static bool s_q4_polar_use_qjl = false;
+
+void ggml_q4_polar_set_use_qjl(bool use_qjl) { s_q4_polar_use_qjl = use_qjl; }
+bool ggml_q4_polar_get_use_qjl(void) { return s_q4_polar_use_qjl; }
+
 //
 // Mechanically ported from
 //   packages/native-plugins/polarquant-cpu/src/polar_{quantize,dequantize}_ref.c
@@ -2734,12 +2745,16 @@ void dequantize_row_q4_polar(const block_q4_polar * GGML_RESTRICT x, float * GGM
             buf[2 * i + 1] = POLAR_Q4_CENTROIDS[hi];
         }
 
-        // 3. QJL residual correction along the deterministic sign vector
-        const uint8_t bit = (uint8_t)(src->qjl[0] & 1u);
-        const float sign  = bit ? 1.0f : -1.0f;
-        const float mag   = POLAR_QJL_CORRECTION_MAGNITUDE / sqrtf((float)QK_POLAR);
-        for (int i = 0; i < QK_POLAR; i++) {
-            buf[i] += sign * mag * qjl_signs[i];
+        // 3. Optional QJL residual correction. Gated on the runtime flag
+        //    because the sign-vector PRNG isn't portable across encoder
+        //    implementations (see ggml_q4_polar_set_use_qjl docs).
+        if (s_q4_polar_use_qjl) {
+            const uint8_t bit = (uint8_t)(src->qjl[0] & 1u);
+            const float sign  = bit ? 1.0f : -1.0f;
+            const float mag   = POLAR_QJL_CORRECTION_MAGNITUDE / sqrtf((float)QK_POLAR);
+            for (int i = 0; i < QK_POLAR; i++) {
+                buf[i] += sign * mag * qjl_signs[i];
+            }
         }
 
         // 4. Inverse Hadamard + 1/QK_POLAR compensation for the butterfly's scale

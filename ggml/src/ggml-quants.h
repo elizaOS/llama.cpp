@@ -69,6 +69,20 @@ GGML_API void dequantize_row_tbq3_0(const block_tbq3_0 * GGML_RESTRICT x, float 
 GGML_API void dequantize_row_tbq4_0(const block_tbq4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_q4_polar(const block_q4_polar * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 
+// Q4_POLAR runtime QJL toggle.
+//
+// The on-disk block always reserves QJL_RESIDUAL_BYTES for the 1-bit
+// residual, but the sign vector that the residual is projected onto
+// is not portable across PRNG implementations (torch.randint vs C
+// xorshift32). Until that parity is sorted, the decoder defaults to
+// ignoring the QJL byte. Loaders that have verified the sidecar was
+// produced with the same xorshift32 sign vector this build uses can
+// opt back in by calling ggml_q4_polar_set_use_qjl(true). The loader
+// is expected to mirror the value of polarquant.use_qjl in the GGUF
+// metadata after verifying polarquant.qjl_seed matches POLAR_QJL_SEED.
+GGML_API void ggml_q4_polar_set_use_qjl(bool use_qjl);
+GGML_API bool ggml_q4_polar_get_use_qjl(void);
+
 GGML_API void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_iq2_xs (const block_iq2_xs  * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_iq2_s  (const block_iq2_s   * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
