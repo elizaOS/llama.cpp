@@ -432,7 +432,9 @@ extern "C" {
         GGML_TYPE_Q1_0    = 42,
         GGML_TYPE_TBQ3_0  = 43,
         GGML_TYPE_TBQ4_0  = 44,
-        GGML_TYPE_COUNT   = 45,
+        // 45 reserved (was GGML_TYPE_COUNT before QJL was added)
+        GGML_TYPE_QJL1_256 = 46, // 1-bit JL-transform K-cache block (34 B / 256 sketch dims)
+        GGML_TYPE_COUNT   = 47,
     };
 
     // precision
@@ -553,6 +555,7 @@ extern "C" {
 
         GGML_OP_FLASH_ATTN_EXT,
         GGML_OP_FLASH_ATTN_BACK,
+        GGML_OP_ATTN_SCORE_QJL, // QJL 1-bit packed-K attention score (CPU-only)
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
         GGML_OP_WIN_PART,
@@ -2346,6 +2349,37 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // QJL 1-bit packed-K attention score.
+    //
+    // Inputs:
+    //   q          F32 [proj_dim, n_heads, n_batch, ne3] — pre-projected
+    //              query sketch (already through Π). Caller is responsible
+    //              for projecting Q once at the top of the attention block;
+    //              this op never touches the raw query.
+    //   packed_k   QJL1_256 [proj_dim, n_kv_tokens, n_kv_heads, ne3] — the
+    //              packed K-cache. The element type carries the per-token
+    //              norm and the packed signs together. proj_dim is encoded
+    //              in the type's blck_size (= QK_QJL = 256), so the leading
+    //              dim length must equal QK_QJL.
+    //   n_kv_heads number of KV heads (the GQA divisor). n_heads must be a
+    //              multiple of n_kv_heads.
+    //
+    // Output:
+    //   F32 [n_kv_tokens, n_heads, n_batch, ne3] — per-(q-head, token) score
+    //   computed as ||k_t|| * sqrt(pi/2)/proj_dim * sum_j sign[t,j] * q[h_q,j],
+    //   matching the QJL paper's unbiased cosine-similarity estimator.
+    //
+    // Shape invariants:
+    //   q->ne[0] == QK_QJL
+    //   packed_k->ne[0] == QK_QJL
+    //   q->ne[1] % packed_k->ne[2] == 0
+    //   q->ne[2] == packed_k->ne[3]   // batch dim matches
+    GGML_API struct ggml_tensor * ggml_attn_score_qjl(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * packed_k,
+            int                   n_kv_heads);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

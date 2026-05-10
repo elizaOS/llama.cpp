@@ -408,6 +408,13 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
+    [GGML_TYPE_QJL1_256] = {
+        // QJL is K-cache-only; it is never an operand to mul_mat. The
+        // attention path uses GGML_OP_ATTN_SCORE_QJL instead, which calls
+        // qjl_score_qk() directly and bypasses the vec_dot table. We only
+        // need from_float so ggml_cpy(K_cur -> K_view) can quantize.
+        .from_float               = quantize_row_qjl1_256,
+    },
     [GGML_TYPE_I32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
     },
@@ -1990,6 +1997,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_flash_attn_ext(params, tensor);
             } break;
+        case GGML_OP_ATTN_SCORE_QJL:
+            {
+                ggml_compute_forward_attn_score_qjl(params, tensor);
+            } break;
         case GGML_OP_FLASH_ATTN_BACK:
             {
                 int32_t t = ggml_get_op_params_i32(tensor, 0);
@@ -2368,6 +2379,14 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_RWKV_WKV7:
             {
                 n_tasks = n_threads;
+            } break;
+        case GGML_OP_ATTN_SCORE_QJL:
+            {
+                // QJL score forward dispatches over (h_q, t) inside the
+                // SIMD path itself; the outer loop here is a small
+                // n_batch * ne3 fan-out. Single-thread for now — revisit
+                // when we have a real per-token decode profile on arm64.
+                n_tasks = 1;
             } break;
         case GGML_OP_WIN_PART:
         case GGML_OP_WIN_UNPART:

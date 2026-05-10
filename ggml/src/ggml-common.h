@@ -260,6 +260,29 @@ typedef struct {
 } block_tbq4_0;
 static_assert(sizeof(block_tbq4_0) == sizeof(ggml_half) + QK_TBQ/2, "wrong tbq4_0 block size/padding");
 
+// QJL: 1-bit Quantized JL Transform K-cache compression. One block stores
+// the packed signs of Π·k for one cached key vector together with the bf16
+// L2 norm of the original key. Layout matches qjl_block_qjl1_256 in the
+// vendored kernel library at packages/native-plugins/qjl-cpu/include/qjl/qjl.h
+// and ggml-cpu/qjl/include/qjl/qjl.h: 32 bytes of packed signs first, then
+// the 16-bit bf16 norm. The companion attention-score path is
+// GGML_OP_ATTN_SCORE_QJL.
+//
+// `d` holds the raw bf16 bits as uint16_t (same on-cache footprint as
+// ggml_bf16_t, which is itself a `struct { uint16_t bits; }` wrapper).
+// Field order is signs-then-norm so the cast in
+// ggml-cpu/qjl/quants-qjl.c::quantize_row_qjl1_256
+//   `qjl_quantize_rows(x, prj, (qjl_block_qjl1_256 *)y, n_blocks)`
+// produces an on-cache block with bytewise-identical contents to what the
+// kernel library writes — verified by the parity test at
+// packages/native-plugins/qjl-cpu/test/qjl_fork_parity.c.
+#define QK_QJL 256  // projection_dim_per_head (= sketch dim, NOT head_dim)
+typedef struct {
+    uint8_t signs[QK_QJL/8];   // packed 1-bit signs of Π·k, 8 per byte LSB-first
+    uint16_t d;                // bf16 L2 norm of the original key vector
+} block_qjl1_256;
+static_assert(sizeof(block_qjl1_256) == 2 + QK_QJL/8, "wrong qjl1_256 block size/padding");
+
 #define QK8_1 32
 typedef struct {
     GGML_EXTENSION union {

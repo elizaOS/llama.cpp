@@ -34,6 +34,15 @@ void quantize_row_tq1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
 void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 void quantize_row_tbq3_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 void quantize_row_tbq4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+void quantize_row_qjl1_256(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+
+// QJL custom op forward — packed-K attention score. Declared here so
+// ggml-cpu.c's dispatcher can reach it; defined in qjl/quants-qjl.c.
+struct ggml_compute_params;
+struct ggml_tensor;
+void ggml_compute_forward_attn_score_qjl(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst);
 
 void quantize_row_iq4_nl (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 void quantize_row_iq4_xs (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
