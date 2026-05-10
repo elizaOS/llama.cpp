@@ -68,6 +68,16 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/qjl/qjl_score_ref.c
         ggml-cpu/qjl/qjl_score_avx2.c
         ggml-cpu/qjl/qjl_score_neon.c
+        # Fused CPU kernels (W3-B). Each per-ISA TU carries its own
+        # __AVX2__ / __ARM_NEON guard so we can compile all three on every
+        # target and let the dispatch entry pick at runtime.
+        ggml-cpu/fused-q4-polar-dot.c
+        ggml-cpu/fused-q4-polar-dot-avx2.c
+        ggml-cpu/fused-q4-polar-dot-neon.c
+        ggml-cpu/fused-attn-qjl-tbq.c
+        ggml-cpu/fused-attn-qjl-tbq-avx2.c
+        ggml-cpu/fused-attn-qjl-tbq-neon.c
+        ggml-cpu/fused-hadamard-polar-dot.c
         )
 
     # qjl/include lets `#include "qjl/qjl.h"` resolve to the vendored kernel
