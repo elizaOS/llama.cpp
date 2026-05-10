@@ -2007,6 +2007,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_attn_score_qjl(params, tensor);
             } break;
+        case GGML_OP_FUSED_ATTN_QJL_TBQ:
+            {
+                ggml_compute_forward_fused_attn_qjl_tbq(params, tensor);
+            } break;
         case GGML_OP_FLASH_ATTN_BACK:
             {
                 int32_t t = ggml_get_op_params_i32(tensor, 0);
@@ -2387,11 +2391,14 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_ATTN_SCORE_QJL:
+        case GGML_OP_FUSED_ATTN_QJL_TBQ:
             {
                 // QJL score forward dispatches over (h_q, t) inside the
                 // SIMD path itself; the outer loop here is a small
                 // n_batch * ne3 fan-out. Single-thread for now — revisit
                 // when we have a real per-token decode profile on arm64.
+                // The fused QJL-K + TBQ-V kernel uses thread-local
+                // scratch buffers and is also single-threaded today.
                 n_tasks = 1;
             } break;
         case GGML_OP_WIN_PART:

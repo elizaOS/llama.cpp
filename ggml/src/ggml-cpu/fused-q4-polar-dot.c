@@ -61,10 +61,14 @@
 #include <stdint.h>
 #include <string.h>
 
-/* External SIMD entry points. Defined in the per-ISA TUs and guarded by
- * __AVX2__ / __ARM_NEON. Each one returns the dot for `nb_polar` pairs of
- * blocks; `acc_init` lets the dispatcher seed the accumulator (we always
- * pass 0 today). */
+/* SIMD + scalar fused-dot entry points. The scalar version is
+ * declared here so the parity test can call it directly without
+ * pulling in the full ABI wrapper. SIMD definitions are guarded by
+ * __AVX2__ / __ARM_NEON and provide their own external linkage. */
+double ggml_vec_dot_q4_polar_q8_0_fused_ref(int nb_polar,
+                                            const block_q4_polar * x,
+                                            const block_q8_0 * y,
+                                            bool use_qjl);
 #if defined(__AVX2__)
 double ggml_vec_dot_q4_polar_q8_0_fused_avx2(int nb_polar,
                                              const block_q4_polar * x,

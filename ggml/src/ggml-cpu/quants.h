@@ -45,6 +45,12 @@ void ggml_compute_forward_attn_score_qjl(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst);
 
+// Fused QJL-K + TBQ-V attention forward. Defined in
+// ggml/src/ggml-cpu/fused-attn-qjl-tbq.c.
+void ggml_compute_forward_fused_attn_qjl_tbq(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst);
+
 void quantize_row_iq4_nl (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 void quantize_row_iq4_xs (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 

@@ -1089,6 +1089,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FLASH_ATTN_EXT",
     "FLASH_ATTN_BACK",
     "ATTN_SCORE_QJL",
+    "FUSED_ATTN_QJL_TBQ",
     "SSM_CONV",
     "SSM_SCAN",
     "WIN_PART",
@@ -1116,7 +1117,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1199,6 +1200,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "flash_attn_ext(x)",
     "flash_attn_back(x)",
     "attn_score_qjl(q, packed_k)",
+    "fused_attn_qjl_tbq(q, packed_k, packed_v)",
     "ssm_conv(x)",
     "ssm_scan(x)",
     "win_part(x)",
@@ -1226,7 +1228,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5463,6 +5465,57 @@ struct ggml_tensor * ggml_attn_score_qjl(
     result->op     = GGML_OP_ATTN_SCORE_QJL;
     result->src[0] = q;
     result->src[1] = packed_k;
+
+    return result;
+}
+
+// ggml_fused_attn_qjl_tbq
+//
+// Fused QJL-K + TBQ-V attention. See header doc for the math.
+// Output shape: [head_dim, n_heads, n_batch, ne3].
+struct ggml_tensor * ggml_fused_attn_qjl_tbq(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * packed_k,
+        struct ggml_tensor  * packed_v,
+        int                   n_kv_heads,
+        float                 sm_scale) {
+    GGML_ASSERT(q != NULL);
+    GGML_ASSERT(packed_k != NULL);
+    GGML_ASSERT(packed_v != NULL);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(packed_k->type == GGML_TYPE_QJL1_256);
+    GGML_ASSERT(packed_v->type == GGML_TYPE_TBQ3_0);
+    GGML_ASSERT(q->ne[0] == QK_QJL);
+
+    const int64_t head_dim    = packed_k->ne[0];
+    const int64_t n_heads     = q->ne[1];
+    const int64_t n_kv_tokens = packed_k->ne[1];
+
+    GGML_ASSERT(head_dim == packed_v->ne[0]);
+    GGML_ASSERT(n_kv_heads > 0);
+    GGML_ASSERT((n_heads % n_kv_heads) == 0);
+    GGML_ASSERT(packed_k->ne[2] == (int64_t) n_kv_heads);
+    GGML_ASSERT(packed_v->ne[2] == (int64_t) n_kv_heads);
+    GGML_ASSERT(packed_v->ne[1] == n_kv_tokens);
+    GGML_ASSERT(packed_k->ne[3] == q->ne[3]);
+    GGML_ASSERT(packed_v->ne[3] == q->ne[3]);
+
+    // Output shape mirrors V's value channel.
+    const int64_t ne[4] = { head_dim, n_heads, q->ne[2], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    int32_t params[2];
+    params[0] = n_kv_heads;
+    union { float f; int32_t i; } scale_bits;
+    scale_bits.f = sm_scale;
+    params[1] = scale_bits.i;
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_FUSED_ATTN_QJL_TBQ;
+    result->src[0] = q;
+    result->src[1] = packed_k;
+    result->src[2] = packed_v;
 
     return result;
 }

@@ -560,6 +560,7 @@ extern "C" {
         GGML_OP_FLASH_ATTN_EXT,
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_ATTN_SCORE_QJL, // QJL 1-bit packed-K attention score (CPU-only)
+        GGML_OP_FUSED_ATTN_QJL_TBQ, // fused QJL-K + TBQ-V attention (CPU-only)
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
         GGML_OP_WIN_PART,
@@ -2384,6 +2385,23 @@ extern "C" {
             struct ggml_tensor  * q,
             struct ggml_tensor  * packed_k,
             int                   n_kv_heads);
+
+    // Fused QJL-K + TBQ-V attention (CPU-only). Computes
+    //   out[h_q, d] = Σ_t softmax(QJL_score(q, K)/sqrt(d_k))_t * dequant_V[t, d]
+    // in two passes (max pass then exp+mix pass) without materializing
+    // dequantized K or V intermediates. Inputs:
+    //   q         F32      [proj_dim,  n_heads,    n_batch, ne3]
+    //   packed_k  QJL1_256 [head_dim,  n_kv_tokens, n_kv_heads, ne3]
+    //   packed_v  TBQ3_0   [head_dim,  n_kv_tokens, n_kv_heads, ne3]
+    // Output: F32 [head_dim, n_heads, n_batch, ne3].
+    // sm_scale is the pre-softmax temperature (typically 1/sqrt(head_dim)).
+    GGML_API struct ggml_tensor * ggml_fused_attn_qjl_tbq(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * packed_k,
+            struct ggml_tensor  * packed_v,
+            int                   n_kv_heads,
+            float                 sm_scale);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
