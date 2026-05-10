@@ -256,6 +256,9 @@ if (NOT GGML_BACKEND_DL)
     # backends just like the standard quant tests above.
     llama_build_and_test(test-qjl-cache.cpp)
     llama_build_and_test(test-fused-kernels.cpp)
+    # Standalone bench: not part of `ctest` (no LABEL "main") since it
+    # records perf numbers rather than asserting correctness.
+    llama_build(bench-fused-kernels.cpp)
 endif()
 
 # libmtmd
