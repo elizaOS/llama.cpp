@@ -163,6 +163,19 @@ if (CUDAToolkit_FOUND)
         add_compile_definitions(GGML_CUDA_NO_PEER_COPY)
     endif()
 
+    # Milady fork: opt-in CUDA paths for QJL / PolarQuant / TBQ3_TCQ. Default ON
+    # so the standard `-DGGML_CUDA=ON` build picks them up; the .cu files are
+    # always globbed in (above) but their bodies are gated by these macros.
+    if (GGML_CUDA_QJL)
+        add_compile_definitions(GGML_CUDA_QJL)
+    endif()
+    if (GGML_CUDA_POLARQUANT)
+        add_compile_definitions(GGML_CUDA_POLARQUANT)
+    endif()
+    if (GGML_CUDA_TBQ3_TCQ)
+        add_compile_definitions(GGML_CUDA_TBQ3_TCQ)
+    endif()
+
     if (GGML_STATIC)
         if (WIN32)
             # As of 12.3.1 CUDA Toolkit for Windows does not offer a static cublas library

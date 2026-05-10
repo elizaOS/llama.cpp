@@ -203,6 +203,9 @@ option(GGML_CUDA_NO_VMM                     "ggml: do not try to use CUDA VMM"  
 option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention CUDA kernels"  ON)
 option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile all quants for FlashAttention"     OFF)
 option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
+option(GGML_CUDA_QJL                        "ggml: compile QJL 1-bit packed-K KV-cache CUDA kernels"  ON)
+option(GGML_CUDA_POLARQUANT                 "ggml: compile PolarQuant Q4 CUDA kernels"        ON)
+option(GGML_CUDA_TBQ3_TCQ                   "ggml: compile TBQ3_TCQ trellis-coded CUDA kernels" ON)
 set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING
                                             "ggml: cuda link binary compression mode; requires cuda 12.8+")
 set_property(CACHE GGML_CUDA_COMPRESSION_MODE PROPERTY STRINGS "none;speed;balance;size")

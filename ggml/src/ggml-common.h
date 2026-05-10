@@ -297,6 +297,25 @@ typedef struct {
 } block_q4_polar;
 static_assert(sizeof(block_q4_polar) == sizeof(ggml_half) + QK_POLAR / 2 + QJL_RESIDUAL_BYTES, "wrong q4_polar block size/padding");
 
+// TBQ3_TCQ — TurboQuant TCQ-3: trellis-coded 3-bit per element with a
+// 9-bit (3 most-recent symbols, 512-entry) sliding-window codebook lookup.
+// Per block (128 elements):
+//   norm      fp16 reconstruction-corrected L2 norm
+//   qs[49]    6 prefix bits (initial state >> 3) followed by 128*3 = 390
+//             symbol bits, LSB-first within byte, byte-major across qs[].
+//   pad       alignment to 52 bytes total.
+// Decode: for symbol t, read 9-bit window starting at bit position (t*3),
+// look up codebook[state] * norm. Encoder is host-side Viterbi; CUDA kernel
+// only handles decode + dot. Layout matches the reference at
+// packages/inference/reference/turbo_kernels.{h,c} (eliza_block_turbo3_tcq).
+#define QK_TBQ3_TCQ 128
+typedef struct {
+    ggml_half d;       // per-block L2 norm (Viterbi-corrected)
+    uint8_t   qs[49];  // 6 prefix bits + 128*3-bit symbol stream
+    uint8_t   pad;     // alignment
+} block_tbq3_tcq;
+static_assert(sizeof(block_tbq3_tcq) == sizeof(ggml_half) + 49 + 1, "wrong tbq3_tcq block size/padding");
+
 #define QK8_1 32
 typedef struct {
     GGML_EXTENSION union {
