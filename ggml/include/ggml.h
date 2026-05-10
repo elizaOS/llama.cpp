@@ -437,7 +437,8 @@ extern "C" {
         // to either QJL or Q4_POLAR)
         GGML_TYPE_QJL1_256 = 46, // 1-bit JL-transform K-cache block (34 B / 256 sketch dims)
         GGML_TYPE_Q4_POLAR = 47, // PolarQuant Q4: 128-element block, fp16 norm + 4-bit Lloyd-Max codes + optional 1-bit QJL residual
-        GGML_TYPE_COUNT   = 48,
+        GGML_TYPE_TBQ3_TCQ = 48, // TurboQuant TCQ-3: 128-element block, fp16 norm + 6-bit init state + 128*3-bit Viterbi-encoded symbol stream (52 B = 3.25 bpw)
+        GGML_TYPE_COUNT   = 49,
     };
 
     // precision
