@@ -259,6 +259,25 @@ if (NOT GGML_BACKEND_DL)
     # Standalone bench: not part of `ctest` (no LABEL "main") since it
     # records perf numbers rather than asserting correctness.
     llama_build(bench-fused-kernels.cpp)
+    # W4-B compile-only validation that the new CUDA host wrappers for
+    # QJL / PolarQuant Q4 / TBQ3_TCQ are linkable. Skipped entirely when
+    # the CUDA backend is not built; otherwise the matching feature
+    # macros (set on the ggml-cuda target) decide which symbol blocks
+    # the test references.
+    if (GGML_CUDA)
+        llama_build_and_test(test-cuda-extra-kernels.cpp)
+        target_compile_definitions(test-cuda-extra-kernels PRIVATE GGML_USE_CUDA)
+        if (GGML_CUDA_QJL)
+            target_compile_definitions(test-cuda-extra-kernels PRIVATE GGML_CUDA_QJL)
+        endif()
+        if (GGML_CUDA_POLARQUANT)
+            target_compile_definitions(test-cuda-extra-kernels PRIVATE GGML_CUDA_POLARQUANT)
+        endif()
+        if (GGML_CUDA_TBQ3_TCQ)
+            target_compile_definitions(test-cuda-extra-kernels PRIVATE GGML_CUDA_TBQ3_TCQ)
+        endif()
+        target_link_libraries(test-cuda-extra-kernels PRIVATE ggml-cuda)
+    endif()
 endif()
 
 # libmtmd
