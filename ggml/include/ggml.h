@@ -432,8 +432,12 @@ extern "C" {
         GGML_TYPE_Q1_0    = 42,
         GGML_TYPE_TBQ3_0  = 43,
         GGML_TYPE_TBQ4_0  = 44,
-        GGML_TYPE_Q4_POLAR = 45, // PolarQuant Q4: 128-element block, fp16 norm + 4-bit Lloyd-Max codes + optional 1-bit QJL residual
-        GGML_TYPE_COUNT   = 46,
+        // 45 reserved (was GGML_TYPE_COUNT in TBQ-only build; intentional hole so a
+        // GGUF that recorded type=45 against the old build is not silently aliased)
+        // 46 is GGML_TYPE_QJL1_256 — registered on milady/qjl, kept as the canonical
+        // QJL slot in milady/integration.
+        GGML_TYPE_Q4_POLAR = 47, // PolarQuant Q4: 128-element block, fp16 norm + 4-bit Lloyd-Max codes + optional 1-bit QJL residual
+        GGML_TYPE_COUNT   = 48,
     };
 
     // precision
