@@ -3359,7 +3359,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_DRAFT_P_SPLIT"));
     add_opt(common_arg(
-        {"--draft-p-min"}, "P",
+        // --draft-min-prob is the spiritbuun/buun-llama-cpp spelling that the
+        // Milady consumer (`dflash-server.ts`, AGENTS.md env mapping) emits
+        // under `ELIZA_LOCAL_NGRAM=on`. Keep it as an alias for the upstream
+        // --draft-p-min so existing downstream code and rollout scripts work
+        // unchanged on the unified fork.
+        {"--draft-p-min", "--draft-min-prob"}, "P",
         string_format("minimum speculative decoding probability (greedy) (default: %.2f)", (double)params.speculative.p_min),
         [](common_params & params, const std::string & value) {
             params.speculative.p_min = std::stof(value);
@@ -3415,7 +3420,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
-        {"--spec-type"}, "[none|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]",
+        {"--spec-type"}, "[none|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod|dflash]",
         string_format("type of speculative decoding to use when no draft model is provided (default: %s)\n",
             common_speculative_type_to_str(params.speculative.type).c_str()),
         [](common_params & params, const std::string & value) {
@@ -3431,6 +3436,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V;
             } else if (value == "ngram-mod") {
                 params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_MOD;
+            } else if (value == "dflash") {
+                // Milady alias: behaves identically to draft-model speculative decoding
+                // when -md / --model-draft is supplied. Carrying the spelling preserves
+                // the AOSP/desktop CLI in `aosp-dflash-adapter.ts` and `dflash-server.ts`.
+                params.speculative.type = COMMON_SPECULATIVE_TYPE_DFLASH;
             } else {
                 throw std::invalid_argument("unknown speculative decoding type without draft model");
             }
