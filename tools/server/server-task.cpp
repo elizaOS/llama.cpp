@@ -1763,6 +1763,9 @@ json server_task_result_metrics::to_json() {
         { "n_decode_total",                  n_decode_total },
         { "n_busy_slots_total",              n_busy_slots_total },
 
+        { "n_drafted_total",                 n_drafted_total },
+        { "n_drafted_accepted_total",        n_drafted_accepted_total },
+
         { "slots",                           slots_data },
     };
 }
