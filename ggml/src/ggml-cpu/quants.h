@@ -45,6 +45,12 @@ void ggml_compute_forward_attn_score_qjl(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst);
 
+// Fused QJL-K + TBQ-V attention forward. Defined in
+// ggml/src/ggml-cpu/fused-attn-qjl-tbq.c.
+void ggml_compute_forward_fused_attn_qjl_tbq(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst);
+
 void quantize_row_iq4_nl (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 void quantize_row_iq4_xs (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 
@@ -70,6 +76,14 @@ void ggml_vec_dot_tq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 void ggml_vec_dot_tbq3_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_tbq4_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q4_polar_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+
+// Fused Q4_POLAR x Q8_0 dot. Streams centroids directly into the FMA
+// accumulator, applies the WHT to the Q8_0 activation side once, and
+// folds the (l2 / QK_POLAR) compensation into the per-chunk scale at
+// load time. Bit-equivalent to ggml_vec_dot_q4_polar_q8_0 modulo
+// floating-point reordering. See ggml/src/ggml-cpu/fused-q4-polar-dot.c
+// for the algorithm. Tested by tests/test-fused-kernels.cpp.
+void ggml_vec_dot_q4_polar_q8_0_fused(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 
 void ggml_vec_dot_iq2_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_iq2_xs_q8_K (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);

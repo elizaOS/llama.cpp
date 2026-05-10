@@ -250,6 +250,15 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-quantize-fns.cpp)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)
+    # Milady CPU smoke tests for QJL + the W3-B fused kernels. These
+    # call into ggml-cpu directly via the type-traits table and the
+    # GGML_OP_FUSED_ATTN_QJL_TBQ op, so they require static-linked
+    # backends just like the standard quant tests above.
+    llama_build_and_test(test-qjl-cache.cpp)
+    llama_build_and_test(test-fused-kernels.cpp)
+    # Standalone bench: not part of `ctest` (no LABEL "main") since it
+    # records perf numbers rather than asserting correctness.
+    llama_build(bench-fused-kernels.cpp)
 endif()
 
 # libmtmd
