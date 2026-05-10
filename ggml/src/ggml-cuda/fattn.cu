@@ -259,10 +259,19 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
+
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ4_0, GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ4_0, GGML_TYPE_TBQ4_0)
 #else
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ4_0, GGML_TYPE_TBQ3_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ4_0, GGML_TYPE_TBQ4_0)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     GGML_ABORT("fatal error");
@@ -294,6 +303,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+
+    const bool K_tbq = K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0;
+    const bool V_tbq = V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0;
+    const bool KV_tbq = K_tbq && V_tbq;
 
     // The effective batch size for the kernel can be increased by gqa_ratio.
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
@@ -338,10 +351,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
-    if (K->type != V->type) {
+    if (K->type != V->type && !KV_tbq) {
         return BEST_FATTN_KERNEL_NONE;
     }
 #endif // GGML_CUDA_FA_ALL_QUANTS
+
+    if (K_tbq != V_tbq) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
 
     switch (K->type) {
         case GGML_TYPE_F32:
@@ -355,6 +372,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 #endif // GGML_CUDA_FA_ALL_QUANTS
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_TBQ3_0:
+        case GGML_TYPE_TBQ4_0:
             break;
         default:
             return BEST_FATTN_KERNEL_NONE;
@@ -366,6 +385,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    if (KV_tbq) {
+        return can_use_vector_kernel ? BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_NONE;
+    }
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
