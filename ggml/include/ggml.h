@@ -432,9 +432,12 @@ extern "C" {
         GGML_TYPE_Q1_0    = 42,
         GGML_TYPE_TBQ3_0  = 43,
         GGML_TYPE_TBQ4_0  = 44,
-        // 45 reserved (was GGML_TYPE_COUNT before QJL was added)
+        // 45 reserved (was GGML_TYPE_COUNT in TBQ-only build; intentional hole so a
+        // GGUF that recorded type=45 against the old build is not silently aliased
+        // to either QJL or Q4_POLAR)
         GGML_TYPE_QJL1_256 = 46, // 1-bit JL-transform K-cache block (34 B / 256 sketch dims)
-        GGML_TYPE_COUNT   = 47,
+        GGML_TYPE_Q4_POLAR = 47, // PolarQuant Q4: 128-element block, fp16 norm + 4-bit Lloyd-Max codes + optional 1-bit QJL residual
+        GGML_TYPE_COUNT   = 48,
     };
 
     // precision
@@ -472,6 +475,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0_g128 = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q4_POLAR = 29, // except 1d tensors
     };
 
     // available tensor operations:

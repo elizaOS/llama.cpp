@@ -2639,6 +2639,144 @@ void dequantize_row_tbq4_0(const block_tbq4_0 * GGML_RESTRICT x, float * GGML_RE
     }
 }
 
+// ====================== PolarQuant Q4 (Q4_POLAR) reference kernels
+
+#include <stdbool.h>
+
+// Runtime toggle, see ggml-quants.h. Default false: dequantize ignores
+// the on-disk QJL byte until the loader has verified PRNG parity with
+// the sidecar that produced it.
+static bool s_q4_polar_use_qjl = false;
+
+void ggml_q4_polar_set_use_qjl(bool use_qjl) { s_q4_polar_use_qjl = use_qjl; }
+bool ggml_q4_polar_get_use_qjl(void) { return s_q4_polar_use_qjl; }
+
+//
+// Mechanically ported from
+//   packages/native-plugins/polarquant-cpu/src/polar_{quantize,dequantize}_ref.c
+// onto ggml's in-tree block_q4_polar / block_q8_0 types.
+//
+// Block layout (locked, see ggml-common.h):
+//   ggml_half d;                          // per-block L2 norm
+//   uint8_t   qs[QK_POLAR/2];             // 4-bit Lloyd-Max indices, 2 per byte
+//   uint8_t   qjl[QJL_RESIDUAL_BYTES];    // optional 1-bit QJL residual sign
+//
+// 82 bytes/block. With qjl: 5.125 bpw. Without (qjl bytes zero on disk
+// and decoder skips correction): 4.125 bpw effective.
+
+#include "polar_centroids.h"
+
+void quantize_row_q4_polar_ref(const float * GGML_RESTRICT x, block_q4_polar * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_POLAR == 0);
+    const int64_t nb = k / QK_POLAR;
+
+    float qjl_signs[QK_POLAR];
+    polar_qjl_signs(qjl_signs);
+
+    for (int64_t b = 0; b < nb; b++) {
+        const float * src = x + b * QK_POLAR;
+        block_q4_polar * dst = y + b;
+
+        // 1. L2 norm
+        double sumsq = 0.0;
+        for (int i = 0; i < QK_POLAR; i++) {
+            sumsq += (double)src[i] * (double)src[i];
+        }
+        const float l2     = (float)sqrt(sumsq);
+        const float inv_l2 = (l2 > 1e-10f) ? (1.0f / l2) : 0.0f;
+        dst->d = GGML_FP32_TO_FP16(l2);
+
+        // 2. Normalize
+        float buf[QK_POLAR];
+        for (int i = 0; i < QK_POLAR; i++) {
+            buf[i] = src[i] * inv_l2;
+        }
+
+        // 3. Walsh-Hadamard rotation -> N(0,1) coordinates
+        polar_hadamard_inplace(buf);
+
+        // 4+5. Bucketize and pack 2 codes per byte (low nibble = even index)
+        uint8_t codes[QK_POLAR];
+        for (int i = 0; i < QK_POLAR; i++) {
+            codes[i] = polar_q4_bucketize(buf[i]);
+        }
+        for (int i = 0; i < QK_POLAR / 2; i++) {
+            const uint8_t lo = codes[2 * i];
+            const uint8_t hi = codes[2 * i + 1];
+            dst->qs[i] = (uint8_t)((hi << 4) | (lo & 0x0F));
+        }
+
+        // 6. Always emit one QJL residual sign bit. The on-disk size is
+        //    fixed; the GGUF metadata flag drives whether the decoder
+        //    consumes it. Reserved bytes 1..15 stay zero for forward-
+        //    compatible per-coord residuals without a layout change.
+        memset(dst->qjl, 0, QJL_RESIDUAL_BYTES);
+        float proj = 0.0f;
+        for (int i = 0; i < QK_POLAR; i++) {
+            const float c = POLAR_Q4_CENTROIDS[codes[i]];
+            proj += (buf[i] - c) * qjl_signs[i];
+        }
+        dst->qjl[0] = (proj >= 0.0f) ? 1u : 0u;
+    }
+}
+
+void dequantize_row_q4_polar(const block_q4_polar * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_POLAR == 0);
+    const int64_t nb = k / QK_POLAR;
+
+    float qjl_signs[QK_POLAR];
+    polar_qjl_signs(qjl_signs);
+
+    const float inv_d = 1.0f / (float)QK_POLAR;
+
+    for (int64_t b = 0; b < nb; b++) {
+        const block_q4_polar * src = x + b;
+        float * dst = y + b * QK_POLAR;
+
+        const float l2 = GGML_FP16_TO_FP32(src->d);
+
+        // 1+2. Unpack codes -> centroid values
+        float buf[QK_POLAR];
+        for (int i = 0; i < QK_POLAR / 2; i++) {
+            const uint8_t byte = src->qs[i];
+            const uint8_t lo = (uint8_t)(byte & 0x0Fu);
+            const uint8_t hi = (uint8_t)((byte >> 4) & 0x0Fu);
+            buf[2 * i]     = POLAR_Q4_CENTROIDS[lo];
+            buf[2 * i + 1] = POLAR_Q4_CENTROIDS[hi];
+        }
+
+        // 3. Optional QJL residual correction. Gated on the runtime flag
+        //    because the sign-vector PRNG isn't portable across encoder
+        //    implementations (see ggml_q4_polar_set_use_qjl docs).
+        if (s_q4_polar_use_qjl) {
+            const uint8_t bit = (uint8_t)(src->qjl[0] & 1u);
+            const float sign  = bit ? 1.0f : -1.0f;
+            const float mag   = POLAR_QJL_CORRECTION_MAGNITUDE / sqrtf((float)QK_POLAR);
+            for (int i = 0; i < QK_POLAR; i++) {
+                buf[i] += sign * mag * qjl_signs[i];
+            }
+        }
+
+        // 4. Inverse Hadamard + 1/QK_POLAR compensation for the butterfly's scale
+        polar_hadamard_inplace(buf);
+        for (int i = 0; i < QK_POLAR; i++) {
+            buf[i] *= inv_d;
+        }
+
+        // 5. Per-block L2 rescale
+        for (int i = 0; i < QK_POLAR; i++) {
+            dst[i] = buf[i] * l2;
+        }
+    }
+}
+
+size_t quantize_q4_polar(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights;
+    const size_t row_size = ggml_row_size(GGML_TYPE_Q4_POLAR, n_per_row);
+    quantize_row_q4_polar_ref(src, (block_q4_polar *)dst, (int64_t)nrow * n_per_row);
+    return nrow * row_size;
+}
+
 // ====================== "True" 2-bit (de)-quantization
 
 void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {

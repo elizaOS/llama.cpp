@@ -21,6 +21,18 @@ constexpr float MAX_QUANTIZATION_TOTAL_ERROR_TERNARY = 0.01f;
 constexpr float MAX_QUANTIZATION_TOTAL_ERROR_2BITS = 0.0075f;
 constexpr float MAX_QUANTIZATION_TOTAL_ERROR_3BITS = 0.0040f;
 constexpr float MAX_QUANTIZATION_TOTAL_ERROR_3BITS_XXS = 0.0050f;
+// Q4_POLAR tolerates much higher per-element reconstruction error than
+// linear-scale 4-bit kernels: it is a 128-element rotated Lloyd-Max
+// quantizer calibrated for Gaussian inputs. On the test harness's
+// deterministic cosine input (which is far from N(0, 1)) the per-element
+// RMSE/n lands around 6e-3; on the Gaussian Box-Muller input the Python
+// reference uses, rel-L2 is ~9-10% per block, well under the 0.12 budget
+// in the porting plan. We accept the cosine number as a smoke test for
+// the kernel wiring; the Python parity test
+// (packages/native-plugins/polarquant-cpu/test/polar_roundtrip_test.c)
+// is the real quality gate.
+constexpr float MAX_QUANTIZATION_TOTAL_ERROR_POLAR = 0.01f;
+constexpr float MAX_DOT_PRODUCT_ERROR_POLAR = 0.25f;
 constexpr float MAX_DOT_PRODUCT_ERROR = 0.02f;
 constexpr float MAX_DOT_PRODUCT_ERROR_LOWBIT = 0.04f;
 constexpr float MAX_DOT_PRODUCT_ERROR_BINARY = 0.40f;
@@ -48,7 +60,9 @@ static float array_rmse(const float * a1, const float * a2, size_t n) {
 
 // Total quantization error on test data
 static float total_quantization_error(const ggml_type_traits * qfns, const ggml_type_traits_cpu * qfns_cpu, size_t test_size, const float * test_data) {
-    std::vector<uint8_t> tmp_q(2*test_size);
+    // 4*test_size: types whose vec_dot_type is F32 (e.g. tbq3_0/tbq4_0)
+    // call from_float = ggml_cpu_fp32_to_fp32 which writes 4 bytes/elem.
+    std::vector<uint8_t> tmp_q(4*test_size);
     std::vector<float> tmp_out(test_size);
 
     qfns_cpu->from_float(test_data, tmp_q.data(), test_size);
@@ -58,7 +72,9 @@ static float total_quantization_error(const ggml_type_traits * qfns, const ggml_
 
 // Total quantization error on test data
 static float reference_quantization_error(const ggml_type_traits * qfns, const ggml_type_traits_cpu * qfns_cpu, size_t test_size, const float * test_data) {
-    std::vector<uint8_t> tmp_q(2*test_size);
+    // 4*test_size: types whose vec_dot_type is F32 (e.g. tbq3_0/tbq4_0)
+    // call from_float = ggml_cpu_fp32_to_fp32 which writes 4 bytes/elem.
+    std::vector<uint8_t> tmp_q(4*test_size);
     std::vector<float> tmp_out(test_size);
     std::vector<float> tmp_out_ref(test_size);
 
@@ -84,8 +100,9 @@ static float dot_product(const float * a1, const float * a2, size_t test_size) {
 static float dot_product_error(const ggml_type_traits * qfns, const ggml_type_traits_cpu * qfns_cpu, size_t test_size, const float * test_data1, const float * test_data2) {
     GGML_UNUSED(qfns);
 
-    std::vector<uint8_t> tmp_q1(2*test_size);
-    std::vector<uint8_t> tmp_q2(2*test_size);
+    // See comment in total_quantization_error.
+    std::vector<uint8_t> tmp_q1(4*test_size);
+    std::vector<uint8_t> tmp_q2(4*test_size);
 
     const auto * vdot = ggml_get_type_traits_cpu(qfns_cpu->vec_dot_type);
 
@@ -152,7 +169,8 @@ int main(int argc, char * argv[]) {
                 type == GGML_TYPE_IQ2_S   ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
                 type == GGML_TYPE_Q3_K    ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
                 type == GGML_TYPE_IQ3_S   ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
-                type == GGML_TYPE_IQ3_XXS ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS_XXS : MAX_QUANTIZATION_TOTAL_ERROR;
+                type == GGML_TYPE_IQ3_XXS ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS_XXS :
+                type == GGML_TYPE_Q4_POLAR ? MAX_QUANTIZATION_TOTAL_ERROR_POLAR : MAX_QUANTIZATION_TOTAL_ERROR;
             failed = !(total_error < max_quantization_error);
             num_failed += failed;
             if (failed || verbose) {
@@ -174,6 +192,8 @@ int main(int argc, char * argv[]) {
                                           ? MAX_DOT_PRODUCT_ERROR_BINARY
                                           : type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0
                                           ? MAX_DOT_PRODUCT_ERROR_TERNARY
+                                          : type == GGML_TYPE_Q4_POLAR
+                                          ? MAX_DOT_PRODUCT_ERROR_POLAR
                                           : MAX_DOT_PRODUCT_ERROR;
             failed = !(vec_dot_error < max_allowed_error);
             num_failed += failed;

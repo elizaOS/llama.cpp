@@ -283,6 +283,20 @@ typedef struct {
 } block_qjl1_256;
 static_assert(sizeof(block_qjl1_256) == 2 + QK_QJL/8, "wrong qjl1_256 block size/padding");
 
+// PolarQuant Q4: 128-element block.
+//   d        per-block L2 norm (fp16)
+//   qs       16 Lloyd-Max centroid indices, 2 per byte (low nibble even, high nibble odd)
+//   qjl      optional 1-bit QJL residual sign vector (bit 0 of byte 0 currently used; rest reserved)
+// Total 82 bytes/block. With qjl: 5.125 bpw. Without (qjl bytes zero on disk): 4.125 bpw effective.
+#define QK_POLAR 128
+#define QJL_RESIDUAL_BYTES (QK_POLAR / 8)
+typedef struct {
+    ggml_half d;                          // per-block L2 norm
+    uint8_t   qs[QK_POLAR / 2];           // 4-bit centroid indices (2 per byte)
+    uint8_t   qjl[QJL_RESIDUAL_BYTES];    // optional 1-bit QJL residual sign
+} block_q4_polar;
+static_assert(sizeof(block_q4_polar) == sizeof(ggml_half) + QK_POLAR / 2 + QJL_RESIDUAL_BYTES, "wrong q4_polar block size/padding");
+
 #define QK8_1 32
 typedef struct {
     GGML_EXTENSION union {
