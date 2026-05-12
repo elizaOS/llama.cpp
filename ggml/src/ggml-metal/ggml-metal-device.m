@@ -121,12 +121,23 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
         NSString * src = nil;
 
 #if GGML_METAL_EMBED_LIBRARY
-        GGML_LOG_INFO("%s: using embedded metal library\n", __func__);
+        GGML_LOG_INFO("%s: using embedded compiled metal library\n", __func__);
 
         extern const char ggml_metallib_start[];
         extern const char ggml_metallib_end[];
 
-        src = [[NSString alloc] initWithBytes:ggml_metallib_start length:(ggml_metallib_end-ggml_metallib_start) encoding:NSUTF8StringEncoding];
+        // // MILADY-EMBEDDED-METALLIB-LOADER-V1
+        // The build patch embeds compiled default.metallib bytes here, not
+        // Metal source. Loading with newLibraryWithData keeps iOS on the same
+        // multi-TU kernel set as desktop and avoids duplicate declarations
+        // between ggml-metal.metal and the milady standalone shaders.
+        const NSUInteger metallib_len = (NSUInteger)(ggml_metallib_end - ggml_metallib_start);
+        dispatch_data_t metallib_data = dispatch_data_create(ggml_metallib_start, metallib_len, nil, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+        library = [device newLibraryWithData:metallib_data error:&error];
+        if (error) {
+            GGML_LOG_ERROR("%s: error: %s\n", __func__, [[error description] UTF8String]);
+            return nil;
+        }
 #else
 
 #ifdef SWIFT_PACKAGE
@@ -1129,6 +1140,46 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_TOP_K:
         case GGML_OP_ARANGE:
             return true;
+        case GGML_OP_ATTN_SCORE_TBQ:
+            // // MILADY-TBQ-POLAR-ATTN-DISPATCH-V1
+            return has_simdgroup_reduction &&
+                op->type == GGML_TYPE_F32 &&
+                op->src[0] != NULL &&
+                op->src[1] != NULL &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                (op->src[1]->type == GGML_TYPE_TBQ3_0 ||
+                 op->src[1]->type == GGML_TYPE_TBQ4_0 ||
+                 op->src[1]->type == GGML_TYPE_TBQ3_TCQ) &&
+                op->src[0]->ne[0] == 128 &&
+                op->src[1]->ne[0] == 128 &&
+                ggml_is_contiguous_rows(op) &&
+                ggml_is_contiguous_rows(op->src[0]) &&
+                ggml_is_contiguous_rows(op->src[1]);
+        case GGML_OP_ATTN_SCORE_POLAR:
+            return has_simdgroup_reduction &&
+                op->type == GGML_TYPE_F32 &&
+                op->src[0] != NULL &&
+                op->src[1] != NULL &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_Q4_POLAR &&
+                op->src[0]->ne[0] == 128 &&
+                op->src[1]->ne[0] == 128 &&
+                ggml_is_contiguous_rows(op) &&
+                ggml_is_contiguous_rows(op->src[0]) &&
+                ggml_is_contiguous_rows(op->src[1]);
+        case GGML_OP_ATTN_SCORE_QJL:
+            // // MILADY-QJL-ATTN-DISPATCH-V1
+            return has_simdgroup_reduction &&
+                op->type == GGML_TYPE_F32 &&
+                op->src[0] != NULL &&
+                op->src[1] != NULL &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_QJL1_256 &&
+                op->src[0]->ne[0] == 256 &&
+                op->src[1]->ne[0] == 128 &&
+                ggml_is_contiguous_rows(op) &&
+                ggml_is_contiguous_rows(op->src[0]) &&
+                ggml_is_contiguous_rows(op->src[1]);
         case GGML_OP_FLASH_ATTN_EXT:
             // for new head sizes, add checks here
             if (op->src[0]->ne[0] != 32 &&

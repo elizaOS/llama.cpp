@@ -206,7 +206,27 @@ add_library(ggml-base
             ggml-quants.c
             ggml-quants.h
             polar_centroids.h
-            gguf.cpp)
+            gguf.cpp
+            # MILADY-WINDOWS-QJL-IN-GGML-BASE
+            # PE/COFF requires every imported symbol to be resolved at
+            # link time; the QJL definitions in ggml-cpu/qjl/ are referenced
+            # from ggml.c (ggml-base), so on Windows shared-lib builds they
+            # must also live in ggml-base. Linux/macOS use the original
+            # ggml-cpu placement and ignore this duplicate. The list mirrors
+            # QJL_GGML_BASE_LINK_FILES in kernel-patches/cpu-simd-kernels.mjs.
+            ggml-cpu/qjl/quants-qjl.c
+            ggml-cpu/qjl/qjl_dispatch.c
+            ggml-cpu/qjl/qjl_projection.c
+            ggml-cpu/qjl/qjl_quantize_ref.c
+            ggml-cpu/qjl/qjl_quantize_avx2.c
+            ggml-cpu/qjl/qjl_quantize_neon.c
+            ggml-cpu/qjl/qjl_score_ref.c
+            ggml-cpu/qjl/qjl_score_i8_ref.c
+            ggml-cpu/qjl/qjl_score_avx2.c
+            ggml-cpu/qjl/qjl_score_avxvnni.c
+            ggml-cpu/qjl/qjl_score_neon.c
+            ggml-cpu/qjl/qjl_score_dotprod.c)
+target_include_directories(ggml-base PRIVATE ggml-cpu ggml-cpu/qjl ggml-cpu/qjl/include)
 
 set_target_properties(ggml-base PROPERTIES
     VERSION ${GGML_VERSION}

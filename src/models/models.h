@@ -507,6 +507,10 @@ struct llm_build_qwen3moe : public llm_graph_context {
     llm_build_qwen3moe(const llama_model & model, const llm_graph_params & params);
 };
 
+struct llm_build_dflash_draft : public llm_graph_context {
+    llm_build_dflash_draft(const llama_model & model, const llm_graph_params & params);
+};
+
 struct llm_build_qwen3vl : public llm_graph_context {
     llm_build_qwen3vl(const llama_model & model, const llm_graph_params & params);
 };

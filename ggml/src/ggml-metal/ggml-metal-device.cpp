@@ -1435,6 +1435,70 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     GGML_UNUSED(op);
 }
 
+// MILADY-QJL-ATTN-DISPATCH-V1
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_attn_score_qjl(ggml_metal_library_t lib) {
+    const char * name = "kernel_attn_score_qjl1_256_multi";
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        // Standalone shipped shader: it declares no Metal function constants,
+        // so compile by direct symbol name with a null constants table.
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    if (!res.pipeline) {
+        GGML_LOG_ERROR("attn_score_qjl: kernel '%s' missing from default.metallib\n", name);
+        GGML_ABORT("attn_score_qjl: pipeline compile failed");
+    }
+    res.nr0 = 1;
+    res.nr1 = 1;
+    res.nsg = 1;
+    res.smem = 0;
+    return res;
+}
+
+// MILADY-TBQ-POLAR-ATTN-DISPATCH-V1
+static const char * milady_metal_tbq_kernel_name(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TBQ3_0:   return "kernel_turbo3_dot_multi";
+        case GGML_TYPE_TBQ4_0:   return "kernel_turbo4_dot_multi";
+        case GGML_TYPE_TBQ3_TCQ: return "kernel_turbo3_tcq_dot_multi";
+        default: GGML_ABORT("unsupported TurboQuant attention score type");
+    }
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_attn_score_tbq(ggml_metal_library_t lib, ggml_type type) {
+    const char * name = milady_metal_tbq_kernel_name(type);
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    if (!res.pipeline) {
+        GGML_LOG_ERROR("attn_score_tbq: kernel '%s' missing from default.metallib\n", name);
+        GGML_ABORT("attn_score_tbq: pipeline compile failed");
+    }
+    res.nr0 = 1;
+    res.nr1 = 1;
+    res.nsg = 1;
+    res.smem = 0;
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_attn_score_polar(ggml_metal_library_t lib) {
+    const char * name = "kernel_mul_mv_q4_polar_f32";
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    if (!res.pipeline) {
+        GGML_LOG_ERROR("attn_score_polar: kernel '%s' missing from default.metallib\n", name);
+        GGML_ABORT("attn_score_polar: pipeline compile failed");
+    }
+    res.nr0 = 1;
+    res.nr1 = 1;
+    res.nsg = 1;
+    res.smem = 0;
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin(ggml_metal_library_t lib, const ggml_tensor * op, int32_t n_fuse) {
     char base[256];
     char name[256];

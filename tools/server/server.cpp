@@ -7,6 +7,212 @@
 #include "llama.h"
 #include "log.h"
 
+// MILADY-OMNIVOICE-AUDIO-SPEECH-ROUTE-V1
+#ifdef MILADY_FUSE_OMNIVOICE
+#include "omnivoice.h"
+#include <cstdlib>
+#include <cstdint>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <vector>
+
+namespace milady_omnivoice {
+
+// Resolve a config value: prefer the CLI override captured in main(), then
+// the env var, then empty.
+static std::string g_model_path;
+static std::string g_codec_path;
+
+static std::string env_or(const char * name, const std::string & fallback) {
+    const char * v = std::getenv(name);
+    if (v && v[0] != '\0') return std::string(v);
+    return fallback;
+}
+
+static std::string resolved_model_path() {
+    return env_or("ELIZA_OMNIVOICE_MODEL", g_model_path);
+}
+static std::string resolved_codec_path() {
+    return env_or("ELIZA_OMNIVOICE_CODEC", g_codec_path);
+}
+
+static std::mutex      g_mu;
+static ov_context *    g_ctx = nullptr;   // lazily initialised under g_mu
+static std::string     g_init_error;       // sticky: a failed init stays failed until paths change
+static std::string     g_init_signature;   // model|codec the live ctx was built from
+
+// Returns the OmniVoice context, initialising it on first use. Returns
+// nullptr and sets *err on failure. Caller must hold g_mu.
+static ov_context * acquire_locked(std::string & err) {
+    const std::string model = resolved_model_path();
+    const std::string codec = resolved_codec_path();
+    const std::string sig = model + "|" + codec;
+    if (g_ctx && g_init_signature == sig) return g_ctx;
+    if (g_ctx && g_init_signature != sig) {
+        ov_free(g_ctx);
+        g_ctx = nullptr;
+        g_init_error.clear();
+    }
+    if (model.empty() || codec.empty()) {
+        err = "omnivoice TTS not configured: pass --omnivoice-model and "
+              "--omnivoice-codec (or set ELIZA_OMNIVOICE_MODEL / "
+              "ELIZA_OMNIVOICE_CODEC) when launching the fused server";
+        return nullptr;
+    }
+    if (!g_init_error.empty() && g_init_signature == sig) {
+        err = g_init_error;
+        return nullptr;
+    }
+    ov_init_params ip;
+    ov_init_default_params(&ip);
+    ip.model_path = model.c_str();
+    ip.codec_path = codec.c_str();
+    ov_context * ctx = ov_init(&ip);
+    if (!ctx) {
+        const char * le = ov_last_error();
+        g_init_error = std::string("omnivoice ov_init failed: ") + (le ? le : "(no detail)");
+        g_init_signature = sig;
+        err = g_init_error;
+        return nullptr;
+    }
+    g_ctx = ctx;
+    g_init_signature = sig;
+    g_init_error.clear();
+    return g_ctx;
+}
+
+// Build a 16-bit PCM WAV container around f32 mono samples at sample_rate.
+static std::string wav16_from_f32(const float * pcm, int n, int sample_rate) {
+    auto put_u32 = [](std::string & s, uint32_t v) {
+        s.push_back((char)(v & 0xff));
+        s.push_back((char)((v >> 8) & 0xff));
+        s.push_back((char)((v >> 16) & 0xff));
+        s.push_back((char)((v >> 24) & 0xff));
+    };
+    auto put_u16 = [](std::string & s, uint16_t v) {
+        s.push_back((char)(v & 0xff));
+        s.push_back((char)((v >> 8) & 0xff));
+    };
+    const uint16_t channels = 1;
+    const uint16_t bits = 16;
+    const uint32_t byte_rate = (uint32_t)sample_rate * channels * (bits / 8);
+    const uint16_t block_align = channels * (bits / 8);
+    const uint32_t data_bytes = (uint32_t)n * (bits / 8);
+    std::string out;
+    out.reserve(44 + data_bytes);
+    out += "RIFF";
+    put_u32(out, 36 + data_bytes);
+    out += "WAVE";
+    out += "fmt ";
+    put_u32(out, 16);          // PCM fmt chunk size
+    put_u16(out, 1);           // PCM
+    put_u16(out, channels);
+    put_u32(out, (uint32_t)sample_rate);
+    put_u32(out, byte_rate);
+    put_u16(out, block_align);
+    put_u16(out, bits);
+    out += "data";
+    put_u32(out, data_bytes);
+    for (int i = 0; i < n; ++i) {
+        float v = pcm[i];
+        if (v > 1.0f) v = 1.0f;
+        if (v < -1.0f) v = -1.0f;
+        int32_t s = (int32_t)(v * 32767.0f);
+        put_u16(out, (uint16_t)(int16_t)s);
+    }
+    return out;
+}
+
+// Raw little-endian f32 PCM (the runtime's preferred wire form — the JS
+// ring buffer is f32 @ 24 kHz, no decode step).
+static std::string pcm_f32_le(const float * pcm, int n) {
+    std::string out;
+    out.resize((size_t)n * sizeof(float));
+    std::memcpy(out.data(), pcm, out.size());
+    return out;
+}
+
+static server_http_res_ptr error_res(int status, const std::string & message) {
+    auto res = std::make_unique<server_http_res>();
+    res->status = status;
+    res->content_type = "application/json; charset=utf-8";
+    json body = { { "error", { { "message", message }, { "type", "omnivoice_error" } } } };
+    res->data = body.dump();
+    return res;
+}
+
+// handler_t for POST /v1/audio/speech.
+static server_http_context::handler_t audio_speech_handler() {
+    return [](const server_http_req & req) -> server_http_res_ptr {
+        json in;
+        try {
+            in = req.body.empty() ? json::object() : json::parse(req.body);
+        } catch (const std::exception & e) {
+            return error_res(400, std::string("invalid JSON body: ") + e.what());
+        }
+        std::string text;
+        if (in.contains("input") && in["input"].is_string()) {
+            text = in["input"].get<std::string>();
+        } else if (in.contains("text") && in["text"].is_string()) {
+            text = in["text"].get<std::string>();
+        }
+        if (text.empty()) {
+            return error_res(400, "missing or empty 'input' field");
+        }
+        std::string fmt = "wav";
+        if (in.contains("response_format") && in["response_format"].is_string()) {
+            fmt = in["response_format"].get<std::string>();
+        }
+        // 'voice' is accepted for OpenAI shape compatibility; the Eliza-1
+        // bundle ships one default voice preset, so it is informational only
+        // until per-voice presets are wired into omnivoice-core.
+
+        std::string err;
+        ov_context * ctx = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_mu);
+            ctx = acquire_locked(err);
+        }
+        if (!ctx) return error_res(503, err);
+
+        ov_tts_params tp;
+        ov_tts_default_params(&tp);
+        tp.text = text.c_str();
+        ov_audio audio = { nullptr, 0 };
+        ov_status st;
+        {
+            // ov_synthesize is not reentrant on one context; serialise.
+            std::lock_guard<std::mutex> lk(g_mu);
+            st = ov_synthesize(ctx, &tp, &audio);
+        }
+        if (st != OV_STATUS_OK) {
+            const char * le = ov_last_error();
+            ov_audio_free(&audio);
+            return error_res(500, std::string("ov_synthesize failed (status ") +
+                std::to_string((int)st) + "): " + (le ? le : "(no detail)"));
+        }
+        const int sample_rate = 24000; // omnivoice codec output rate
+        auto res = std::make_unique<server_http_res>();
+        res->status = 200;
+        if (fmt == "pcm" || fmt == "f32" || fmt == "raw") {
+            res->content_type = "application/octet-stream";
+            res->headers["X-Sample-Rate"] = std::to_string(sample_rate);
+            res->headers["X-Sample-Format"] = "f32le";
+            res->data = pcm_f32_le(audio.samples, audio.n_samples);
+        } else {
+            res->content_type = "audio/wav";
+            res->data = wav16_from_f32(audio.samples, audio.n_samples, sample_rate);
+        }
+        ov_audio_free(&audio);
+        return res;
+    };
+}
+
+} // namespace milady_omnivoice
+#endif // MILADY_FUSE_OMNIVOICE
+// end // MILADY-OMNIVOICE-AUDIO-SPEECH-ROUTE-V1
+
 #include <atomic>
 #include <clocale>
 #include <exception>
@@ -72,6 +278,28 @@ int main(int argc, char ** argv) {
 
     // own arguments required by this example
     common_params params;
+
+#ifdef MILADY_FUSE_OMNIVOICE
+    // Strip omnivoice-fused-only flags before common_params_parse so the
+    // upstream parser doesn't reject them. Values feed the lazily-created
+    // OmniVoice context (see the milady_omnivoice namespace above).
+    {
+        std::vector<char *> filtered;
+        filtered.reserve((size_t)argc);
+        for (int i = 0; i < argc; ++i) {
+            const std::string a = argv[i];
+            if ((a == "--omnivoice-model" || a == "--omnivoice-codec") && i + 1 < argc) {
+                if (a == "--omnivoice-model") milady_omnivoice::g_model_path = argv[++i];
+                else                          milady_omnivoice::g_codec_path = argv[++i];
+                continue;
+            }
+            filtered.push_back(argv[i]);
+        }
+        static std::vector<char *> s_filtered = filtered;
+        argc = (int) s_filtered.size();
+        argv = s_filtered.data();
+    }
+#endif
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)) {
         return 1;
@@ -188,6 +416,11 @@ int main(int argc, char ** argv) {
     ctx_http.post("/embedding",           ex_wrapper(routes.post_embeddings)); // legacy
     ctx_http.post("/embeddings",          ex_wrapper(routes.post_embeddings));
     ctx_http.post("/v1/embeddings",       ex_wrapper(routes.post_embeddings_oai));
+#ifdef MILADY_FUSE_OMNIVOICE
+    // Fused omnivoice TTS — same process as the text/DFlash routes above.
+    ctx_http.post("/v1/audio/speech",     ex_wrapper(milady_omnivoice::audio_speech_handler()));
+    ctx_http.post("/audio/speech",        ex_wrapper(milady_omnivoice::audio_speech_handler()));
+#endif
     ctx_http.post("/rerank",              ex_wrapper(routes.post_rerank));
     ctx_http.post("/reranking",           ex_wrapper(routes.post_rerank));
     ctx_http.post("/v1/rerank",           ex_wrapper(routes.post_rerank));

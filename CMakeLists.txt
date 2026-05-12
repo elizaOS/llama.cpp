@@ -283,3 +283,144 @@ configure_file(cmake/llama.pc.in
 
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+
+
+# MILADY-OMNIVOICE-FUSION-GRAFT-V1
+# ----------------------------------------------------------------------
+# Source-level fusion of github.com/ServeurpersoCom/omnivoice.cpp into
+# this build tree. See packages/app-core/scripts/omnivoice-fuse/README.md
+# for the strategy. The omnivoice sources were copied into omnivoice/
+# by prepare.mjs and intentionally do NOT bring their own ggml — they
+# share llama.cpp's vendored ggml.
+# ----------------------------------------------------------------------
+
+if(MILADY_FUSE_OMNIVOICE)
+    find_package(Threads REQUIRED)
+
+    # Audio tokenizer tensor names exceed default GGML_MAX_NAME of 64.
+    # Mirrored from omnivoice's own CMakeLists.txt.
+    add_compile_definitions(GGML_MAX_NAME=128)
+    foreach(_milady_ggml_max_name_target
+            ggml ggml-base ggml-cpu ggml-blas ggml-metal ggml-vulkan ggml-cuda
+            llama common mtmd server-context)
+        if(TARGET ${_milady_ggml_max_name_target})
+            target_compile_definitions(${_milady_ggml_max_name_target}
+                PUBLIC GGML_MAX_NAME=128)
+        endif()
+    endforeach()
+
+    file(GLOB MILADY_OMNIVOICE_SOURCES
+        CONFIGURE_DEPENDS
+        ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice/src/*.cpp)
+    file(GLOB MILADY_OMNIVOICE_HEADERS
+        CONFIGURE_DEPENDS
+        ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice/src/*.h)
+
+    if(NOT MILADY_OMNIVOICE_SOURCES)
+        message(FATAL_ERROR "MILADY_FUSE_OMNIVOICE=ON but no sources under omnivoice/src/")
+    endif()
+
+    add_library(omnivoice-core STATIC ${MILADY_OMNIVOICE_SOURCES})
+    target_compile_definitions(omnivoice-core PUBLIC OMNIVOICE_STATIC)
+    target_compile_features(omnivoice-core PUBLIC cxx_std_17)
+    target_include_directories(omnivoice-core PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/mtmd
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_BINARY_DIR})
+    # Share llama.cpp's ggml. NEVER add a second add_subdirectory(ggml)
+    # from the omnivoice tree — see the README's reconciliation
+    # strategy for why.
+    target_include_directories(omnivoice-core SYSTEM PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include)
+    target_link_libraries(omnivoice-core PUBLIC llama mtmd ggml Threads::Threads)
+    if(TARGET ggml-base)
+        target_link_libraries(omnivoice-core PUBLIC ggml-base)
+    endif()
+    foreach(_milady_backend cpu blas cuda metal vulkan)
+        if(TARGET ggml-${_milady_backend})
+            get_target_property(_milady_btype ggml-${_milady_backend} TYPE)
+            if(NOT _milady_btype STREQUAL "MODULE_LIBRARY")
+                target_link_libraries(omnivoice-core PUBLIC ggml-${_milady_backend})
+            endif()
+        endif()
+    endforeach()
+
+    # Fused shared library exporting both `llama_*` and `omnivoice_*`.
+    # Used by Electrobun + Capacitor bridges that dlopen one artifact.
+    add_library(elizainference SHARED
+        ${MILADY_OMNIVOICE_SOURCES})
+    target_compile_definitions(elizainference PRIVATE OMNIVOICE_BUILD)
+    target_compile_features(elizainference PUBLIC cxx_std_17)
+    target_include_directories(elizainference PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/mtmd
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_BINARY_DIR})
+    target_include_directories(elizainference SYSTEM PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include)
+    target_link_libraries(elizainference PUBLIC llama mtmd)
+    if(APPLE)
+        target_link_options(elizainference PRIVATE
+            "LINKER:-reexport_library,$<TARGET_FILE:llama>")
+    endif()
+    target_link_libraries(elizainference PUBLIC ggml Threads::Threads)
+    if(TARGET ggml-base)
+        target_link_libraries(elizainference PUBLIC ggml-base)
+    endif()
+    foreach(_milady_backend cpu blas cuda metal vulkan)
+        if(TARGET ggml-${_milady_backend})
+            get_target_property(_milady_btype ggml-${_milady_backend} TYPE)
+            if(NOT _milady_btype STREQUAL "MODULE_LIBRARY")
+                target_link_libraries(elizainference PUBLIC ggml-${_milady_backend})
+            endif()
+        endif()
+    endforeach()
+    set_target_properties(elizainference PROPERTIES
+        OUTPUT_NAME elizainference
+        POSITION_INDEPENDENT_CODE ON)
+
+    # The fused HTTP server IS `llama-server`. The kernel-patch
+    # `server-omnivoice-route.mjs` adds a `POST /v1/audio/speech` route to
+    # tools/server/server.cpp, guarded by `#ifdef MILADY_FUSE_OMNIVOICE`,
+    # backed by omnivoice-core's `ov_synthesize`. So the same process that
+    # serves `/completion` + `/v1/chat/completions` + the DFlash spec loop
+    # also serves TTS — one process, one llama.cpp build, one GGML pin
+    # (packages/inference/AGENTS.md §4). We link omnivoice-core into the
+    # `llama-server` target and put the route define + omnivoice headers on
+    # it. The non-fused build is untouched (this whole block is inside
+    # `if(MILADY_FUSE_OMNIVOICE)`).
+    if(TARGET llama-server)
+        target_link_libraries(llama-server PRIVATE omnivoice-core)
+        target_include_directories(llama-server PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice)
+        # Match the rest of the fused build's ggml_tensor layout (the
+        # foreach above bumps GGML_MAX_NAME on every other target);
+        # omnivoice-core was compiled the same way, so the static link is
+        # ABI-consistent.
+        target_compile_definitions(llama-server PRIVATE
+            MILADY_FUSE_OMNIVOICE GGML_MAX_NAME=128)
+    endif()
+
+    # Legacy `llama-omnivoice-server` placeholder kept ONLY so the symbol
+    # verifier can still confirm both symbol families are co-resident in an
+    # executable, and so an operator who scripted the old binary name still
+    # gets a working OmniVoice CLI. The real merged HTTP route lives in
+    # `llama-server` above; spawn that, not this.
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice/tools/omnivoice-tts.cpp)
+        add_executable(llama-omnivoice-server
+            ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice/tools/omnivoice-tts.cpp)
+        target_include_directories(llama-omnivoice-server PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice
+            ${CMAKE_CURRENT_BINARY_DIR})
+        target_compile_features(llama-omnivoice-server PRIVATE cxx_std_17)
+        target_link_libraries(llama-omnivoice-server PRIVATE
+            omnivoice-core llama)
+    endif()
+endif()
+# ----------------------------------------------------------------------
+# end # MILADY-OMNIVOICE-FUSION-GRAFT-V1

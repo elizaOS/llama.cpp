@@ -910,6 +910,12 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_tbq4_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_tbq4_0_ref,
     },
+    [GGML_TYPE_TBQ3_TCQ] = {
+        .type_name                = "tbq3_tcq",
+        .blck_size                = QK_TBQ3_TCQ,
+        .type_size                = sizeof(block_tbq3_tcq),
+        .is_quantized             = true,
+    },
     [GGML_TYPE_QJL1_256] = {
         .type_name                = "qjl1_256",
         // QJL is asymmetric: input is 128 fp32 lanes per cached key
@@ -1089,6 +1095,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FLASH_ATTN_EXT",
     "FLASH_ATTN_BACK",
     "ATTN_SCORE_QJL",
+    "ATTN_SCORE_TBQ",
+    "ATTN_SCORE_POLAR",
     "FUSED_ATTN_QJL_TBQ",
     "SSM_CONV",
     "SSM_SCAN",
@@ -1117,7 +1125,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1200,6 +1208,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "flash_attn_ext(x)",
     "flash_attn_back(x)",
     "attn_score_qjl(q, packed_k)",
+    "attn_score_tbq(q, packed_k)",
+    "attn_score_polar(q, packed_k)",
     "fused_attn_qjl_tbq(q, packed_k, packed_v)",
     "ssm_conv(x)",
     "ssm_scan(x)",
@@ -1228,7 +1238,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5463,6 +5473,80 @@ struct ggml_tensor * ggml_attn_score_qjl(
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op     = GGML_OP_ATTN_SCORE_QJL;
+    result->src[0] = q;
+    result->src[1] = packed_k;
+
+    return result;
+}
+
+// // MILADY-TBQ-POLAR-ATTN-DISPATCH-V1
+// ggml_attn_score_tbq
+//
+struct ggml_tensor * ggml_attn_score_tbq(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * packed_k,
+        int                   n_kv_heads) {
+    GGML_ASSERT(q != NULL);
+    GGML_ASSERT(packed_k != NULL);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(packed_k->type == GGML_TYPE_TBQ3_0 ||
+                packed_k->type == GGML_TYPE_TBQ4_0 ||
+                packed_k->type == GGML_TYPE_TBQ3_TCQ);
+    GGML_ASSERT(q->ne[0] == 128);
+    GGML_ASSERT(packed_k->ne[0] == 128);
+
+    const int64_t n_heads     = q->ne[1];
+    const int64_t n_kv_tokens = packed_k->ne[1];
+
+    GGML_ASSERT(n_kv_heads > 0);
+    GGML_ASSERT((n_heads % n_kv_heads) == 0);
+    GGML_ASSERT(packed_k->ne[2] == (int64_t) n_kv_heads);
+    GGML_ASSERT(packed_k->ne[3] == q->ne[3]);
+
+    const int64_t ne[4] = { n_kv_tokens, n_heads, q->ne[2], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    int32_t params[1] = { n_kv_heads };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_ATTN_SCORE_TBQ;
+    result->src[0] = q;
+    result->src[1] = packed_k;
+
+    return result;
+}
+
+// ggml_attn_score_polar
+//
+struct ggml_tensor * ggml_attn_score_polar(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * packed_k,
+        int                   n_kv_heads,
+        bool                  use_qjl) {
+    GGML_ASSERT(q != NULL);
+    GGML_ASSERT(packed_k != NULL);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(packed_k->type == GGML_TYPE_Q4_POLAR);
+    GGML_ASSERT(q->ne[0] == 128);
+    GGML_ASSERT(packed_k->ne[0] == 128);
+
+    const int64_t n_heads     = q->ne[1];
+    const int64_t n_kv_tokens = packed_k->ne[1];
+
+    GGML_ASSERT(n_kv_heads > 0);
+    GGML_ASSERT((n_heads % n_kv_heads) == 0);
+    GGML_ASSERT(packed_k->ne[2] == (int64_t) n_kv_heads);
+    GGML_ASSERT(packed_k->ne[3] == q->ne[3]);
+
+    const int64_t ne[4] = { n_kv_tokens, n_heads, q->ne[2], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    int32_t params[2] = { n_kv_heads, use_qjl ? 1 : 0 };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_ATTN_SCORE_POLAR;
     result->src[0] = q;
     result->src[1] = packed_k;
 
