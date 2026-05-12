@@ -29,6 +29,13 @@ else()
     add_subdirectory(parser)
     add_subdirectory(tts)
     add_subdirectory(mtmd)
+    if (LLAMA_BUILD_OMNIVOICE)
+        # The merged omnivoice subtree lives under tools/omnivoice/. The
+        # top-level CMakeLists.txt has a parallel add_subdirectory hook for
+        # the embed-as-library case (LLAMA_BUILD_TOOLS=OFF) ; this gate is
+        # the one that fires for the normal standalone build.
+        add_subdirectory(omnivoice)
+    endif()
     if (GGML_RPC)
         add_subdirectory(rpc)
     endif()

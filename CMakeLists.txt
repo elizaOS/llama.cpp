@@ -228,10 +228,18 @@ endif()
 if (LLAMA_BUILD_OMNIVOICE)
     if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/omnivoice/CMakeLists.txt")
         message(FATAL_ERROR
-            "LLAMA_BUILD_OMNIVOICE=ON but OMNIVOICE_VENDOR_DIR not yet wired (patch 0002). "
-            "Vendor tools/omnivoice/ from packages/inference/omnivoice.cpp first, then re-run cmake.")
+            "LLAMA_BUILD_OMNIVOICE=ON but tools/omnivoice/CMakeLists.txt is missing. "
+            "Re-vendor the omnivoice subtree (see ../llama.cpp-omnivoice-merge/PLAN.md "
+            "patch 0002), then re-run cmake.")
     endif()
-    add_subdirectory(tools/omnivoice)
+    # When LLAMA_BUILD_TOOLS=ON the tools/ subdirectory above already
+    # adds omnivoice. Only add it directly from here for the
+    # embed-as-library case (LLAMA_BUILD_TOOLS=OFF), where the consumer
+    # wants the omnivoice library + ggml + llama but skips the rest of
+    # the CLI tools subset.
+    if (NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
+        add_subdirectory(tools/omnivoice)
+    endif()
 endif()
 
 # Automatically add all files from the 'licenses' directory
