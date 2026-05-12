@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <limits>
 #include <cmath>
+#include <cstdlib>
 
 static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
     if (!t) {
@@ -170,6 +171,507 @@ static bool ggml_metal_op_concurrency_add(ggml_metal_op_t ctx, const ggml_tensor
     }
 
     return ggml_mem_ranges_add(ctx->mem_ranges, node);
+}
+
+// ELIZA-QJL-ATTN-DISPATCH-V1
+struct eliza_qjl_score_args {
+    uint32_t n_heads;
+    uint32_t n_kv_heads;
+    uint32_t n_tokens;
+    uint32_t proj_dim;
+    uint32_t tokens_per_threadgroup;
+};
+
+static inline ggml_metal_buffer_id eliza_metal_buffer_offset(ggml_metal_buffer_id id, size_t extra) {
+    id.offs += extra;
+    return id;
+}
+
+static inline uint32_t eliza_env_u32(const char * name, uint32_t fallback, uint32_t min_value, uint32_t max_value) {
+    const char * raw = std::getenv(name);
+    if (raw == nullptr || raw[0] == '\0') {
+        return fallback;
+    }
+    char * end = nullptr;
+    const unsigned long parsed = std::strtoul(raw, &end, 10);
+    if (end == raw || *end != '\0' || parsed < min_value || parsed > max_value) {
+        GGML_LOG_WARN("%s: ignoring invalid %s=%s (expected %u..%u)\n",
+                      __func__, name, raw, min_value, max_value);
+        return fallback;
+    }
+    return (uint32_t) parsed;
+}
+
+int ggml_metal_op_attn_score_qjl(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * q  = op->src[0];
+    const ggml_tensor * pk = op->src[1];
+
+    GGML_ASSERT(q  != nullptr);
+    GGML_ASSERT(pk != nullptr);
+    GGML_ASSERT(q->type  == GGML_TYPE_F32);
+    GGML_ASSERT(pk->type == GGML_TYPE_QJL1_256);
+    GGML_ASSERT(op->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->ne[0]  == 256);
+    GGML_ASSERT(pk->ne[0] == 128);
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(pk));
+    GGML_ASSERT(ggml_is_contiguous_rows(op));
+    const uint32_t n_heads     = (uint32_t) q->ne[1];
+    const uint32_t n_kv_heads  = (uint32_t) ((const int32_t *) op->op_params)[0];
+    const uint32_t n_tokens    = (uint32_t) pk->ne[1];
+    const int64_t  n_batch     = q->ne[2];
+    const int64_t  ne3         = q->ne[3];
+
+    GGML_ASSERT(n_kv_heads > 0);
+    GGML_ASSERT((n_heads % n_kv_heads) == 0);
+    GGML_ASSERT(pk->ne[2] == (int64_t) n_kv_heads);
+    GGML_ASSERT(pk->ne[3] == ne3);
+    GGML_ASSERT(op->ne[0] == (int64_t) n_tokens);
+    GGML_ASSERT(op->ne[1] == (int64_t) n_heads);
+    GGML_ASSERT(op->ne[2] == n_batch);
+    GGML_ASSERT(op->ne[3] == ne3);
+    GGML_ASSERT(pk->nb[1] == ggml_row_size(GGML_TYPE_QJL1_256, 128));
+    GGML_ASSERT(pk->nb[2] == (size_t) n_tokens * pk->nb[1]);
+
+    eliza_qjl_score_args args = {
+        /* n_heads    = */ n_heads,
+        /* n_kv_heads = */ n_kv_heads,
+        /* n_tokens   = */ n_tokens,
+        /* proj_dim   = */ 256u,
+        // M4 Max 2026-05-12 sweep: N=64 had the best median and p99.
+        // Keep env override for per-device autotuning and voice-mode latency policy.
+        /* tokens_per_threadgroup = */ eliza_env_u32("ELIZA_METAL_QJL_TOKENS_PER_TG", 64u, 1u, 64u),
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_attn_score_qjl(lib);
+
+    const ggml_metal_buffer_id q_base  = ggml_metal_get_buffer_id(q);
+    const ggml_metal_buffer_id pk_base = ggml_metal_get_buffer_id(pk);
+    const ggml_metal_buffer_id dst_base = ggml_metal_get_buffer_id(op);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 3);
+
+    for (int64_t i3 = 0; i3 < ne3; ++i3) {
+        const size_t q_i3  = (size_t) i3 * q->nb[3];
+        const size_t pk_i3 = (size_t) i3 * pk->nb[3];
+        const size_t dst_i3 = (size_t) i3 * op->nb[3];
+        for (int64_t ib = 0; ib < n_batch; ++ib) {
+            ggml_metal_encoder_set_buffer(enc, eliza_metal_buffer_offset(q_base,  q_i3  + (size_t) ib * q->nb[2]),  0);
+            ggml_metal_encoder_set_buffer(enc, eliza_metal_buffer_offset(pk_base, pk_i3),                          1);
+            ggml_metal_encoder_set_buffer(enc, eliza_metal_buffer_offset(dst_base, dst_i3 + (size_t) ib * op->nb[2]), 2);
+            const int token_groups = (int) ((n_tokens + args.tokens_per_threadgroup - 1u) / args.tokens_per_threadgroup);
+            ggml_metal_encoder_dispatch_threadgroups(enc, (int) n_heads, token_groups, 1, 32, 1, 1);
+        }
+    }
+
+    return 1;
+}
+
+// ELIZA-TBQ-POLAR-ATTN-DISPATCH-V1
+struct eliza_tbq_score_args {
+    uint32_t head_dim;
+    uint32_t n_kv;
+    uint32_t kv_stride_blocks;
+    uint32_t q_head;
+    uint32_t head_offset_bytes;
+    uint32_t blocks_per_threadgroup;
+};
+
+struct eliza_polar_score_args {
+    uint32_t n_rows;
+    uint32_t head_dim;
+    uint32_t use_qjl;
+};
+
+struct eliza_polar_preht_score_args {
+    uint32_t head_dim;
+    uint32_t n_kv;
+    uint32_t kv_stride_blocks;
+    uint32_t q_head;
+    uint32_t head_offset_bytes;
+    uint32_t use_qjl;
+};
+
+struct eliza_fused_attn_qjl_tbq_args {
+    uint32_t head_dim;
+    uint32_t proj_dim;
+    uint32_t n_heads;
+    uint32_t n_kv_heads;
+    uint32_t n_q_pos;
+    uint32_t n_kv;
+    uint32_t kv_tile;
+    uint32_t v_use_qjl;
+    float    scale;
+    uint32_t causal;
+    uint32_t q_pos_base;
+};
+
+static const float k_eliza_tbq3_tcq_codebook[512] = {
+-0.14559399f, -0.09062801f, -0.054925077f, -0.03699251f, -0.006363985f, +0.026264573f, +0.067378916f, +0.121981815f,
+    -0.18648055f, -0.106522456f, -0.052047577f, -0.011695214f, +0.021953275f, +0.059698727f, +0.09831437f, +0.16083933f,
+    -0.16390342f, -0.12639847f, -0.09513180f, -0.05938352f, -0.028396897f, +0.005973862f, +0.049104784f, +0.11334257f,
+    -0.25952467f, -0.079778515f, -0.036024813f, +0.0003641268f, +0.031858794f, +0.073280424f, +0.11835553f, +0.19738495f,
+    -0.14218009f, -0.10224814f, -0.062498566f, -0.027066832f, +0.00393002f, +0.04069300f, +0.08257346f, +0.14548601f,
+    -0.18673635f, -0.13438253f, -0.088401966f, -0.05205436f, -0.02032501f, +0.012399545f, +0.05127183f, +0.10316186f,
+    -0.10807011f, -0.065903045f, -0.032206114f, -0.0062006037f, +0.020679146f, +0.04422085f, +0.08313074f, +0.16821936f,
+    -0.22979105f, -0.14431947f, -0.07689272f, -0.02755307f, +0.009225173f, +0.046684854f, +0.08834142f, +0.13766693f,
+    -0.22114082f, -0.12612148f, -0.06890522f, -0.016128855f, +0.03691900f, +0.08474852f, +0.14940020f, +0.23229980f,
+    -0.14933491f, -0.099693604f, -0.06738499f, -0.037100967f, -0.009332986f, +0.023535024f, +0.060272533f, +0.109464675f,
+    -0.20200425f, -0.07398328f, -0.038700905f, -0.01714807f, +0.011161969f, +0.04528101f, +0.08902637f, +0.19573534f,
+    -0.16645233f, -0.124482535f, -0.089342155f, -0.04427387f, -0.007353691f, +0.028033108f, +0.066108435f, +0.15552913f,
+    -0.22295763f, -0.059887577f, -0.018804537f, +0.020141022f, +0.059682943f, +0.097920544f, +0.14080113f, +0.25698325f,
+    -0.14248224f, -0.089685425f, -0.050101686f, -0.017257255f, +0.011412255f, +0.040830314f, +0.07400172f, +0.11997315f,
+    -0.18649384f, -0.113997504f, -0.067775466f, -0.033394672f, +0.006586988f, +0.05312057f, +0.10433043f, +0.22344802f,
+    -0.16138338f, -0.108194515f, -0.07600300f, -0.05135381f, -0.023365447f, +0.0087320795f, +0.045431953f, +0.09113002f,
+    -0.12630440f, -0.07225349f, -0.032280035f, +0.0029231994f, +0.019239848f, +0.05081419f, +0.077840395f, +0.121695265f,
+    -0.08928155f, -0.044983763f, -0.009889568f, +0.020831043f, +0.05684458f, +0.09409702f, +0.13867535f, +0.19084482f,
+    -0.14182915f, -0.11380146f, -0.06904074f, -0.002002765f, +0.034864165f, +0.070399575f, +0.11403063f, +0.15394832f,
+    -0.10876417f, -0.056122433f, -0.02267638f, +0.011113975f, +0.039639056f, +0.074084364f, +0.10155376f, +0.12540291f,
+    -0.17693359f, -0.13940524f, -0.10049578f, -0.06796275f, -0.036915872f, +0.00062823476f, +0.042142134f, +0.17906062f,
+    -0.09253492f, -0.04290128f, -0.006311852f, +0.023908244f, +0.049849935f, +0.078770354f, +0.10818172f, +0.15166481f,
+    -0.12429565f, -0.07392063f, -0.029114135f, +0.0059440783f, +0.042675965f, +0.08425635f, +0.13836108f, +0.18634140f,
+    -0.11795639f, -0.07033707f, -0.034163877f, -0.0008773357f, +0.03334606f, +0.07188203f, +0.12216825f, +0.17097956f,
+    -0.18718453f, -0.14090346f, -0.097799584f, -0.059522875f, -0.019208657f, +0.03079176f, +0.09334672f, +0.15811224f,
+    -0.27198875f, -0.16546582f, -0.11433405f, -0.06933013f, -0.04026183f, -0.0061146915f, +0.029263576f, +0.07322499f,
+    -0.18471734f, -0.102074504f, -0.06492570f, -0.034418534f, -0.009636157f, +0.023043344f, +0.05751496f, +0.09905984f,
+    -0.22826399f, -0.15946552f, -0.09913176f, -0.06585259f, -0.03252090f, +0.001313243f, +0.03556729f, +0.21612854f,
+    -0.13243781f, -0.087299444f, -0.049820945f, -0.016216082f, +0.01799807f, +0.057916876f, +0.09001349f, +0.13221787f,
+    -0.19516511f, -0.120894566f, -0.076130204f, -0.051442243f, -0.029535033f, -0.0020043184f, +0.029452588f, +0.075566076f,
+    -0.27272871f, -0.15841717f, -0.105432935f, -0.06792948f, -0.024532158f, +0.014960791f, +0.054415092f, +0.101517834f,
+    -0.21153601f, -0.15015371f, -0.08676790f, -0.04414934f, -0.0042129597f, +0.033762872f, +0.07589151f, +0.12768789f,
+    -0.090428725f, -0.037582967f, +0.0013173596f, +0.03900247f, +0.06840049f, +0.116906695f, +0.16584939f, +0.25382105f,
+    -0.13446195f, -0.07865091f, -0.039625354f, -0.0028398742f, +0.03019514f, +0.06799379f, +0.11850997f, +0.17521496f,
+    -0.11350345f, -0.058599845f, -0.017512511f, +0.019431496f, +0.055897832f, +0.093173414f, +0.14820710f, +0.22092152f,
+    -0.15165758f, -0.08869354f, -0.04974287f, -0.01705474f, +0.013134752f, +0.04367713f, +0.07733791f, +0.12430801f,
+    -0.09329869f, -0.04673005f, -0.00045857552f, +0.042781368f, +0.07802363f, +0.11887439f, +0.16250038f, +0.28612965f,
+    -0.12571070f, -0.07786012f, -0.03843933f, -0.0075433915f, +0.025822964f, +0.066053316f, +0.12021536f, +0.18341768f,
+    -0.16079275f, -0.04921760f, -0.006114644f, +0.026215268f, +0.05699377f, +0.09813471f, +0.16080129f, +0.23786584f,
+    -0.09980837f, -0.048535258f, -0.0096120685f, +0.025387142f, +0.05979822f, +0.09875251f, +0.14474337f, +0.20324114f,
+    -0.15846540f, -0.09938028f, -0.061492465f, -0.03523542f, -0.0061364113f, +0.024916094f, +0.06037314f, +0.106796466f,
+    -0.20557843f, -0.123237535f, -0.07734871f, -0.044549115f, -0.017114898f, +0.01616654f, +0.049574375f, +0.092319444f,
+    -0.19221115f, -0.14642999f, -0.091701314f, -0.055265956f, -0.021026207f, +0.017720066f, +0.05786183f, +0.110154524f,
+    -0.09956386f, -0.03870283f, +0.003052007f, +0.034851722f, +0.06256365f, +0.09628840f, +0.13979156f, +0.16582295f,
+    -0.18026546f, -0.12448310f, -0.07424377f, -0.03954519f, -0.01221123f, +0.028641058f, +0.100819774f, +0.18240699f,
+    -0.21520759f, -0.15573645f, -0.09820838f, -0.051450998f, -0.012993679f, +0.021135861f, +0.058727216f, +0.105848536f,
+    -0.11207385f, -0.08335689f, -0.048542723f, -0.023198519f, +0.0039304253f, +0.037778318f, +0.07813917f, +0.13106476f,
+    -0.17849164f, -0.120988995f, -0.078016765f, -0.043093704f, -0.016565649f, +0.015182641f, +0.050754096f, +0.09595712f,
+    -0.22132620f, -0.13407415f, -0.065785654f, -0.013291034f, +0.032098345f, +0.07478225f, +0.12431934f, +0.19174045f,
+    -0.095454164f, -0.051898945f, -0.015116375f, -0.012596778f, +0.018636847f, +0.05006925f, +0.087654814f, +0.13754296f,
+    -0.15254061f, -0.09576059f, -0.052086458f, -0.01596074f, +0.017607626f, +0.04778498f, +0.08950204f, +0.14901252f,
+    -0.26057002f, -0.12472382f, -0.074396215f, -0.03764066f, +0.0011168446f, +0.061569117f, +0.10793752f, +0.19771695f,
+    -0.08661132f, -0.045195263f, -0.016098704f, +0.012780116f, +0.040476497f, +0.074102715f, +0.074102715f, +0.12635531f,
+    -0.14047913f, -0.059587404f, -0.016261123f, +0.019801628f, +0.053541403f, +0.096650146f, +0.15005490f, +0.21051759f,
+    -0.22986396f, -0.11964334f, -0.07266585f, -0.026522418f, +0.018169926f, +0.058630653f, +0.100647695f, +0.15919648f,
+    -0.13251697f, -0.077567816f, -0.042766172f, -0.011389967f, +0.01831755f, +0.05304656f, +0.09620367f, +0.15567583f,
+    -0.119819686f, -0.06772876f, -0.028123451f, +0.00876240f, +0.014405836f, +0.048829112f, +0.08422175f, +0.13823749f,
+    -0.16379014f, -0.08956941f, -0.041652776f, +0.008921398f, +0.05473602f, +0.10037984f, +0.16022855f, +0.23457925f,
+    -0.115844205f, -0.05939626f, -0.020390417f, +0.01374377f, +0.044976473f, +0.07873563f, +0.12207942f, +0.18412720f,
+    -0.19048831f, -0.07587487f, -0.03220580f, -0.00011795067f, +0.02721784f, +0.04380719f, +0.07886723f, +0.13193911f,
+    -0.13935551f, -0.092902906f, -0.052706074f, -0.017797327f, +0.015312965f, +0.056098964f, +0.11203423f, +0.24448302f,
+    -0.17986591f, -0.10738580f, -0.06376371f, -0.026595421f, +0.00842492f, +0.04272362f, +0.08608052f, +0.15240218f,
+    -0.10953678f, -0.057022586f, -0.012483291f, +0.024463262f, +0.06076792f, +0.09776234f, +0.12983681f, +0.18648379f,
+    -0.16471463f, -0.089491285f, -0.037574016f, +0.004444791f, +0.039293647f, +0.07845859f, +0.12893885f, +0.23508036f,
+};
+
+static inline uint32_t eliza_tbq_blocks_per_row(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TBQ3_0:   return 4u;
+        case GGML_TYPE_TBQ4_0:   return 4u;
+        case GGML_TYPE_TBQ3_TCQ: return 1u;
+        default: GGML_ABORT("unsupported TurboQuant attention score type");
+    }
+}
+
+static inline uint32_t eliza_tbq_blocks_per_threadgroup(ggml_type type) {
+    // M4 Max multiblock bench best medians (2026-05-12):
+    //   TBQ3=16, TBQ4=8, TBQ3_TCQ=32. Voice-mode policy can still force N=1
+    //   at a higher scheduler layer when barge-in latency dominates.
+    switch (type) {
+        case GGML_TYPE_TBQ3_0:   return eliza_env_u32("ELIZA_METAL_TBQ3_BLOCKS_PER_TG", 16u, 1u, 64u);
+        case GGML_TYPE_TBQ4_0:   return eliza_env_u32("ELIZA_METAL_TBQ4_BLOCKS_PER_TG", 8u, 1u, 64u);
+        case GGML_TYPE_TBQ3_TCQ: return eliza_env_u32("ELIZA_METAL_TBQ3_TCQ_BLOCKS_PER_TG", 32u, 1u, 64u);
+        default: GGML_ABORT("unsupported TurboQuant attention score type");
+    }
+}
+
+int ggml_metal_op_attn_score_tbq(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * q  = op->src[0];
+    const ggml_tensor * pk = op->src[1];
+    const ggml_type ktype = pk->type;
+
+    GGML_ASSERT(q  != nullptr);
+    GGML_ASSERT(pk != nullptr);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(ktype == GGML_TYPE_TBQ3_0 || ktype == GGML_TYPE_TBQ4_0 || ktype == GGML_TYPE_TBQ3_TCQ);
+    GGML_ASSERT(op->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->ne[0]  == 128);
+    GGML_ASSERT(pk->ne[0] == 128);
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(pk));
+    GGML_ASSERT(ggml_is_contiguous_rows(op));
+
+    const uint32_t n_heads     = (uint32_t) q->ne[1];
+    const uint32_t n_kv_heads  = (uint32_t) ((const int32_t *) op->op_params)[0];
+    const uint32_t n_tokens    = (uint32_t) pk->ne[1];
+    const int64_t  n_batch     = q->ne[2];
+    const int64_t  ne3         = q->ne[3];
+
+    GGML_ASSERT(n_kv_heads > 0);
+    GGML_ASSERT((n_heads % n_kv_heads) == 0);
+    GGML_ASSERT(pk->ne[2] == (int64_t) n_kv_heads);
+    GGML_ASSERT(pk->ne[3] == ne3);
+    GGML_ASSERT(op->ne[0] == (int64_t) n_tokens);
+    GGML_ASSERT(op->ne[1] == (int64_t) n_heads);
+    GGML_ASSERT(op->ne[2] == n_batch);
+    GGML_ASSERT(op->ne[3] == ne3);
+    GGML_ASSERT(pk->nb[1] == ggml_row_size(ktype, 128));
+    GGML_ASSERT(pk->nb[2] == (size_t) n_tokens * pk->nb[1]);
+
+    eliza_tbq_score_args args = {
+        /* head_dim = */ 128u,
+        /* n_kv = */ n_tokens,
+        /* kv_stride_blocks = */ eliza_tbq_blocks_per_row(ktype),
+        /* q_head = */ 0u,
+        /* head_offset_bytes = */ 0u,
+        /* blocks_per_threadgroup = */ eliza_tbq_blocks_per_threadgroup(ktype),
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_attn_score_tbq(lib, ktype);
+
+    const ggml_metal_buffer_id q_base   = ggml_metal_get_buffer_id(q);
+    const ggml_metal_buffer_id pk_base  = ggml_metal_get_buffer_id(pk);
+    const ggml_metal_buffer_id dst_base = ggml_metal_get_buffer_id(op);
+    const uint32_t gqa = n_heads / n_kv_heads;
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    if (ktype == GGML_TYPE_TBQ3_TCQ) {
+        ggml_metal_encoder_set_bytes(enc, (void *) k_eliza_tbq3_tcq_codebook, sizeof(k_eliza_tbq3_tcq_codebook), 3);
+        ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 4);
+    } else {
+        ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 3);
+    }
+
+    const int token_groups = (int) ((n_tokens + args.blocks_per_threadgroup - 1u) / args.blocks_per_threadgroup);
+    for (int64_t i3 = 0; i3 < ne3; ++i3) {
+        const size_t q_i3   = (size_t) i3 * q->nb[3];
+        const size_t pk_i3  = (size_t) i3 * pk->nb[3];
+        const size_t dst_i3 = (size_t) i3 * op->nb[3];
+        for (int64_t ib = 0; ib < n_batch; ++ib) {
+            for (uint32_t h = 0; h < n_heads; ++h) {
+                const uint32_t h_k = h / gqa;
+                ggml_metal_encoder_set_buffer(enc, eliza_metal_buffer_offset(q_base,   q_i3  + (size_t) ib * q->nb[2]  + (size_t) h   * q->nb[1]),  0);
+                ggml_metal_encoder_set_buffer(enc, eliza_metal_buffer_offset(pk_base,  pk_i3 + (size_t) h_k * pk->nb[2]), 1);
+                ggml_metal_encoder_set_buffer(enc, eliza_metal_buffer_offset(dst_base, dst_i3 + (size_t) ib * op->nb[2] + (size_t) h   * op->nb[1]), 2);
+                ggml_metal_encoder_dispatch_threadgroups(enc, token_groups, 1, 1, 32, 1, 1);
+            }
+        }
+    }
+
+    return 1;
+}
+
+int ggml_metal_op_attn_score_polar(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * q  = op->src[0];
+    const ggml_tensor * pk = op->src[1];
+
+    GGML_ASSERT(q  != nullptr);
+    GGML_ASSERT(pk != nullptr);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(pk->type == GGML_TYPE_Q4_POLAR);
+    GGML_ASSERT(op->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->ne[0]  == 128);
+    GGML_ASSERT(pk->ne[0] == 128);
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(pk));
+    GGML_ASSERT(ggml_is_contiguous_rows(op));
+
+    const int32_t * params = (const int32_t *) op->op_params;
+    const uint32_t n_heads     = (uint32_t) q->ne[1];
+    const uint32_t n_kv_heads  = (uint32_t) params[0];
+    const uint32_t n_tokens    = (uint32_t) pk->ne[1];
+    const uint32_t use_qjl     = (uint32_t) (params[1] != 0);
+    const uint32_t q_preht     = (uint32_t) (params[2] != 0);
+    const int64_t  n_batch     = q->ne[2];
+    const int64_t  ne3         = q->ne[3];
+
+    GGML_ASSERT(n_kv_heads > 0);
+    GGML_ASSERT((n_heads % n_kv_heads) == 0);
+    GGML_ASSERT(pk->ne[2] == (int64_t) n_kv_heads);
+    GGML_ASSERT(pk->ne[3] == ne3);
+    GGML_ASSERT(op->ne[0] == (int64_t) n_tokens);
+    GGML_ASSERT(op->ne[1] == (int64_t) n_heads);
+    GGML_ASSERT(op->ne[2] == n_batch);
+    GGML_ASSERT(op->ne[3] == ne3);
+    GGML_ASSERT(pk->nb[1] == ggml_row_size(GGML_TYPE_Q4_POLAR, 128));
+    GGML_ASSERT(pk->nb[2] == (size_t) n_tokens * pk->nb[1]);
+
+    const ggml_metal_buffer_id q_base   = ggml_metal_get_buffer_id(q);
+    const ggml_metal_buffer_id pk_base  = ggml_metal_get_buffer_id(pk);
+    const ggml_metal_buffer_id dst_base = ggml_metal_get_buffer_id(op);
+    const uint32_t gqa = n_heads / n_kv_heads;
+
+    if (q_preht != 0u) {
+        auto pipeline = ggml_metal_library_get_pipeline_attn_score_polar_preht(lib);
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+
+        for (int64_t i3 = 0; i3 < ne3; ++i3) {
+            const size_t q_i3   = (size_t) i3 * q->nb[3];
+            const size_t pk_i3  = (size_t) i3 * pk->nb[3];
+            const size_t dst_i3 = (size_t) i3 * op->nb[3];
+            for (int64_t ib = 0; ib < n_batch; ++ib) {
+                ggml_metal_encoder_set_buffer(enc, eliza_metal_buffer_offset(q_base,   q_i3  + (size_t) ib * q->nb[2]), 0);
+                ggml_metal_encoder_set_buffer(enc, eliza_metal_buffer_offset(pk_base,  pk_i3),                         1);
+                ggml_metal_encoder_set_buffer(enc, eliza_metal_buffer_offset(dst_base, dst_i3 + (size_t) ib * op->nb[2]), 2);
+                for (uint32_t h = 0; h < n_heads; ++h) {
+                    const uint32_t h_k = h / gqa;
+                    eliza_polar_preht_score_args args = {
+                        /* head_dim = */ 128u,
+                        /* n_kv = */ n_tokens,
+                        /* kv_stride_blocks = */ 1u,
+                        /* q_head = */ h,
+                        /* head_offset_bytes = */ (uint32_t) ((size_t) h_k * pk->nb[2]),
+                        /* use_qjl = */ use_qjl,
+                    };
+                    ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 3);
+                    ggml_metal_encoder_dispatch_threadgroups(enc, (int) n_tokens, 1, 1, 32, 1, 1);
+                }
+            }
+        }
+    } else {
+        eliza_polar_score_args args = {
+            /* n_rows = */ n_tokens,
+            /* head_dim = */ 128u,
+            /* use_qjl = */ use_qjl,
+        };
+
+        auto pipeline = ggml_metal_library_get_pipeline_attn_score_polar(lib);
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 3);
+
+        for (int64_t i3 = 0; i3 < ne3; ++i3) {
+            const size_t q_i3   = (size_t) i3 * q->nb[3];
+            const size_t pk_i3  = (size_t) i3 * pk->nb[3];
+            const size_t dst_i3 = (size_t) i3 * op->nb[3];
+            for (int64_t ib = 0; ib < n_batch; ++ib) {
+                for (uint32_t h = 0; h < n_heads; ++h) {
+                    const uint32_t h_k = h / gqa;
+                    ggml_metal_encoder_set_buffer(enc, eliza_metal_buffer_offset(pk_base,  pk_i3 + (size_t) h_k * pk->nb[2]), 0);
+                    ggml_metal_encoder_set_buffer(enc, eliza_metal_buffer_offset(q_base,   q_i3  + (size_t) ib * q->nb[2]  + (size_t) h   * q->nb[1]),  1);
+                    ggml_metal_encoder_set_buffer(enc, eliza_metal_buffer_offset(dst_base, dst_i3 + (size_t) ib * op->nb[2] + (size_t) h   * op->nb[1]), 2);
+                    ggml_metal_encoder_dispatch_threadgroups(enc, (int) n_tokens, 1, 1, 32, 1, 1);
+                }
+            }
+        }
+    }
+
+    return 1;
+}
+
+int ggml_metal_op_fused_attn_qjl_tbq(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * q  = op->src[0];
+    const ggml_tensor * pk = op->src[1];
+    const ggml_tensor * pv = op->src[2];
+
+    GGML_ASSERT(q  != nullptr);
+    GGML_ASSERT(pk != nullptr);
+    GGML_ASSERT(pv != nullptr);
+    GGML_ASSERT(q->type  == GGML_TYPE_F32);
+    GGML_ASSERT(pk->type == GGML_TYPE_QJL1_256);
+    GGML_ASSERT(pv->type == GGML_TYPE_TBQ3_0);
+    GGML_ASSERT(op->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->ne[0]  == 256);
+    GGML_ASSERT(pk->ne[0] == 128);
+    GGML_ASSERT(pv->ne[0] == 128);
+    GGML_ASSERT(op->ne[0] == 128);
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(pk));
+    GGML_ASSERT(ggml_is_contiguous_rows(pv));
+    GGML_ASSERT(ggml_is_contiguous_rows(op));
+
+    const int32_t * params = (const int32_t *) op->op_params;
+    const uint32_t n_kv_heads = (uint32_t) params[0];
+    union { int32_t i; float f; } scale_bits;
+    scale_bits.i = params[1];
+
+    const uint32_t n_heads = (uint32_t) q->ne[1];
+    const uint32_t n_q_pos = (uint32_t) q->ne[2];
+    const uint32_t n_kv    = (uint32_t) pk->ne[1];
+    const int64_t  ne3     = q->ne[3];
+
+    GGML_ASSERT(n_kv_heads > 0);
+    GGML_ASSERT((n_heads % n_kv_heads) == 0);
+    GGML_ASSERT(pk->ne[2] == (int64_t) n_kv_heads);
+    GGML_ASSERT(pv->ne[1] == (int64_t) n_kv);
+    GGML_ASSERT(pv->ne[2] == (int64_t) n_kv_heads);
+    GGML_ASSERT(pk->ne[3] == ne3);
+    GGML_ASSERT(pv->ne[3] == ne3);
+    GGML_ASSERT(op->ne[1] == (int64_t) n_heads);
+    GGML_ASSERT(op->ne[2] == (int64_t) n_q_pos);
+    GGML_ASSERT(op->ne[3] == ne3);
+    GGML_ASSERT(q->nb[1] == (size_t) q->ne[0] * ggml_type_size(q->type));
+    GGML_ASSERT(q->nb[2] == (size_t) n_heads * q->nb[1]);
+    GGML_ASSERT(pk->nb[1] == ggml_row_size(GGML_TYPE_QJL1_256, 128));
+    GGML_ASSERT(pk->nb[2] == (size_t) n_kv * pk->nb[1]);
+    GGML_ASSERT(pv->nb[1] == ggml_row_size(GGML_TYPE_TBQ3_0, 128));
+    GGML_ASSERT(pv->nb[2] == (size_t) n_kv * pv->nb[1]);
+    GGML_ASSERT(op->nb[1] == (size_t) op->ne[0] * ggml_type_size(op->type));
+    GGML_ASSERT(op->nb[2] == (size_t) n_heads * op->nb[1]);
+
+    eliza_fused_attn_qjl_tbq_args args = {
+        /* head_dim   = */ 128u,
+        /* proj_dim   = */ 256u,
+        /* n_heads    = */ n_heads,
+        /* n_kv_heads = */ n_kv_heads,
+        /* n_q_pos    = */ n_q_pos,
+        /* n_kv       = */ n_kv,
+        /* kv_tile    = */ (uint32_t) params[3],
+        /* v_use_qjl  = */ (uint32_t) params[2],
+        /* scale      = */ scale_bits.f,
+        /* causal     = */ (uint32_t) params[4],
+        /* q_pos_base = */ (uint32_t) params[5],
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_fused_attn_qjl_tbq(lib);
+
+    const ggml_metal_buffer_id q_base   = ggml_metal_get_buffer_id(q);
+    const ggml_metal_buffer_id pk_base  = ggml_metal_get_buffer_id(pk);
+    const ggml_metal_buffer_id pv_base  = ggml_metal_get_buffer_id(pv);
+    const ggml_metal_buffer_id dst_base = ggml_metal_get_buffer_id(op);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 4);
+
+    for (int64_t i3 = 0; i3 < ne3; ++i3) {
+        ggml_metal_encoder_set_buffer(enc, eliza_metal_buffer_offset(q_base,   (size_t) i3 * q->nb[3]),  0);
+        ggml_metal_encoder_set_buffer(enc, eliza_metal_buffer_offset(pk_base,  (size_t) i3 * pk->nb[3]), 1);
+        ggml_metal_encoder_set_buffer(enc, eliza_metal_buffer_offset(pv_base,  (size_t) i3 * pv->nb[3]), 2);
+        ggml_metal_encoder_set_buffer(enc, eliza_metal_buffer_offset(dst_base, (size_t) i3 * op->nb[3]), 3);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (int) n_heads, (int) n_q_pos, 1, 32, 1, 1);
+    }
+
+    return 1;
 }
 
 static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
@@ -425,6 +927,22 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 n_fuse = ggml_metal_op_flash_attn_ext(ctx, idx);
+            } break;
+        case GGML_OP_ATTN_SCORE_QJL:
+            {
+                n_fuse = ggml_metal_op_attn_score_qjl(ctx, idx);
+            } break;
+        case GGML_OP_ATTN_SCORE_TBQ:
+            {
+                n_fuse = ggml_metal_op_attn_score_tbq(ctx, idx);
+            } break;
+        case GGML_OP_ATTN_SCORE_POLAR:
+            {
+                n_fuse = ggml_metal_op_attn_score_polar(ctx, idx);
+            } break;
+        case GGML_OP_FUSED_ATTN_QJL_TBQ:
+            {
+                n_fuse = ggml_metal_op_fused_attn_qjl_tbq(ctx, idx);
             } break;
         case GGML_OP_SET:
             {

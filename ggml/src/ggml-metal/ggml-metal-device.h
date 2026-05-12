@@ -179,6 +179,24 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         bool    has_kvpad,
         int32_t nsg);
 
+// ELIZA-QJL-ATTN-DISPATCH-V1
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_attn_score_qjl(
+        ggml_metal_library_t lib);
+
+// ELIZA-TBQ-POLAR-ATTN-DISPATCH-V1
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_attn_score_tbq(
+        ggml_metal_library_t lib,
+        enum ggml_type        type);
+
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_attn_score_polar(
+        ggml_metal_library_t lib);
+
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_attn_score_polar_preht(
+        ggml_metal_library_t lib);
+
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fused_attn_qjl_tbq(
+        ggml_metal_library_t lib);
+
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec(
         ggml_metal_library_t lib,
         const struct ggml_tensor * op,
