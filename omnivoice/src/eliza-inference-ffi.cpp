@@ -634,12 +634,10 @@ int eliza_inference_asr_transcribe(
         }
     }
     if (!completed) {
-        std::string cleaned_partial = eliza_clean_asr_transcript(transcript);
-        if (cleaned_partial.empty()) {
-            eliza_set_error(out_error, "[libelizainference] asr_transcribe: decode reached token cap before EOG and produced no transcript");
-            return ELIZA_ERR_FFI_FAULT;
-        }
-        transcript = cleaned_partial;
+        eliza_set_error(out_error,
+            "[libelizainference] asr_transcribe: decode reached token cap before EOG; "
+            "refusing to return a possibly truncated transcript");
+        return ELIZA_ERR_FFI_FAULT;
     } else {
         transcript = eliza_clean_asr_transcript(transcript);
     }
@@ -659,8 +657,8 @@ int eliza_inference_asr_transcribe(
  * decoder above; the windowed streaming-session decoder is not yet wired
  * (W7). Per packages/inference/AGENTS.md §3 we do NOT fake it — the
  * capability probe returns 0 so EngineVoiceBridge / StreamingTranscriber
- * pick the batch path (or the whisper.cpp interim adapter) instead of
- * opening a session that would only return ELIZA_ERR_NOT_IMPLEMENTED.
+ * pick the fused batch ASR adapter instead of opening a session that would
+ * only return ELIZA_ERR_NOT_IMPLEMENTED.
  * These symbols exist so the ABI surface is complete and the loader's
  * version check (ffi-bindings.ts expects v3) succeeds.
  */
