@@ -3360,7 +3360,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_DRAFT_P_SPLIT"));
     add_opt(common_arg(
         // --draft-min-prob is the spiritbuun/buun-llama-cpp spelling that the
-        // Milady consumer (`dflash-server.ts`, AGENTS.md env mapping) emits
+        // Eliza consumer (`dflash-server.ts`, AGENTS.md env mapping) emits
         // under `ELIZA_LOCAL_NGRAM=on`. Keep it as an alias for the upstream
         // --draft-p-min so existing downstream code and rollout scripts work
         // unchanged on the unified fork.
@@ -3437,7 +3437,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             } else if (value == "ngram-mod") {
                 params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_MOD;
             } else if (value == "dflash") {
-                // Milady alias: behaves identically to draft-model speculative decoding
+                // Eliza alias: behaves identically to draft-model speculative decoding
                 // when -md / --model-draft is supplied. Carrying the spelling preserves
                 // the AOSP/desktop CLI in `aosp-dflash-adapter.ts` and `dflash-server.ts`.
                 params.speculative.type = COMMON_SPECULATIVE_TYPE_DFLASH;

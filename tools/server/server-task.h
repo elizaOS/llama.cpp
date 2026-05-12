@@ -514,7 +514,7 @@ struct server_task_result_metrics : server_task_result {
     uint64_t n_decode_total     = 0;
     uint64_t n_busy_slots_total = 0;
 
-    // Speculative decoding totals (Milady DFlash port). Mirrors fields on
+    // Speculative decoding totals (Eliza DFlash port). Mirrors fields on
     // `server_metrics` in server-context.cpp; surfaced through to_json() and
     // the Prometheus /metrics endpoint so consumers can verify the drafter is
     // actually engaged.

@@ -478,7 +478,7 @@ struct server_metrics {
     uint64_t n_decode_total     = 0;
     uint64_t n_busy_slots_total = 0;
 
-    // Speculative decoding totals (Milady DFlash port — see
+    // Speculative decoding totals (Eliza DFlash port — see
     // docs/porting/unified-fork-strategy.md §H step 3). We expose draft
     // generation and acceptance as Prometheus counters so the AOSP DFlash
     // adapter and host-side dflash-server can confirm the speculative path

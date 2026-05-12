@@ -39,7 +39,7 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"ngram_mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
     {"ngram_cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
     // dflash is the upstream draft-model path with the spiritbuun branding.
-    // The Milady consumer always supplies -md so this is functionally
+    // The Eliza consumer always supplies -md so this is functionally
     // equivalent to COMMON_SPECULATIVE_TYPE_DRAFT; carrying the name preserves
     // the existing AOSP/desktop CLI without forcing the consumer to learn a
     // new spelling. See docs/porting/unified-fork-strategy.md §H step 3.
