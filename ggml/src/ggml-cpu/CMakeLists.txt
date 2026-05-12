@@ -58,16 +58,21 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         # kernel files themselves carry their own SIMD guards (__AVX2__ /
         # __ARM_NEON), so we always compile all of them and the dispatcher
         # picks the right one at link/runtime.
+        # ELIZA-CPU-SIMD-PATCH-V1 — QJL kernel TUs mirrored from packages/native-plugins/qjl-cpu
         ggml-cpu/qjl/quants-qjl.c
         ggml-cpu/qjl/qjl_block.h
+        ggml-cpu/qjl/qjl_cpu_features.h
         ggml-cpu/qjl/qjl_dispatch.c
         ggml-cpu/qjl/qjl_projection.c
         ggml-cpu/qjl/qjl_quantize_ref.c
         ggml-cpu/qjl/qjl_quantize_avx2.c
         ggml-cpu/qjl/qjl_quantize_neon.c
         ggml-cpu/qjl/qjl_score_ref.c
+        ggml-cpu/qjl/qjl_score_i8_ref.c
         ggml-cpu/qjl/qjl_score_avx2.c
+        ggml-cpu/qjl/qjl_score_avxvnni.c
         ggml-cpu/qjl/qjl_score_neon.c
+        ggml-cpu/qjl/qjl_score_dotprod.c
         # Fused CPU kernels (W3-B). Each per-ISA TU carries its own
         # __AVX2__ / __ARM_NEON guard so we can compile all three on every
         # target and let the dispatch entry pick at runtime.
@@ -78,6 +83,16 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/fused-attn-qjl-tbq-avx2.c
         ggml-cpu/fused-attn-qjl-tbq-neon.c
         ggml-cpu/fused-hadamard-polar-dot.c
+        # ELIZA-CPU-POLAR-PREHT-V1 — PolarQuant pre-Hadamard-transposed dot TUs
+        # (mirrored from packages/native-plugins/polarquant-cpu + two
+        # generated fork-shim files). Each per-ISA body self-guards on
+        # __AVX2__ / __ARM_NEON; the dispatcher picks at runtime.
+        ggml-cpu/polarquant/polar_dot_preht_ref.c
+        ggml-cpu/polarquant/polar_dot_preht_avx2.c
+        ggml-cpu/polarquant/polar_dot_preht_neon.c
+        ggml-cpu/polarquant/polar_cpu_features.h
+        ggml-cpu/polarquant/polarquant_preht.h
+        ggml-cpu/polarquant/polarquant_preht_dispatch.c
         )
 
     # qjl/include lets `#include "qjl/qjl.h"` resolve to the vendored kernel
@@ -86,6 +101,45 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     # `qjl_block.h` (their internal header) the same way they do in the
     # standalone packages/native-plugins/qjl-cpu/ build.
     target_include_directories(${GGML_CPU_NAME} PRIVATE ggml-cpu/qjl/include ggml-cpu/qjl)
+
+    # ELIZA-CPU-POLAR-PREHT-V1 POLARQUANT include + HAVE_* defines
+    # ggml-cpu/polarquant holds the PolarQuant pre-Hadamard-transposed
+    # dot TUs + the generated fork-shim header. The runtime dispatcher
+    # (polarquant_preht_dispatch.c) picks the best *available* SIMD path
+    # at run time from cpuid/hwcap, but can only call into a path whose
+    # TU was actually compiled — POLARQUANT_HAVE_* records which.
+    target_include_directories(${GGML_CPU_NAME} PRIVATE ggml-cpu/polarquant)
+    if (GGML_SYSTEM_ARCH STREQUAL "x86")
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE POLARQUANT_HAVE_AVX2=1)
+        if (GGML_AVX_VNNI)
+            target_compile_definitions(${GGML_CPU_NAME} PRIVATE POLARQUANT_HAVE_AVXVNNI=1)
+        endif()
+    elseif (GGML_SYSTEM_ARCH STREQUAL "ARM")
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE POLARQUANT_HAVE_NEON=1)
+    endif()
+
+    # ELIZA-CPU-SIMD-PATCH-V1 QJL_HAVE_* dispatch defines
+    # The runtime QJL dispatcher (ggml-cpu/qjl/qjl_dispatch.c) picks the
+    # best *available* SIMD path at run time from cpuid/hwcap, but it can
+    # only call into a path whose TU was actually compiled. Expose the
+    # QJL_HAVE_* feature macros so the dispatcher knows which symbols were
+    # linked; the per-TU bodies still self-guard on __AVX2__ / __AVXVNNI__
+    # / __ARM_FEATURE_DOTPROD so a host without the ISA gets a dead body,
+    # never an undefined symbol.
+    if (GGML_SYSTEM_ARCH STREQUAL "x86")
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE QJL_HAVE_AVX2=1)
+        if (GGML_AVX_VNNI)
+            # build-llama-cpp-dflash.mjs sets -DGGML_AVX_VNNI=ON only for
+            # native x86_64 hosts that report avx_vnni, which is exactly
+            # when the global ARCH_FLAGS make __AVXVNNI__ available.
+            target_compile_definitions(${GGML_CPU_NAME} PRIVATE QJL_HAVE_AVXVNNI=1)
+        endif()
+    elseif (GGML_SYSTEM_ARCH STREQUAL "ARM")
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE QJL_HAVE_NEON=1)
+        if (GGML_INTERNAL_DOTPROD OR GGML_USE_DOTPROD)
+            target_compile_definitions(${GGML_CPU_NAME} PRIVATE QJL_HAVE_NEON_DOTPROD=1)
+        endif()
+    endif()
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)

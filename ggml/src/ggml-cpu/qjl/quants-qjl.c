@@ -179,8 +179,7 @@ size_t quantize_qjl1_256(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
 void ggml_compute_forward_attn_score_qjl(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
-    if (params->ith != 0) return; /* single-threaded for now */
-
+    /* ELIZA-CPU-THREAD-PARALLELISM-V1 — ith/nth split over flattened (ne3, n_batch, h_q). */
     const struct ggml_tensor * q  = dst->src[0];
     const struct ggml_tensor * pk = dst->src[1];
 
@@ -201,32 +200,46 @@ void ggml_compute_forward_attn_score_qjl(
     const int64_t ne3     = q->ne[3];
     GGML_ASSERT(pk->ne[3] == ne3);
 
-    /* Strides in bytes — ggml `nb` is byte units. */
-    const size_t q_stride_b   = q->nb[2];   /* bytes between batches in q */
+    const size_t q_stride_b   = q->nb[2];
     const size_t q_stride_3   = q->nb[3];
-    const size_t pk_stride_3  = pk->nb[3];  /* one full (n_kv_heads, n_kv_tokens) plane */
+    const size_t pk_stride_3  = pk->nb[3];
     const size_t s_stride_b   = dst->nb[2];
     const size_t s_stride_3   = dst->nb[3];
 
-    /* The packed_k layout for one (batch,ne3) plane is contiguous over
-     * (n_kv_heads, n_kv_tokens, block_qjl1_256). The score kernel expects
-     * n_kv_heads first then n_tokens for indexing — that matches our
-     * pk->ne[1]=n_kv_tokens, ne[2]=n_kv_heads layout iff stride from the
-     * head dim is one block (34 B) per token, and the per-head stride is
-     * n_kv_tokens * 34. Asserting catches mis-shaped inputs early. */
     GGML_ASSERT(pk->nb[1] == sizeof(block_qjl1_256));
     GGML_ASSERT(pk->nb[2] == (size_t) n_kv_tokens * sizeof(block_qjl1_256));
 
-    for (int64_t i3 = 0; i3 < ne3; i3++) {
-        const char * pk_plane = (const char *) pk->data + i3 * pk_stride_3;
-        for (int64_t i2 = 0; i2 < n_batch; i2++) {
-            const float * q_plane = (const float *) ((const char *) q->data + i2 * q_stride_b + i3 * q_stride_3);
-            float       * s_plane = (float *)       ((char *)       dst->data + i2 * s_stride_b + i3 * s_stride_3);
+    const int gqa = n_heads / n_kv_heads;
 
-            qjl_score_qk(q_plane,
-                         (const qjl_block_qjl1_256 *) pk_plane,
-                         n_heads, n_kv_heads, n_kv_tokens,
-                         s_plane);
-        }
+    /* Flatten the (ne3, n_batch, h_q) output space; distribute over
+     * ith/nth. Each (i3,i2,hq) work unit owns the scores row for one head
+     * of one batch plane — the QJL score kernel is per-head and stateless,
+     * so calling it with n_heads=1/n_kv_heads=1 plus offset q/packed_k/
+     * scores pointers shards cleanly with no shared state. */
+    const int64_t n_work = ne3 * n_batch * (int64_t) n_heads;
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    for (int64_t w = ith; w < n_work; w += nth) {
+        const int64_t hq = w % n_heads;
+        const int64_t bi = w / n_heads;          /* i3*n_batch + i2 */
+        const int64_t i2 = bi % n_batch;
+        const int64_t i3 = bi / n_batch;
+        const int64_t hk = hq / gqa;
+
+        const float * q_plane = (const float *) ((const char *) q->data
+            + i2 * q_stride_b + i3 * q_stride_3);
+        float       * s_plane = (float *)       ((char *)       dst->data
+            + i2 * s_stride_b + i3 * s_stride_3);
+        const char  * pk_plane = (const char *) pk->data + i3 * pk_stride_3;
+
+        const float * q_head = q_plane + hq * QK_QJL;
+        float       * s_head = s_plane + hq * n_kv_tokens;
+        const qjl_block_qjl1_256 * pk_head =
+            (const qjl_block_qjl1_256 *) (pk_plane + hk * pk->nb[2]);
+
+        /* n_heads=1, n_kv_heads=1 -> gqa=1, hk=0 inside the kernel, so
+         * pk_head[0..n_kv_tokens) is exactly this kv-head's blocks. */
+        qjl_score_qk(q_head, pk_head, 1, 1, n_kv_tokens, s_head);
     }
 }

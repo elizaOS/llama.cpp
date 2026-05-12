@@ -288,8 +288,7 @@ void fused_attn_qjl_tbq_ref(int n_tokens,
 void ggml_compute_forward_fused_attn_qjl_tbq(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
-    if (params->ith != 0) return; /* single-thread scratch alloc */
-
+    /* ELIZA-CPU-THREAD-PARALLELISM-V1 — ith/nth split over flattened (ne3, n_batch, h_q). */
     const struct ggml_tensor * q  = dst->src[0];
     const struct ggml_tensor * pk = dst->src[1];
     const struct ggml_tensor * pv = dst->src[2];
@@ -305,7 +304,6 @@ void ggml_compute_forward_fused_attn_qjl_tbq(
     const int n_kv_heads  = ((const int32_t *) dst->op_params)[0];
     const int n_kv_tokens = (int) pk->ne[1];
 
-    /* Decode sm_scale from op_params[1]. */
     union { int32_t i; float f; } scale_bits;
     scale_bits.i = ((const int32_t *) dst->op_params)[1];
     const float sm_scale = scale_bits.f;
@@ -321,85 +319,81 @@ void ggml_compute_forward_fused_attn_qjl_tbq(
     const int64_t n_batch = q->ne[2];
     const int64_t ne3 = q->ne[3];
 
-    /* Per-head scratch: n_tokens fp32. Single-threaded for now so one
-     * stack buffer is fine; switch to ggml's wdata if we ever go
-     * multi-threaded.
-     *
-     * Cap at a generous 256k tokens to avoid stack blowup. Real callers
-     * gate context length way below this. */
     GGML_ASSERT(n_kv_tokens > 0 && n_kv_tokens <= 256 * 1024);
-    float * scratch = (float *) params->wdata;
-    if (scratch == NULL) {
-        /* Fallback: alloca for small contexts. Kept short to avoid stack
-         * blowup on phone class devices. */
+
+    /* Per-task softmax-weight scratch: n_kv_tokens fp32. ggml-cpu.c's
+     * work-size case sizes wdata as n_tasks * n_kv_tokens * sizeof(float),
+     * so task ith owns the slice [ith*n_kv_tokens, (ith+1)*n_kv_tokens).
+     * No wdata (synthetic single-thread callers): fall back to a small
+     * alloca, only valid for nth==1. */
+    float * scratch;
+    if (params->wdata != NULL) {
+        scratch = (float *) params->wdata + (size_t) params->ith * n_kv_tokens;
+    } else {
+        GGML_ASSERT(params->nth == 1 &&
+            "fused-attn: multi-thread path requires wdata");
         GGML_ASSERT(n_kv_tokens <= 8192 &&
             "fused-attn: provide wdata for contexts > 8192 tokens");
         scratch = (float *) alloca((size_t) n_kv_tokens * sizeof(float));
     }
 
-    for (int64_t i3 = 0; i3 < ne3; i3++) {
-        for (int64_t i2 = 0; i2 < n_batch; i2++) {
-            const float * q_plane = (const float *) ((const char *) q->data
-                + i2 * q->nb[2] + i3 * q->nb[3]);
-            float * out_plane = (float *) ((char *) dst->data
-                + i2 * dst->nb[2] + i3 * dst->nb[3]);
+    static const size_t QJL_BLK = 34; /* signs[32] then d (uint16_t) */
+    const size_t TBQ_BLK = sizeof(ggml_half) + (FUSED_TBQ_BLOCK * 3 / 8);
 
-            for (int hq = 0; hq < n_heads; hq++) {
-                const int hk = hq / gqa;
-                const float * q_sketch = q_plane + hq * FUSED_QJL_PROJ_DIM;
-                float * out_head = out_plane + hq * FUSED_QJL_HEAD_DIM;
+    const int64_t n_work = ne3 * n_batch * (int64_t) n_heads;
+    const int ith = params->ith;
+    const int nth = params->nth;
 
-                /* K side: pull packed signs + norms for this kv-head.
-                 * Layout is interleaved per token: 32 signs then 2-byte
-                 * norm. We need contiguous arrays for the fused kernel,
-                 * so memcpy into temporary stacks (fits comfortably:
-                 * n_tokens * 32 + n_tokens * 2 = 34 KB at 1k tokens). */
-                const char * pk_plane = (const char *) pk->data
-                    + i3 * pk->nb[3]
-                    + hk * pk->nb[2];
-                /* qjl1_256 layout: signs[32] then d (uint16_t). */
-                static const size_t QJL_BLK = 34;
-                /* Compose contiguous staging buffers per kv-head. */
-                static __thread uint8_t  k_signs_buf[256 * 1024];   /* bytes */
-                static __thread uint16_t k_norms_buf[8 * 1024];     /* tokens */
-                GGML_ASSERT((size_t) n_kv_tokens * 32 <= sizeof(k_signs_buf));
-                GGML_ASSERT((size_t) n_kv_tokens     <= sizeof(k_norms_buf) / sizeof(uint16_t));
-                for (int t = 0; t < n_kv_tokens; t++) {
-                    memcpy(k_signs_buf + (size_t) t * 32, pk_plane + (size_t) t * QJL_BLK, 32);
-                    uint16_t d;
-                    memcpy(&d, pk_plane + (size_t) t * QJL_BLK + 32, sizeof(uint16_t));
-                    k_norms_buf[t] = d;
-                }
+    for (int64_t w = ith; w < n_work; w += nth) {
+        const int64_t hq = w % n_heads;
+        const int64_t bi = w / n_heads;          /* i3*n_batch + i2 */
+        const int64_t i2 = bi % n_batch;
+        const int64_t i3 = bi / n_batch;
+        const int64_t hk = hq / gqa;
 
-                /* V side: tbq3_0 blocks, 4 per token. block layout is
-                 * fp16 d then 12 bytes codes. Stage into matching
-                 * codes / scales buffers. */
-                const char * pv_plane = (const char *) pv->data
-                    + i3 * pv->nb[3]
-                    + hk * pv->nb[2];
-                /* sizeof(block_tbq3_0) = sizeof(ggml_half) + 12 = 14 B */
-                const size_t TBQ_BLK = sizeof(ggml_half) + (FUSED_TBQ_BLOCK * 3 / 8);
-                static __thread uint8_t  v_codes_buf[8 * 1024 * 4 * 12];
-                static __thread uint16_t v_scales_buf[8 * 1024 * 4];
-                const size_t n_v_blocks = (size_t) n_kv_tokens * FUSED_TBQ_PER_TOKEN;
-                GGML_ASSERT(n_v_blocks * 12 <= sizeof(v_codes_buf));
-                GGML_ASSERT(n_v_blocks      <= sizeof(v_scales_buf) / sizeof(uint16_t));
-                /* pv layout: per-token 4 blocks of 14 bytes each = 56 B/token. */
-                for (size_t blk = 0; blk < n_v_blocks; blk++) {
-                    const char * src = pv_plane + blk * TBQ_BLK;
-                    ggml_half d;
-                    memcpy(&d, src, sizeof(ggml_half));
-                    v_scales_buf[blk] = (uint16_t) d;
-                    memcpy(v_codes_buf + blk * (FUSED_TBQ_BLOCK * 3 / 8),
-                           src + sizeof(ggml_half),
-                           FUSED_TBQ_BLOCK * 3 / 8);
-                }
+        const float * q_plane = (const float *) ((const char *) q->data
+            + i2 * q->nb[2] + i3 * q->nb[3]);
+        float * out_plane = (float *) ((char *) dst->data
+            + i2 * dst->nb[2] + i3 * dst->nb[3]);
 
-                fused_attn_qjl_tbq_ref(n_kv_tokens, q_sketch,
-                                        k_signs_buf, k_norms_buf,
-                                        v_codes_buf, v_scales_buf,
-                                        sm_scale, scratch, out_head);
-            }
+        const float * q_sketch = q_plane + hq * FUSED_QJL_PROJ_DIM;
+        float * out_head = out_plane + hq * FUSED_QJL_HEAD_DIM;
+
+        /* K side: contiguous signs/norms staging, per-thread. */
+        const char * pk_plane = (const char *) pk->data
+            + i3 * pk->nb[3] + hk * pk->nb[2];
+        static __thread uint8_t  k_signs_buf[256 * 1024];   /* bytes */
+        static __thread uint16_t k_norms_buf[8 * 1024];     /* tokens */
+        GGML_ASSERT((size_t) n_kv_tokens * 32 <= sizeof(k_signs_buf));
+        GGML_ASSERT((size_t) n_kv_tokens     <= sizeof(k_norms_buf) / sizeof(uint16_t));
+        for (int t = 0; t < n_kv_tokens; t++) {
+            memcpy(k_signs_buf + (size_t) t * 32, pk_plane + (size_t) t * QJL_BLK, 32);
+            uint16_t d;
+            memcpy(&d, pk_plane + (size_t) t * QJL_BLK + 32, sizeof(uint16_t));
+            k_norms_buf[t] = d;
         }
+
+        /* V side: tbq3_0, FUSED_TBQ_PER_TOKEN blocks/token, per-thread. */
+        const char * pv_plane = (const char *) pv->data
+            + i3 * pv->nb[3] + hk * pv->nb[2];
+        static __thread uint8_t  v_codes_buf[8 * 1024 * 4 * 12];
+        static __thread uint16_t v_scales_buf[8 * 1024 * 4];
+        const size_t n_v_blocks = (size_t) n_kv_tokens * FUSED_TBQ_PER_TOKEN;
+        GGML_ASSERT(n_v_blocks * 12 <= sizeof(v_codes_buf));
+        GGML_ASSERT(n_v_blocks      <= sizeof(v_scales_buf) / sizeof(uint16_t));
+        for (size_t blk = 0; blk < n_v_blocks; blk++) {
+            const char * src = pv_plane + blk * TBQ_BLK;
+            ggml_half d;
+            memcpy(&d, src, sizeof(ggml_half));
+            v_scales_buf[blk] = (uint16_t) d;
+            memcpy(v_codes_buf + blk * (FUSED_TBQ_BLOCK * 3 / 8),
+                   src + sizeof(ggml_half),
+                   FUSED_TBQ_BLOCK * 3 / 8);
+        }
+
+        fused_attn_qjl_tbq_ref(n_kv_tokens, q_sketch,
+                                k_signs_buf, k_norms_buf,
+                                v_codes_buf, v_scales_buf,
+                                sm_scale, scratch, out_head);
     }
 }

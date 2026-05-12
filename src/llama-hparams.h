@@ -139,6 +139,13 @@ struct llama_hparams {
     // for Kimi Linear KDA
     uint32_t n_embd_head_kda = 0;
 
+    // for DFlash drafter
+    uint32_t dflash_block_size        = 16;
+    uint32_t dflash_mask_token_id     = 0;
+    uint32_t dflash_n_target_features = 25600;
+    uint32_t dflash_n_target_layers   = 0;
+    uint32_t dflash_target_layer_ids[8] = {};
+
     // for hybrid state space models
     std::array<bool, LLAMA_MAX_LAYERS> recurrent_layer_arr;
 

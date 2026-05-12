@@ -2393,13 +2393,13 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_ATTN_SCORE_QJL:
         case GGML_OP_FUSED_ATTN_QJL_TBQ:
             {
-                // QJL score forward dispatches over (h_q, t) inside the
-                // SIMD path itself; the outer loop here is a small
-                // n_batch * ne3 fan-out. Single-thread for now — revisit
-                // when we have a real per-token decode profile on arm64.
-                // The fused QJL-K + TBQ-V kernel uses thread-local
-                // scratch buffers and is also single-threaded today.
-                n_tasks = 1;
+                // ELIZA-CPU-THREAD-PARALLELISM-V1
+                // QJL score forward and the fused QJL-K + TBQ-V kernel
+                // both split the flattened (ne3, n_batch, h_q) output
+                // space over ith/nth — each task owns disjoint score rows
+                // / head outputs, no shared scratch race (the fused op
+                // takes a per-task wdata slice; see the work-size case).
+                n_tasks = n_threads;
             } break;
         case GGML_OP_WIN_PART:
         case GGML_OP_WIN_UNPART:
@@ -2939,6 +2939,13 @@ struct ggml_cplan ggml_graph_plan(
                         size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
 
                         cur += MAX(prefill, decode);
+                    } break;
+                // ELIZA-CPU-THREAD-PARALLELISM-V1
+                case GGML_OP_FUSED_ATTN_QJL_TBQ:
+                    {
+                        // per-task softmax-weight scratch: n_kv_tokens fp32.
+                        // src[1] is the packed K cache, ne[1] = n_kv_tokens.
+                        cur += sizeof(float) * node->src[1]->ne[1] * n_tasks;
                     } break;
                 case GGML_OP_FLASH_ATTN_BACK:
                     {

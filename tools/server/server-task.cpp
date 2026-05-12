@@ -10,6 +10,33 @@
 
 using json = nlohmann::ordered_json;
 
+// ELIZA-DFLASH-VERIFIER-STREAM-V1
+// Eliza-1 voice swarm (W4): expose the DFlash verifier's reject span on
+// streamed chunks as `{ "verifier": { "rejected": [a, b] } }` so the
+// runtime can drop the not-yet-played TTS audio for the overlapping
+// phrases (docs/porting/dflash-drafter-strategy.md "DFlash↔TTS Rollback
+// Coupling"). `a`/`b` are inclusive token indices in target output order.
+namespace eliza_dflash {
+  // Set by the speculative loop after each verify pass; consumed + cleared
+  // by the next streamed-chunk send. -1 means "no reject this step".
+  static thread_local long long g_reject_from = -1;
+  static thread_local long long g_reject_to   = -1;
+  [[maybe_unused]] static inline void note_reject(long long from, long long to) {
+    if (from < 0 || to < from) { return; }
+    g_reject_from = from; g_reject_to = to;
+  }
+  // Returns the pending reject extension as a JSON fragment string and
+  // clears it, or an empty string when there is nothing pending.
+  [[maybe_unused]] static inline std::string take_reject_json() {
+    if (g_reject_from < 0) { return std::string(); }
+    std::string out = "\"verifier\":{\"rejected\":[" +
+      std::to_string(g_reject_from) + "," + std::to_string(g_reject_to) + "]}";
+    g_reject_from = -1; g_reject_to = -1;
+    return out;
+  }
+}
+
+
 //
 // task_params
 //
