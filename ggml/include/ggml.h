@@ -560,7 +560,9 @@ extern "C" {
 
         GGML_OP_FLASH_ATTN_EXT,
         GGML_OP_FLASH_ATTN_BACK,
-        GGML_OP_ATTN_SCORE_QJL, // QJL 1-bit packed-K attention score (CPU-only)
+        GGML_OP_ATTN_SCORE_QJL, // QJL 1-bit packed-K attention score
+        GGML_OP_ATTN_SCORE_TBQ, // // ELIZA-TBQ-POLAR-ATTN-DISPATCH-V1 TurboQuant packed-K attention score
+        GGML_OP_ATTN_SCORE_POLAR, // PolarQuant packed-K attention score
         GGML_OP_FUSED_ATTN_QJL_TBQ, // fused QJL-K + TBQ-V attention (CPU-only)
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
@@ -2386,6 +2388,41 @@ extern "C" {
             struct ggml_tensor  * q,
             struct ggml_tensor  * packed_k,
             int                   n_kv_heads);
+
+    // // ELIZA-TBQ-POLAR-ATTN-DISPATCH-V1
+    // TurboQuant packed-K attention score.
+    // q: F32 [128, n_heads, n_batch, ne3]
+    // packed_k: TBQ3_0/TBQ4_0/TBQ3_TCQ [128, n_kv_tokens, n_kv_heads, ne3]
+    // output: F32 [n_kv_tokens, n_heads, n_batch, ne3]
+    GGML_API struct ggml_tensor * ggml_attn_score_tbq(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * packed_k,
+            int                   n_kv_heads);
+
+    // PolarQuant packed-K attention score.
+    // q: F32 [128, n_heads, n_batch, ne3]
+    // packed_k: Q4_POLAR [128, n_kv_tokens, n_kv_heads, ne3]
+    // use_qjl mirrors the PolarQuant GGUF residual flag.
+    // output: F32 [n_kv_tokens, n_heads, n_batch, ne3]
+    GGML_API struct ggml_tensor * ggml_attn_score_polar(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * packed_k,
+            int                   n_kv_heads,
+            bool                  use_qjl);
+
+    // PolarQuant packed-K attention score with pre-Hadamarded query.
+    // q_preht MUST contain H*q for each query head, where H is the same
+    // unnormalised 128-point Walsh-Hadamard transform used by the PolarQuant
+    // decoder. This is faster than ggml_attn_score_polar() because the backend
+    // can use dot(H*x, q) == dot(x, H*q) and avoid one Hadamard per K row.
+    GGML_API struct ggml_tensor * ggml_attn_score_polar_preht(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q_preht,
+            struct ggml_tensor  * packed_k,
+            int                   n_kv_heads,
+            bool                  use_qjl);
 
     // Fused QJL-K + TBQ-V attention (CPU-only). Computes
     //   out[h_q, d] = Σ_t softmax(QJL_score(q, K)/sqrt(d_k))_t * dequant_V[t, d]
