@@ -1499,6 +1499,23 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_attn_score_polar
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_attn_score_polar_preht(ggml_metal_library_t lib) {
+    const char * name = "kernel_attn_score_q4_polar_preht_f32";
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    if (!res.pipeline) {
+        GGML_LOG_ERROR("attn_score_polar_preht: kernel '%s' missing from default.metallib\n", name);
+        GGML_ABORT("attn_score_polar_preht: pipeline compile failed");
+    }
+    res.nr0 = 1;
+    res.nr1 = 1;
+    res.nsg = 1;
+    res.smem = 0;
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin(ggml_metal_library_t lib, const ggml_tensor * op, int32_t n_fuse) {
     char base[256];
     char name[256];

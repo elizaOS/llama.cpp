@@ -5517,14 +5517,15 @@ struct ggml_tensor * ggml_attn_score_tbq(
     return result;
 }
 
-// ggml_attn_score_polar
+// ggml_attn_score_polar_impl
 //
-struct ggml_tensor * ggml_attn_score_polar(
+static struct ggml_tensor * ggml_attn_score_polar_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * packed_k,
         int                   n_kv_heads,
-        bool                  use_qjl) {
+        bool                  use_qjl,
+        bool                  q_preht) {
     GGML_ASSERT(q != NULL);
     GGML_ASSERT(packed_k != NULL);
     GGML_ASSERT(q->type == GGML_TYPE_F32);
@@ -5543,7 +5544,7 @@ struct ggml_tensor * ggml_attn_score_polar(
     const int64_t ne[4] = { n_kv_tokens, n_heads, q->ne[2], q->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
-    int32_t params[2] = { n_kv_heads, use_qjl ? 1 : 0 };
+    int32_t params[3] = { n_kv_heads, use_qjl ? 1 : 0, q_preht ? 1 : 0 };
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op     = GGML_OP_ATTN_SCORE_POLAR;
@@ -5551,6 +5552,28 @@ struct ggml_tensor * ggml_attn_score_polar(
     result->src[1] = packed_k;
 
     return result;
+}
+
+// ggml_attn_score_polar
+//
+struct ggml_tensor * ggml_attn_score_polar(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * packed_k,
+        int                   n_kv_heads,
+        bool                  use_qjl) {
+    return ggml_attn_score_polar_impl(ctx, q, packed_k, n_kv_heads, use_qjl, false);
+}
+
+// ggml_attn_score_polar_preht
+//
+struct ggml_tensor * ggml_attn_score_polar_preht(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q_preht,
+        struct ggml_tensor  * packed_k,
+        int                   n_kv_heads,
+        bool                  use_qjl) {
+    return ggml_attn_score_polar_impl(ctx, q_preht, packed_k, n_kv_heads, use_qjl, true);
 }
 
 // ggml_fused_attn_qjl_tbq
