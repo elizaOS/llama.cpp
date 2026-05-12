@@ -112,6 +112,16 @@ option(LLAMA_BUILD_WEBUI    "llama: build the embedded Web UI for server"  ON)
 option(LLAMA_TOOLS_INSTALL  "llama: install tools"        ${LLAMA_TOOLS_INSTALL_DEFAULT})
 option(LLAMA_TESTS_INSTALL  "llama: install tests"        ON)
 
+# omnivoice.cpp merged subtree: opt-in. When enabled, tools/omnivoice/
+# is compiled against the same GGML + backend selection as the rest of
+# llama.cpp, producing the libomnivoice shared library (when
+# OMNIVOICE_SHARED is also set) and the omnivoice-tts / omnivoice-codec
+# CLI tools. Default OFF so stock llama.cpp consumers see no change.
+# NOTE: until patch 0002 vendors tools/omnivoice/, enabling this flag
+# is a hard error - see the guard near the bottom of this file.
+option(LLAMA_BUILD_OMNIVOICE "Build the merged omnivoice TTS subtree" OFF)
+option(OMNIVOICE_SHARED      "Build libomnivoice for ABI consumers" OFF)
+
 # 3rd party libs
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
@@ -213,6 +223,15 @@ endif()
 
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
     add_subdirectory(tools)
+endif()
+
+if (LLAMA_BUILD_OMNIVOICE)
+    if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/omnivoice/CMakeLists.txt")
+        message(FATAL_ERROR
+            "LLAMA_BUILD_OMNIVOICE=ON but OMNIVOICE_VENDOR_DIR not yet wired (patch 0002). "
+            "Vendor tools/omnivoice/ from packages/inference/omnivoice.cpp first, then re-run cmake.")
+    endif()
+    add_subdirectory(tools/omnivoice)
 endif()
 
 # Automatically add all files from the 'licenses' directory
