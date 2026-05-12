@@ -45,6 +45,26 @@ enum stop_type {
     STOP_TYPE_LIMIT,
 };
 
+// Eliza-1 guided-decode forced-token fast-forward (`eliza_prefill_plan`).
+// See structured-output.ts ElizaPrefillPlan in @elizaos/app-core. Each run is
+// a sequence of deterministic bytes anchored by the index of the free span it
+// follows (-1 = leading assistant-turn prefill, 0..N = run after free span N).
+// A request without a plan still produces byte-identical output via the lazy
+// GBNF — the plan only skips the per-token sampling overhead for forced runs.
+struct task_prefill_run {
+    int32_t after_free_span = -1;
+    std::string text;
+};
+
+struct task_prefill_plan {
+    std::string                   prefix;       // mirror of runs[0].text when after_free_span == -1
+    std::vector<task_prefill_run> runs;
+    int32_t                       free_count = 0;
+    std::string                   id;           // opaque cache key
+
+    bool empty() const { return runs.empty(); }
+};
+
 struct task_params {
     bool stream          = true;
     bool include_usage   = false;
@@ -82,6 +102,10 @@ struct task_params {
 
     // per-request parameters for chat parsing
     common_chat_parser_params chat_parser_params;
+
+    // Eliza-1 forced-token fast-forward (off by default). See task_prefill_plan
+    // above; when empty the lazy GBNF still forces the same bytes.
+    task_prefill_plan prefill_plan;
 
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
