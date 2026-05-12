@@ -162,6 +162,28 @@ struct server_slot {
     int32_t n_draft_total = 0;      // Total draft tokens generated
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
 
+    // Eliza-1 forced-token fast-forward cursor (`eliza_prefill_plan`).
+    //
+    // - prefill_next_run: index into task.params.prefill_plan.runs[] of the
+    //   next run that may still fire (-1 when no plan / all runs fired). We
+    //   skip the leading run (after_free_span == -1) — that one is the
+    //   assistant-turn prefill, already injected via the chat-template path.
+    // - prefill_run_byte_anchor: byte offset in generated_text at which we
+    //   started matching the current pending run. Each sampled token's text
+    //   is compared against runs[prefill_next_run].text[match_pos..]; when
+    //   the run is fully matched, advance the cursor and the splice has fired
+    //   (zero per-token sampling savings on that run — the GBNF would have
+    //   sampled them anyway). When the next sampled token's text *partially*
+    //   matches the run prefix, we splice the run's remaining bytes directly
+    //   (tokenize them, write the ids into the slot, advance the sampler+
+    //   grammar) and skip those forward passes' per-token sampling calls.
+    // - prefill_tokens_spliced / prefill_tokens_saved: bookkeeping for the
+    //   fork test (tests/test-eliza-prefill-plan.cpp).
+    int32_t prefill_next_run        = -1;
+    size_t  prefill_run_byte_anchor = 0;
+    int32_t prefill_tokens_spliced  = 0;
+    int32_t prefill_tokens_saved    = 0;
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -184,6 +206,12 @@ struct server_slot {
         // clear speculative decoding stats
         n_draft_total = 0;
         n_draft_accepted = 0;
+
+        // clear forced-token fast-forward state
+        prefill_next_run        = -1;
+        prefill_run_byte_anchor = 0;
+        prefill_tokens_spliced  = 0;
+        prefill_tokens_saved    = 0;
 
         task_prev = std::move(task);
         task.reset();
@@ -216,6 +244,52 @@ struct server_slot {
 
         SLT_INF(*this, "init sampler, took %0.2f ms, tokens: text = %d, total = %d\n",
                 (ggml_time_us() - t_start) / 1000.0, n_text, (int) prompt.tokens.size());
+    }
+
+    // Initialize the forced-token fast-forward cursor at start-of-generation.
+    void init_prefill_plan() {
+        prefill_next_run        = -1;
+        prefill_run_byte_anchor = 0;
+        prefill_tokens_spliced  = 0;
+        prefill_tokens_saved    = 0;
+
+        if (!task) return;
+        const auto & plan = task->params.prefill_plan;
+        if (plan.empty()) return;
+
+        // Skip the leading run (after_free_span == -1); that one is the
+        // assistant-turn prefill, already injected by the chat-template path.
+        for (size_t i = 0; i < plan.runs.size(); ++i) {
+            if (plan.runs[i].after_free_span >= 0) {
+                prefill_next_run = (int32_t) i;
+                break;
+            }
+        }
+    }
+
+    // Look up the next pending run, if any. Returns nullptr when no plan, no
+    // task, or the cursor has run off the end.
+    const task_prefill_run * prefill_pending_run() const {
+        if (prefill_next_run < 0 || !task) return nullptr;
+        const auto & plan = task->params.prefill_plan;
+        if ((size_t) prefill_next_run >= plan.runs.size()) return nullptr;
+        return &plan.runs[prefill_next_run];
+    }
+
+    // Advance to the next pending run; mark the byte anchor at the END of the
+    // current generated_text (where the next deterministic run will start).
+    void prefill_advance_to_next_run() {
+        if (!task) return;
+        const auto & plan = task->params.prefill_plan;
+        prefill_run_byte_anchor = generated_text.size();
+        int32_t next = -1;
+        for (size_t i = (size_t) prefill_next_run + 1; i < plan.runs.size(); ++i) {
+            if (plan.runs[i].after_free_span >= 0) {
+                next = (int32_t) i;
+                break;
+            }
+        }
+        prefill_next_run = next;
     }
 
     // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
