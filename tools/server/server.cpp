@@ -632,6 +632,16 @@ int main(int argc, char ** argv) {
             monitor_thread = server_models::setup_child_server(shutdown_handler, model_info);
         }
 
+        // TODO(dflash-native-events): after verifier batch completes, emit:
+        // { "type": "dflash_event", "native": true, "draft_tokens": [...],
+        //   "accept_count": N, "reject_range": [s,e]|null,
+        //   "accept_tokens": [...], "timing": { "proposal_ms": X, "verify_ms": Y } }
+        // Use send_event(slot_id, json_str) which already exists in this file.
+        // Flag: --dflash-emit-events (default on when drafter loaded).
+        // The speculative-decode slot loop (server-context.h) is the emission
+        // point: hook into the post-verify step where llama_speculative_decode
+        // returns the accepted token mask and corrected token.
+
         // this call blocks the main thread until queue_tasks.terminate() is called
         ctx_server.start_loop();
 
