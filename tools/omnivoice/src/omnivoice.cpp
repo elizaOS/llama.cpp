@@ -3,12 +3,31 @@
 // Every entry declared in omnivoice.h lives here under one extern "C" block
 // so the symbols carry C linkage and are linkable from C, Rust, Go, Python
 // ctypes and any other binding generator. The struct ov_context opaque
-// handle owns one BackendPair, one PipelineTTS, one PipelineCodec
+// handle owns one BackendPairOwned (which tracks the BackendPair and whether
+// omnivoice allocated the handles), one PipelineTTS, one PipelineCodec
 // (optional), one BPETokenizer and one VoiceDesign instance. ov_init walks
 // the load chain in dependency order and unwinds whatever it already
 // allocated when any step fails. ov_free mirrors that order in reverse.
+//
+// Patch 0003: backend selection is now performed by backend_init_auto()
+// (see backend.h) instead of the old backend_init() / backend_release()
+// refcounted cache.  When the merged llama.cpp tree calls omnivoice from an
+// existing llama_context, the caller should use omnivoice_backend_from_llama()
+// to extract the shared backend pair (borrowed, not owned) and then construct
+// the ov_context with a pre-filled BackendPairOwned.  The public ov_init()
+// entry continues to work standalone via backend_init_auto().
 
 #include "omnivoice.h"
+
+// llama-context.h is available in the merged llama.cpp tree (LLAMA_BUILD_OMNIVOICE).
+// It supplies the llama_context class definition required by
+// omnivoice_backend_from_llama() declared in backend.h.
+// When building omnivoice standalone (outside llama.cpp), omit the include:
+// omnivoice_backend_from_llama() will still be declared but any call to it
+// will fail to link unless llama-context.h is later provided.
+#if defined(LLAMA_BUILD_OMNIVOICE)
+#    include "llama-context.h"
+#endif
 
 #include "backend.h"
 #include "bpe.h"
@@ -30,12 +49,13 @@
 // because nothing in this struct ever crosses the public ABI boundary :
 // callers only ever see `struct ov_context *`.
 struct ov_context {
-    BackendPair   bp;
-    PipelineTTS   pt;
-    PipelineCodec pc;
-    BPETokenizer  tok;
-    VoiceDesign   vd;
-    bool          codec_loaded;
+    BackendPairOwned owned_bp;    // backend handles + ownership flags (patch 0003)
+    BackendPair      bp;          // convenience alias: set to owned_bp.bp after init
+    PipelineTTS      pt;
+    PipelineCodec    pc;
+    BPETokenizer     tok;
+    VoiceDesign      vd;
+    bool             codec_loaded;
 };
 
 // Thread-local backing store for ov_last_error(). std::string sized once
@@ -222,8 +242,8 @@ struct ov_context * ov_init(const struct ov_init_params * params) {
     ov_log(OV_LOG_INFO, "[OmniVoice] omnivoice.cpp %s", ov_version());
 
     // new ov_context() value-initialises every field: POD aggregates
-    // (BackendPair, PipelineTTS, PipelineCodec) are zero-init, std
-    // containers in BPETokenizer construct empty, codec_loaded falls to
+    // (BackendPairOwned, BackendPair, PipelineTTS, PipelineCodec) are zero-init,
+    // std containers in BPETokenizer construct empty, codec_loaded falls to
     // false. Only VoiceDesign needs explicit population below.
     ov_context * ov = new ov_context();
     voice_design_init(&ov->vd);
@@ -232,11 +252,16 @@ struct ov_context * ov_init(const struct ov_init_params * params) {
     // reader, the audio tokenizer load or the LM weight load throws via
     // ov_throw ; the catch funnels every variant into one cleanup via
     // ov_free, which is idempotent on partial state (NULL-safe sched, NULL
-    // GGUF handles, refcount-correct backend release).
+    // GGUF handles, backend_auto_free handles partial ownership correctly).
     try {
-        ov->bp = backend_init("LM");
+        // Patch 0003: use backend_init_auto() instead of backend_init().
+        // backend_init_auto() calls ggml_backend_load_all() (idempotent in
+        // the merged build), scans devices, and returns a BackendPairOwned
+        // that records which handles omnivoice allocated.
+        ov->owned_bp = backend_init_auto("LM");
+        ov->bp       = ov->owned_bp.bp;
         if (!ov->bp.backend) {
-            ov_throw("ov_init : backend_init failed (no GGML backend available)");
+            ov_throw("ov_init : backend_init_auto failed (no GGML backend available)");
         }
 
         if (!pipeline_tts_load(&ov->pt, params->model_path, ov->bp, params->use_fa, params->clamp_fp16)) {
@@ -275,7 +300,11 @@ void ov_free(struct ov_context * ov) {
         pipeline_codec_free(&ov->pc);
     }
     pipeline_tts_free(&ov->pt);
-    backend_release(ov->bp.backend, ov->bp.cpu_backend);
+    // Patch 0003: backend_auto_free() respects owned_bp.owns_* flags.
+    // Borrowed handles (sourced from a llama_context via
+    // omnivoice_backend_from_llama) are skipped; only handles that
+    // omnivoice allocated via backend_init_auto() are freed.
+    backend_auto_free(ov->owned_bp);
     delete ov;
 }
 
