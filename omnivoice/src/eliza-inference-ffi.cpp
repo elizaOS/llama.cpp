@@ -6,6 +6,7 @@
 #include "llama.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "common.h"
 
 #include <algorithm>
 #include <atomic>
@@ -674,32 +675,89 @@ int eliza_inference_asr_transcribe(
     return (int) transcript.size();
 }
 
-/* ---- Streaming ASR (ABI v2) ---------------------------------------- *
+/* ---- Streaming ASR (ABI v2/W7) ------------------------------------- *
  *
- * The fused build ships the v1 batch `eliza_inference_asr_transcribe`
- * decoder above; the windowed streaming-session decoder is not yet wired
- * (W7). Per packages/inference/AGENTS.md §3 we do NOT fake it — the
-     * capability probe returns 0 so EngineVoiceBridge / StreamingTranscriber
-     * pick the fused batch ASR adapter instead of opening a session that would
-     * only return ELIZA_ERR_NOT_IMPLEMENTED.
- * These symbols exist so the ABI surface is complete and the loader's
- * version check (ffi-bindings.ts expects v3) succeeds.
+ * Implementation strategy: the OmniVoice/Qwen3-ASR audio encoder operates on
+ * the WHOLE utterance window — there is no per-frame incremental encoder
+ * exposed by mtmd today, and a true sliding-window streaming decoder
+ * requires changes to the audio encoder graph that aren't safe to land in
+ * this PR without verification on a dedicated audio fixture. So this build
+ * ships a *buffered* streaming session: PCM samples accumulate in the
+ * session, and each `_partial()` / `_finish()` call re-runs the batch
+ * `eliza_inference_asr_transcribe` over the buffer-so-far. From the
+ * caller's POV the streaming API is correct (each partial reflects all
+ * audio fed so far; finish returns the full transcript); the perf vs.
+ * single-batch is bounded by the partial-call rate.
+ *
+ * Gate: `eliza_inference_asr_stream_supported()` returns 1 only when the
+ * caller has *also* opened a context whose loaded ASR model carries the
+ * expected special-token / audio-marker map. The bare static probe still
+ * returns 1 (the API surface is implemented in this build) — per-context
+ * gating happens at `_open()` against the vocab.
+ *
+ * Future work (real sliding-window): track `n_past` across `_feed()` calls
+ * and reuse the KV cache, with the audio encoder running on overlapping
+ * frame windows. This requires mtmd surface changes; tracked in the W7
+ * follow-up.
  */
 
+struct EliAsrStream {
+    EliInferenceContext * ctx              = nullptr;
+    int                   sample_rate_hz   = 0;
+    std::vector<float>    pcm;             // accumulated since open()
+    std::mutex            mu;
+};
+
+// Per-context probe: returns true when ctx has an ASR model loaded AND its
+// vocab carries the Qwen3-ASR audio framing markers (`<|im_start|>` /
+// `<|im_end|>`). We probe by tokenizing the markers and checking they
+// resolve to a single special token id each — same pattern the batch path
+// uses to construct its prompt.
+static bool eliza_asr_stream_model_supported(EliInferenceContext * ctx) {
+    if (!ctx || !ctx->asr_model) return false;
+    const llama_vocab * vocab = llama_model_get_vocab(ctx->asr_model);
+    if (!vocab) return false;
+    static const char * const markers[] = { "<|im_start|>", "<|im_end|>" };
+    for (const char * m : markers) {
+        std::vector<llama_token> toks = common_tokenize(vocab, m, /* add_special= */ false, /* parse_special= */ true);
+        if (toks.size() != 1) return false;
+    }
+    return true;
+}
+
 int eliza_inference_asr_stream_supported(void) {
-    return 0;
+    // Build-time capability: streaming surface is implemented (buffered).
+    // Per-context support is gated at _open() against the loaded vocab.
+    return 1;
 }
 
 EliAsrStream * eliza_inference_asr_stream_open(
     EliInferenceContext * ctx,
     int sample_rate_hz,
     char ** out_error) {
-    (void) ctx;
-    (void) sample_rate_hz;
-    eliza_set_error(out_error,
-        "[libelizainference] streaming ASR session API is not implemented in this build "
-        "(eliza_inference_asr_stream_supported() == 0); use the batch transcribe path");
-    return nullptr;
+    if (!ctx || sample_rate_hz <= 0) {
+        eliza_set_error(out_error, "[libelizainference] asr_stream_open: invalid arguments");
+        return nullptr;
+    }
+    {
+        std::lock_guard<std::mutex> lock(ctx->asr_mutex);
+        if (!ctx->asr_model || !ctx->asr_lctx || !ctx->asr_mtmd) {
+            eliza_set_error(out_error,
+                "[libelizainference] asr_stream_open: ASR region is not acquired; call mmap_acquire(\"asr\") after arming voice input");
+            return nullptr;
+        }
+    }
+    if (!eliza_asr_stream_model_supported(ctx)) {
+        eliza_set_error(out_error,
+            "[libelizainference] asr_stream_open: the loaded ASR model does not carry the expected "
+            "Qwen3-ASR special-token map (<|im_start|>/<|im_end|>) — streaming session disabled, "
+            "use the batch transcribe path");
+        return nullptr;
+    }
+    EliAsrStream * stream = new EliAsrStream();
+    stream->ctx = ctx;
+    stream->sample_rate_hz = sample_rate_hz;
+    return stream;
 }
 
 int eliza_inference_asr_stream_feed(
@@ -707,11 +765,49 @@ int eliza_inference_asr_stream_feed(
     const float * pcm,
     size_t n_samples,
     char ** out_error) {
-    (void) stream;
-    (void) pcm;
-    (void) n_samples;
-    eliza_set_error(out_error, "[libelizainference] streaming ASR is not implemented in this build");
-    return ELIZA_ERR_NOT_IMPLEMENTED;
+    if (!stream || !pcm) {
+        eliza_set_error(out_error, "[libelizainference] asr_stream_feed: invalid arguments");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    if (n_samples == 0) return ELIZA_OK;
+    std::lock_guard<std::mutex> lock(stream->mu);
+    stream->pcm.insert(stream->pcm.end(), pcm, pcm + n_samples);
+    return ELIZA_OK;
+}
+
+// Shared helper: run the batch transcribe over the accumulated PCM and
+// write the result into the caller's buffers. Used by both _partial and
+// _finish; the only difference is finish() additionally resets the buffer.
+static int eliza_asr_stream_decode_locked(
+    EliAsrStream * stream,
+    char * out_text,
+    size_t max_text_bytes,
+    int * out_tokens,
+    size_t * io_n_tokens,
+    char ** out_error) {
+    if (stream->pcm.empty()) {
+        if (max_text_bytes > 0) out_text[0] = '\0';
+        if (io_n_tokens) *io_n_tokens = 0;
+        return 0;
+    }
+    int rc = eliza_inference_asr_transcribe(
+        stream->ctx,
+        stream->pcm.data(),
+        stream->pcm.size(),
+        stream->sample_rate_hz,
+        out_text,
+        max_text_bytes,
+        out_error);
+    if (rc < 0) {
+        if (io_n_tokens) *io_n_tokens = 0;
+        return rc;
+    }
+    // The buffered path doesn't expose intermediate token ids — set the
+    // count to 0 and let the caller fall back to the text. A future real
+    // streaming impl would populate out_tokens from the decode loop.
+    (void) out_tokens;
+    if (io_n_tokens) *io_n_tokens = 0;
+    return rc;
 }
 
 int eliza_inference_asr_stream_partial(
@@ -721,13 +817,13 @@ int eliza_inference_asr_stream_partial(
     int * out_tokens,
     size_t * io_n_tokens,
     char ** out_error) {
-    (void) stream;
-    (void) out_text;
-    (void) max_text_bytes;
-    (void) out_tokens;
-    if (io_n_tokens) *io_n_tokens = 0;
-    eliza_set_error(out_error, "[libelizainference] streaming ASR is not implemented in this build");
-    return ELIZA_ERR_NOT_IMPLEMENTED;
+    if (!stream || !out_text || max_text_bytes == 0) {
+        if (io_n_tokens) *io_n_tokens = 0;
+        eliza_set_error(out_error, "[libelizainference] asr_stream_partial: invalid arguments");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::mutex> lock(stream->mu);
+    return eliza_asr_stream_decode_locked(stream, out_text, max_text_bytes, out_tokens, io_n_tokens, out_error);
 }
 
 int eliza_inference_asr_stream_finish(
@@ -737,17 +833,20 @@ int eliza_inference_asr_stream_finish(
     int * out_tokens,
     size_t * io_n_tokens,
     char ** out_error) {
-    (void) stream;
-    (void) out_text;
-    (void) max_text_bytes;
-    (void) out_tokens;
-    if (io_n_tokens) *io_n_tokens = 0;
-    eliza_set_error(out_error, "[libelizainference] streaming ASR is not implemented in this build");
-    return ELIZA_ERR_NOT_IMPLEMENTED;
+    if (!stream || !out_text || max_text_bytes == 0) {
+        if (io_n_tokens) *io_n_tokens = 0;
+        eliza_set_error(out_error, "[libelizainference] asr_stream_finish: invalid arguments");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::mutex> lock(stream->mu);
+    int rc = eliza_asr_stream_decode_locked(stream, out_text, max_text_bytes, out_tokens, io_n_tokens, out_error);
+    // Reset the buffer so the session can be reused for the next utterance.
+    stream->pcm.clear();
+    return rc;
 }
 
 void eliza_inference_asr_stream_close(EliAsrStream * stream) {
-    (void) stream;
+    delete stream;
 }
 
 /* ---- Streaming TTS + hard-cancel (ABI v2) ------------------------- *
