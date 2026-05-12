@@ -431,6 +431,42 @@ task_params server_task::params_from_json_cmpl(
         }
     }
 
+    // Eliza-1 guided-decode forced-token fast-forward (`eliza_prefill_plan`).
+    // Tolerantly parsed: an absent / malformed plan is dropped silently so the
+    // lazy GBNF still drives the bytes. See task_prefill_plan in server-task.h.
+    {
+        const auto plan_it = data.find("eliza_prefill_plan");
+        if (plan_it != data.end() && plan_it->is_object()) {
+            try {
+                const auto & j = *plan_it;
+                params.prefill_plan.prefix     = json_value(j, "prefix", std::string());
+                params.prefill_plan.free_count = json_value(j, "free_count", 0);
+                params.prefill_plan.id         = json_value(j, "id", std::string());
+                const auto runs_it = j.find("runs");
+                if (runs_it != j.end() && runs_it->is_array()) {
+                    for (const auto & r : *runs_it) {
+                        task_prefill_run run;
+                        run.after_free_span = json_value(r, "after_free_span", -1);
+                        run.text            = json_value(r, "text", std::string());
+                        if (!run.text.empty()) {
+                            params.prefill_plan.runs.push_back(std::move(run));
+                        }
+                    }
+                }
+                if (!params.prefill_plan.runs.empty()) {
+                    SRV_DBG("eliza_prefill_plan: id=%s prefix=%zub runs=%zu free_count=%d\n",
+                            params.prefill_plan.id.c_str(),
+                            params.prefill_plan.prefix.size(),
+                            params.prefill_plan.runs.size(),
+                            params.prefill_plan.free_count);
+                }
+            } catch (const std::exception & e) {
+                SRV_WRN("eliza_prefill_plan: malformed (%s) — falling back to grammar-only path\n", e.what());
+                params.prefill_plan = task_prefill_plan{};
+            }
+        }
+    }
+
     {
         params.sampling.logit_bias.clear();
 
