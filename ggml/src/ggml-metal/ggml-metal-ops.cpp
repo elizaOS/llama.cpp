@@ -227,7 +227,6 @@ int ggml_metal_op_attn_score_qjl(ggml_metal_op_t ctx, int idx) {
     GGML_ASSERT(ggml_is_contiguous_rows(q));
     GGML_ASSERT(ggml_is_contiguous_rows(pk));
     GGML_ASSERT(ggml_is_contiguous_rows(op));
-
     const uint32_t n_heads     = (uint32_t) q->ne[1];
     const uint32_t n_kv_heads  = (uint32_t) ((const int32_t *) op->op_params)[0];
     const uint32_t n_tokens    = (uint32_t) pk->ne[1];
