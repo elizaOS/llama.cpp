@@ -2,181 +2,125 @@
 	import { Square } from '@lucide/svelte';
 	import { Button } from '$lib/components/ui/button';
 	import {
-		ChatFormActionAttachmentsDropdown,
+		ChatFormActionsAdd,
+		ChatFormActionModels,
 		ChatFormActionRecord,
-		ChatFormActionSubmit,
-		ModelsSelector
+		ChatFormActionSubmit
 	} from '$lib/components/app';
 	import { FileTypeCategory } from '$lib/enums';
-	import { getFileTypeCategory } from '$lib/utils';
+	import { mcpStore } from '$lib/stores/mcp.svelte';
 	import { config } from '$lib/stores/settings.svelte';
-	import { modelsStore, modelOptions, selectedModelId } from '$lib/stores/models.svelte';
-	import { isRouterMode } from '$lib/stores/server.svelte';
-	import { chatStore } from '$lib/stores/chat.svelte';
-	import { activeMessages } from '$lib/stores/conversations.svelte';
+	import { conversationsStore } from '$lib/stores/conversations.svelte';
+	import { getFileTypeCategory } from '$lib/utils';
+	import { goto } from '$app/navigation';
+	import { ROUTES } from '$lib/constants/routes';
 
 	interface Props {
 		canSend?: boolean;
+		canSubmit?: boolean;
 		class?: string;
 		disabled?: boolean;
 		isLoading?: boolean;
 		isRecording?: boolean;
-		hasText?: boolean;
+		showAddButton?: boolean;
+		showModelSelector?: boolean;
 		uploadedFiles?: ChatUploadedFile[];
 		onFileUpload?: () => void;
 		onMicClick?: () => void;
 		onStop?: () => void;
 		onSystemPromptClick?: () => void;
+		onMcpPromptClick?: () => void;
+		onMcpResourcesClick?: () => void;
 	}
 
 	let {
 		canSend = false,
+		canSubmit = false,
 		class: className = '',
 		disabled = false,
 		isLoading = false,
 		isRecording = false,
-		hasText = false,
+		showAddButton = true,
+		showModelSelector = true,
 		uploadedFiles = [],
 		onFileUpload,
 		onMicClick,
 		onStop,
-		onSystemPromptClick
+		onSystemPromptClick,
+		onMcpPromptClick,
+		onMcpResourcesClick
 	}: Props = $props();
 
 	let currentConfig = $derived(config());
-	let isRouter = $derived(isRouterMode());
 
-	let conversationModel = $derived(
-		chatStore.getConversationModel(activeMessages() as DatabaseMessage[])
-	);
+	let hasMcpPromptsSupport = $derived.by(() => {
+		const perChatOverrides = conversationsStore.getAllMcpServerOverrides();
 
-	let previousConversationModel: string | null = null;
-
-	$effect(() => {
-		if (conversationModel && conversationModel !== previousConversationModel) {
-			previousConversationModel = conversationModel;
-			modelsStore.selectModelByName(conversationModel);
-		}
+		return mcpStore.hasPromptsCapability(perChatOverrides);
 	});
 
-	let activeModelId = $derived.by(() => {
-		const options = modelOptions();
+	let hasMcpResourcesSupport = $derived.by(() => {
+		const perChatOverrides = conversationsStore.getAllMcpServerOverrides();
 
-		if (!isRouter) {
-			return options.length > 0 ? options[0].model : null;
-		}
-
-		const selectedId = selectedModelId();
-		if (selectedId) {
-			const model = options.find((m) => m.id === selectedId);
-			if (model) return model.model;
-		}
-
-		if (conversationModel) {
-			const model = options.find((m) => m.model === conversationModel);
-			if (model) return model.model;
-		}
-
-		return null;
+		return mcpStore.hasResourcesCapability(perChatOverrides);
 	});
 
-	let modelPropsVersion = $state(0); // Used to trigger reactivity after fetch
-
-	$effect(() => {
-		if (activeModelId) {
-			const cached = modelsStore.getModelProps(activeModelId);
-
-			if (!cached) {
-				modelsStore.fetchModelProps(activeModelId).then(() => {
-					modelPropsVersion++;
-				});
-			}
-		}
-	});
-
-	let hasAudioModality = $derived.by(() => {
-		if (activeModelId) {
-			void modelPropsVersion;
-
-			return modelsStore.modelSupportsAudio(activeModelId);
-		}
-
-		return false;
-	});
-
-	let hasVisionModality = $derived.by(() => {
-		if (activeModelId) {
-			void modelPropsVersion;
-
-			return modelsStore.modelSupportsVision(activeModelId);
-		}
-
-		return false;
-	});
+	let hasAudioModality = $state(false);
+	let hasVisionModality = $state(false);
+	let hasModelSelected = $state(false);
+	let isSelectedModelInCache = $state(true);
+	let submitTooltip = $state('');
 
 	let hasAudioAttachments = $derived(
 		uploadedFiles.some((file) => getFileTypeCategory(file.type) === FileTypeCategory.AUDIO)
 	);
 	let shouldShowRecordButton = $derived(
-		hasAudioModality && !hasText && !hasAudioAttachments && currentConfig.autoMicOnEmpty
+		hasAudioModality && !canSubmit && !hasAudioAttachments && currentConfig.autoMicOnEmpty
 	);
 
-	let hasModelSelected = $derived(!isRouter || !!conversationModel || !!selectedModelId());
-
-	let isSelectedModelInCache = $derived.by(() => {
-		if (!isRouter) return true;
-
-		if (conversationModel) {
-			return modelOptions().some((option) => option.model === conversationModel);
-		}
-
-		const currentModelId = selectedModelId();
-		if (!currentModelId) return false;
-
-		return modelOptions().some((option) => option.id === currentModelId);
-	});
-
-	let submitTooltip = $derived.by(() => {
-		if (!hasModelSelected) {
-			return 'Please select a model first';
-		}
-
-		if (!isSelectedModelInCache) {
-			return 'Selected model is not available, please select another';
-		}
-
-		return '';
-	});
-
-	let selectorModelRef: ModelsSelector | undefined = $state(undefined);
+	let selectorModelRef: ChatFormActionModels | undefined = $state(undefined);
 
 	export function openModelSelector() {
 		selectorModelRef?.open();
 	}
 </script>
 
-<div class="flex w-full items-center gap-3 {className}" style="container-type: inline-size">
-	<div class="mr-auto flex items-center gap-2">
-		<ChatFormActionAttachmentsDropdown
-			{disabled}
-			{hasAudioModality}
-			{hasVisionModality}
-			{onFileUpload}
-			{onSystemPromptClick}
-		/>
-	</div>
+<div
+	class="flex w-full items-center gap-3 {className} {showAddButton ? '' : 'justify-end'}"
+	style="container-type: inline-size"
+>
+	{#if showAddButton}
+		<div class="mr-auto flex items-center gap-2">
+			<ChatFormActionsAdd
+				{disabled}
+				{hasAudioModality}
+				{hasVisionModality}
+				{hasMcpPromptsSupport}
+				{hasMcpResourcesSupport}
+				{onFileUpload}
+				{onSystemPromptClick}
+				{onMcpPromptClick}
+				{onMcpResourcesClick}
+				onMcpSettingsClick={() => goto(ROUTES.MCP_SERVERS)}
+			/>
+		</div>
+	{/if}
 
-	<div class="ml-auto flex items-center gap-1.5">
-		<ModelsSelector
+	{#if showModelSelector}
+		<ChatFormActionModels
 			{disabled}
 			bind:this={selectorModelRef}
-			currentModel={conversationModel}
-			forceForegroundText={true}
-			useGlobalSelection={true}
+			bind:hasAudioModality
+			bind:hasVisionModality
+			bind:hasModelSelected
+			bind:isSelectedModelInCache
+			bind:submitTooltip
+			forceForegroundText
+			useGlobalSelection
 		/>
-	</div>
+	{/if}
 
-	{#if isLoading}
+	{#if isLoading && !canSubmit}
 		<Button
 			type="button"
 			variant="secondary"
@@ -193,11 +137,10 @@
 		<ChatFormActionRecord {disabled} {hasAudioModality} {isLoading} {isRecording} {onMicClick} />
 	{:else}
 		<ChatFormActionSubmit
-			canSend={canSend && hasModelSelected && isSelectedModelInCache}
+			canSend={canSend && (showModelSelector ? hasModelSelected && isSelectedModelInCache : true)}
 			{disabled}
-			{isLoading}
 			tooltipLabel={submitTooltip}
-			showErrorState={hasModelSelected && !isSelectedModelInCache}
+			showErrorState={showModelSelector && hasModelSelected && !isSelectedModelInCache}
 		/>
 	{/if}
 </div>

@@ -128,6 +128,12 @@ class LoraTorchTensor:
         assert dim is None
         return self.shape
 
+    def contiguous(self) -> LoraTorchTensor:
+        return LoraTorchTensor(
+            self._lora_A.contiguous(),
+            self._lora_B.contiguous(),
+        )
+
     def reshape(self, *shape: int | tuple[int, ...]) -> LoraTorchTensor:
         if isinstance(shape[0], tuple):
             new_shape: tuple[int, ...] = shape[0]
@@ -182,6 +188,24 @@ class LoraTorchTensor:
     def swapaxes(self, axis0: int, axis1: int) -> LoraTorchTensor:
         return self.transpose(axis0, axis1)
 
+    def split(self, split_size: int | Sequence[int], dim: int = 0) -> tuple[LoraTorchTensor, ...]:
+        shape = self.shape
+        ndim = len(shape)
+        if dim < 0:
+            dim += ndim
+        if dim == ndim - 1:
+            A_chunks = self._lora_A.split(split_size, dim=-1)
+            return tuple(LoraTorchTensor(a, self._lora_B) for a in A_chunks)
+        elif dim == ndim - 2:
+            B_chunks = self._lora_B.split(split_size, dim=-2)
+            return tuple(LoraTorchTensor(self._lora_A, b) for b in B_chunks)
+        else:
+            B_chunks = self._lora_B.split(split_size, dim=dim)
+            if self._lora_A.shape[dim] == 1:
+                return tuple(LoraTorchTensor(self._lora_A, b) for b in B_chunks)
+            A_chunks = self._lora_A.split(split_size, dim=dim)
+            return tuple(LoraTorchTensor(a, b) for a, b in zip(A_chunks, B_chunks))
+
     def to(self, *args, **kwargs):
         return LoraTorchTensor(self._lora_A.to(*args, **kwargs), self._lora_B.to(*args, **kwargs))
 
@@ -193,10 +217,13 @@ class LoraTorchTensor:
             kwargs = {}
 
         if func is torch.permute:
+            assert len(args)
             return type(args[0]).permute(*args, **kwargs)
         elif func is torch.reshape:
+            assert len(args)
             return type(args[0]).reshape(*args, **kwargs)
         elif func is torch.stack:
+            assert len(args)
             assert isinstance(args[0], Sequence)
             dim = kwargs.get("dim", 0)
             assert dim == 0
@@ -205,6 +232,7 @@ class LoraTorchTensor:
                 torch.stack([b._lora_B for b in args[0]], dim),
             )
         elif func is torch.cat:
+            assert len(args)
             assert isinstance(args[0], Sequence)
             dim = kwargs.get("dim", 0)
             assert dim == 0
@@ -220,6 +248,11 @@ class LoraTorchTensor:
                 )
             else:
                 raise NotImplementedError
+        elif func is torch.split:
+            assert len(args) and len(args) >= 2
+            tensor, split_size = args[0], args[1]
+            dim = args[2] if len(args) > 2 else kwargs.get("dim", 0)
+            return tensor.split(split_size, dim=dim)
         else:
             raise NotImplementedError
 
@@ -356,7 +389,7 @@ if __name__ == '__main__':
             logger.error(f"Model {hparams['architectures'][0]} is not supported")
             sys.exit(1)
 
-        class LoraModel(model_class):
+        class LoraModel(model_class):  # ty: ignore[unsupported-base]
             model_arch = model_class.model_arch
 
             lora_alpha: float
@@ -392,7 +425,7 @@ if __name__ == '__main__':
                     # the invocation string includes the "<|start_of_turn|>"
                     # token, but the adapters themselves were trained to
                     # activate _after_ that first token, so we drop it here.
-                    alora_invocation_tokens = tokenizer(invocation_string)["input_ids"][1:]
+                    alora_invocation_tokens = tokenizer(invocation_string)["input_ids"][1:]  # ty: ignore[call-non-callable]
                 if alora_invocation_tokens:
                     logger.debug("GGUF KV: %s = %s", gguf.Keys.Adapter.ALORA_INVOCATION_TOKENS, alora_invocation_tokens)
                     self.gguf_writer.add_key_value(

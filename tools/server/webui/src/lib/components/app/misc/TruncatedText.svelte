@@ -4,9 +4,10 @@
 	interface Props {
 		text: string;
 		class?: string;
+		showTooltip?: boolean;
 	}
 
-	let { text, class: className = '' }: Props = $props();
+	let { text, class: className = '', showTooltip = true }: Props = $props();
 
 	let textElement: HTMLSpanElement | undefined = $state();
 	let isTruncated = $state(false);
@@ -29,9 +30,9 @@
 	});
 </script>
 
-{#if isTruncated}
+{#if isTruncated && showTooltip}
 	<Tooltip.Root>
-		<Tooltip.Trigger class={className}>
+		<Tooltip.Trigger class="{className} min-w-0">
 			<span bind:this={textElement} class="block truncate">
 				{text}
 			</span>
@@ -42,7 +43,7 @@
 		</Tooltip.Content>
 	</Tooltip.Root>
 {:else}
-	<span bind:this={textElement} class="{className} block truncate">
+	<span bind:this={textElement} class="{className} block min-w-0 truncate">
 		{text}
 	</span>
 {/if}

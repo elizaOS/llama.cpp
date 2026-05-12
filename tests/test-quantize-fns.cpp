@@ -21,20 +21,13 @@ constexpr float MAX_QUANTIZATION_TOTAL_ERROR_TERNARY = 0.01f;
 constexpr float MAX_QUANTIZATION_TOTAL_ERROR_2BITS = 0.0075f;
 constexpr float MAX_QUANTIZATION_TOTAL_ERROR_3BITS = 0.0040f;
 constexpr float MAX_QUANTIZATION_TOTAL_ERROR_3BITS_XXS = 0.0050f;
-// Q4_POLAR tolerates much higher per-element reconstruction error than
-// linear-scale 4-bit kernels: it is a 128-element rotated Lloyd-Max
-// quantizer calibrated for Gaussian inputs. On the test harness's
-// deterministic cosine input (which is far from N(0, 1)) the per-element
-// RMSE/n lands around 6e-3; on the Gaussian Box-Muller input the Python
-// reference uses, rel-L2 is ~9-10% per block, well under the 0.12 budget
-// in the porting plan. We accept the cosine number as a smoke test for
-// the kernel wiring; the Python parity test
-// (packages/native-plugins/polarquant-cpu/test/polar_roundtrip_test.c)
-// is the real quality gate.
+constexpr float MAX_QUANTIZATION_TOTAL_ERROR_FP4 = 0.0030f;
+// elizaOS: Q4_POLAR — rotated Lloyd-Max quantizer; higher error budget on deterministic test input
 constexpr float MAX_QUANTIZATION_TOTAL_ERROR_POLAR = 0.01f;
-constexpr float MAX_DOT_PRODUCT_ERROR_POLAR = 0.25f;
 constexpr float MAX_DOT_PRODUCT_ERROR = 0.02f;
 constexpr float MAX_DOT_PRODUCT_ERROR_LOWBIT = 0.04f;
+constexpr float MAX_DOT_PRODUCT_ERROR_FP4 = 0.03f;
+constexpr float MAX_DOT_PRODUCT_ERROR_POLAR = 0.25f;
 constexpr float MAX_DOT_PRODUCT_ERROR_BINARY = 0.40f;
 constexpr float MAX_DOT_PRODUCT_ERROR_TERNARY = 0.15f;
 
@@ -170,6 +163,7 @@ int main(int argc, char * argv[]) {
                 type == GGML_TYPE_Q3_K    ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
                 type == GGML_TYPE_IQ3_S   ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
                 type == GGML_TYPE_IQ3_XXS ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS_XXS :
+                type == GGML_TYPE_NVFP4    ? MAX_QUANTIZATION_TOTAL_ERROR_FP4 :
                 type == GGML_TYPE_Q4_POLAR ? MAX_QUANTIZATION_TOTAL_ERROR_POLAR : MAX_QUANTIZATION_TOTAL_ERROR;
             failed = !(total_error < max_quantization_error);
             num_failed += failed;
@@ -192,6 +186,8 @@ int main(int argc, char * argv[]) {
                                           ? MAX_DOT_PRODUCT_ERROR_BINARY
                                           : type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0
                                           ? MAX_DOT_PRODUCT_ERROR_TERNARY
+                                          : type == GGML_TYPE_NVFP4
+                                          ? MAX_DOT_PRODUCT_ERROR_FP4
                                           : type == GGML_TYPE_Q4_POLAR
                                           ? MAX_DOT_PRODUCT_ERROR_POLAR
                                           : MAX_DOT_PRODUCT_ERROR;
