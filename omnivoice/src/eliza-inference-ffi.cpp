@@ -51,6 +51,16 @@ struct EliInferenceContext {
     // so an in-flight streaming forward pass aborts at the next chunk boundary
     // (AGENTS.md §4 barge-in). Cleared at the start of each streaming call.
     std::atomic<int> tts_cancel{0};
+
+    // DFlash verifier callback (registered via
+    // eliza_inference_set_verifier_callback). The spec loop in server-context
+    // (and the in-process fused drafter when embedded) calls
+    // eliza_inference_emit_verifier_event() on every speculative-accept step;
+    // when a callback is registered this dispatches synchronously on the
+    // generation thread. Single-callback design: re-registering replaces.
+    std::mutex          verifier_mu;
+    eliza_verifier_cb   verifier_cb        = nullptr;
+    void *              verifier_user_data = nullptr;
 };
 
 #define ELIZA_STRINGIFY_IMPL(x) #x
@@ -887,13 +897,40 @@ int eliza_inference_set_verifier_callback(
     eliza_verifier_cb cb,
     void * user_data,
     char ** out_error) {
-    (void) ctx;
-    (void) cb;
-    (void) user_data;
-    eliza_set_error(out_error,
-        "[libelizainference] native DFlash verifier callback is not implemented in this build; "
-        "the JS scheduler synthesizes verifier events from llama-server streaming deltas");
-    return ELIZA_ERR_NOT_IMPLEMENTED;
+    if (!ctx) {
+        eliza_set_error(out_error,
+            "[libelizainference] eliza_inference_set_verifier_callback: ctx is null");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::mutex> lock(ctx->verifier_mu);
+    // cb == nullptr clears a previously-registered callback (ffi.h contract).
+    ctx->verifier_cb        = cb;
+    ctx->verifier_user_data = user_data;
+    return ELIZA_OK;
+}
+
+// Internal entry point: the in-process spec loop dispatches a verifier event
+// to the registered callback (if any). Safe to call with no callback —
+// returns immediately. Synchronous + on the calling thread; the contract in
+// ffi.h tells callers to keep their callbacks cheap (enqueue, don't block).
+//
+// The pointer fields on EliVerifierEvent must remain valid for the duration
+// of this call (the caller usually has them on the stack — copy out in your
+// callback before returning).
+void eliza_inference_emit_verifier_event(
+    EliInferenceContext * ctx,
+    const EliVerifierEvent * ev) {
+    if (!ctx || !ev) return;
+    eliza_verifier_cb cb = nullptr;
+    void * ud = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(ctx->verifier_mu);
+        cb = ctx->verifier_cb;
+        ud = ctx->verifier_user_data;
+    }
+    if (cb) {
+        cb(ev, ud);
+    }
 }
 
 /* ---- Native VAD (ABI v3) ------------------------------------------- *
