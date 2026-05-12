@@ -135,11 +135,11 @@ static void dac_load_passthrough(struct ggml_tensor * dst, const GGUFModel & gf,
     ggml_backend_tensor_set(dst, src, 0, ggml_nbytes(dst));
 }
 
-// Load ConvTranspose1d weights in milady ggml's native kernel layout.
+// Load ConvTranspose1d weights in eliza ggml's native kernel layout.
 // Source-side layout is (IC, OC, K), represented by ggml as ne=(K, OC, IC).
-// milady ggml already ships GGML_OP_CONV_TRANSPOSE_1D for CPU/CUDA/Metal/
+// eliza ggml already ships GGML_OP_CONV_TRANSPOSE_1D for CPU/CUDA/Metal/
 // Vulkan, while omnivoice's fork used a private col2im_1d op. Keeping the
-// native layout lets the fused build share the patched milady ggml without
+// native layout lets the fused build share the patched eliza ggml without
 // adding a second custom op.
 static void dac_load_ctw(struct ggml_tensor * dst, const GGUFModel & gf, const std::string & name) {
     struct ggml_tensor * mt = ggml_get_tensor(gf.meta, name.c_str());
@@ -327,9 +327,9 @@ static struct ggml_tensor * dac_conv1d(struct ggml_context * ctx,
     return y;
 }
 
-// ConvTranspose1d using milady ggml's native GGML_OP_CONV_TRANSPOSE_1D.
+// ConvTranspose1d using eliza ggml's native GGML_OP_CONV_TRANSPOSE_1D.
 // The upstream omnivoice fork used a private col2im_1d op with padding.
-// milady's native op requires p0=0, so we crop pad samples from both ends
+// eliza's native op requires p0=0, so we crop pad samples from both ends
 // and then apply output_pad to match the original length contract.
 static struct ggml_tensor * dac_conv_t1d(struct ggml_context * ctx,
                                          struct ggml_tensor *  w,

@@ -126,11 +126,11 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
         extern const char ggml_metallib_start[];
         extern const char ggml_metallib_end[];
 
-        // // MILADY-EMBEDDED-METALLIB-LOADER-V1
+        // // ELIZA-EMBEDDED-METALLIB-LOADER-V1
         // The build patch embeds compiled default.metallib bytes here, not
         // Metal source. Loading with newLibraryWithData keeps iOS on the same
         // multi-TU kernel set as desktop and avoids duplicate declarations
-        // between ggml-metal.metal and the milady standalone shaders.
+        // between ggml-metal.metal and the eliza standalone shaders.
         const NSUInteger metallib_len = (NSUInteger)(ggml_metallib_end - ggml_metallib_start);
         dispatch_data_t metallib_data = dispatch_data_create(ggml_metallib_start, metallib_len, nil, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
         library = [device newLibraryWithData:metallib_data error:&error];
@@ -1141,7 +1141,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_ARANGE:
             return true;
         case GGML_OP_ATTN_SCORE_TBQ:
-            // // MILADY-TBQ-POLAR-ATTN-DISPATCH-V1
+            // // ELIZA-TBQ-POLAR-ATTN-DISPATCH-V1
             return has_simdgroup_reduction &&
                 op->type == GGML_TYPE_F32 &&
                 op->src[0] != NULL &&
@@ -1199,7 +1199,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     ggml_is_contiguous_rows(op->src[2]);
             }
         case GGML_OP_ATTN_SCORE_QJL:
-            // // MILADY-QJL-ATTN-DISPATCH-V1
+            // // ELIZA-QJL-ATTN-DISPATCH-V1
             return has_simdgroup_reduction &&
                 op->type == GGML_TYPE_F32 &&
                 op->src[0] != NULL &&

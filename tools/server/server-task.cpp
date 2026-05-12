@@ -10,13 +10,13 @@
 
 using json = nlohmann::ordered_json;
 
-// MILADY-DFLASH-VERIFIER-STREAM-V1
+// ELIZA-DFLASH-VERIFIER-STREAM-V1
 // Eliza-1 voice swarm (W4): expose the DFlash verifier's reject span on
 // streamed chunks as `{ "verifier": { "rejected": [a, b] } }` so the
 // runtime can drop the not-yet-played TTS audio for the overlapping
 // phrases (docs/porting/dflash-drafter-strategy.md "DFlash↔TTS Rollback
 // Coupling"). `a`/`b` are inclusive token indices in target output order.
-namespace milady_dflash {
+namespace eliza_dflash {
   // Set by the speculative loop after each verify pass; consumed + cleared
   // by the next streamed-chunk send. -1 means "no reject this step".
   static thread_local long long g_reject_from = -1;

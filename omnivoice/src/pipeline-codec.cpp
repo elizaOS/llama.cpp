@@ -32,7 +32,7 @@
 bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair bp) {
     *pc                    = {};
     // Keep the MaskGIT/LM path on the selected accelerator, but pin the
-    // audio tokenizer / DAC codec to CPU on Apple Metal. The merged milady
+    // audio tokenizer / DAC codec to CPU on Apple Metal. The merged eliza
     // ggml Metal DAC decode graph has been observed to stall immediately
     // after "[TTS] Decode"; using CPU here keeps one fused process and one
     // model lifecycle while avoiding the bad Metal codec scheduler path.

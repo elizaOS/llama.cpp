@@ -1435,7 +1435,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     GGML_UNUSED(op);
 }
 
-// MILADY-QJL-ATTN-DISPATCH-V1
+// ELIZA-QJL-ATTN-DISPATCH-V1
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_attn_score_qjl(ggml_metal_library_t lib) {
     const char * name = "kernel_attn_score_qjl1_256_multi";
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -1455,8 +1455,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_attn_score_qjl(g
     return res;
 }
 
-// MILADY-TBQ-POLAR-ATTN-DISPATCH-V1
-static const char * milady_metal_tbq_kernel_name(ggml_type type) {
+// ELIZA-TBQ-POLAR-ATTN-DISPATCH-V1
+static const char * eliza_metal_tbq_kernel_name(ggml_type type) {
     switch (type) {
         case GGML_TYPE_TBQ3_0:   return "kernel_turbo3_dot_multi";
         case GGML_TYPE_TBQ4_0:   return "kernel_turbo4_dot_multi";
@@ -1466,7 +1466,7 @@ static const char * milady_metal_tbq_kernel_name(ggml_type type) {
 }
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_attn_score_tbq(ggml_metal_library_t lib, ggml_type type) {
-    const char * name = milady_metal_tbq_kernel_name(type);
+    const char * name = eliza_metal_tbq_kernel_name(type);
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);

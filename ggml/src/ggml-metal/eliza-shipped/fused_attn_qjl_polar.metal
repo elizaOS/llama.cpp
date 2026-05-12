@@ -1,4 +1,4 @@
-// # MILADY-KERNEL-PATCH-V1 — copied verbatim from packages/inference/metal/fused_attn_qjl_polar.metal
+// # ELIZA-KERNEL-PATCH-V1 — copied verbatim from packages/inference/metal/fused_attn_qjl_polar.metal
 // at build time by build-llama-cpp-dflash.mjs. Do not edit in place;
 // edit the standalone source and rerun the build.
 // Hardware-verified on Apple M4 Max via `make metal-verify-fused`.

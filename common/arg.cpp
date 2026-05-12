@@ -400,6 +400,10 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_Q5_1,
     GGML_TYPE_TBQ3_0,
     GGML_TYPE_TBQ4_0,
+    // ELIZA-KV-CACHE-TYPES-V1 — Eliza-1 QJL K-cache + PolarQuant V-cache (full ggml
+    // type traits in ggml.c; K uses the GGML_OP_ATTN_SCORE_QJL graph route)
+    GGML_TYPE_QJL1_256,
+    GGML_TYPE_Q4_POLAR,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -3360,7 +3364,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_DRAFT_P_SPLIT"));
     add_opt(common_arg(
         // --draft-min-prob is the spiritbuun/buun-llama-cpp spelling that the
-        // Milady consumer (`dflash-server.ts`, AGENTS.md env mapping) emits
+        // Eliza consumer (`dflash-server.ts`, AGENTS.md env mapping) emits
         // under `ELIZA_LOCAL_NGRAM=on`. Keep it as an alias for the upstream
         // --draft-p-min so existing downstream code and rollout scripts work
         // unchanged on the unified fork.
@@ -3437,7 +3441,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             } else if (value == "ngram-mod") {
                 params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_MOD;
             } else if (value == "dflash") {
-                // Milady alias: behaves identically to draft-model speculative decoding
+                // Eliza alias: behaves identically to draft-model speculative decoding
                 // when -md / --model-draft is supplied. Carrying the spelling preserves
                 // the AOSP/desktop CLI in `aosp-dflash-adapter.ts` and `dflash-server.ts`.
                 params.speculative.type = COMMON_SPECULATIVE_TYPE_DFLASH;

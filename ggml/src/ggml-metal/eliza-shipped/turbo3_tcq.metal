@@ -1,4 +1,4 @@
-// # MILADY-KERNEL-PATCH-V1 — copied verbatim from packages/inference/metal/turbo3_tcq.metal
+// # ELIZA-KERNEL-PATCH-V1 — copied verbatim from packages/inference/metal/turbo3_tcq.metal
 // at build time by build-llama-cpp-dflash.mjs. Do not edit in place;
 // edit the standalone source and rerun the build.
 // HARDWARE VERIFIED on Apple M4 Max (Metal runtime JIT): 8/8 PASS against the

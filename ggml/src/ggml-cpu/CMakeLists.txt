@@ -58,7 +58,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         # kernel files themselves carry their own SIMD guards (__AVX2__ /
         # __ARM_NEON), so we always compile all of them and the dispatcher
         # picks the right one at link/runtime.
-        # MILADY-CPU-SIMD-PATCH-V1 — QJL kernel TUs mirrored from packages/native-plugins/qjl-cpu
+        # ELIZA-CPU-SIMD-PATCH-V1 — QJL kernel TUs mirrored from packages/native-plugins/qjl-cpu
         ggml-cpu/qjl/quants-qjl.c
         ggml-cpu/qjl/qjl_block.h
         ggml-cpu/qjl/qjl_cpu_features.h
@@ -83,7 +83,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/fused-attn-qjl-tbq-avx2.c
         ggml-cpu/fused-attn-qjl-tbq-neon.c
         ggml-cpu/fused-hadamard-polar-dot.c
-        # MILADY-CPU-POLAR-PREHT-V1 — PolarQuant pre-Hadamard-transposed dot TUs
+        # ELIZA-CPU-POLAR-PREHT-V1 — PolarQuant pre-Hadamard-transposed dot TUs
         # (mirrored from packages/native-plugins/polarquant-cpu + two
         # generated fork-shim files). Each per-ISA body self-guards on
         # __AVX2__ / __ARM_NEON; the dispatcher picks at runtime.
@@ -102,7 +102,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     # standalone packages/native-plugins/qjl-cpu/ build.
     target_include_directories(${GGML_CPU_NAME} PRIVATE ggml-cpu/qjl/include ggml-cpu/qjl)
 
-    # MILADY-CPU-POLAR-PREHT-V1 POLARQUANT include + HAVE_* defines
+    # ELIZA-CPU-POLAR-PREHT-V1 POLARQUANT include + HAVE_* defines
     # ggml-cpu/polarquant holds the PolarQuant pre-Hadamard-transposed
     # dot TUs + the generated fork-shim header. The runtime dispatcher
     # (polarquant_preht_dispatch.c) picks the best *available* SIMD path
@@ -118,7 +118,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         target_compile_definitions(${GGML_CPU_NAME} PRIVATE POLARQUANT_HAVE_NEON=1)
     endif()
 
-    # MILADY-CPU-SIMD-PATCH-V1 QJL_HAVE_* dispatch defines
+    # ELIZA-CPU-SIMD-PATCH-V1 QJL_HAVE_* dispatch defines
     # The runtime QJL dispatcher (ggml-cpu/qjl/qjl_dispatch.c) picks the
     # best *available* SIMD path at run time from cpuid/hwcap, but it can
     # only call into a path whose TU was actually compiled. Expose the

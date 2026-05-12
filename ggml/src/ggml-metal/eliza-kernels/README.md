@@ -1,8 +1,8 @@
-# milady-kernels — Metal kernel sources for milady/integration
+# eliza-kernels — Metal kernel sources for eliza/integration
 
 These five `.metal` files are the Metal-side implementations of the
-quantization techniques carried on `milady/integration`. They land on
-their own branch (`milady/metal`) so the kernel SOURCES live in the
+quantization techniques carried on `eliza/integration`. They land on
+their own branch (`eliza/metal`) so the kernel SOURCES live in the
 fork tree (instead of being stamped in by `build-llama-cpp-dflash.mjs`
 patches), and so a future agent can wire them into the standard
 `ggml-metal` dispatcher with one CMake change instead of N runtime
@@ -23,7 +23,7 @@ patches.
 Source files are named after the canonical `GGML_TYPE_*` slot they back
 (e.g. `tbq3_0.metal` for `GGML_TYPE_TBQ3_0`). The W1-D agent originally
 authored `turbo3.metal` and `turbo4.metal` against the spiritbuun
-naming convention; renamed here to match the apothic + milady TBQ
+naming convention; renamed here to match the apothic + eliza TBQ
 scheme used everywhere else in the consumer (`aosp-llama-adapter.ts`
 hard-codes `GGML_TYPE_TBQ3_0 = 43`, `GGML_TYPE_TBQ4_0 = 44`).
 

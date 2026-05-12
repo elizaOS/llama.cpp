@@ -5479,7 +5479,7 @@ struct ggml_tensor * ggml_attn_score_qjl(
     return result;
 }
 
-// // MILADY-TBQ-POLAR-ATTN-DISPATCH-V1
+// // ELIZA-TBQ-POLAR-ATTN-DISPATCH-V1
 // ggml_attn_score_tbq
 //
 struct ggml_tensor * ggml_attn_score_tbq(

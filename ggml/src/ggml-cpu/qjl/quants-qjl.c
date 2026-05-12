@@ -179,7 +179,7 @@ size_t quantize_qjl1_256(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
 void ggml_compute_forward_attn_score_qjl(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
-    /* MILADY-CPU-THREAD-PARALLELISM-V1 — ith/nth split over flattened (ne3, n_batch, h_q). */
+    /* ELIZA-CPU-THREAD-PARALLELISM-V1 — ith/nth split over flattened (ne3, n_batch, h_q). */
     const struct ggml_tensor * q  = dst->src[0];
     const struct ggml_tensor * pk = dst->src[1];
 

@@ -285,7 +285,7 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 
 
-# MILADY-OMNIVOICE-FUSION-GRAFT-V1
+# ELIZA-OMNIVOICE-FUSION-GRAFT-V1
 # ----------------------------------------------------------------------
 # Source-level fusion of github.com/ServeurpersoCom/omnivoice.cpp into
 # this build tree. See packages/app-core/scripts/omnivoice-fuse/README.md
@@ -294,33 +294,33 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
 # share llama.cpp's vendored ggml.
 # ----------------------------------------------------------------------
 
-if(MILADY_FUSE_OMNIVOICE)
+if(ELIZA_FUSE_OMNIVOICE)
     find_package(Threads REQUIRED)
 
     # Audio tokenizer tensor names exceed default GGML_MAX_NAME of 64.
     # Mirrored from omnivoice's own CMakeLists.txt.
     add_compile_definitions(GGML_MAX_NAME=128)
-    foreach(_milady_ggml_max_name_target
+    foreach(_eliza_ggml_max_name_target
             ggml ggml-base ggml-cpu ggml-blas ggml-metal ggml-vulkan ggml-cuda
             llama common mtmd server-context)
-        if(TARGET ${_milady_ggml_max_name_target})
-            target_compile_definitions(${_milady_ggml_max_name_target}
+        if(TARGET ${_eliza_ggml_max_name_target})
+            target_compile_definitions(${_eliza_ggml_max_name_target}
                 PUBLIC GGML_MAX_NAME=128)
         endif()
     endforeach()
 
-    file(GLOB MILADY_OMNIVOICE_SOURCES
+    file(GLOB ELIZA_OMNIVOICE_SOURCES
         CONFIGURE_DEPENDS
         ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice/src/*.cpp)
-    file(GLOB MILADY_OMNIVOICE_HEADERS
+    file(GLOB ELIZA_OMNIVOICE_HEADERS
         CONFIGURE_DEPENDS
         ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice/src/*.h)
 
-    if(NOT MILADY_OMNIVOICE_SOURCES)
-        message(FATAL_ERROR "MILADY_FUSE_OMNIVOICE=ON but no sources under omnivoice/src/")
+    if(NOT ELIZA_OMNIVOICE_SOURCES)
+        message(FATAL_ERROR "ELIZA_FUSE_OMNIVOICE=ON but no sources under omnivoice/src/")
     endif()
 
-    add_library(omnivoice-core STATIC ${MILADY_OMNIVOICE_SOURCES})
+    add_library(omnivoice-core STATIC ${ELIZA_OMNIVOICE_SOURCES})
     target_compile_definitions(omnivoice-core PUBLIC OMNIVOICE_STATIC)
     target_compile_features(omnivoice-core PUBLIC cxx_std_17)
     target_include_directories(omnivoice-core PUBLIC
@@ -338,11 +338,11 @@ if(MILADY_FUSE_OMNIVOICE)
     if(TARGET ggml-base)
         target_link_libraries(omnivoice-core PUBLIC ggml-base)
     endif()
-    foreach(_milady_backend cpu blas cuda metal vulkan)
-        if(TARGET ggml-${_milady_backend})
-            get_target_property(_milady_btype ggml-${_milady_backend} TYPE)
-            if(NOT _milady_btype STREQUAL "MODULE_LIBRARY")
-                target_link_libraries(omnivoice-core PUBLIC ggml-${_milady_backend})
+    foreach(_eliza_backend cpu blas cuda metal vulkan)
+        if(TARGET ggml-${_eliza_backend})
+            get_target_property(_eliza_btype ggml-${_eliza_backend} TYPE)
+            if(NOT _eliza_btype STREQUAL "MODULE_LIBRARY")
+                target_link_libraries(omnivoice-core PUBLIC ggml-${_eliza_backend})
             endif()
         endif()
     endforeach()
@@ -350,7 +350,7 @@ if(MILADY_FUSE_OMNIVOICE)
     # Fused shared library exporting both `llama_*` and `omnivoice_*`.
     # Used by Electrobun + Capacitor bridges that dlopen one artifact.
     add_library(elizainference SHARED
-        ${MILADY_OMNIVOICE_SOURCES})
+        ${ELIZA_OMNIVOICE_SOURCES})
     target_compile_definitions(elizainference PRIVATE OMNIVOICE_BUILD)
     target_compile_features(elizainference PUBLIC cxx_std_17)
     target_include_directories(elizainference PUBLIC
@@ -370,11 +370,11 @@ if(MILADY_FUSE_OMNIVOICE)
     if(TARGET ggml-base)
         target_link_libraries(elizainference PUBLIC ggml-base)
     endif()
-    foreach(_milady_backend cpu blas cuda metal vulkan)
-        if(TARGET ggml-${_milady_backend})
-            get_target_property(_milady_btype ggml-${_milady_backend} TYPE)
-            if(NOT _milady_btype STREQUAL "MODULE_LIBRARY")
-                target_link_libraries(elizainference PUBLIC ggml-${_milady_backend})
+    foreach(_eliza_backend cpu blas cuda metal vulkan)
+        if(TARGET ggml-${_eliza_backend})
+            get_target_property(_eliza_btype ggml-${_eliza_backend} TYPE)
+            if(NOT _eliza_btype STREQUAL "MODULE_LIBRARY")
+                target_link_libraries(elizainference PUBLIC ggml-${_eliza_backend})
             endif()
         endif()
     endforeach()
@@ -384,14 +384,14 @@ if(MILADY_FUSE_OMNIVOICE)
 
     # The fused HTTP server IS `llama-server`. The kernel-patch
     # `server-omnivoice-route.mjs` adds a `POST /v1/audio/speech` route to
-    # tools/server/server.cpp, guarded by `#ifdef MILADY_FUSE_OMNIVOICE`,
+    # tools/server/server.cpp, guarded by `#ifdef ELIZA_FUSE_OMNIVOICE`,
     # backed by omnivoice-core's `ov_synthesize`. So the same process that
     # serves `/completion` + `/v1/chat/completions` + the DFlash spec loop
     # also serves TTS — one process, one llama.cpp build, one GGML pin
     # (packages/inference/AGENTS.md §4). We link omnivoice-core into the
     # `llama-server` target and put the route define + omnivoice headers on
     # it. The non-fused build is untouched (this whole block is inside
-    # `if(MILADY_FUSE_OMNIVOICE)`).
+    # `if(ELIZA_FUSE_OMNIVOICE)`).
     if(TARGET llama-server)
         target_link_libraries(llama-server PRIVATE omnivoice-core)
         target_include_directories(llama-server PRIVATE
@@ -402,7 +402,7 @@ if(MILADY_FUSE_OMNIVOICE)
         # omnivoice-core was compiled the same way, so the static link is
         # ABI-consistent.
         target_compile_definitions(llama-server PRIVATE
-            MILADY_FUSE_OMNIVOICE GGML_MAX_NAME=128)
+            ELIZA_FUSE_OMNIVOICE GGML_MAX_NAME=128)
     endif()
 
     # Legacy `llama-omnivoice-server` placeholder kept ONLY so the symbol
@@ -423,4 +423,4 @@ if(MILADY_FUSE_OMNIVOICE)
     endif()
 endif()
 # ----------------------------------------------------------------------
-# end # MILADY-OMNIVOICE-FUSION-GRAFT-V1
+# end # ELIZA-OMNIVOICE-FUSION-GRAFT-V1

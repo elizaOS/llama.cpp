@@ -207,7 +207,7 @@ add_library(ggml-base
             ggml-quants.h
             polar_centroids.h
             gguf.cpp
-            # MILADY-WINDOWS-QJL-IN-GGML-BASE
+            # ELIZA-WINDOWS-QJL-IN-GGML-BASE
             # PE/COFF requires every imported symbol to be resolved at
             # link time; the QJL definitions in ggml-cpu/qjl/ are referenced
             # from ggml.c (ggml-base), so on Windows shared-lib builds they

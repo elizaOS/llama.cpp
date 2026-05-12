@@ -7,8 +7,8 @@
 #include "llama.h"
 #include "log.h"
 
-// MILADY-OMNIVOICE-AUDIO-SPEECH-ROUTE-V1
-#ifdef MILADY_FUSE_OMNIVOICE
+// ELIZA-OMNIVOICE-AUDIO-SPEECH-ROUTE-V1
+#ifdef ELIZA_FUSE_OMNIVOICE
 #include "omnivoice.h"
 #include <algorithm>
 #include <cstdlib>
@@ -18,7 +18,7 @@
 #include <string>
 #include <vector>
 
-namespace milady_omnivoice {
+namespace eliza_omnivoice {
 
 // Resolve a config value: prefer the CLI override captured in main(), then
 // the env var, then empty.
@@ -266,9 +266,9 @@ static server_http_context::handler_t audio_speech_handler() {
     };
 }
 
-} // namespace milady_omnivoice
-#endif // MILADY_FUSE_OMNIVOICE
-// end // MILADY-OMNIVOICE-AUDIO-SPEECH-ROUTE-V1
+} // namespace eliza_omnivoice
+#endif // ELIZA_FUSE_OMNIVOICE
+// end // ELIZA-OMNIVOICE-AUDIO-SPEECH-ROUTE-V1
 
 #include <atomic>
 #include <clocale>
@@ -336,18 +336,18 @@ int main(int argc, char ** argv) {
     // own arguments required by this example
     common_params params;
 
-#ifdef MILADY_FUSE_OMNIVOICE
+#ifdef ELIZA_FUSE_OMNIVOICE
     // Strip omnivoice-fused-only flags before common_params_parse so the
     // upstream parser doesn't reject them. Values feed the lazily-created
-    // OmniVoice context (see the milady_omnivoice namespace above).
+    // OmniVoice context (see the eliza_omnivoice namespace above).
     {
         std::vector<char *> filtered;
         filtered.reserve((size_t)argc);
         for (int i = 0; i < argc; ++i) {
             const std::string a = argv[i];
             if ((a == "--omnivoice-model" || a == "--omnivoice-codec") && i + 1 < argc) {
-                if (a == "--omnivoice-model") milady_omnivoice::g_model_path = argv[++i];
-                else                          milady_omnivoice::g_codec_path = argv[++i];
+                if (a == "--omnivoice-model") eliza_omnivoice::g_model_path = argv[++i];
+                else                          eliza_omnivoice::g_codec_path = argv[++i];
                 continue;
             }
             filtered.push_back(argv[i]);
@@ -473,10 +473,10 @@ int main(int argc, char ** argv) {
     ctx_http.post("/embedding",           ex_wrapper(routes.post_embeddings)); // legacy
     ctx_http.post("/embeddings",          ex_wrapper(routes.post_embeddings));
     ctx_http.post("/v1/embeddings",       ex_wrapper(routes.post_embeddings_oai));
-#ifdef MILADY_FUSE_OMNIVOICE
+#ifdef ELIZA_FUSE_OMNIVOICE
     // Fused omnivoice TTS — same process as the text/DFlash routes above.
-    ctx_http.post("/v1/audio/speech",     ex_wrapper(milady_omnivoice::audio_speech_handler()));
-    ctx_http.post("/audio/speech",        ex_wrapper(milady_omnivoice::audio_speech_handler()));
+    ctx_http.post("/v1/audio/speech",     ex_wrapper(eliza_omnivoice::audio_speech_handler()));
+    ctx_http.post("/audio/speech",        ex_wrapper(eliza_omnivoice::audio_speech_handler()));
 #endif
     ctx_http.post("/rerank",              ex_wrapper(routes.post_rerank));
     ctx_http.post("/reranking",           ex_wrapper(routes.post_rerank));

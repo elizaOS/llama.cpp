@@ -12,8 +12,8 @@
  * mirrored `_preht` TUs include this shim instead of polarquant.h: it
  * re-exports the fork's definitions and supplies the one missing helper.
  */
-#ifndef MILADY_POLARQUANT_PREHT_H
-#define MILADY_POLARQUANT_PREHT_H
+#ifndef ELIZA_POLARQUANT_PREHT_H
+#define ELIZA_POLARQUANT_PREHT_H
 
 #define GGML_COMMON_DECL_C
 #include "ggml-common.h"        /* block_q4_polar, QK_POLAR, ggml_half */
@@ -73,4 +73,4 @@ const char * polarquant_active_simd(void);
 }
 #endif
 
-#endif /* MILADY_POLARQUANT_PREHT_H */
+#endif /* ELIZA_POLARQUANT_PREHT_H */

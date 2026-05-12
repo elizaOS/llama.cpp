@@ -2393,7 +2393,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_ATTN_SCORE_QJL:
         case GGML_OP_FUSED_ATTN_QJL_TBQ:
             {
-                // MILADY-CPU-THREAD-PARALLELISM-V1
+                // ELIZA-CPU-THREAD-PARALLELISM-V1
                 // QJL score forward and the fused QJL-K + TBQ-V kernel
                 // both split the flattened (ne3, n_batch, h_q) output
                 // space over ith/nth — each task owns disjoint score rows
@@ -2940,7 +2940,7 @@ struct ggml_cplan ggml_graph_plan(
 
                         cur += MAX(prefill, decode);
                     } break;
-                // MILADY-CPU-THREAD-PARALLELISM-V1
+                // ELIZA-CPU-THREAD-PARALLELISM-V1
                 case GGML_OP_FUSED_ATTN_QJL_TBQ:
                     {
                         // per-task softmax-weight scratch: n_kv_tokens fp32.

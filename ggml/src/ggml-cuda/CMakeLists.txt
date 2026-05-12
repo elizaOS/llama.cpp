@@ -163,7 +163,7 @@ if (CUDAToolkit_FOUND)
         add_compile_definitions(GGML_CUDA_NO_PEER_COPY)
     endif()
 
-    # Milady fork: opt-in CUDA paths for QJL / PolarQuant / TBQ3_TCQ. Default ON
+    # Eliza fork: opt-in CUDA paths for QJL / PolarQuant / TBQ3_TCQ. Default ON
     # so the standard `-DGGML_CUDA=ON` build picks them up; the .cu files are
     # always globbed in (above) but their bodies are gated by these macros.
     if (GGML_CUDA_QJL)
