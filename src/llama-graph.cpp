@@ -1769,6 +1769,22 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
+        // Eliza fused-attn K/V cache types (QJL1_256, Q4_POLAR, TBQ3_TCQ) have
+        // no vec_dot in the CPU type-traits — they are stored cache types that
+        // require either the fused custom op (GGML_OP_FUSED_ATTN_QJL_TBQ) or a
+        // dequantize hop before ggml_flash_attn_ext. The graph builder does
+        // not yet route to the fused op, so dequantize via F32 -> F16 here.
+        // This is bit-exact w.r.t. the type's to_float (dequantize_row_*).
+        if (k->type == GGML_TYPE_QJL1_256 || k->type == GGML_TYPE_TBQ3_TCQ) {
+            ggml_tensor * k_f32 = ggml_cast(ctx0, k, GGML_TYPE_F32);
+            k = ggml_cast(ctx0, k_f32, GGML_TYPE_F16);
+        }
+
+        if (v->type == GGML_TYPE_Q4_POLAR) {
+            ggml_tensor * v_f32 = ggml_cast(ctx0, v, GGML_TYPE_F32);
+            v = ggml_cast(ctx0, v_f32, GGML_TYPE_F16);
+        }
+
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         cb(cur, LLAMA_TENSOR_NAME_FATTN, il);
