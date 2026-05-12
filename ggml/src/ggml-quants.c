@@ -2639,6 +2639,177 @@ void dequantize_row_tbq4_0(const block_tbq4_0 * GGML_RESTRICT x, float * GGML_RE
     }
 }
 
+// ====================== TurboQuant TCQ-3 (TBQ3_TCQ) reference kernels
+//
+// Trellis-coded 3-bit-per-element K-cache type, 128-element blocks. Mechanically
+// ported from packages/inference/reference/turbo_kernels.c
+// (eliza_quantize_turbo3_tcq_block / eliza_dequantize_turbo3_tcq_block) onto
+// ggml's in-tree block_tbq3_tcq. The CUDA decode kernel
+// (ggml-cuda/turbo-tcq.cu) and the Metal kernel are bit-identical to
+// dequantize_row_tbq3_tcq below; they index k_tbq3_tcq_codebook[state] directly.
+// The encoder rotates into the WHT basis (orthogonal — preserves L2 geometry,
+// which is what the attention score consumes), runs a 512-state Viterbi forward
+// pass + backtrack, then re-corrects the per-block norm against the codebook
+// reconstruction. Decode is a single sliding-9-bit-window lookup (no inverse
+// rotation — the codebook lives in the rotated basis; this matches the K-cache
+// score path which never needs the unrotated key vector).
+//
+// Block layout (locked, see ggml-common.h):
+//   ggml_half d;       // per-block L2 norm (Viterbi-corrected)
+//   uint8_t   qs[49];  // 6 prefix bits (initial_state >> 3) + 128*3 symbol bits,
+//                      // LSB-first within byte, byte-major across qs[]
+//   uint8_t   pad;     // alignment to 52 B (3.25 bpw)
+
+#include "ggml-tcq-codebook.h"
+
+static void tbq3_tcq_fwht_128(float * GGML_RESTRICT x) {
+    for (int h = 1; h < 128; h *= 2) {
+        for (int i = 0; i < 128; i += h * 2) {
+            for (int j = i; j < i + h; j++) {
+                const float a = x[j];
+                const float b = x[j + h];
+                x[j]     = a + b;
+                x[j + h] = a - b;
+            }
+        }
+    }
+    const float inv_sqrt_128 = 0.08838834764831845f;
+    for (int i = 0; i < 128; i++) x[i] *= inv_sqrt_128;
+}
+
+static void tbq3_tcq_rotate_forward(float * GGML_RESTRICT x) {
+    for (int i = 0; i < 128; i++) x[i] *= k_tbq3_tcq_wht_signs1[i];
+    tbq3_tcq_fwht_128(x);
+    for (int i = 0; i < 128; i++) x[i] *= k_tbq3_tcq_wht_signs2[i];
+}
+
+void quantize_row_tbq3_tcq_ref(const float * GGML_RESTRICT x, block_tbq3_tcq * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TBQ3_TCQ == 0);
+    const int64_t nb = k / QK_TBQ3_TCQ;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        float xb[128];
+        float norm_sq = 0.0f;
+        for (int j = 0; j < 128; j++) { xb[j] = x[i*128 + j]; norm_sq += xb[j] * xb[j]; }
+        const float grp_norm = sqrtf(norm_sq);
+        const float inv_norm = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
+        for (int j = 0; j < 128; j++) xb[j] *= inv_norm;
+        tbq3_tcq_rotate_forward(xb);
+
+        // Viterbi forward pass: 512-state right-shift trellis
+        // (state' = ((state & 0x3F) << 3) | out). Free initial state (cost 0).
+        float cost_a[512];
+        float cost_b[512];
+        uint8_t bt[128 * 64]; // best predecessor low-bits per low-6-bit group per step
+        for (int s = 0; s < 512; s++) cost_a[s] = 0.0f;
+        float * cur = cost_a;
+        float * nxt = cost_b;
+
+        for (int t = 0; t < 128; t++) {
+            float pred_min[64];
+            for (int low = 0; low < 64; low++) {
+                const int base_prev = low << 3;
+                float best = cur[base_prev];
+                int best_p = 0;
+                for (int p = 1; p < 8; p++) {
+                    const float c = cur[base_prev | p];
+                    if (c < best) { best = c; best_p = p; }
+                }
+                pred_min[low] = best;
+                bt[t * 64 + low] = (uint8_t) best_p;
+            }
+            for (int s = 0; s < 512; s++) {
+                const int pred_idx = s & 0x3F;
+                const float dist = xb[t] - k_tbq3_tcq_codebook[s];
+                nxt[s] = pred_min[pred_idx] + dist * dist;
+            }
+            float * tmp = cur; cur = nxt; nxt = tmp;
+        }
+
+        int final_state = 0;
+        float best_cost = cur[0];
+        for (int s = 1; s < 512; s++) {
+            if (cur[s] < best_cost) { best_cost = cur[s]; final_state = s; }
+        }
+
+        uint8_t outputs[128];
+        int state = final_state;
+        for (int t = 127; t >= 0; t--) {
+            outputs[t] = (uint8_t) ((state >> 6) & 0x7);
+            const int p = bt[t * 64 + (state & 0x3F)];
+            state = ((state & 0x3F) << 3) | p;
+        }
+        const int initial_state = state;
+
+        // Norm correction against the codebook reconstruction.
+        float recon_sq = 0.0f;
+        for (int t = 0; t < 128; t++) {
+            int s;
+            if (t < 2) {
+                s = initial_state;
+                for (int kk = 0; kk <= t; kk++) {
+                    s = (s >> 3) | (((int) outputs[kk]) << 6);
+                }
+            } else {
+                s = ((int) outputs[t - 2] & 0x7)
+                  | (((int) outputs[t - 1] & 0x7) << 3)
+                  | (((int) outputs[t]     & 0x7) << 6);
+            }
+            const float c = k_tbq3_tcq_codebook[s];
+            recon_sq += c * c;
+        }
+        const float recon_norm = sqrtf(recon_sq);
+        const float corrected = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
+        y[i].d = GGML_FP32_TO_FP16(corrected);
+
+        // Bitpack: 6 bits of (initial_state >> 3), then 128 * 3-bit symbols.
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+        const int init_bits = (initial_state >> 3) & 0x3F;
+        for (int byte = 0; byte < 49; byte++) {
+            uint8_t packed = 0;
+            for (int bit = 0; bit < 8; bit++) {
+                const int pos = byte * 8 + bit;
+                int v = 0;
+                if (pos < 6) {
+                    v = (init_bits >> pos) & 1;
+                } else {
+                    const int sym_bit = pos - 6;
+                    const int sym_idx = sym_bit / 3;
+                    if (sym_idx < 128) v = (outputs[sym_idx] >> (sym_bit % 3)) & 1;
+                }
+                packed |= (uint8_t) (v << bit);
+            }
+            y[i].qs[byte] = packed;
+        }
+        y[i].pad = 0;
+    }
+}
+
+void dequantize_row_tbq3_tcq(const block_tbq3_tcq * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TBQ3_TCQ == 0);
+    const int64_t nb = k / QK_TBQ3_TCQ;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float n = GGML_FP16_TO_FP32(x[i].d);
+        for (int t = 0; t < 128; t++) {
+            const int bit_pos  = t * 3;
+            const int byte_idx = bit_pos / 8;
+            const int bit_off  = bit_pos % 8;
+            uint16_t raw = (uint16_t) x[i].qs[byte_idx];
+            if (byte_idx + 1 < 49) raw |= (uint16_t) x[i].qs[byte_idx + 1] << 8;
+            const int s = (raw >> bit_off) & 0x1FF;
+            y[i*128 + t] = k_tbq3_tcq_codebook[s] * n;
+        }
+    }
+}
+
+size_t quantize_tbq3_tcq(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void) quant_weights;
+    const size_t row_size = ggml_row_size(GGML_TYPE_TBQ3_TCQ, n_per_row);
+    quantize_row_tbq3_tcq_ref(src, dst, (int64_t) nrow*n_per_row);
+    return nrow * row_size;
+}
+
 // ====================== PolarQuant Q4 (Q4_POLAR) reference kernels
 
 #include <stdbool.h>
@@ -5784,6 +5955,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_TBQ4_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_tbq4_0, data, nb);
+            } break;
+        case GGML_TYPE_TBQ3_TCQ:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_tbq3_tcq, data, nb);
             } break;
         case GGML_TYPE_IQ1_S:
             {

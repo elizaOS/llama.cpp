@@ -124,6 +124,12 @@ void quantize_row_tbq4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy,
     quantize_row_tbq4_0_ref(x, y, k);
 }
 
+void quantize_row_tbq3_tcq(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_TBQ3_TCQ == 0);
+    block_tbq3_tcq * GGML_RESTRICT y = vy;
+    quantize_row_tbq3_tcq_ref(x, y, k);
+}
+
 //===================================== Q8_K ==============================================
 
 void quantize_row_q8_K_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {

@@ -910,6 +910,22 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_tbq4_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_tbq4_0_ref,
     },
+    [GGML_TYPE_TBQ3_TCQ] = {
+        // TurboQuant TCQ-3 K-cache: 128-element block, fp16 norm + 6-bit
+        // initial-state prefix + 128*3-bit Viterbi-encoded symbol stream
+        // (52 B = 3.25 bpw). from_float_ref runs the host-side Viterbi
+        // encoder in the orthogonal WHT basis; to_float is a single
+        // sliding-9-bit-window codebook lookup, bit-identical to the CUDA
+        // (ggml-cuda/turbo-tcq.cu) and Metal decode kernels. Like qjl1_256
+        // it is a cache type only — never a mul_mat operand; the attention
+        // path scores against the rotated cache directly.
+        .type_name                = "tbq3_tcq",
+        .blck_size                = QK_TBQ3_TCQ,
+        .type_size                = sizeof(block_tbq3_tcq),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_tbq3_tcq,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_tbq3_tcq_ref,
+    },
     [GGML_TYPE_QJL1_256] = {
         .type_name                = "qjl1_256",
         // QJL is asymmetric: input is 128 fp32 lanes per cached key
@@ -7767,6 +7783,7 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_TQ2_0:   result = quantize_tq2_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TBQ3_0:  result = quantize_tbq3_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TBQ4_0:  result = quantize_tbq4_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TBQ3_TCQ: result = quantize_tbq3_tcq(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_QJL1_256: result = quantize_qjl1_256(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_POLAR: result = quantize_q4_polar(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ2_XXS: result = quantize_iq2_xxs(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

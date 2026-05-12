@@ -408,6 +408,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
+    [GGML_TYPE_TBQ3_TCQ] = {
+        // TCQ-3 is K-cache-only, like QJL: never a mul_mat operand. The
+        // attention path scores against the (WHT-rotated) cache directly.
+        // We only need from_float so ggml_cpy(K_cur -> K_view) can quantize.
+        .from_float               = quantize_row_tbq3_tcq,
+    },
     [GGML_TYPE_QJL1_256] = {
         // QJL is K-cache-only; it is never an operand to mul_mat. The
         // attention path uses GGML_OP_ATTN_SCORE_QJL instead, which calls
