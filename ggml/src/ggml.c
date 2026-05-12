@@ -5592,6 +5592,9 @@ struct ggml_tensor * ggml_fused_attn_qjl_tbq(
     GGML_ASSERT(packed_v != NULL);
     GGML_ASSERT(q->type == GGML_TYPE_F32);
     GGML_ASSERT(packed_k->type == GGML_TYPE_QJL1_256);
+    // The GGML graph op is currently the TBQ3-V contract. The Polar V-mix
+    // standalone kernels need a separate op/API and CPU reference before this
+    // constructor can accept GGML_TYPE_Q4_POLAR safely.
     GGML_ASSERT(packed_v->type == GGML_TYPE_TBQ3_0);
     GGML_ASSERT(q->ne[0] == QK_QJL);
 
@@ -5612,11 +5615,15 @@ struct ggml_tensor * ggml_fused_attn_qjl_tbq(
     const int64_t ne[4] = { head_dim, n_heads, q->ne[2], q->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
-    int32_t params[2];
+    int32_t params[6] = { 0 };
     params[0] = n_kv_heads;
     union { float f; int32_t i; } scale_bits;
     scale_bits.f = sm_scale;
     params[1] = scale_bits.i;
+    // Reserved for backend fused dispatch ABI: [2] v_use_qjl, [3] kv_tile,
+    // [4] causal, [5] q_pos_base. The public constructor preserves the
+    // existing non-causal CPU semantics by default.
+    params[5] = n_kv_tokens >= q->ne[2] ? (int32_t) (n_kv_tokens - q->ne[2]) : 0;
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op     = GGML_OP_FUSED_ATTN_QJL_TBQ;

@@ -72,6 +72,7 @@ int ggml_metal_op_attn_score_qjl  (ggml_metal_op_t ctx, int idx);
 // MILADY-TBQ-POLAR-ATTN-DISPATCH-V1
 int ggml_metal_op_attn_score_tbq  (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_attn_score_polar(ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_fused_attn_qjl_tbq(ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_bin               (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_l2_norm           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_group_norm        (ggml_metal_op_t ctx, int idx);

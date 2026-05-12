@@ -1167,6 +1167,37 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 ggml_is_contiguous_rows(op) &&
                 ggml_is_contiguous_rows(op->src[0]) &&
                 ggml_is_contiguous_rows(op->src[1]);
+        case GGML_OP_FUSED_ATTN_QJL_TBQ:
+            {
+                const int32_t * params = (const int32_t *) op->op_params;
+                const int64_t n_kv_heads = params[0];
+                return has_simdgroup_reduction &&
+                    op->type == GGML_TYPE_F32 &&
+                    op->src[0] != NULL &&
+                    op->src[1] != NULL &&
+                    op->src[2] != NULL &&
+                    op->src[0]->type == GGML_TYPE_F32 &&
+                    op->src[1]->type == GGML_TYPE_QJL1_256 &&
+                    op->src[2]->type == GGML_TYPE_TBQ3_0 &&
+                    op->src[0]->ne[0] == 256 &&
+                    op->src[1]->ne[0] == 128 &&
+                    op->src[2]->ne[0] == 128 &&
+                    op->ne[0] == 128 &&
+                    n_kv_heads > 0 &&
+                    (op->src[0]->ne[1] % n_kv_heads) == 0 &&
+                    op->src[1]->ne[1] == op->src[2]->ne[1] &&
+                    op->src[1]->ne[2] == n_kv_heads &&
+                    op->src[2]->ne[2] == n_kv_heads &&
+                    op->src[1]->ne[3] == op->src[0]->ne[3] &&
+                    op->src[2]->ne[3] == op->src[0]->ne[3] &&
+                    op->ne[1] == op->src[0]->ne[1] &&
+                    op->ne[2] == op->src[0]->ne[2] &&
+                    op->ne[3] == op->src[0]->ne[3] &&
+                    ggml_is_contiguous_rows(op) &&
+                    ggml_is_contiguous_rows(op->src[0]) &&
+                    ggml_is_contiguous_rows(op->src[1]) &&
+                    ggml_is_contiguous_rows(op->src[2]);
+            }
         case GGML_OP_ATTN_SCORE_QJL:
             // // MILADY-QJL-ATTN-DISPATCH-V1
             return has_simdgroup_reduction &&
