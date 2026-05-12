@@ -404,6 +404,10 @@ const std::vector<ggml_type> kv_cache_types = {
     // type traits in ggml.c; K uses the GGML_OP_ATTN_SCORE_QJL graph route)
     GGML_TYPE_QJL1_256,
     GGML_TYPE_Q4_POLAR,
+    // ELIZA-KV-CACHE-TYPES-V2 — Eliza-1 TurboQuant TCQ-3 K-cache (full ggml type traits
+    // in ggml.c; Viterbi quantize_row_tbq3_tcq_ref + sliding-window
+    // dequantize_row_tbq3_tcq, required for the 27b 64k+ context tiers)
+    GGML_TYPE_TBQ3_TCQ,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
