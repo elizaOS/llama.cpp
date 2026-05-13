@@ -356,16 +356,6 @@ struct common_params_speculative {
 
     common_params_speculative_ngram_cache ngram_cache;
 
-    // Cross-vocab token replacement pairs for spec-decode: when the
-    // target and draft models have different tokenizers, replace
-    // occurrences of `first` (target-tokenizer string) with `second`
-    // (draft-tokenizer string) in the prompt fed to the draft model.
-    // Wired by the `--spec-replace TARGET DRAFT` CLI flag and consumed
-    // by `common_speculative_apply_replacements()`. Required by the
-    // upstream/master speculative-decode rewrite that landed in
-    // 79079c25e but not added to this struct as part of that merge.
-    std::vector<std::pair<std::string, std::string>> replacements;
-
     bool has_dft() const {
         return !draft.mparams.path.empty() || !draft.mparams.hf_repo.empty();
     }
