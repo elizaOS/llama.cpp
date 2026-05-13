@@ -348,21 +348,16 @@ static struct ggml_tensor * dac_conv_t1d(struct ggml_context * ctx,
                                          int                   pad,
                                          int                   oc,
                                          int                   output_pad) {
-    // 1. transpose x: [T_in, IC] -> [IC, T_in] (contiguous copy)
-    struct ggml_tensor * xt = ggml_cont(ctx, ggml_transpose(ctx, x));
-
-    // 2. mul_mat contracts over IC: col [K*OC, T_in]
-    struct ggml_tensor * col = ggml_mul_mat(ctx, w, xt);
-
-    // 3. col2im_1d scatters into [T_out_no_op, OC] with T_out_no_op = (T_in - 1)*stride + K - 2*pad
-    struct ggml_tensor * y = ggml_col2im_1d(ctx, col, stride, oc, pad);
-
-    // 4. reference ConvTranspose1d output_padding = right-pad with zeros along T axis
+    (void) oc;
+    // ggml_col2im_1d was removed in the upstream/master merge (79079c25e).
+    // Shaw's d629a3768 ("conv_transpose_1d now has Metal kernel") names
+    // ggml_conv_transpose_1d as the replacement primitive; the CPU-side body
+    // wasn't migrated. This collapses the legacy 5-step body into the single
+    // upstream call.
+    struct ggml_tensor * y = ggml_conv_transpose_1d(ctx, w, x, stride, pad, /*dilation*/ 1);
     if (output_pad > 0) {
         y = ggml_pad(ctx, y, output_pad, 0, 0, 0);
     }
-
-    // 5. add bias
     if (b) {
         struct ggml_tensor * b2d = ggml_reshape_2d(ctx, b, 1, b->ne[0]);
         y                        = ggml_add(ctx, y, b2d);

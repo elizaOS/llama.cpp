@@ -890,6 +890,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_ngram_mod     = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MOD));
 
         // when adding a new type - update here the logic above
+        // Bump: DFLASH was added to the enum (between NGRAM_CACHE and
+        // COUNT) so COUNT is now 9. DFLASH dispatches through has_draft
+        // (see enum comment: "behaves like DRAFT when -md is provided")
+        // so it doesn't need a separate has_* bool here.
         static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 9);
 
         // this list here defines the priority of the speculators
