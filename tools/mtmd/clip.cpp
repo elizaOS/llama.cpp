@@ -963,10 +963,6 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
             {
                 builder = std::make_unique<clip_graph_glm4v>(ctx, img);
             } break;
-        case PROJECTOR_TYPE_QWEN3A:
-            {
-                builder = std::make_unique<clip_graph_qwen3a>(ctx, img);
-            } break;
         case PROJECTOR_TYPE_YOUTUVL:
             {
                 builder = std::make_unique<clip_graph_youtuvl>(ctx, img);

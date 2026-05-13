@@ -1002,14 +1002,6 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 0,
         .is_quantized             = false,
     },
-    [45] = { // RESERVED — was GGML_TYPE_COUNT pre-QJL; left as a hole so a
-             // GGUF that recorded this id under the old build is unambiguously
-             // not a QJL block at runtime.
-        .type_name                = "TYPE_45 RESERVED (pre-QJL GGML_TYPE_COUNT)",
-        .blck_size                = 0,
-        .type_size                = 0,
-        .is_quantized             = false,
-    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
