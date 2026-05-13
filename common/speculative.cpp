@@ -876,7 +876,8 @@ common_speculative * common_speculative_init(common_params_speculative & params,
     {
         uint32_t enabled_configs = common_get_enabled_speculative_configs(params.types);
 
-        bool has_draft = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT));
+        bool has_dflash = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DFLASH));
+        bool has_draft = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT)) || has_dflash;
         bool has_draft_model = !params.draft.mparams.path.empty();
 
         // bool has_mtp = false; // TODO: add MTP here
@@ -889,7 +890,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_ngram_mod     = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MOD));
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 8);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 9);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -921,7 +922,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         }
 
         if (has_draft) {
-            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT, params));
+            configs.push_back(common_speculative_config(has_dflash ? COMMON_SPECULATIVE_TYPE_DFLASH : COMMON_SPECULATIVE_TYPE_DRAFT, params));
         }
         // TODO: add MTP here
         if (has_draft_eagle3) {
@@ -936,7 +937,8 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         switch (config.type) {
             case COMMON_SPECULATIVE_TYPE_NONE:
                 break;
-            case COMMON_SPECULATIVE_TYPE_DRAFT: {
+            case COMMON_SPECULATIVE_TYPE_DRAFT:
+            case COMMON_SPECULATIVE_TYPE_DFLASH: {
                 impls.push_back(std::make_unique<common_speculative_state_draft>(config.params, n_seq));
                 break;
             }

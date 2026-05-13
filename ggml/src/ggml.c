@@ -1002,14 +1002,6 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 0,
         .is_quantized             = false,
     },
-    [45] = { // RESERVED — was GGML_TYPE_COUNT pre-QJL; left as a hole so a
-             // GGUF that recorded this id under the old build is unambiguously
-             // not a QJL block at runtime.
-        .type_name                = "TYPE_45 RESERVED (pre-QJL GGML_TYPE_COUNT)",
-        .blck_size                = 0,
-        .type_size                = 0,
-        .is_quantized             = false,
-    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
@@ -1136,6 +1128,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FLASH_ATTN_EXT",
     "FLASH_ATTN_BACK",
     "ATTN_SCORE_QJL",
+    "ATTN_SCORE_TBQ",
+    "ATTN_SCORE_POLAR",
     "FUSED_ATTN_QJL_TBQ",
     "SSM_CONV",
     "SSM_SCAN",
@@ -1248,6 +1242,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "flash_attn_ext(x)",
     "flash_attn_back(x)",
     "attn_score_qjl(q, packed_k)",
+    "attn_score_tbq(q, packed_k)",
+    "attn_score_polar(q, packed_k)",
     "fused_attn_qjl_tbq(q, packed_k, packed_v)",
     "ssm_conv(x)",
     "ssm_scan(x)",
@@ -5538,6 +5534,103 @@ struct ggml_tensor * ggml_attn_score_qjl(
     return result;
 }
 
+// // ELIZA-TBQ-POLAR-ATTN-DISPATCH-V1
+// ggml_attn_score_tbq
+//
+struct ggml_tensor * ggml_attn_score_tbq(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * packed_k,
+        int                   n_kv_heads) {
+    GGML_ASSERT(q != NULL);
+    GGML_ASSERT(packed_k != NULL);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(packed_k->type == GGML_TYPE_TBQ3_0 ||
+                packed_k->type == GGML_TYPE_TBQ4_0 ||
+                packed_k->type == GGML_TYPE_TBQ3_TCQ);
+    GGML_ASSERT(q->ne[0] == 128);
+    GGML_ASSERT(packed_k->ne[0] == 128);
+
+    const int64_t n_heads     = q->ne[1];
+    const int64_t n_kv_tokens = packed_k->ne[1];
+
+    GGML_ASSERT(n_kv_heads > 0);
+    GGML_ASSERT((n_heads % n_kv_heads) == 0);
+    GGML_ASSERT(packed_k->ne[2] == (int64_t) n_kv_heads);
+    GGML_ASSERT(packed_k->ne[3] == q->ne[3]);
+
+    const int64_t ne[4] = { n_kv_tokens, n_heads, q->ne[2], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    int32_t params[1] = { n_kv_heads };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_ATTN_SCORE_TBQ;
+    result->src[0] = q;
+    result->src[1] = packed_k;
+
+    return result;
+}
+
+// ggml_attn_score_polar_impl
+//
+static struct ggml_tensor * ggml_attn_score_polar_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * packed_k,
+        int                   n_kv_heads,
+        bool                  use_qjl,
+        bool                  q_preht) {
+    GGML_ASSERT(q != NULL);
+    GGML_ASSERT(packed_k != NULL);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(packed_k->type == GGML_TYPE_Q4_POLAR);
+    GGML_ASSERT(q->ne[0] == 128);
+    GGML_ASSERT(packed_k->ne[0] == 128);
+
+    const int64_t n_heads     = q->ne[1];
+    const int64_t n_kv_tokens = packed_k->ne[1];
+
+    GGML_ASSERT(n_kv_heads > 0);
+    GGML_ASSERT((n_heads % n_kv_heads) == 0);
+    GGML_ASSERT(packed_k->ne[2] == (int64_t) n_kv_heads);
+    GGML_ASSERT(packed_k->ne[3] == q->ne[3]);
+
+    const int64_t ne[4] = { n_kv_tokens, n_heads, q->ne[2], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    int32_t params[3] = { n_kv_heads, use_qjl ? 1 : 0, q_preht ? 1 : 0 };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_ATTN_SCORE_POLAR;
+    result->src[0] = q;
+    result->src[1] = packed_k;
+
+    return result;
+}
+
+// ggml_attn_score_polar
+//
+struct ggml_tensor * ggml_attn_score_polar(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * packed_k,
+        int                   n_kv_heads,
+        bool                  use_qjl) {
+    return ggml_attn_score_polar_impl(ctx, q, packed_k, n_kv_heads, use_qjl, false);
+}
+
+// ggml_attn_score_polar_preht
+//
+struct ggml_tensor * ggml_attn_score_polar_preht(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q_preht,
+        struct ggml_tensor  * packed_k,
+        int                   n_kv_heads,
+        bool                  use_qjl) {
+    return ggml_attn_score_polar_impl(ctx, q_preht, packed_k, n_kv_heads, use_qjl, true);
+}
+
 // ggml_fused_attn_qjl_tbq
 //
 // Fused QJL-K + TBQ-V attention. See header doc for the math.
@@ -5574,11 +5667,15 @@ struct ggml_tensor * ggml_fused_attn_qjl_tbq(
     const int64_t ne[4] = { head_dim, n_heads, q->ne[2], q->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
-    int32_t params[2];
+    int32_t params[6] = { 0 };
     params[0] = n_kv_heads;
     union { float f; int32_t i; } scale_bits;
     scale_bits.f = sm_scale;
     params[1] = scale_bits.i;
+    // Reserved for backend fused dispatch ABI: [2] v_use_qjl, [3] kv_tile,
+    // [4] causal, [5] q_pos_base. The public constructor preserves the
+    // existing non-causal CPU semantics by default.
+    params[5] = n_kv_tokens >= q->ne[2] ? (int32_t) (n_kv_tokens - q->ne[2]) : 0;
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op     = GGML_OP_FUSED_ATTN_QJL_TBQ;

@@ -221,6 +221,9 @@ int ggml_metal_op_attn_score_qjl(ggml_metal_op_t ctx, int idx) {
     GGML_ASSERT(ggml_is_contiguous_rows(q));
     GGML_ASSERT(ggml_is_contiguous_rows(pk));
     GGML_ASSERT(ggml_is_contiguous_rows(op));
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(pk));
+    GGML_ASSERT(ggml_is_contiguous_rows(op));
     const uint32_t n_heads     = (uint32_t) q->ne[1];
     const uint32_t n_kv_heads  = (uint32_t) ((const int32_t *) op->op_params)[0];
     const uint32_t n_tokens    = (uint32_t) pk->ne[1];
@@ -1709,6 +1712,35 @@ int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
     auto pipeline = ggml_metal_library_get_pipeline_set_rows(lib, op->src[1]->type, op->type);
 
     const int32_t nk0 = ne0/ggml_blck_size(op->type);
+
+    if (op->type == GGML_TYPE_QJL1_256) {
+        // // ELIZA-QJL-SET-ROWS-V1
+        ggml_metal_kargs_set_rows args = {
+            /*.nk0  =*/ nk0,
+            /*.ne01 =*/ ne01,
+            /*.nb01 =*/ nb01,
+            /*.nb02 =*/ nb02,
+            /*.nb03 =*/ nb03,
+            /*.ne11 =*/ ne11,
+            /*.ne12 =*/ ne12,
+            /*.nb10 =*/ nb10,
+            /*.nb11 =*/ nb11,
+            /*.nb12 =*/ nb12,
+            /*.nb1  =*/ nb1,
+            /*.nb2  =*/ nb2,
+            /*.nb3  =*/ nb3,
+        };
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, 32, 1, 1);
+
+        return 1;
+    }
 
     int nth = 32; // SIMD width
 

@@ -564,7 +564,12 @@ struct mtmd_context {
         audio_preproc->initialize();
 
         // set special tokens
-        if (proj == PROJECTOR_TYPE_QWEN2A || proj == PROJECTOR_TYPE_QWEN3A || proj == PROJECTOR_TYPE_QWEN25O) {
+        if (proj == PROJECTOR_TYPE_QWEN3A) {
+            // <|audio_start|> ... (embeddings replacing <|audio_pad|>) ... <|audio_end|>
+            aud_beg = "<|audio_start|>";
+            aud_end = "<|audio_end|>";
+
+        } else if (proj == PROJECTOR_TYPE_QWEN2A || proj == PROJECTOR_TYPE_QWEN25O) {
             // <|audio_bos|> ... (embeddings) ... <|audio_eos|>
             aud_beg = "<|audio_bos|>";
             aud_end = "<|audio_eos|>";

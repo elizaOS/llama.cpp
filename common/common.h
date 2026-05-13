@@ -346,6 +346,9 @@ struct common_params_speculative {
 
     common_params_speculative_draft draft;
 
+    // Optional target-token-string -> draft-token-string compatibility map used by --spec-replace.
+    std::vector<std::pair<std::string, std::string>> replacements;
+
     common_params_speculative_ngram_mod ngram_mod;
     common_params_speculative_ngram_map ngram_simple;
     common_params_speculative_ngram_map ngram_map_k;
