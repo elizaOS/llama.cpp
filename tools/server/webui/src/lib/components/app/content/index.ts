@@ -29,7 +29,7 @@
  * <MarkdownContent content={message.content} attachments={message.extra} />
  * ```
  */
-export { default as MarkdownContent } from './MarkdownContent.svelte';
+export { default as MarkdownContent } from './MarkdownContent/MarkdownContent.svelte';
 
 /**
  * **SyntaxHighlightedCode** - Code syntax highlighting
@@ -70,7 +70,7 @@ export { default as SyntaxHighlightedCode } from './SyntaxHighlightedCode.svelte
  *   bind:open
  *   icon={BrainIcon}
  *   title="Thinking..."
- *   isStreaming={true}
+ *   isStreaming
  * >
  *   {reasoningContent}
  * </CollapsibleContentBlock>

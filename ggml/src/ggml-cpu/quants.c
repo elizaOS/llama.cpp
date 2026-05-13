@@ -26,9 +26,14 @@ void quantize_row_q1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
     quantize_row_q1_0_ref(x, y, k);
 }
 
+void quantize_row_q1_0_g32(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q1_0_g32_ref(x, y, k);
+}
+
 void quantize_row_q1_0_g128(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q1_0_g128_ref(x, y, k);
 }
+
 
 void quantize_row_q4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q4_0_ref(x, y, k);
@@ -56,6 +61,10 @@ void quantize_row_q8_1_generic(const float * GGML_RESTRICT x, void * GGML_RESTRI
 
 void quantize_row_mxfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_mxfp4_ref(x, y, k);
+}
+
+void quantize_row_nvfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_nvfp4_ref(x, y, k);
 }
 
 //
@@ -138,81 +147,125 @@ void quantize_row_q8_K_generic(const float * GGML_RESTRICT x, void * GGML_RESTRI
 
 //===================================== Dot products =================================
 
+// upstream Q1_0: 128-element blocks, optimized bit unpacking
 void ggml_vec_dot_q1_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
-    const int qk = QK8_0;
+    const int qk = QK1_0;
     const int nb = n / qk;
-    
+
     assert(n % qk == 0);
     assert(nrc == 1);
     UNUSED(nrc);
     UNUSED(bx);
     UNUSED(by);
     UNUSED(bs);
-    
+
     const block_q1_0 * GGML_RESTRICT x = vx;
     const block_q8_0 * GGML_RESTRICT y = vy;
-    
-    
-    float sumf = 0.0;
-    
-    for (int i = 0; i < nb; i++) {
-        const float d0 = GGML_FP16_TO_FP32(x[i].d);
-        const float d1 = GGML_FP16_TO_FP32(y[i].d);
-        
-        int sumi = 0;
-        
-        for (int j = 0; j < QK1_0; j++) {
-            const int bit_index = j;
-            const int byte_index = bit_index / 8;
-            const int bit_offset = bit_index % 8;
-            
-            // Extract bit: 1 = +1, 0 = -1
-            const int xi = ((x[i].qs[byte_index] >> bit_offset) & 1) ? 1 : -1;
-            const int yi = y[i].qs[j];
-            
-            sumi += xi * yi;
-        }
-        
-        sumf += d0 * d1 * sumi;
-    }
-    
-    *s = sumf;
-}
 
-void ggml_vec_dot_q1_0_g128_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
-    const int qk = QK1_0_g128;
-    const int nb = n / qk;
-    
-    assert(n % qk == 0);
-    assert(nrc == 1);
-    UNUSED(nrc);
-    UNUSED(bx);
-    UNUSED(by);
-    UNUSED(bs);
-    
-    const block_q1_0_g128 * GGML_RESTRICT x = vx;
-    const block_q8_0 * GGML_RESTRICT y = vy;
-    
-    
     float sumf = 0.0;
-    
-    // Each Q1_0_g128 block has 128 elements, each Q8_0 block has 32 elements
-    // So we need 4 Q8_0 blocks per Q1_0_g128 block
+
     for (int i = 0; i < nb; i++) {
-        const float d0 = GGML_FP16_TO_FP32(x[i].d);
-        
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+
         float sumi = 0.0f;
 
         for (int k = 0; k < 4; k++) {
-            const float d1 = GGML_FP16_TO_FP32(y[i*4 + k].d);
+            const block_q8_0 * GGML_RESTRICT yb = &y[i * 4 + k];
+            const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
+            int sumi_block = 0;
 
+            const uint8_t * GGML_RESTRICT bits = &x[i].qs[k * 4];
+            const int8_t  * GGML_RESTRICT qy   = yb->qs;
+
+            for (int b = 0; b < 4; ++b, qy += 8) {
+                const unsigned mask = bits[b];
+                sumi_block += ((mask & 0x01) ? qy[0] : -qy[0])
+                           +  ((mask & 0x02) ? qy[1] : -qy[1])
+                           +  ((mask & 0x04) ? qy[2] : -qy[2])
+                           +  ((mask & 0x08) ? qy[3] : -qy[3])
+                           +  ((mask & 0x10) ? qy[4] : -qy[4])
+                           +  ((mask & 0x20) ? qy[5] : -qy[5])
+                           +  ((mask & 0x40) ? qy[6] : -qy[6])
+                           +  ((mask & 0x80) ? qy[7] : -qy[7]);
+            }
+
+            sumi += d1 * sumi_block;
+        }
+
+        sumf += d0 * sumi;
+    }
+
+    *s = sumf;
+}
+
+// milady Q1_0_g32: 32-element blocks (enum=200)
+void ggml_vec_dot_q1_0_g32_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK1_0_g32;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q1_0_g32 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0;
+
+    for (int i = 0; i < nb; i++) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+        const float d1 = GGML_CPU_FP16_TO_FP32(y[i].d);
+
+        int sumi = 0;
+
+        for (int j = 0; j < QK1_0_g32; j++) {
+            const int byte_index = j / 8;
+            const int bit_offset = j % 8;
+            const int xi = ((x[i].qs[byte_index] >> bit_offset) & 1) ? 1 : -1;
+            sumi += xi * y[i].qs[j];
+        }
+
+        sumf += d0 * d1 * sumi;
+    }
+
+    *s = sumf;
+}
+
+// milady Q1_0_g128: 128-element blocks (enum=201)
+void ggml_vec_dot_q1_0_g128_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK1_0_g128;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q1_0_g128 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0;
+
+    // Each Q1_0_g128 block has 128 elements, each Q8_0 block has 32 elements
+    // So we need 4 Q8_0 blocks per Q1_0_g128 block
+    for (int i = 0; i < nb; i++) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+
+        float sumi = 0.0f;
+
+        for (int k = 0; k < 4; k++) {
+            const float d1 = GGML_CPU_FP16_TO_FP32(y[i*4 + k].d);
             int sumi_block = 0;
 
             for (int j = 0; j < QK8_0; j++) {
                 const int bit_index = k * QK8_0 + j;
                 const int byte_index = bit_index / 8;
                 const int bit_offset = bit_index % 8;
-
                 const int xi = ((x[i].qs[byte_index] >> bit_offset) & 1) ? 1 : -1;
                 sumi_block += xi * y[i*4 + k].qs[j];
             }
@@ -222,7 +275,7 @@ void ggml_vec_dot_q1_0_g128_q8_0_generic(int n, float * GGML_RESTRICT s, size_t 
 
         sumf += d0 * sumi;
     }
-    
+
     *s = sumf;
 }
 
@@ -327,6 +380,42 @@ void ggml_vec_dot_mxfp4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, 
             sumi2 += y[ib].qs[j + QK_MXFP4/2] * kvalues_mxfp4[x[ib].qs[j] >>  4];
         }
         sumf += d * (sumi1 + sumi2);
+    }
+    *s = sumf;
+}
+
+// NVFP4: super-block of 64 elements = 4 sub-blocks of 16 = 2 q8_0 blocks
+void ggml_vec_dot_nvfp4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_NVFP4 == 0);
+
+    const block_nvfp4 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_NVFP4;
+
+    float sumf = 0;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        for (int s_idx = 0; s_idx < 4; ++s_idx) {
+            const float d = ggml_ue4m3_to_fp32(x[ib].d[s_idx]);
+            const int q8_block = s_idx / 2;
+            const int q8_off   = (s_idx % 2) * QK_NVFP4_SUB;
+            const float dy = GGML_CPU_FP16_TO_FP32(y[2*ib + q8_block].d);
+
+            int sumi_lo = 0, sumi_hi = 0;
+            for (int j = 0; j < QK_NVFP4_SUB/2; ++j) {
+                const uint8_t qv = x[ib].qs[s_idx*(QK_NVFP4_SUB/2) + j];
+                sumi_lo += y[2*ib + q8_block].qs[q8_off + j +               0] * kvalues_mxfp4[qv & 0xf];
+                sumi_hi += y[2*ib + q8_block].qs[q8_off + j + QK_NVFP4_SUB/2] * kvalues_mxfp4[qv >>  4];
+            }
+
+            sumf += dy * d * (sumi_lo + sumi_hi);
+        }
     }
     *s = sumf;
 }

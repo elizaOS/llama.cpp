@@ -93,11 +93,14 @@ typedef sycl::half2 ggml_half2;
 // QR = QK / number of values before dequantization
 // QI = number of 32 bit integers before dequantization
 
-#define QI1_0 (QK1_0 / 32)  // Number of int32s needed for QK1_0 bits (QK1_0/32)
-#define QR1_0 1              // 1 bit per quantized element (matches the 1-bit nature of Q1_0)
+#define QI1_0 (QK1_0 / 32)
+#define QR1_0 1
 
-#define QI1_0_g128 (QK1_0_g128 / 32)  // Number of int32s needed for QK1_0_g128 bits (QK1_0_g128/32)
-#define QR1_0_g128 1              // 1 bit per quantized element (matches the 1-bit nature of Q1_0_g128)
+// milady custom Q1_0 variants
+#define QI1_0_g32  (QK1_0_g32 / 32)   // g32: 32-token group
+#define QR1_0_g32  1
+#define QI1_0_g128 (QK1_0_g128 / 32)  // g128: 128-token group
+#define QR1_0_g128 1
 
 
 #define QI4_0 (QK4_0 / (4 * QR4_0))
@@ -108,6 +111,9 @@ typedef sycl::half2 ggml_half2;
 
 #define QI_MXFP4 (QK_MXFP4 / (4 * QR_MXFP4))
 #define QR_MXFP4 2
+
+#define QI_NVFP4 (QK_NVFP4 / (4 * QR_NVFP4))
+#define QR_NVFP4 2
 
 #define QI5_0 (QK5_0 / (4 * QR5_0))
 #define QR5_0 2
@@ -177,12 +183,21 @@ typedef sycl::half2 ggml_half2;
 #define GGML_EXTENSION __extension__
 #endif // _MSC_VER
 
-#define QK1_0 32  // MUST match QK8_0 for vec_dot computation! TODO see if we can do larger blocks later
+// upstream Q1_0: 128-token group block
+#define QK1_0 128
 typedef struct {
     ggml_half d;           // delta
     uint8_t qs[QK1_0 / 8]; // bits / quants
 } block_q1_0;
 static_assert(sizeof(block_q1_0) == sizeof(ggml_half) + QK1_0 / 8, "wrong q1_0 block size/padding");
+
+// milady custom Q1_0 variants (renumbered to 200-range enum IDs)
+#define QK1_0_g32 32  // MUST match QK8_0 for vec_dot computation
+typedef struct {
+    ggml_half d;              // delta
+    uint8_t qs[QK1_0_g32 / 8]; // bits / quants
+} block_q1_0_g32;
+static_assert(sizeof(block_q1_0_g32) == sizeof(ggml_half) + QK1_0_g32 / 8, "wrong q1_0_g32 block size/padding");
 
 #define QK1_0_g128 128
 typedef struct {
@@ -190,6 +205,7 @@ typedef struct {
     uint8_t qs[QK1_0_g128 / 8]; // bits / quants
 } block_q1_0_g128;
 static_assert(sizeof(block_q1_0_g128) == sizeof(ggml_half) + QK1_0_g128 / 8, "wrong q1_0_g128 block size/padding");
+
 
 #define QK4_0 32
 typedef struct {
@@ -217,6 +233,14 @@ typedef struct {
     uint8_t qs[QK_MXFP4/2];
 } block_mxfp4;
 static_assert(sizeof(block_mxfp4) == sizeof(uint8_t) + QK_MXFP4/2, "wrong mxfp4 block size/padding");
+
+#define QK_NVFP4 64
+#define QK_NVFP4_SUB 16  // sub-block size for per-group scales
+typedef struct {
+    uint8_t d[QK_NVFP4/QK_NVFP4_SUB]; // UE4M3 scales (4 bytes, one per 16-element sub-block)
+    uint8_t qs[QK_NVFP4/2];           // packed 4-bit E2M1 values (32 bytes)
+} block_nvfp4;
+static_assert(sizeof(block_nvfp4) == sizeof(uint8_t)*(QK_NVFP4/QK_NVFP4_SUB) + QK_NVFP4/2, "wrong nvfp4 block size/padding");
 
 #define QK5_0 32
 typedef struct {

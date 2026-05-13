@@ -1,9 +1,16 @@
-import { SvelteSet } from 'svelte/reactivity';
+import { SvelteMap, SvelteSet } from 'svelte/reactivity';
+import { toast } from 'svelte-sonner';
 import { ServerModelStatus, ModelModality } from '$lib/enums';
-import { ModelsService, PropsService } from '$lib/services';
+import { ModelsService } from '$lib/services/models.service';
+import { PropsService } from '$lib/services/props.service';
 import { serverStore } from '$lib/stores/server.svelte';
 import { TTLCache } from '$lib/utils';
-import { MODEL_PROPS_CACHE_TTL_MS, MODEL_PROPS_CACHE_MAX_ENTRIES } from '$lib/constants/cache';
+import {
+	MODEL_PROPS_CACHE_TTL_MS,
+	MODEL_PROPS_CACHE_MAX_ENTRIES,
+	FAVORITE_MODELS_LOCALSTORAGE_KEY
+} from '$lib/constants';
+import { conversationsStore } from '$lib/stores/conversations.svelte';
 
 /**
  * modelsStore - Reactive store for model management in both MODEL and ROUTER modes
@@ -49,8 +56,14 @@ class ModelsStore {
 	selectedModelId = $state<string | null>(null);
 	selectedModelName = $state<string | null>(null);
 
+	// dedup concurrent fetch() callers, all awaiters share the same inflight promise
+	// without this, ?model=<name> URL handler raced an in-progress fetch and saw an empty list
+	private inflightFetch: Promise<void> | null = null;
+
 	private modelUsage = $state<Map<string, SvelteSet<string>>>(new Map());
-	private modelLoadingStates = $state<Map<string, boolean>>(new Map());
+	private modelLoadingStates = new SvelteMap<string, boolean>();
+
+	favoriteModelIds = $state<Set<string>>(this.loadFavoritesFromStorage());
 
 	/**
 	 * Model-specific props cache with TTL
@@ -83,7 +96,11 @@ class ModelsStore {
 
 	get loadedModelIds(): string[] {
 		return this.routerModels
-			.filter((m) => m.status.value === ServerModelStatus.LOADED)
+			.filter(
+				(m) =>
+					m.status.value === ServerModelStatus.LOADED ||
+					m.status.value === ServerModelStatus.SLEEPING
+			)
 			.map((m) => m.id);
 	}
 
@@ -208,7 +225,11 @@ class ModelsStore {
 
 	isModelLoaded(modelId: string): boolean {
 		const model = this.routerModels.find((m) => m.id === modelId);
-		return model?.status.value === ServerModelStatus.LOADED || false;
+		return (
+			model?.status.value === ServerModelStatus.LOADED ||
+			model?.status.value === ServerModelStatus.SLEEPING ||
+			false
+		);
 	}
 
 	isModelOperationInProgress(modelId: string): boolean {
@@ -242,9 +263,18 @@ class ModelsStore {
 	 * Also fetches modalities for MODEL mode (single model)
 	 */
 	async fetch(force = false): Promise<void> {
-		if (this.loading) return;
+		if (this.inflightFetch) return this.inflightFetch;
 		if (this.models.length > 0 && !force) return;
 
+		this.inflightFetch = this.runFetch();
+		try {
+			await this.inflightFetch;
+		} finally {
+			this.inflightFetch = null;
+		}
+	}
+
+	private async runFetch(): Promise<void> {
 		this.loading = true;
 		this.error = null;
 
@@ -261,15 +291,19 @@ class ModelsStore {
 				const displayNameSource =
 					details?.name && details.name.trim().length > 0 ? details.name : item.id;
 				const displayName = this.toDisplayName(displayNameSource);
+				const modelId = details?.model || item.id;
 
 				return {
 					id: item.id,
 					name: displayName,
-					model: details?.model || item.id,
+					model: modelId,
 					description: details?.description,
 					capabilities: rawCapabilities.filter((value: unknown): value is string => Boolean(value)),
 					details: details?.details,
-					meta: item.meta ?? null
+					meta: item.meta ?? null,
+					parsedId: ModelsService.parseModelId(modelId),
+					aliases: item.aliases ?? [],
+					tags: item.tags ?? []
 				} satisfies ModelOption;
 			});
 
@@ -392,6 +426,103 @@ class ModelsStore {
 	}
 
 	/**
+	 * Gets the model name from the last assistant message in the active conversation.
+	 * Iterates backward through messages to find the most recent message with a model.
+	 * Used by both the chat page and settings page to maintain model consistency.
+	 * @returns The model name or null if not found
+	 */
+	getModelFromLastAssistantResponse(): string | null {
+		const messages = conversationsStore.activeMessages;
+		if (!messages || messages.length === 0) return null;
+
+		// Iterate backward to find the last message with a model
+		for (let i = messages.length - 1; i >= 0; i--) {
+			if (messages[i].model) {
+				return messages[i].model;
+			}
+		}
+
+		return null;
+	}
+
+	/**
+	 * Auto-selects the model from the last assistant response if available and loaded.
+	 * Returns true if a model was selected, false otherwise.
+	 * This is used by the chat page to maintain model consistency across page navigation.
+	 */
+	async selectModelFromLastAssistantResponse(): Promise<boolean> {
+		const lastModel = this.getModelFromLastAssistantResponse();
+		if (!lastModel) return false;
+
+		// Skip if already selected
+		if (this.selectedModelName === lastModel) return false;
+
+		const matchingModel = this.models.find((option) => option.model === lastModel);
+		if (!matchingModel) return false;
+
+		if (!this.isModelLoaded(lastModel)) {
+			console.log('[modelsStore] last assistant model not loaded:', lastModel);
+			return false;
+		}
+
+		try {
+			await this.selectModelById(matchingModel.id);
+			console.log(`[modelsStore] Automatically selected model: ${lastModel} from last message`);
+			return true;
+		} catch (error) {
+			console.warn('[modelsStore] Failed to automatically select model from last message:', error);
+			return false;
+		}
+	}
+
+	/**
+	 * Auto-selects the first available model if none is selected, and fetches its props.
+	 * Prioritizes:
+	 * 1. Model from active conversation's last assistant response (if loaded)
+	 * 2. Model from active conversation's last assistant response (if not loaded)
+	 * 3. First loaded model (not from active conversation)
+	 * 4. First available model
+	 * This is used to ensure default values are populated in settings pages.
+	 */
+	async ensureFirstModelSelected(): Promise<void> {
+		if (this.selectedModelName) return;
+
+		// Filter models that are visible in webui
+		const availableModels = this.models.filter((option) => {
+			const modelProps = this.getModelProps(option.model);
+			return modelProps?.webui !== false;
+		});
+
+		if (availableModels.length === 0) return;
+
+		// Try to select model from last assistant response first
+		const lastModel = this.getModelFromLastAssistantResponse();
+		if (lastModel) {
+			const lastModelOption = availableModels.find((m) => m.model === lastModel);
+			if (lastModelOption) {
+				await this.selectModelById(lastModelOption.id);
+				if (this.isModelLoaded(lastModel)) {
+					await this.fetchModelProps(lastModel);
+				}
+				return;
+			}
+		}
+
+		// Try to find a loaded model first
+		const loadedModel = availableModels.find((m) => this.isModelLoaded(m.model));
+		if (loadedModel) {
+			await this.selectModelById(loadedModel.id);
+			await this.fetchModelProps(loadedModel.model);
+			return;
+		}
+
+		// Fall back to the first available model
+		const firstModel = availableModels[0];
+		await this.selectModelById(firstModel.id);
+		// Don't fetch props for unloaded models (will fail in ROUTER mode)
+	}
+
+	/**
 	 * Update modalities for a specific model
 	 * Called when a model is loaded or when we need fresh modality data
 	 */
@@ -446,7 +577,7 @@ class ModelsStore {
 
 	/**
 	 * Select a model by its model name (used for syncing with conversation model)
-	 * @param modelName - Model name to select (e.g., "unsloth/gemma-3-12b-it-GGUF:latest")
+	 * @param modelName - Model name to select (e.g., "ggml-org/GLM-4.7-Flash-GGUF")
 	 */
 	selectModelByName(modelName: string): void {
 		const option = this.models.find((model) => model.model === modelName);
@@ -497,22 +628,21 @@ class ModelsStore {
 
 	/** Polling interval in ms for checking model status */
 	private static readonly STATUS_POLL_INTERVAL = 500;
-	/** Maximum polling attempts before giving up */
-	private static readonly STATUS_POLL_MAX_ATTEMPTS = 60; // 30 seconds max
 
 	/**
 	 * Poll for expected model status after load/unload operation.
-	 * Keeps polling until the model reaches the expected status or max attempts reached.
+	 * Keeps polling indefinitely until the model reaches the expected status or fails.
 	 *
 	 * @param modelId - Model identifier to check
 	 * @param expectedStatus - Expected status to wait for
-	 * @returns Promise that resolves when expected status is reached
+	 * @throws Error if model reaches FAILED status
 	 */
 	private async pollForModelStatus(
 		modelId: string,
 		expectedStatus: ServerModelStatus
 	): Promise<void> {
-		for (let attempt = 0; attempt < ModelsStore.STATUS_POLL_MAX_ATTEMPTS; attempt++) {
+		let attempt = 0;
+		while (true) {
 			await this.fetchRouterModels();
 
 			const currentStatus = this.getModelStatus(modelId);
@@ -520,12 +650,23 @@ class ModelsStore {
 				return;
 			}
 
+			if (currentStatus === ServerModelStatus.FAILED) {
+				throw new Error(
+					`Model failed to ${expectedStatus === ServerModelStatus.LOADED ? 'load' : 'unload'}`
+				);
+			}
+
+			if (
+				expectedStatus === ServerModelStatus.LOADED &&
+				currentStatus === ServerModelStatus.UNLOADED &&
+				attempt > 2
+			) {
+				throw new Error('Model was unloaded unexpectedly during loading');
+			}
+
+			attempt++;
 			await new Promise((resolve) => setTimeout(resolve, ModelsStore.STATUS_POLL_INTERVAL));
 		}
-
-		console.warn(
-			`Model ${modelId} did not reach expected status ${expectedStatus} after ${ModelsStore.STATUS_POLL_MAX_ATTEMPTS} attempts`
-		);
 	}
 
 	/**
@@ -547,8 +688,10 @@ class ModelsStore {
 			await this.pollForModelStatus(modelId, ServerModelStatus.LOADED);
 
 			await this.updateModelModalities(modelId);
+			toast.success(`Model loaded: ${this.toDisplayName(modelId)}`);
 		} catch (error) {
 			this.error = error instanceof Error ? error.message : 'Failed to load model';
+			toast.error(`Failed to load model: ${this.toDisplayName(modelId)}`);
 			throw error;
 		} finally {
 			this.modelLoadingStates.set(modelId, false);
@@ -573,8 +716,10 @@ class ModelsStore {
 			await ModelsService.unload(modelId);
 
 			await this.pollForModelStatus(modelId, ServerModelStatus.UNLOADED);
+			toast.info(`Model unloaded: ${this.toDisplayName(modelId)}`);
 		} catch (error) {
 			this.error = error instanceof Error ? error.message : 'Failed to unload model';
+			toast.error(`Failed to unload model: ${this.toDisplayName(modelId)}`);
 			throw error;
 		} finally {
 			this.modelLoadingStates.set(modelId, false);
@@ -591,6 +736,48 @@ class ModelsStore {
 		}
 
 		await this.loadModel(modelId);
+	}
+
+	/**
+	 *
+	 *
+	 * Favorites
+	 *
+	 *
+	 */
+
+	isFavorite(modelId: string): boolean {
+		return this.favoriteModelIds.has(modelId);
+	}
+
+	toggleFavorite(modelId: string): void {
+		const next = new SvelteSet(this.favoriteModelIds);
+
+		if (next.has(modelId)) {
+			next.delete(modelId);
+		} else {
+			next.add(modelId);
+		}
+
+		this.favoriteModelIds = next;
+
+		try {
+			localStorage.setItem(FAVORITE_MODELS_LOCALSTORAGE_KEY, JSON.stringify([...next]));
+		} catch {
+			toast.error('Failed to save favorite models to local storage');
+		}
+	}
+
+	private loadFavoritesFromStorage(): Set<string> {
+		try {
+			const raw = localStorage.getItem(FAVORITE_MODELS_LOCALSTORAGE_KEY);
+
+			return raw ? new Set(JSON.parse(raw) as string[]) : new Set();
+		} catch {
+			toast.error('Failed to load favorite models from local storage');
+
+			return new Set();
+		}
 	}
 
 	/**
@@ -646,3 +833,4 @@ export const loadingModelIds = () => modelsStore.loadingModelIds;
 export const propsCacheVersion = () => modelsStore.propsCacheVersion;
 export const singleModelName = () => modelsStore.singleModelName;
 export const selectedModelContextSize = () => modelsStore.selectedModelContextSize;
+export const favoriteModelIds = () => modelsStore.favoriteModelIds;

@@ -11,6 +11,13 @@ export enum FileTypeCategory {
 	TEXT = 'text'
 }
 
+/**
+ * Special file types for internal use (not MIME types)
+ */
+export enum SpecialFileType {
+	MCP_PROMPT = 'mcp-prompt'
+}
+
 // Specific file type enums for each category
 export enum FileTypeImage {
 	JPEG = 'jpeg',
@@ -175,7 +182,9 @@ export enum MimeTypeImage {
 	PNG = 'image/png',
 	GIF = 'image/gif',
 	WEBP = 'image/webp',
-	SVG = 'image/svg+xml'
+	SVG = 'image/svg+xml',
+	ICO = 'image/x-icon',
+	ICO_MICROSOFT = 'image/vnd.microsoft.icon'
 }
 
 export enum MimeTypeText {

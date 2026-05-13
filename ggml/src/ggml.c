@@ -53,6 +53,21 @@
 
 #define UNUSED GGML_UNUSED
 
+uint64_t ggml_graph_next_uid(void) {
+#ifdef _MSC_VER
+#if defined(_WIN32)
+    static volatile LONG counter = 1;
+    return (uint64_t) InterlockedIncrement(&counter) - 1;
+#else
+    static volatile long long counter = 1;
+    return (uint64_t) _InterlockedIncrement64(&counter) - 1;
+#endif
+#else
+    static uint64_t counter = 1;
+    return __atomic_fetch_add(&counter, 1, __ATOMIC_RELAXED);
+#endif
+}
+
 // Needed for ggml_fp32_to_bf16_row()
 #if defined(__AVX512BF16__)
 #if defined(_MSC_VER)
@@ -659,6 +674,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_q1_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q1_0_ref,
     },
+    [GGML_TYPE_Q1_0_g32] = {
+        .type_name                = "q1_0_g32",
+        .blck_size                = QK1_0_g32,
+        .type_size                = sizeof(block_q1_0_g32),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q1_0_g32,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q1_0_g32_ref,
+    },
     [GGML_TYPE_Q1_0_g128] = {
         .type_name                = "q1_0_g128",
         .blck_size                = QK1_0_g128,
@@ -733,6 +756,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_mxfp4,
         .from_float_ref           = (ggml_from_float_t)quantize_row_mxfp4_ref,
+    },
+    [GGML_TYPE_NVFP4] = {
+        .type_name                = "nvfp4",
+        .blck_size                = QK_NVFP4,
+        .type_size                = sizeof(block_nvfp4),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_nvfp4,
+        .from_float_ref           = (ggml_from_float_t)quantize_row_nvfp4_ref,
     },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
@@ -971,14 +1002,6 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 0,
         .is_quantized             = false,
     },
-    [45] = { // RESERVED — was GGML_TYPE_COUNT pre-QJL; left as a hole so a
-             // GGUF that recorded this id under the old build is unambiguously
-             // not a QJL block at runtime.
-        .type_name                = "TYPE_45 RESERVED (pre-QJL GGML_TYPE_COUNT)",
-        .blck_size                = 0,
-        .type_size                = 0,
-        .is_quantized             = false,
-    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
@@ -1118,6 +1141,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GATED_LINEAR_ATTN",
     "RWKV_WKV7",
     "SOLVE_TRI",
+    "GATED_DELTA_NET",
 
     "UNARY",
 
@@ -1135,7 +1159,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1231,6 +1255,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "gated_linear_attn(k, v, q, gate, s)",
     "rwkv_wkv7(r, w, k, v, a, b, s)",
     "A X = B, A triangular, solve X",
+    "gated_delta_net(q, k, v, g, beta, s)",
 
     "unary(x)",
 
@@ -1248,7 +1273,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1375,6 +1400,12 @@ size_t ggml_row_size(enum ggml_type type, int64_t ne) {
     return ggml_type_size(type)*ne/ggml_blck_size(type);
 }
 
+double ggml_type_sizef(enum ggml_type type) {
+    assert(type >= 0);
+    assert(type < GGML_TYPE_COUNT);
+    return ((double)(type_traits[type].type_size))/type_traits[type].blck_size;
+}
+
 const char * ggml_type_name(enum ggml_type type) {
     assert(type >= 0);
     assert(type < GGML_TYPE_COUNT);
@@ -1460,12 +1491,14 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
         case GGML_FTYPE_MOSTLY_Q4_0:          wtype = GGML_TYPE_Q4_0;  break;
         case GGML_FTYPE_MOSTLY_Q4_1:          wtype = GGML_TYPE_Q4_1;  break;
         case GGML_FTYPE_MOSTLY_Q1_0:          wtype = GGML_TYPE_Q1_0;  break;
+        case GGML_FTYPE_MOSTLY_Q1_0_g32:      wtype = GGML_TYPE_Q1_0_g32;   break;
         case GGML_FTYPE_MOSTLY_Q1_0_g128:     wtype = GGML_TYPE_Q1_0_g128;  break;
         case GGML_FTYPE_MOSTLY_Q4_POLAR:      wtype = GGML_TYPE_Q4_POLAR; break;
         case GGML_FTYPE_MOSTLY_Q5_0:          wtype = GGML_TYPE_Q5_0;  break;
         case GGML_FTYPE_MOSTLY_Q5_1:          wtype = GGML_TYPE_Q5_1;  break;
         case GGML_FTYPE_MOSTLY_Q8_0:          wtype = GGML_TYPE_Q8_0;  break;
         case GGML_FTYPE_MOSTLY_MXFP4:         wtype = GGML_TYPE_MXFP4; break;
+        case GGML_FTYPE_MOSTLY_NVFP4:         wtype = GGML_TYPE_NVFP4; break;
         case GGML_FTYPE_MOSTLY_Q2_K:          wtype = GGML_TYPE_Q2_K;  break;
         case GGML_FTYPE_MOSTLY_Q3_K:          wtype = GGML_TYPE_Q3_K;  break;
         case GGML_FTYPE_MOSTLY_Q4_K:          wtype = GGML_TYPE_Q4_K;  break;
@@ -3317,6 +3350,16 @@ void ggml_mul_mat_set_prec(
     ggml_set_op_params_i32(a, 0, prec_i32);
 }
 
+void ggml_mul_mat_set_hint(
+        struct ggml_tensor * a,
+        enum ggml_op_hint    hint) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT);
+
+    const int32_t hint_i32 = (int32_t) hint;
+
+    ggml_set_op_params_i32(a, 1, hint_i32);
+}
+
 // ggml_mul_mat_id
 
 /*
@@ -5039,6 +5082,7 @@ static struct ggml_tensor * ggml_interpolate_impl(
     GGML_ASSERT((mode & 0xFF) < GGML_SCALE_MODE_COUNT);
     // TODO: implement antialias for modes other than bilinear
     GGML_ASSERT(!(mode & GGML_SCALE_FLAG_ANTIALIAS) || (mode & 0xFF) == GGML_SCALE_MODE_BILINEAR);
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
 
     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, a->type, ne0, ne1, ne2, ne3);
 
@@ -5384,6 +5428,7 @@ struct ggml_tensor * ggml_flash_attn_ext(
     GGML_ASSERT(q->ne[3] == v->ne[3]);
 
     if (mask) {
+        GGML_ASSERT(mask->type == GGML_TYPE_F16);
         GGML_ASSERT(ggml_is_contiguous(mask));
         //GGML_ASSERT(ggml_can_repeat_rows(mask, qk));
 
@@ -5489,6 +5534,103 @@ struct ggml_tensor * ggml_attn_score_qjl(
     return result;
 }
 
+// // ELIZA-TBQ-POLAR-ATTN-DISPATCH-V1
+// ggml_attn_score_tbq
+//
+struct ggml_tensor * ggml_attn_score_tbq(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * packed_k,
+        int                   n_kv_heads) {
+    GGML_ASSERT(q != NULL);
+    GGML_ASSERT(packed_k != NULL);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(packed_k->type == GGML_TYPE_TBQ3_0 ||
+                packed_k->type == GGML_TYPE_TBQ4_0 ||
+                packed_k->type == GGML_TYPE_TBQ3_TCQ);
+    GGML_ASSERT(q->ne[0] == 128);
+    GGML_ASSERT(packed_k->ne[0] == 128);
+
+    const int64_t n_heads     = q->ne[1];
+    const int64_t n_kv_tokens = packed_k->ne[1];
+
+    GGML_ASSERT(n_kv_heads > 0);
+    GGML_ASSERT((n_heads % n_kv_heads) == 0);
+    GGML_ASSERT(packed_k->ne[2] == (int64_t) n_kv_heads);
+    GGML_ASSERT(packed_k->ne[3] == q->ne[3]);
+
+    const int64_t ne[4] = { n_kv_tokens, n_heads, q->ne[2], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    int32_t params[1] = { n_kv_heads };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_ATTN_SCORE_TBQ;
+    result->src[0] = q;
+    result->src[1] = packed_k;
+
+    return result;
+}
+
+// ggml_attn_score_polar_impl
+//
+static struct ggml_tensor * ggml_attn_score_polar_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * packed_k,
+        int                   n_kv_heads,
+        bool                  use_qjl,
+        bool                  q_preht) {
+    GGML_ASSERT(q != NULL);
+    GGML_ASSERT(packed_k != NULL);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(packed_k->type == GGML_TYPE_Q4_POLAR);
+    GGML_ASSERT(q->ne[0] == 128);
+    GGML_ASSERT(packed_k->ne[0] == 128);
+
+    const int64_t n_heads     = q->ne[1];
+    const int64_t n_kv_tokens = packed_k->ne[1];
+
+    GGML_ASSERT(n_kv_heads > 0);
+    GGML_ASSERT((n_heads % n_kv_heads) == 0);
+    GGML_ASSERT(packed_k->ne[2] == (int64_t) n_kv_heads);
+    GGML_ASSERT(packed_k->ne[3] == q->ne[3]);
+
+    const int64_t ne[4] = { n_kv_tokens, n_heads, q->ne[2], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    int32_t params[3] = { n_kv_heads, use_qjl ? 1 : 0, q_preht ? 1 : 0 };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_ATTN_SCORE_POLAR;
+    result->src[0] = q;
+    result->src[1] = packed_k;
+
+    return result;
+}
+
+// ggml_attn_score_polar
+//
+struct ggml_tensor * ggml_attn_score_polar(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * packed_k,
+        int                   n_kv_heads,
+        bool                  use_qjl) {
+    return ggml_attn_score_polar_impl(ctx, q, packed_k, n_kv_heads, use_qjl, false);
+}
+
+// ggml_attn_score_polar_preht
+//
+struct ggml_tensor * ggml_attn_score_polar_preht(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q_preht,
+        struct ggml_tensor  * packed_k,
+        int                   n_kv_heads,
+        bool                  use_qjl) {
+    return ggml_attn_score_polar_impl(ctx, q_preht, packed_k, n_kv_heads, use_qjl, true);
+}
+
 // ggml_fused_attn_qjl_tbq
 //
 // Fused QJL-K + TBQ-V attention. See header doc for the math.
@@ -5525,11 +5667,15 @@ struct ggml_tensor * ggml_fused_attn_qjl_tbq(
     const int64_t ne[4] = { head_dim, n_heads, q->ne[2], q->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
-    int32_t params[2];
+    int32_t params[6] = { 0 };
     params[0] = n_kv_heads;
     union { float f; int32_t i; } scale_bits;
     scale_bits.f = sm_scale;
     params[1] = scale_bits.i;
+    // Reserved for backend fused dispatch ABI: [2] v_use_qjl, [3] kv_tile,
+    // [4] causal, [5] q_pos_base. The public constructor preserves the
+    // existing non-causal CPU semantics by default.
+    params[5] = n_kv_tokens >= q->ne[2] ? (int32_t) (n_kv_tokens - q->ne[2]) : 0;
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op     = GGML_OP_FUSED_ATTN_QJL_TBQ;
@@ -6308,6 +6454,57 @@ struct ggml_tensor * ggml_solve_tri(
     result->op     = GGML_OP_SOLVE_TRI;
     result->src[0] = a;
     result->src[1] = b;
+
+    return result;
+}
+
+// ggml_gated_delta_net
+
+struct ggml_tensor * ggml_gated_delta_net(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state) {
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_is_contiguous_rows(v));
+    GGML_ASSERT(ggml_is_contiguous(g));
+    GGML_ASSERT(ggml_is_contiguous(beta));
+    GGML_ASSERT(ggml_is_contiguous(state));
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(v->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32);
+    GGML_ASSERT(beta->type == GGML_TYPE_F32);
+    GGML_ASSERT(state->type == GGML_TYPE_F32);
+
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+
+    // gate: scalar [1, H, T, B] or vector [S_v, H, T, B] (KDA)
+    GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S_v);
+    GGML_ASSERT(beta->ne[0] == 1);
+
+    GGML_ASSERT(ggml_nelements(state) == S_v * S_v * H * n_seqs);
+
+    // concat output and new_state into a single tensor
+    // output: S_v * H * n_tokens * n_seqs, state: S_v * S_v * H * n_seqs
+    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + S_v * n_seqs, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_GATED_DELTA_NET;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state;
 
     return result;
 }
@@ -7207,6 +7404,7 @@ struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t siz
         /*.use_counts   =*/ use_counts_ptr,
         /*.hash_table   =*/ { hash_size, hash_used, hash_keys_ptr },
         /*.order        =*/ GGML_CGRAPH_EVAL_ORDER_LEFT_TO_RIGHT,
+        /*.uid          =*/ 0,
     };
 
     ggml_hash_set_reset(&cgraph->visited_hash_set);
@@ -7234,6 +7432,7 @@ struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph0, int i0, int i1)
         /*.use_counts       =*/ cgraph0->use_counts,
         /*.visited_hash_set =*/ cgraph0->visited_hash_set,
         /*.order            =*/ cgraph0->order,
+        /*.uid              =*/ 0
     };
 
     return cgraph;
@@ -7753,7 +7952,7 @@ size_t ggml_quantize_chunk(
                int64_t   nrows,
                int64_t   n_per_row,
            const float * imatrix) {
-    const int64_t n = (int64_t) nrows * n_per_row;
+    const int64_t n = nrows * n_per_row;
 
     if (ggml_quantize_requires_imatrix(type)) {
         GGML_ASSERT(imatrix != NULL);
@@ -7770,26 +7969,28 @@ size_t ggml_quantize_chunk(
     size_t result = 0;
 
     switch (type) {
-        case GGML_TYPE_Q1_0:    result = quantize_q1_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q1_0:     result = quantize_q1_0      (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q1_0_g32: result = quantize_q1_0_g32  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q1_0_g128: result = quantize_q1_0_g128(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_Q4_0:    result = quantize_q4_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_Q4_1:    result = quantize_q4_1(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_Q5_0:    result = quantize_q5_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_Q5_1:    result = quantize_q5_1(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_Q8_0:    result = quantize_q8_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_MXFP4:   result = quantize_mxfp4(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_Q2_K:    result = quantize_q2_K(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_Q3_K:    result = quantize_q3_K(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_Q4_K:    result = quantize_q4_K(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_Q5_K:    result = quantize_q5_K(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_Q6_K:    result = quantize_q6_K(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_TQ1_0:   result = quantize_tq1_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_TQ2_0:   result = quantize_tq2_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_TBQ3_0:  result = quantize_tbq3_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_TBQ4_0:  result = quantize_tbq4_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_TBQ3_TCQ: result = quantize_tbq3_tcq(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_QJL1_256: result = quantize_qjl1_256(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_Q4_POLAR: result = quantize_q4_polar(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q4_0:     result = quantize_q4_0      (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q4_1:     result = quantize_q4_1      (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q5_0:     result = quantize_q5_0      (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q5_1:     result = quantize_q5_1      (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q8_0:     result = quantize_q8_0      (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_MXFP4:    result = quantize_mxfp4     (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_NVFP4:    result = quantize_nvfp4     (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q2_K:     result = quantize_q2_K      (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q3_K:     result = quantize_q3_K      (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q4_K:     result = quantize_q4_K      (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q5_K:     result = quantize_q5_K      (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q6_K:     result = quantize_q6_K      (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TQ1_0:    result = quantize_tq1_0     (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TQ2_0:    result = quantize_tq2_0     (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TBQ3_0:   result = quantize_tbq3_0    (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TBQ4_0:   result = quantize_tbq4_0    (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TBQ3_TCQ: result = quantize_tbq3_tcq  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_QJL1_256: result = quantize_qjl1_256  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q4_POLAR: result = quantize_q4_polar   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ2_XXS: result = quantize_iq2_xxs(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ2_XS:  result = quantize_iq2_xs (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ3_XXS: result = quantize_iq3_xxs(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
@@ -7854,9 +8055,9 @@ struct ggml_threadpool_params ggml_threadpool_params_default(int n_threads) {
 }
 
 bool ggml_threadpool_params_match(const struct ggml_threadpool_params * p0, const struct ggml_threadpool_params * p1) {
-    if (p0->n_threads      != p1->n_threads  )    return false;
-    if (p0->prio           != p1->prio       )    return false;
-    if (p0->poll           != p1->poll       )    return false;
-    if (p0->strict_cpu     != p1->strict_cpu )    return false;
+    if (p0->n_threads  != p1->n_threads  ) return false;
+    if (p0->prio       != p1->prio       ) return false;
+    if (p0->poll       != p1->poll       ) return false;
+    if (p0->strict_cpu != p1->strict_cpu ) return false;
     return memcmp(p0->cpumask, p1->cpumask, GGML_MAX_N_THREADS) == 0;
 }

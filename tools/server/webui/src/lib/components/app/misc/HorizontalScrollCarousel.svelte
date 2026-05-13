@@ -1,9 +1,10 @@
 <script lang="ts">
 	import { ChevronLeft, ChevronRight } from '@lucide/svelte';
+	import type { Snippet } from 'svelte';
 
 	interface Props {
 		class?: string;
-		children?: import('svelte').Snippet;
+		children?: Snippet;
 		gapSize?: string;
 		onScrollableChange?: (isScrollable: boolean) => void;
 	}
@@ -64,7 +65,7 @@
 
 <div class="relative {className}">
 	<button
-		class="absolute top-1/2 left-4 z-10 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-full bg-foreground/15 shadow-md backdrop-blur-xs transition-opacity hover:bg-foreground/35 {canScrollLeft
+		class="absolute top-1/2 left-4 z-10 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-full bg-background/25 shadow-md backdrop-blur-xs transition-opacity hover:bg-background/45 {canScrollLeft
 			? 'opacity-100'
 			: 'pointer-events-none opacity-0'}"
 		onclick={scrollLeft}
@@ -82,7 +83,7 @@
 	</div>
 
 	<button
-		class="absolute top-1/2 right-4 z-10 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-full bg-foreground/15 shadow-md backdrop-blur-xs transition-opacity hover:bg-foreground/35 {canScrollRight
+		class="absolute top-1/2 right-4 z-10 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-full bg-background/25 shadow-md backdrop-blur-xs transition-opacity hover:bg-background/45 {canScrollRight
 			? 'opacity-100'
 			: 'pointer-events-none opacity-0'}"
 		onclick={scrollRight}

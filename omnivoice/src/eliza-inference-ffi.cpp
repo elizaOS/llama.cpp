@@ -13,6 +13,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -467,7 +468,7 @@ static int eliza_load_asr(EliInferenceContext * ctx, char ** out_error) {
         eliza_set_error(out_error, "[libelizainference] ASR mmproj does not report audio support");
         return ELIZA_ERR_BUNDLE_INVALID;
     }
-    ctx->asr_sample_rate = mtmd_get_audio_bitrate(ctx->asr_mtmd);
+    ctx->asr_sample_rate = mtmd_get_audio_sample_rate(ctx->asr_mtmd);
     if (ctx->asr_sample_rate <= 0) {
         eliza_free_asr(ctx);
         eliza_set_error(out_error, "[libelizainference] ASR mmproj returned an invalid audio sample rate");
@@ -749,13 +750,12 @@ int eliza_inference_asr_transcribe(
             return ELIZA_ERR_FFI_FAULT;
         }
     }
-    if (!completed) {
+    transcript = eliza_clean_asr_transcript(transcript);
+    if (!completed && !eliza_asr_has_text_payload(transcript)) {
         eliza_set_error(out_error,
-            "[libelizainference] asr_transcribe: decode reached token cap before EOG; "
-            "refusing to return a possibly truncated transcript");
+            "[libelizainference] asr_transcribe: decode reached token cap before EOG "
+            "and no usable transcript payload was produced");
         return ELIZA_ERR_FFI_FAULT;
-    } else {
-        transcript = eliza_clean_asr_transcript(transcript);
     }
 
     if (transcript.size() + 1 > max_text_bytes) {

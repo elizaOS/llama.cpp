@@ -3,18 +3,36 @@
 		ChatAttachmentsList,
 		ChatFormActions,
 		ChatFormFileInputInvisible,
-		ChatFormTextarea
+		ChatFormMcpResourcesList,
+		ChatFormPickers,
+		ChatFormTextarea,
+		DialogMcpResourcesBrowser
 	} from '$lib/components/app';
-	import { INPUT_CLASSES } from '$lib/constants/css-classes';
-	import { SETTING_CONFIG_DEFAULT } from '$lib/constants/settings-config';
-	import { CLIPBOARD_CONTENT_QUOTE_PREFIX } from '$lib/constants/chat-form';
-	import { KeyboardKey, MimeTypeText } from '$lib/enums';
+	import {
+		CLIPBOARD_CONTENT_QUOTE_PREFIX,
+		INPUT_CLASSES,
+		SETTING_CONFIG_DEFAULT,
+		INITIAL_FILE_SIZE,
+		PROMPT_CONTENT_SEPARATOR,
+		PROMPT_TRIGGER_PREFIX,
+		RESOURCE_TRIGGER_PREFIX
+	} from '$lib/constants';
+	import {
+		ContentPartType,
+		FileExtensionText,
+		KeyboardKey,
+		MimeTypeText,
+		SpecialFileType
+	} from '$lib/enums';
 	import { config } from '$lib/stores/settings.svelte';
 	import { modelOptions, selectedModelId } from '$lib/stores/models.svelte';
 	import { isRouterMode } from '$lib/stores/server.svelte';
 	import { chatStore } from '$lib/stores/chat.svelte';
-	import { activeMessages } from '$lib/stores/conversations.svelte';
-	import { isIMEComposing, parseClipboardContent } from '$lib/utils';
+	import { mcpStore } from '$lib/stores/mcp.svelte';
+	import { mcpHasResourceAttachments } from '$lib/stores/mcp-resources.svelte';
+	import { conversationsStore, activeMessages } from '$lib/stores/conversations.svelte';
+	import type { GetPromptResult, MCPPromptInfo, MCPResourceInfo, PromptMessage } from '$lib/types';
+	import { isIMEComposing, parseClipboardContent, uuid } from '$lib/utils';
 	import {
 		AudioRecorder,
 		convertToWav,
@@ -34,6 +52,9 @@
 		disabled?: boolean;
 		isLoading?: boolean;
 		placeholder?: string;
+		showMcpPromptButton?: boolean;
+		showAddButton?: boolean;
+		showModelSelector?: boolean;
 
 		// Event Handlers
 		onAttachmentRemove?: (index: number) => void;
@@ -42,6 +63,7 @@
 		onSubmit?: () => void;
 		onSystemPromptClick?: (draft: { message: string; files: ChatUploadedFile[] }) => void;
 		onUploadedFileRemove?: (fileId: string) => void;
+		onUploadedFilesChange?: (files: ChatUploadedFile[]) => void;
 		onValueChange?: (value: string) => void;
 	}
 
@@ -51,6 +73,9 @@
 		disabled = false,
 		isLoading = false,
 		placeholder = 'Type a message...',
+		showMcpPromptButton = false,
+		showAddButton = true,
+		showModelSelector = true,
 		uploadedFiles = $bindable([]),
 		value = $bindable(''),
 		onAttachmentRemove,
@@ -59,43 +84,38 @@
 		onSubmit,
 		onSystemPromptClick,
 		onUploadedFileRemove,
+		onUploadedFilesChange,
 		onValueChange
 	}: Props = $props();
-
-	/**
-	 *
-	 *
-	 * STATE
-	 *
-	 *
-	 */
 
 	// Component References
 	let audioRecorder: AudioRecorder | undefined;
 	let chatFormActionsRef: ChatFormActions | undefined = $state(undefined);
 	let fileInputRef: ChatFormFileInputInvisible | undefined = $state(undefined);
+	let pickersRef: { handleKeydown: (event: KeyboardEvent) => boolean } | undefined =
+		$state(undefined);
 	let textareaRef: ChatFormTextarea | undefined = $state(undefined);
 
 	// Audio Recording State
 	let isRecording = $state(false);
 	let recordingSupported = $state(false);
 
-	/**
-	 *
-	 *
-	 * DERIVED STATE
-	 *
-	 *
-	 */
+	// Picker State
+	let isPromptPickerOpen = $state(false);
+	let promptSearchQuery = $state('');
+	let isInlineResourcePickerOpen = $state(false);
+	let resourceSearchQuery = $state('');
 
-	// Configuration
+	// Resource Dialog State
+	let isResourceDialogOpen = $state(false);
+	let preSelectedResourceUri = $state<string | undefined>(undefined);
+
 	let currentConfig = $derived(config());
 	let pasteLongTextToFileLength = $derived.by(() => {
 		const n = Number(currentConfig.pasteLongTextToFileLen);
 		return Number.isNaN(n) ? Number(SETTING_CONFIG_DEFAULT.pasteLongTextToFileLen) : n;
 	});
 
-	// Model Selection Logic
 	let isRouter = $derived(isRouterMode());
 	let conversationModel = $derived(
 		chatStore.getConversationModel(activeMessages() as DatabaseMessage[])
@@ -121,7 +141,6 @@
 		return null;
 	});
 
-	// Form Validation State
 	let hasModelSelected = $derived(!isRouter || !!conversationModel || !!selectedModelId());
 	let hasLoadingAttachments = $derived(uploadedFiles.some((f) => f.isLoading));
 	let hasAttachments = $derived(
@@ -129,26 +148,10 @@
 	);
 	let canSubmit = $derived(value.trim().length > 0 || hasAttachments);
 
-	/**
-	 *
-	 *
-	 * LIFECYCLE
-	 *
-	 *
-	 */
-
 	onMount(() => {
 		recordingSupported = isAudioRecordingSupported();
 		audioRecorder = new AudioRecorder();
 	});
-
-	/**
-	 *
-	 *
-	 * PUBLIC API
-	 *
-	 *
-	 */
 
 	export function focus() {
 		textareaRef?.focus();
@@ -162,10 +165,6 @@
 		chatFormActionsRef?.openModelSelector();
 	}
 
-	/**
-	 * Check if a model is selected, open selector if not
-	 * @returns true if model is selected, false otherwise
-	 */
 	export function checkModelSelected(): boolean {
 		if (!hasModelSelected) {
 			chatFormActionsRef?.openModelSelector();
@@ -173,14 +172,6 @@
 		}
 		return true;
 	}
-
-	/**
-	 *
-	 *
-	 * EVENT HANDLERS - File Management
-	 *
-	 *
-	 */
 
 	function handleFileSelect(files: File[]) {
 		onFilesAdd?.(files);
@@ -201,21 +192,60 @@
 		}
 	}
 
-	/**
-	 *
-	 *
-	 * EVENT HANDLERS - Input & Keyboard
-	 *
-	 *
-	 */
+	function handleInput() {
+		const perChatOverrides = conversationsStore.getAllMcpServerOverrides();
+		const hasServers = mcpStore.hasEnabledServers(perChatOverrides);
+
+		if (value.startsWith(PROMPT_TRIGGER_PREFIX) && hasServers) {
+			isPromptPickerOpen = true;
+			promptSearchQuery = value.slice(1);
+			isInlineResourcePickerOpen = false;
+			resourceSearchQuery = '';
+		} else if (
+			value.startsWith(RESOURCE_TRIGGER_PREFIX) &&
+			hasServers &&
+			mcpStore.hasResourcesCapability(perChatOverrides)
+		) {
+			isInlineResourcePickerOpen = true;
+			resourceSearchQuery = value.slice(1);
+			isPromptPickerOpen = false;
+			promptSearchQuery = '';
+		} else {
+			isPromptPickerOpen = false;
+			promptSearchQuery = '';
+			isInlineResourcePickerOpen = false;
+			resourceSearchQuery = '';
+		}
+	}
 
 	function handleKeydown(event: KeyboardEvent) {
+		if (pickersRef?.handleKeydown(event)) {
+			return;
+		}
+
+		if (event.key === KeyboardKey.ESCAPE && isPromptPickerOpen) {
+			isPromptPickerOpen = false;
+			promptSearchQuery = '';
+			return;
+		}
+
+		if (event.key === KeyboardKey.ESCAPE && isInlineResourcePickerOpen) {
+			isInlineResourcePickerOpen = false;
+			resourceSearchQuery = '';
+			return;
+		}
+
 		if (event.key === KeyboardKey.ENTER && !event.shiftKey && !isIMEComposing(event)) {
-			event.preventDefault();
+			const isModifier = event.ctrlKey || event.metaKey;
+			const sendOnEnter = currentConfig.sendOnEnter !== false;
 
-			if (!canSubmit || disabled || isLoading || hasLoadingAttachments) return;
+			if (sendOnEnter || isModifier) {
+				event.preventDefault();
 
-			onSubmit?.();
+				if (!canSubmit || disabled || hasLoadingAttachments) return;
+
+				onSubmit?.();
+			}
 		}
 	}
 
@@ -238,7 +268,7 @@
 		if (text.startsWith(CLIPBOARD_CONTENT_QUOTE_PREFIX)) {
 			const parsed = parseClipboardContent(text);
 
-			if (parsed.textAttachments.length > 0) {
+			if (parsed.textAttachments.length > 0 || parsed.mcpPromptAttachments.length > 0) {
 				event.preventDefault();
 				value = parsed.message;
 				onValueChange?.(parsed.message);
@@ -252,6 +282,29 @@
 							})
 					);
 					onFilesAdd?.(attachmentFiles);
+				}
+
+				// Handle MCP prompt attachments as ChatUploadedFile with mcpPrompt data
+				if (parsed.mcpPromptAttachments.length > 0) {
+					const mcpPromptFiles: ChatUploadedFile[] = parsed.mcpPromptAttachments.map((att) => ({
+						id: uuid(),
+						name: att.name,
+						size: att.content.length,
+						type: SpecialFileType.MCP_PROMPT,
+						file: new File([att.content], `${att.name}${FileExtensionText.TXT}`, {
+							type: MimeTypeText.PLAIN
+						}),
+						isLoading: false,
+						textContent: att.content,
+						mcpPrompt: {
+							serverName: att.serverName,
+							promptName: att.promptName,
+							arguments: att.arguments
+						}
+					}));
+
+					uploadedFiles = [...uploadedFiles, ...mcpPromptFiles];
+					onUploadedFilesChange?.(uploadedFiles);
 				}
 
 				setTimeout(() => {
@@ -277,13 +330,112 @@
 		}
 	}
 
-	/**
-	 *
-	 *
-	 * EVENT HANDLERS - Audio Recording
-	 *
-	 *
-	 */
+	function handlePromptLoadStart(
+		placeholderId: string,
+		promptInfo: MCPPromptInfo,
+		args?: Record<string, string>
+	) {
+		// Only clear the value if the prompt was triggered by typing '/'
+		if (value.startsWith(PROMPT_TRIGGER_PREFIX)) {
+			value = '';
+			onValueChange?.('');
+		}
+		isPromptPickerOpen = false;
+		promptSearchQuery = '';
+
+		const promptName = promptInfo.title || promptInfo.name;
+		const placeholder: ChatUploadedFile = {
+			id: placeholderId,
+			name: promptName,
+			size: INITIAL_FILE_SIZE,
+			type: SpecialFileType.MCP_PROMPT,
+			file: new File([], 'loading'),
+			isLoading: true,
+			mcpPrompt: {
+				serverName: promptInfo.serverName,
+				promptName: promptInfo.name,
+				arguments: args ? { ...args } : undefined
+			}
+		};
+
+		uploadedFiles = [...uploadedFiles, placeholder];
+		onUploadedFilesChange?.(uploadedFiles);
+		textareaRef?.focus();
+	}
+
+	function handlePromptLoadComplete(placeholderId: string, result: GetPromptResult) {
+		const promptText = result.messages
+			?.map((msg: PromptMessage) => {
+				if (typeof msg.content === 'string') {
+					return msg.content;
+				}
+
+				if (msg.content.type === ContentPartType.TEXT) {
+					return msg.content.text;
+				}
+
+				return '';
+			})
+			.filter(Boolean)
+			.join(PROMPT_CONTENT_SEPARATOR);
+
+		uploadedFiles = uploadedFiles.map((f) =>
+			f.id === placeholderId
+				? {
+						...f,
+						isLoading: false,
+						textContent: promptText,
+						size: promptText.length,
+						file: new File([promptText], `${f.name}${FileExtensionText.TXT}`, {
+							type: MimeTypeText.PLAIN
+						})
+					}
+				: f
+		);
+		onUploadedFilesChange?.(uploadedFiles);
+	}
+
+	function handlePromptLoadError(placeholderId: string, error: string) {
+		uploadedFiles = uploadedFiles.map((f) =>
+			f.id === placeholderId ? { ...f, isLoading: false, loadError: error } : f
+		);
+		onUploadedFilesChange?.(uploadedFiles);
+	}
+
+	function handlePromptPickerClose() {
+		isPromptPickerOpen = false;
+		promptSearchQuery = '';
+		textareaRef?.focus();
+	}
+
+	function handleInlineResourcePickerClose() {
+		isInlineResourcePickerOpen = false;
+		resourceSearchQuery = '';
+		textareaRef?.focus();
+	}
+
+	function handleInlineResourceSelect() {
+		if (value.startsWith(RESOURCE_TRIGGER_PREFIX)) {
+			value = '';
+			onValueChange?.('');
+		}
+
+		isInlineResourcePickerOpen = false;
+		resourceSearchQuery = '';
+		textareaRef?.focus();
+	}
+
+	function handleBrowseResources() {
+		isInlineResourcePickerOpen = false;
+		resourceSearchQuery = '';
+
+		if (value.startsWith(RESOURCE_TRIGGER_PREFIX)) {
+			value = '';
+			onValueChange?.('');
+		}
+
+		isResourceDialogOpen = true;
+	}
 
 	async function handleMicClick() {
 		if (!audioRecorder || !recordingSupported) {
@@ -292,16 +444,15 @@
 		}
 
 		if (isRecording) {
+			isRecording = false;
 			try {
 				const audioBlob = await audioRecorder.stopRecording();
 				const wavBlob = await convertToWav(audioBlob);
 				const audioFile = createAudioFile(wavBlob);
 
 				onFilesAdd?.([audioFile]);
-				isRecording = false;
 			} catch (error) {
 				console.error('Failed to stop recording:', error);
-				isRecording = false;
 			}
 		} else {
 			try {
@@ -318,12 +469,29 @@
 
 <form
 	class="relative {className}"
-	onsubmit={(e) => {
-		e.preventDefault();
-		if (!canSubmit || disabled || isLoading || hasLoadingAttachments) return;
+	onsubmit={(event) => {
+		event.preventDefault();
+
+		if (!canSubmit || disabled || hasLoadingAttachments) return;
+
 		onSubmit?.();
 	}}
 >
+	<ChatFormPickers
+		bind:this={pickersRef}
+		{isPromptPickerOpen}
+		{promptSearchQuery}
+		{isInlineResourcePickerOpen}
+		{resourceSearchQuery}
+		onPromptPickerClose={handlePromptPickerClose}
+		onInlineResourcePickerClose={handleInlineResourcePickerClose}
+		onInlineResourceSelect={handleInlineResourceSelect}
+		onPromptLoadStart={handlePromptLoadStart}
+		onPromptLoadComplete={handlePromptLoadComplete}
+		onPromptLoadError={handlePromptLoadError}
+		onInlineResourceBrowse={handleBrowseResources}
+	/>
+
 	<div
 		class="{INPUT_CLASSES} overflow-hidden rounded-3xl backdrop-blur-md {disabled
 			? 'cursor-not-allowed opacity-60'
@@ -350,26 +518,53 @@
 				bind:value
 				onKeydown={handleKeydown}
 				onInput={() => {
+					handleInput();
 					onValueChange?.(value);
 				}}
 				{disabled}
 				{placeholder}
 			/>
 
+			{#if mcpHasResourceAttachments()}
+				<ChatFormMcpResourcesList
+					class="mb-3"
+					onResourceClick={(uri) => {
+						preSelectedResourceUri = uri;
+						isResourceDialogOpen = true;
+					}}
+				/>
+			{/if}
+
 			<ChatFormActions
 				class="px-3"
 				bind:this={chatFormActionsRef}
 				canSend={canSubmit}
-				hasText={value.trim().length > 0}
 				{disabled}
 				{isLoading}
 				{isRecording}
+				{showAddButton}
+				{showModelSelector}
 				{uploadedFiles}
 				onFileUpload={handleFileUpload}
 				onMicClick={handleMicClick}
 				{onStop}
 				onSystemPromptClick={() => onSystemPromptClick?.({ message: value, files: uploadedFiles })}
+				onMcpPromptClick={showMcpPromptButton ? () => (isPromptPickerOpen = true) : undefined}
+				onMcpResourcesClick={() => (isResourceDialogOpen = true)}
 			/>
 		</div>
 	</div>
 </form>
+
+<DialogMcpResourcesBrowser
+	bind:open={isResourceDialogOpen}
+	preSelectedUri={preSelectedResourceUri}
+	onAttach={(resource: MCPResourceInfo) => {
+		mcpStore.attachResource(resource.uri);
+	}}
+	onOpenChange={(newOpen: boolean) => {
+		if (!newOpen) {
+			preSelectedResourceUri = undefined;
+		}
+	}}
+/>

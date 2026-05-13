@@ -108,8 +108,19 @@ option(LLAMA_BUILD_TESTS    "llama: build tests"          ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_TOOLS    "llama: build tools"          ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_EXAMPLES "llama: build examples"       ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_SERVER   "llama: build server example" ${LLAMA_STANDALONE})
+option(LLAMA_BUILD_WEBUI    "llama: build the embedded Web UI for server"  ON)
 option(LLAMA_TOOLS_INSTALL  "llama: install tools"        ${LLAMA_TOOLS_INSTALL_DEFAULT})
 option(LLAMA_TESTS_INSTALL  "llama: install tests"        ON)
+
+# omnivoice.cpp merged subtree: opt-in. When enabled, tools/omnivoice/
+# is compiled against the same GGML + backend selection as the rest of
+# llama.cpp, producing the libomnivoice shared library (when
+# OMNIVOICE_SHARED is also set) and the omnivoice-tts / omnivoice-codec
+# CLI tools. Default OFF so stock llama.cpp consumers see no change.
+# NOTE: until patch 0002 vendors tools/omnivoice/, enabling this flag
+# is a hard error - see the guard near the bottom of this file.
+option(LLAMA_BUILD_OMNIVOICE "Build the merged omnivoice TTS subtree" OFF)
+option(OMNIVOICE_SHARED      "Build libomnivoice for ABI consumers" OFF)
 
 # 3rd party libs
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
@@ -214,6 +225,23 @@ if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
     add_subdirectory(tools)
 endif()
 
+if (LLAMA_BUILD_OMNIVOICE)
+    if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/omnivoice/CMakeLists.txt")
+        message(FATAL_ERROR
+            "LLAMA_BUILD_OMNIVOICE=ON but tools/omnivoice/CMakeLists.txt is missing. "
+            "Re-vendor the omnivoice subtree (see ../llama.cpp-omnivoice-merge/PLAN.md "
+            "patch 0002), then re-run cmake.")
+    endif()
+    # When LLAMA_BUILD_TOOLS=ON the tools/ subdirectory above already
+    # adds omnivoice. Only add it directly from here for the
+    # embed-as-library case (LLAMA_BUILD_TOOLS=OFF), where the consumer
+    # wants the omnivoice library + ggml + llama but skips the rest of
+    # the CLI tools subset.
+    if (NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
+        add_subdirectory(tools/omnivoice)
+    endif()
+endif()
+
 # Automatically add all files from the 'licenses' directory
 file(GLOB EXTRA_LICENSES "${CMAKE_SOURCE_DIR}/licenses/LICENSE-*")
 
@@ -224,7 +252,7 @@ foreach(FILE_PATH ${EXTRA_LICENSES})
 endforeach()
 
 if (LLAMA_BUILD_COMMON)
-    license_generate(common)
+    license_generate(llama-common)
 endif()
 
 #
@@ -247,6 +275,10 @@ set_target_properties(llama
         PUBLIC_HEADER "${LLAMA_PUBLIC_HEADERS}")
 
 install(TARGETS llama LIBRARY PUBLIC_HEADER)
+
+if (LLAMA_BUILD_COMMON)
+    install(TARGETS llama-common LIBRARY)
+endif()
 
 configure_package_config_file(
         ${CMAKE_CURRENT_SOURCE_DIR}/cmake/llama-config.cmake.in

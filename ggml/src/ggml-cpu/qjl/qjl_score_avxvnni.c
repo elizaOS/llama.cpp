@@ -149,3 +149,8 @@ void qjl_score_qk_i8_avxvnni(const qjl_i8_sketch_256 *q_sketch_i8,
 }
 
 #endif /* AVX-VNNI */
+
+/* On non-AVX-VNNI targets the entire body above preprocesses out — give
+ * the translation unit at least one declaration so -Werror=pedantic
+ * doesn't trip on ISO C's empty-TU rule. */
+typedef int qjl_score_avxvnni_tu_marker_t;
