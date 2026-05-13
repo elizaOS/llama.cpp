@@ -108,3 +108,8 @@ void qjl_dequantize_row_avx2(const qjl_block_qjl1_256 *blk, const float *prj,
 }
 
 #endif /* __AVX2__ */
+
+/* On non-AVX2 targets the entire body above preprocesses out — give the
+ * translation unit at least one declaration so -Werror=pedantic doesn't
+ * trip on ISO C's empty-TU rule. */
+typedef int qjl_quantize_avx2_tu_marker_t;
