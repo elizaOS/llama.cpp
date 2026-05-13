@@ -833,6 +833,27 @@ private:
         slots.clear();
 
         ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
+
+        // SWA-aware probe fallback. The `common_context_can_seq_rm` probe
+        // does a 2-token test decode that returns `_TYPE_NO` whenever the
+        // first `llama_decode()` call returns nonzero. On SWA-based bodies
+        // (Qwen3.6, gemma-4) the probe's all-zero positions / single-seq
+        // batch can fail validation (M-RoPE position constraints, SWA
+        // window setup edge cases) even though the body would otherwise
+        // be perfectly usable for spec-decode via the checkpoint path
+        // (the `do_checkpoint` block ~1850 lines below already enables
+        // it when `n_swa > 0`). When the probe returns `_TYPE_NO` but
+        // the model declares SWA, demote the probe result to `_TYPE_FULL`
+        // (use checkpoints) rather than disable spec-decode entirely.
+        // This unblocks DFlash speculative decoding on Qwen3.6-class
+        // bodies paired with their community / Eliza-1 distilled drafters.
+        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO &&
+            llama_model_n_swa(model_tgt) > 0 &&
+            !params_base.swa_full) {
+            SRV_WRN("%s", "seq_rm probe failed but model declares SWA — falling back to checkpoint-mode spec-decode\n");
+            ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+        }
+
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
