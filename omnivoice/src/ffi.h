@@ -252,6 +252,15 @@ int eliza_inference_set_verifier_callback(
     void * user_data,
     char ** out_error);
 
+/* Internal entry point for the in-process spec loop / fused drafter to
+ * dispatch a verifier event to the registered callback. Idempotent on a NULL
+ * callback (no-op). Synchronous on the calling thread; the host runtime is
+ * expected to keep the callback cheap (enqueue, don't block). The pointer
+ * fields on `ev` must remain valid for the duration of this call. */
+void eliza_inference_emit_verifier_event(
+    EliInferenceContext * ctx,
+    const EliVerifierEvent * ev);
+
 /* ---- Native VAD (ABI v3) ------------------------------------------ *
  *
  * Native Silero VAD backend. The shape intentionally mirrors

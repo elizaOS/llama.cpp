@@ -175,6 +175,17 @@ if (CUDAToolkit_FOUND)
         add_compile_definitions(GGML_CUDA_TBQ3_TCQ)
     endif()
 
+# ELIZA-CUDA-FUSED-ATTN-QJL
+# Fused QJL-K + TBQ-V attention (packages/inference/cuda/fused-attn-qjl-tbq.cu,
+# staged in by patchCudaKernels). Body is #ifdef GGML_CUDA_FUSED_ATTN_QJL; this
+# flips that define on when -DGGML_CUDA_FUSED_ATTN_QJL=ON is passed. Same shape
+# as the GGML_CUDA_QJL / POLARQUANT / TBQ3_TCQ blocks above. Optional kernel
+# (packages/inference/AGENTS.md §3) — off by default.
+if (GGML_CUDA_FUSED_ATTN_QJL)
+    add_compile_definitions(GGML_CUDA_FUSED_ATTN_QJL)
+    message(STATUS "ggml-cuda: GGML_CUDA_FUSED_ATTN_QJL enabled (fused QJL-K + TBQ-V attention)")
+endif()
+
     if (GGML_STATIC)
         if (WIN32)
             # As of 12.3.1 CUDA Toolkit for Windows does not offer a static cublas library

@@ -178,6 +178,27 @@ struct server_slot {
     int32_t n_draft_total = 0;      // Total draft tokens generated
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
 
+    // Eliza-1 forced-token fast-forward (`eliza_prefill_plan`).
+    //
+    // - prefill_next_run: index into task.params.prefill_plan.runs[] of the
+    //   next run that may still fire (-1 when no plan / all runs fired).
+    // - prefill_run_byte_anchor: byte offset in generated_text where the next
+    //   pending run is expected to start (= length of generated_text at the
+    //   moment we advanced the cursor past the previous run).
+    // - prefill_spliced_tokens: tokens queued for the next batch-build (the
+    //   tokenized remainder of a run we're about to fast-forward through).
+    //   The batch-build adds them to the same batch as slot.sampled — one
+    //   forward pass for the whole splice — and they're accepted by the
+    //   sampler (advancing the grammar state) without ever going through
+    //   common_sampler_sample.
+    // - prefill_tokens_spliced / prefill_tokens_saved: counters for the fork
+    //   test (tests/test-eliza-prefill-plan.cpp).
+    int32_t      prefill_next_run        = -1;
+    size_t       prefill_run_byte_anchor = 0;
+    llama_tokens prefill_spliced_tokens;
+    int32_t      prefill_tokens_spliced  = 0;
+    int32_t      prefill_tokens_saved    = 0;
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -203,6 +224,13 @@ struct server_slot {
         // clear speculative decoding stats
         n_draft_total = 0;
         n_draft_accepted = 0;
+
+        // clear forced-token fast-forward state
+        prefill_next_run        = -1;
+        prefill_run_byte_anchor = 0;
+        prefill_spliced_tokens.clear();
+        prefill_tokens_spliced  = 0;
+        prefill_tokens_saved    = 0;
 
         task_prev = std::move(task);
         task.reset();
@@ -235,6 +263,52 @@ struct server_slot {
 
         SLT_INF(*this, "init sampler, took %0.2f ms, tokens: text = %d, total = %d\n",
                 (ggml_time_us() - t_start) / 1000.0, n_text, (int) prompt.tokens.size());
+    }
+
+    // Initialize the forced-token fast-forward cursor at start-of-generation.
+    void init_prefill_plan() {
+        prefill_next_run        = -1;
+        prefill_run_byte_anchor = 0;
+        prefill_tokens_spliced  = 0;
+        prefill_tokens_saved    = 0;
+
+        if (!task) return;
+        const auto & plan = task->params.prefill_plan;
+        if (plan.empty()) return;
+
+        // Skip the leading run (after_free_span == -1); that one is the
+        // assistant-turn prefill, already injected by the chat-template path.
+        for (size_t i = 0; i < plan.runs.size(); ++i) {
+            if (plan.runs[i].after_free_span >= 0) {
+                prefill_next_run = (int32_t) i;
+                break;
+            }
+        }
+    }
+
+    // Look up the next pending run, if any. Returns nullptr when no plan, no
+    // task, or the cursor has run off the end.
+    const task_prefill_run * prefill_pending_run() const {
+        if (prefill_next_run < 0 || !task) return nullptr;
+        const auto & plan = task->params.prefill_plan;
+        if ((size_t) prefill_next_run >= plan.runs.size()) return nullptr;
+        return &plan.runs[prefill_next_run];
+    }
+
+    // Advance to the next pending run; mark the byte anchor at the END of the
+    // current generated_text (where the next deterministic run will start).
+    void prefill_advance_to_next_run() {
+        if (!task) return;
+        const auto & plan = task->params.prefill_plan;
+        prefill_run_byte_anchor = generated_text.size();
+        int32_t next = -1;
+        for (size_t i = (size_t) prefill_next_run + 1; i < plan.runs.size(); ++i) {
+            if (plan.runs[i].after_free_span >= 0) {
+                next = (int32_t) i;
+                break;
+            }
+        }
+        prefill_next_run = next;
     }
 
     // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
@@ -1333,6 +1407,98 @@ private:
         return true;
     }
 
+    // Eliza-1 forced-token fast-forward: detect that the slot just sampled
+    // through the start of the next pending deterministic run and queue the
+    // run's remaining bytes onto slot.prefill_spliced_tokens so the next
+    // batch-build adds them in one shot.
+    //
+    // Detection: after process_token(), generated_text grows by the just-
+    // sampled token's text. If runs[next].text starts at or before the new
+    // tail position (i.e. the model emitted the first byte of the run as
+    // part of its last sampled token), we know the free span has ended and
+    // the run is in progress. Tokenize the unsampled remainder of the run
+    // and queue it.
+    //
+    // Boundary search: find run.text inside generated_text starting at
+    // prefill_run_byte_anchor. Only the first match counts, and the match
+    // must START on or after the anchor (no scanning earlier text).
+    //
+    // Byte-identity guarantee: the lazy GBNF accepts only the exact bytes in
+    // run.text at this position (it would have forced them anyway). Splicing
+    // the same bytes as pre-tokenized ids produces the same output stream
+    // and the same KV state — the per-token sampling/grammar/softmax round-
+    // trips are what gets skipped.
+    void try_fast_forward_prefill_plan(server_slot & slot) {
+        const task_prefill_run * run = slot.prefill_pending_run();
+        if (!run) return;
+
+        const std::string & gt = slot.generated_text;
+        if (gt.size() <= slot.prefill_run_byte_anchor) return;
+
+        // Look for the run starting at or after the anchor.
+        const size_t at = gt.find(run->text, slot.prefill_run_byte_anchor);
+        if (at == std::string::npos) {
+            // No occurrence yet — either the model is still emitting free-span
+            // bytes, or the run starts later. Either way: nothing to splice.
+            return;
+        }
+
+        // Did the model already emit the full run? Then it was the GBNF that
+        // forced it — no savings, but advance the cursor so we don't keep
+        // matching.
+        const size_t end = at + run->text.size();
+        if (end <= gt.size()) {
+            // Fully present — advance cursor; the anchor moves to the end of
+            // the run so the next run is searched after.
+            slot.prefill_run_byte_anchor = end;
+            // Step the cursor to the NEXT run (skipping leading runs).
+            const auto & plan = slot.task->params.prefill_plan;
+            int32_t next = -1;
+            for (size_t i = (size_t) slot.prefill_next_run + 1; i < plan.runs.size(); ++i) {
+                if (plan.runs[i].after_free_span >= 0) {
+                    next = (int32_t) i;
+                    break;
+                }
+            }
+            slot.prefill_next_run = next;
+            return;
+        }
+
+        // Partial match: the model started the run but didn't finish it. The
+        // remainder is a guaranteed-forced byte string; splice it. The
+        // batch-build step (the "no speculative decoding" branch in the slot
+        // batch loop) consumes prefill_spliced_tokens, emits the bytes as a
+        // streaming delta + advances slot.generated_text + i_batch + n_decoded.
+        const size_t consumed = gt.size() - at;
+        const std::string remainder = run->text.substr(consumed);
+        if (remainder.empty()) return;
+
+        llama_tokens toks = common_tokenize(vocab, remainder, /* add_special= */ false, /* parse_special= */ true);
+        if (toks.empty()) return;
+
+        slot.prefill_spliced_tokens = std::move(toks);
+        slot.prefill_tokens_spliced += (int32_t) slot.prefill_spliced_tokens.size();
+        // n_decoded would have grown by exactly this many sample/accept round-
+        // trips — count what's saved.
+        slot.prefill_tokens_saved   += (int32_t) slot.prefill_spliced_tokens.size();
+
+        // Advance the cursor to the NEXT run; the byte anchor is fixed up in
+        // the splice path once generated_text has the remainder appended.
+        const auto & plan = slot.task->params.prefill_plan;
+        int32_t next = -1;
+        for (size_t i = (size_t) slot.prefill_next_run + 1; i < plan.runs.size(); ++i) {
+            if (plan.runs[i].after_free_span >= 0) {
+                next = (int32_t) i;
+                break;
+            }
+        }
+        slot.prefill_next_run = next;
+
+        SLT_DBG(slot, "eliza_prefill_plan: queued %zu tokens (%zu bytes) for splice, runs remaining: %d\n",
+                slot.prefill_spliced_tokens.size(), remainder.size(),
+                slot.prefill_next_run >= 0 ? (int)(plan.runs.size() - slot.prefill_next_run) : 0);
+    }
+
     bool process_token(completion_token_output & result, server_slot & slot) {
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
@@ -2287,6 +2453,58 @@ private:
                         drafting.push_back(&slot);
                     }
                 }
+            } else {
+                // no speculative decoding
+                slot.i_batch = batch.n_tokens;
+
+                common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
+
+                slot.prompt.tokens.push_back(slot.sampled);
+
+                // Eliza-1 forced-token fast-forward: when the boundary detector
+                // queued spliced run tokens for this step, append them to the
+                // SAME batch and advance the sampler past each. The result is
+                // a single forward pass for slot.sampled + N forced run tokens
+                // (instead of N+1 sequential sample/accept round-trips). The
+                // last spliced token holds the logits the next free-span step
+                // reads, so i_batch points at it. We also rewrite the streamed
+                // chunk via send_partial_response so the client sees the run's
+                // bytes as a normal streaming delta — the prefill_plan is
+                // purely a server-side speedup, not a wire-format change.
+                if (!slot.prefill_spliced_tokens.empty()) {
+                    for (const llama_token tok : slot.prefill_spliced_tokens) {
+                        common_batch_add(batch, tok, slot.prompt.tokens.pos_next(), { slot.id }, true);
+                        slot.prompt.tokens.push_back(tok);
+                        common_sampler_accept(slot.smpl.get(), tok, /* accept_grammar= */ true);
+
+                        completion_token_output spliced{};
+                        spliced.tok          = tok;
+                        spliced.text_to_send = common_token_to_piece(ctx_tgt, tok, /*special=*/ false);
+                        spliced.prob         = 1.0f;
+                        slot.generated_text += spliced.text_to_send;
+                        if (slot.task->params.return_tokens) {
+                            slot.generated_tokens.push_back(tok);
+                        }
+                        slot.add_token(spliced);
+                        if (slot.task->params.stream) {
+                            send_partial_response(slot, spliced, /*is_progress=*/ false);
+                        }
+                    }
+                    slot.i_batch = batch.n_tokens - 1; // logits for the last spliced token
+                    slot.n_decoded += (int32_t) slot.prefill_spliced_tokens.size();
+                    SLT_DBG(slot, "eliza_prefill_plan: appended %zu spliced tokens to batch (i_batch=%d, n_decoded=%d)\n",
+                            slot.prefill_spliced_tokens.size(), slot.i_batch, slot.n_decoded);
+                    slot.prefill_spliced_tokens.clear();
+                    // The boundary detector already moved prefill_run_byte_anchor
+                    // to the END of the run — the splice path doesn't get to
+                    // re-detect, so update the anchor to track what we just
+                    // appended so the next-run detector sees a consistent
+                    // generated_text size.
+                    slot.prefill_run_byte_anchor = slot.generated_text.size();
+                }
+
+                SLT_DBG(slot, "slot decode token, n_ctx = %d, n_tokens = %d, truncated = %d\n",
+                        slot.n_ctx, slot.prompt.n_tokens(), slot.truncated);
             }
         }
 
@@ -2801,6 +3019,8 @@ private:
                         slot.i_batch   = batch.n_tokens - 1;
 
                         slot.init_sampler();
+                        slot.init_prefill_plan();
+
                         SLT_INF(slot, "prompt processing done, n_tokens = %d, batch.n_tokens = %d\n", slot.prompt.n_tokens(), batch.n_tokens);
                     } else {
                         if (slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch) {
@@ -3121,6 +3341,11 @@ private:
 
                     continue;
                 }
+
+                // Eliza-1 forced-token fast-forward: detect run boundaries and
+                // queue spliced tokens for the next batch-build (no-op when
+                // no plan / no boundary crossed this step).
+                try_fast_forward_prefill_plan(slot);
             }
 
             // speculative decoding - main model sample and accept
