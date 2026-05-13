@@ -98,8 +98,8 @@ llm_build_dflash_draft::llm_build_dflash_draft(
         const llama_model & model,
         const llm_graph_params & params) :
     llm_graph_context(params) {
-    const int64_t n_embd_head = hparams.n_embd_head_v;
-    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
+    const int64_t n_embd_head = hparams.n_embd_head_v();
+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
     int64_t ctx_len = cross && cross->n_enc > 0 ? cross->n_enc : LLAMA_DFLASH_PER_SLOT_CTX_LOCAL;
     const int64_t max_ctx = dflash_max_cross_ctx();
