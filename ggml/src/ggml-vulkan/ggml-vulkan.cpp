@@ -1888,6 +1888,14 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
+struct pending_host_write {
+    void * dst;
+    size_t dst_stride;
+    std::vector<uint8_t> src_data;
+    size_t size;
+    size_t n_copies;
+};
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -1899,6 +1907,7 @@ struct ggml_backend_vk_context {
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
+    std::vector<pending_host_write> pending_host_writes;
     bool almost_ready_fence_pending {};
     // Set before op_add and unset after op_rms_norm to indicate that the add should
     // write partial sums to accumulate the square of the vector components
@@ -14177,6 +14186,18 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             cmd_buf->buf.reset();
         }
     }
+
+    for (auto& w : ctx->pending_host_writes) {
+        if (w.dst_stride == w.size) {
+            memcpy(w.dst, w.src_data.data(), w.size * w.n_copies);
+        } else {
+            for (size_t i = 0; i < w.n_copies; i++) {
+                memcpy((uint8_t*)w.dst + i * w.dst_stride,
+                       w.src_data.data() + i * w.size, w.size);
+            }
+        }
+    }
+    ctx->pending_host_writes.clear();
 
     if (do_transfer) {
         for (auto& cpy : compute_ctx->out_memcpys) {
