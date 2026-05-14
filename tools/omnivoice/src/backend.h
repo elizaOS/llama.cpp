@@ -155,10 +155,7 @@ static inline void backend_release(ggml_backend_t /*backend*/, ggml_backend_t /*
 // ---------------------------------------------------------------------------
 #ifdef __cplusplus
 
-// Forward declaration so this header can be included in translation units
-// that do not pull in llama-context.h directly.  The full class definition
-// is required at the call site (omnivoice.cpp in the merged tree).
-struct llama_context;
+#include "llama-context.h"
 
 inline BackendPairOwned omnivoice_backend_from_llama(llama_context * ctx) {
     BackendPairOwned result = {};

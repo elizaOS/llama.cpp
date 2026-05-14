@@ -57,6 +57,7 @@ target_compile_definitions(omnivoice_lib
 target_include_directories(omnivoice_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_CURRENT_BINARY_DIR})
 # llama transitively pulls ggml + the backend pair chosen at parent
 # configure time. The omnivoice tree never touches backend selection
@@ -86,6 +87,7 @@ if(OMNIVOICE_SHARED)
     target_include_directories(omnivoice PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
         ${CMAKE_CURRENT_BINARY_DIR})
     target_link_libraries(omnivoice PUBLIC llama)
     set_target_properties(omnivoice PROPERTIES
