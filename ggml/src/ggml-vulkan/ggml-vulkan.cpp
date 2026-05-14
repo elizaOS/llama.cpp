@@ -13957,8 +13957,27 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
 
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
 
-    vk_context cpy_ctx;
+    vk_buffer buf = buf_ctx->dev_buffer;
+    auto dst_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
 
+    if (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
+        GGML_ASSERT(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
+
+        std::vector<uint8_t> src_data(size * n_copies);
+        if (stride_data == size) {
+            memcpy(src_data.data(), data, size * n_copies);
+        } else {
+            for (size_t i = 0; i < n_copies; i++) {
+                memcpy(src_data.data() + i * size, (const uint8_t*)data + i * stride_data, size);
+            }
+        }
+
+        ctx->pending_host_writes.emplace_back(
+            (uint8_t*)buf->ptr + dst_offset, stride_tensor, std::move(src_data), size, n_copies);
+        return;
+    }
+
+    vk_context cpy_ctx;
     if (ctx->device->async_use_transfer_queue) {
         if (ctx->transfer_ctx.expired()) {
             cpy_ctx = ggml_vk_create_context(ctx, ctx->transfer_cmd_pool);
@@ -13970,10 +13989,6 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
     } else {
         cpy_ctx = ggml_vk_get_compute_ctx(ctx);
     }
-
-    vk_buffer buf = buf_ctx->dev_buffer;
-
-    auto dst_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
 
     bool ret = ggml_vk_buffer_write_2d_async(cpy_ctx, buf, dst_offset, data, stride_data, stride_tensor, size, n_copies);
 
