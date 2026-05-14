@@ -77,6 +77,16 @@ static bool common_speculative_are_compatible(
         return false;
     }
 
+    const llama_rope_type rope_type_tgt = llama_model_rope_type(model_tgt);
+    if (rope_type_tgt == LLAMA_ROPE_TYPE_MROPE || rope_type_tgt == LLAMA_ROPE_TYPE_IMROPE) {
+        LOG_WRN("%s: target model uses M-RoPE, which is not currently compatible with "
+                "speculative decoding because the target batch validator requires strict "
+                "monotone positions and rejects the boundary-token re-feed pattern. "
+                "Disable speculation or use a non-M-RoPE target until the harness supports it.\n",
+                __func__);
+        return false;
+    }
+
     {
         const int n_vocab_tgt = llama_vocab_n_tokens(vocab_tgt);
         const int n_vocab_dft = llama_vocab_n_tokens(vocab_dft);
