@@ -465,7 +465,7 @@ static std::string eliza_llama_token_piece(const llama_vocab * vocab, llama_toke
     int32_t n = llama_token_to_piece(vocab, token, small, (int32_t) sizeof(small), 0, false);
     if (n > 0) return std::string(small, (size_t) n);
     if (n == 0) return "";
-    std::string buf((size_t) -n, '\\0');
+    std::string buf((size_t) -n, '\0');
     n = llama_token_to_piece(vocab, token, buf.data(), (int32_t) buf.size(), 0, false);
     if (n > 0) return std::string(buf.data(), (size_t) n);
     return "";
@@ -493,9 +493,9 @@ static std::string eliza_format_asr_prompt(llama_model * model) {
     // one user audio turn, and a generation prompt. Appending
     // "language X<asr_text>" follows the upstream text-only forcing path
     // and avoids returning language metadata or role-token chatter.
-    std::string prompt = std::string("<|im_start|>system\\n<|im_end|>\\n<|im_start|>user\\n") +
+    std::string prompt = std::string("<|im_start|>system\n<|im_end|>\n<|im_start|>user\n") +
         mtmd_default_marker() +
-        "<|im_end|>\\n<|im_start|>assistant\\n";
+        "<|im_end|>\n<|im_start|>assistant\n";
     std::string language = eliza_asr_force_language();
     if (!language.empty()) {
         prompt += "language " + language + "<asr_text>";
@@ -505,7 +505,7 @@ static std::string eliza_format_asr_prompt(llama_model * model) {
 
 static std::string eliza_trim_ascii(std::string value) {
     auto is_space = [](unsigned char c) {
-        return c == ' ' || c == '\\n' || c == '\\r' || c == '\\t';
+        return c == ' ' || c == '\n' || c == '\r' || c == '\t';
     };
     while (!value.empty() && is_space((unsigned char) value.front())) {
         value.erase(value.begin());
@@ -742,7 +742,7 @@ const char * eliza_inference_abi_version(void) {
 EliInferenceContext * eliza_inference_create(
     const char * bundle_dir,
     char ** out_error) {
-    if (!bundle_dir || bundle_dir[0] == '\\0') {
+    if (!bundle_dir || bundle_dir[0] == '\0') {
         eliza_set_error(out_error, "[libelizainference] bundle_dir is required");
         return nullptr;
     }
@@ -846,7 +846,7 @@ int eliza_inference_tts_synthesize(
 
     std::lock_guard<std::mutex> lock(ctx->tts_mutex);
     if (!ctx->ov) {
-        eliza_set_error(out_error, "[libelizainference] tts_synthesize: TTS region is not acquired; call mmap_acquire(\\"tts\\") after arming voice");
+        eliza_set_error(out_error, "[libelizainference] tts_synthesize: TTS region is not acquired; call mmap_acquire(\"tts\") after arming voice");
         return ELIZA_ERR_INVALID_ARG;
     }
     ElizaScopedTtsForward forward(ctx);
@@ -860,7 +860,7 @@ int eliza_inference_tts_synthesize(
      * overwrites params.instruct / ref_audio_tokens / ref_text via
      * eliza_apply_preset_to_params below. */
     params.instruct = "";
-    if (speaker_preset_id && speaker_preset_id[0] != '\\0') {
+    if (speaker_preset_id && speaker_preset_id[0] != '\0') {
         std::string preset_err;
         const EliVoicePreset * preset = nullptr;
         {
@@ -912,13 +912,13 @@ int eliza_inference_asr_transcribe(
         return ELIZA_ERR_INVALID_ARG;
     }
     if (n_samples == 0) {
-        out_text[0] = '\\0';
+        out_text[0] = '\0';
         return 0;
     }
 
     std::lock_guard<std::mutex> lock(ctx->asr_mutex);
     if (!ctx->asr_model || !ctx->asr_lctx || !ctx->asr_mtmd || !ctx->asr_sampler) {
-        eliza_set_error(out_error, "[libelizainference] asr_transcribe: ASR region is not acquired; call mmap_acquire(\\"asr\\") after arming voice input");
+        eliza_set_error(out_error, "[libelizainference] asr_transcribe: ASR region is not acquired; call mmap_acquire(\"asr\") after arming voice input");
         return ELIZA_ERR_INVALID_ARG;
     }
 
@@ -992,7 +992,7 @@ int eliza_inference_asr_transcribe(
             if (eliza_asr_has_text_payload(cleaned_partial)) {
                 const char last = cleaned_partial.back();
                 const bool sentence_complete = last == '.' || last == '?' || last == '!';
-                if (piece.find('\\n') != std::string::npos ||
+                if (piece.find('\n') != std::string::npos ||
                     transcript.find("<|im_end|>") != std::string::npos ||
                     transcript.find("<|endoftext|>") != std::string::npos ||
                     transcript.find("</s>") != std::string::npos ||
@@ -1024,7 +1024,7 @@ int eliza_inference_asr_transcribe(
         return ELIZA_ERR_INVALID_ARG;
     }
     std::memcpy(out_text, transcript.data(), transcript.size());
-    out_text[transcript.size()] = '\\0';
+    out_text[transcript.size()] = '\0';
     return (int) transcript.size();
 }
 
@@ -1136,7 +1136,7 @@ int eliza_inference_tts_synthesize_stream(
 
     std::lock_guard<std::mutex> lock(ctx->tts_mutex);
     if (!ctx->ov) {
-        eliza_set_error(out_error, "[libelizainference] tts_synthesize_stream: TTS region is not acquired; call mmap_acquire(\\"tts\\") after arming voice");
+        eliza_set_error(out_error, "[libelizainference] tts_synthesize_stream: TTS region is not acquired; call mmap_acquire(\"tts\") after arming voice");
         return ELIZA_ERR_INVALID_ARG;
     }
     ElizaScopedTtsForward forward(ctx);
@@ -1150,7 +1150,7 @@ int eliza_inference_tts_synthesize_stream(
      * overwrites params.instruct / ref_audio_tokens / ref_text via
      * eliza_apply_preset_to_params below. */
     params.instruct = "";
-    if (speaker_preset_id && speaker_preset_id[0] != '\\0') {
+    if (speaker_preset_id && speaker_preset_id[0] != '\0') {
         std::string preset_err;
         const EliVoicePreset * preset = nullptr;
         {
@@ -1245,9 +1245,8 @@ int eliza_inference_encode_reference(
     }
     if (sample_rate_hz != 24000) {
         eliza_set_error(out_error,
-            "[libelizainference] encode_reference: sample_rate_hz must be 24000 (got %d); "
-            "caller is responsible for upstream resample",
-            sample_rate_hz);
+            "[libelizainference] encode_reference: sample_rate_hz must be 24000 (got " +
+            std::to_string(sample_rate_hz) + "); caller is responsible for upstream resample");
         return ELIZA_ERR_INVALID_ARG;
     }
 
@@ -1255,7 +1254,7 @@ int eliza_inference_encode_reference(
     if (!ctx->ov) {
         eliza_set_error(out_error,
             "[libelizainference] encode_reference: TTS region is not acquired; "
-            "call mmap_acquire(\\"tts\\") after arming voice");
+            "call mmap_acquire(\"tts\") after arming voice");
         return ELIZA_ERR_INVALID_ARG;
     }
 
