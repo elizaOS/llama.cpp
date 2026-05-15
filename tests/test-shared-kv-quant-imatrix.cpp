@@ -75,9 +75,9 @@ int main() {
     result_types.resize(tensor_specs.size());
 
     ggml_init_params params = {
-        .mem_size   = 1024 * 1024 * 10,
-        .mem_buffer = nullptr,
-        .no_alloc   = true,
+        /* .mem_size   = */ 1024 * 1024 * 10,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
     };
     ggml_context * ctx = ggml_init(params);
     if (!ctx) {
