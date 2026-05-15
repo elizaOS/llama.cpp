@@ -436,9 +436,12 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     GGML_ASSERT(ggml_nbytes(src0) <= INT_MAX);
     GGML_ASSERT(ggml_nbytes(src1) <= INT_MAX);
 
-    const int64_t ne00 = src0->ne[0];
-    const int64_t ne01 = src0->ne[1];
-    const int64_t ne02 = src0->ne[2];
+    // Note: not const — the can_be_transposed branches below reassign these
+    // to flattened/folded dims (ne00n/ne01n/ne02n) so downstream kernels see
+    // the rewritten shape. HIP clang `-Werror` (gcc CUDA host accepts silently).
+    int64_t ne00 = src0->ne[0];
+    int64_t ne01 = src0->ne[1];
+    int64_t ne02 = src0->ne[2];
 
     //GGML_ASSERT(src0->ne[3] == 1);
 
