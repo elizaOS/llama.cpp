@@ -377,6 +377,11 @@ if(ELIZA_FUSE_OMNIVOICE)
     target_include_directories(omnivoice-core SYSTEM PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include)
     target_link_libraries(omnivoice-core PUBLIC llama mtmd ggml Threads::Threads)
+    if(TARGET llama-common)
+        target_link_libraries(omnivoice-core PUBLIC llama-common)
+        target_include_directories(omnivoice-core PUBLIC
+            ${CMAKE_CURRENT_SOURCE_DIR}/common)
+    endif()
     if(TARGET ggml-base)
         target_link_libraries(omnivoice-core PUBLIC ggml-base)
     endif()
@@ -404,6 +409,11 @@ if(ELIZA_FUSE_OMNIVOICE)
     target_include_directories(elizainference SYSTEM PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include)
     target_link_libraries(elizainference PUBLIC llama mtmd)
+    if(TARGET llama-common)
+        target_link_libraries(elizainference PUBLIC llama-common)
+        target_include_directories(elizainference PUBLIC
+            ${CMAKE_CURRENT_SOURCE_DIR}/common)
+    endif()
     if(APPLE)
         target_link_options(elizainference PRIVATE
             "LINKER:-reexport_library,$<TARGET_FILE:llama>")

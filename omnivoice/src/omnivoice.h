@@ -257,6 +257,29 @@ OV_API enum ov_status ov_synthesize(struct ov_context * ov, const struct ov_tts_
 // frame. Requires a codec-loaded handle.
 OV_API int ov_duration_sec_to_tokens(const struct ov_context * ov, float duration_sec);
 
+// Encode-only entry point used by the freeze pipeline: runs the
+// HuBERT-semantic + RVQ tokenizer half of the codec graph on a raw
+// 24 kHz mono fp32 PCM buffer and returns the resulting per-codebook
+// audio-token tensor.
+//
+// Returns OV_STATUS_OK on success and writes:
+//   *out_tokens  -> malloc-allocated row-major int32[K * ref_T] tensor.
+//                  Caller MUST release via ov_tokens_free().
+//   *out_K       -> number of codebooks (8 for the shipped tokenizer).
+//   *out_ref_T   -> number of token frames produced.
+//
+// On failure the *out_* pointers are zeroed and ov_last_error() carries
+// a diagnostic. Requires a codec-loaded handle.
+OV_API enum ov_status ov_encode_reference(struct ov_context * ov,
+                                          const float * pcm_24k,
+                                          int n_samples,
+                                          int32_t ** out_tokens,
+                                          int * out_K,
+                                          int * out_ref_T);
+
+// Release a token buffer returned by ov_encode_reference. Safe on NULL.
+OV_API void ov_tokens_free(int32_t * tokens);
+
 #ifdef __cplusplus
 }
 #endif

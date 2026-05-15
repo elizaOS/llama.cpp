@@ -7,8 +7,12 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "common.h"
+#include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cctype>
@@ -19,6 +23,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -165,6 +172,87 @@ static bool eliza_pick_asr_files(
     return !asr_model.empty() && !asr_mmproj.empty();
 }
 
+static constexpr int ELIZA_VAD_SAMPLE_RATE = 16000;
+static constexpr int ELIZA_VAD_WINDOW = 512;
+static constexpr int ELIZA_VAD_MAX_NODES = 4096;
+
+enum ElizaVadTensor {
+    ELIZA_VAD_TENSOR_STFT_BASIS = 0,
+    ELIZA_VAD_TENSOR_ENC_0_WEIGHT,
+    ELIZA_VAD_TENSOR_ENC_0_BIAS,
+    ELIZA_VAD_TENSOR_ENC_1_WEIGHT,
+    ELIZA_VAD_TENSOR_ENC_1_BIAS,
+    ELIZA_VAD_TENSOR_ENC_2_WEIGHT,
+    ELIZA_VAD_TENSOR_ENC_2_BIAS,
+    ELIZA_VAD_TENSOR_ENC_3_WEIGHT,
+    ELIZA_VAD_TENSOR_ENC_3_BIAS,
+    ELIZA_VAD_TENSOR_LSTM_WEIGHT_IH,
+    ELIZA_VAD_TENSOR_LSTM_WEIGHT_HH,
+    ELIZA_VAD_TENSOR_LSTM_BIAS_IH,
+    ELIZA_VAD_TENSOR_LSTM_BIAS_HH,
+    ELIZA_VAD_TENSOR_FINAL_CONV_WEIGHT,
+    ELIZA_VAD_TENSOR_FINAL_CONV_BIAS,
+    ELIZA_VAD_TENSOR_COUNT,
+};
+
+static const std::array<const char *, ELIZA_VAD_TENSOR_COUNT> ELIZA_VAD_TENSOR_NAMES = {{
+    "_model.stft.forward_basis_buffer",
+    "_model.encoder.0.reparam_conv.weight",
+    "_model.encoder.0.reparam_conv.bias",
+    "_model.encoder.1.reparam_conv.weight",
+    "_model.encoder.1.reparam_conv.bias",
+    "_model.encoder.2.reparam_conv.weight",
+    "_model.encoder.2.reparam_conv.bias",
+    "_model.encoder.3.reparam_conv.weight",
+    "_model.encoder.3.reparam_conv.bias",
+    "_model.decoder.rnn.weight_ih",
+    "_model.decoder.rnn.weight_hh",
+    "_model.decoder.rnn.bias_ih",
+    "_model.decoder.rnn.bias_hh",
+    "_model.decoder.decoder.2.weight",
+    "_model.decoder.decoder.2.bias",
+}};
+
+struct ElizaVadHParams {
+    int32_t n_encoder_layers = 0;
+    std::vector<int32_t> encoder_in_channels;
+    std::vector<int32_t> encoder_out_channels;
+    std::vector<int32_t> kernel_sizes;
+    int32_t lstm_input_size = 0;
+    int32_t lstm_hidden_size = 0;
+    int32_t final_conv_in = 0;
+    int32_t final_conv_out = 0;
+};
+
+struct EliVad {
+    std::string model_path;
+    std::string model_type;
+    std::string model_version;
+    int n_window = 0;
+    int n_context = 0;
+    int n_threads = 0;
+    ElizaVadHParams hparams;
+
+    ggml_backend_t backend = nullptr;
+    ggml_context * model_ctx = nullptr;
+    ggml_backend_buffer_t model_buffer = nullptr;
+    ggml_context * state_ctx = nullptr;
+    ggml_backend_buffer_t state_buffer = nullptr;
+    ggml_backend_sched_t sched = nullptr;
+
+    std::vector<uint8_t> model_meta;
+    std::vector<uint8_t> state_meta;
+    std::vector<uint8_t> graph_meta;
+
+    std::array<ggml_tensor *, ELIZA_VAD_TENSOR_COUNT> tensors = {};
+    std::map<std::string, ggml_tensor *> tensors_by_name;
+
+    ggml_tensor * h_state = nullptr;
+    ggml_tensor * c_state = nullptr;
+
+    std::mutex mu;
+};
+
 static std::once_flag eliza_llama_backend_once;
 
 static int eliza_thread_count(bool batch) {
@@ -193,6 +281,109 @@ static int eliza_asr_thread_count(bool encoder) {
     return (int) std::max(1u, std::min(hw, cap));
 }
 
+static int eliza_vad_thread_count(void) {
+    if (const char * env = std::getenv("ELIZA_VAD_THREADS")) {
+        int n = std::atoi(env);
+        if (n > 0) return n;
+    }
+    unsigned int hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 4;
+    return (int) std::max(1u, std::min(hw, 4u));
+}
+
+static bool eliza_pick_vad_file(
+    const std::filesystem::path & bundle_dir,
+    std::string & vad_model,
+    std::string & error) {
+    std::error_code ec;
+    const auto canonical = bundle_dir / "vad" / "silero-vad-v5.1.2.ggml.bin";
+    if (std::filesystem::is_regular_file(canonical, ec)) {
+        vad_model = canonical.string();
+        return true;
+    }
+
+    if (const char * env = std::getenv("ELIZA_VAD_MODEL_PATH")) {
+        std::filesystem::path env_path(env);
+        if (!env_path.empty() && std::filesystem::is_regular_file(env_path, ec)) {
+            vad_model = env_path.string();
+            return true;
+        }
+    }
+
+    const auto vad_dir = bundle_dir / "vad";
+    if (std::filesystem::exists(vad_dir, ec) && std::filesystem::is_directory(vad_dir, ec)) {
+        for (const auto & entry : std::filesystem::directory_iterator(vad_dir, ec)) {
+            if (ec) break;
+            if (!entry.is_regular_file(ec)) continue;
+            const auto path = entry.path();
+            const std::string filename = eliza_lower_ascii(path.filename().string());
+            if (filename.find("silero") != std::string::npos &&
+                filename.find("vad") != std::string::npos &&
+                filename.find("ggml") != std::string::npos &&
+                path.extension() == ".bin") {
+                vad_model = path.string();
+                return true;
+            }
+        }
+    }
+
+    error = std::string("[libelizainference] native VAD model not found; expected ") +
+        canonical.string() +
+        " or set ELIZA_VAD_MODEL_PATH to a whisper.cpp Silero GGML .bin";
+    return false;
+}
+
+static void eliza_vad_free(EliVad * vad) {
+    if (!vad) return;
+    if (vad->sched) {
+        ggml_backend_sched_free(vad->sched);
+        vad->sched = nullptr;
+    }
+    if (vad->state_buffer) {
+        ggml_backend_buffer_free(vad->state_buffer);
+        vad->state_buffer = nullptr;
+    }
+    if (vad->state_ctx) {
+        ggml_free(vad->state_ctx);
+        vad->state_ctx = nullptr;
+    }
+    if (vad->model_buffer) {
+        ggml_backend_buffer_free(vad->model_buffer);
+        vad->model_buffer = nullptr;
+    }
+    if (vad->model_ctx) {
+        ggml_free(vad->model_ctx);
+        vad->model_ctx = nullptr;
+    }
+    if (vad->backend) {
+        ggml_backend_free(vad->backend);
+        vad->backend = nullptr;
+    }
+    delete vad;
+}
+
+template <typename T>
+static bool eliza_vad_read_value(std::ifstream & in, T & dest, std::string & error, const char * what) {
+    if (!in.read(reinterpret_cast<char *>(&dest), sizeof(T))) {
+        error = std::string("[libelizainference] VAD model truncated while reading ") + what;
+        return false;
+    }
+    return true;
+}
+
+static bool eliza_vad_read_bytes(
+    std::ifstream & in,
+    void * dest,
+    size_t n_bytes,
+    std::string & error,
+    const char * what) {
+    if (!in.read(reinterpret_cast<char *>(dest), (std::streamsize) n_bytes)) {
+        error = std::string("[libelizainference] VAD model truncated while reading ") + what;
+        return false;
+    }
+    return true;
+}
+
 static std::vector<float> eliza_resample_linear(
     const float * pcm,
     size_t n_samples,
@@ -212,6 +403,200 @@ static std::vector<float> eliza_resample_linear(
         out[i] = pcm[lo] * (1.0f - t) + pcm[hi] * t;
     }
     return out;
+}
+
+static void eliza_vad_set_backend_threads(EliVad * vad) {
+    if (!vad || !vad->backend) return;
+    ggml_backend_dev_t dev = ggml_backend_get_device(vad->backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (!reg) return;
+    auto * fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(
+        reg,
+        "ggml_backend_set_n_threads");
+    if (fn) fn(vad->backend, vad->n_threads);
+}
+
+static bool eliza_vad_put_tensor(
+    EliVad * vad,
+    ElizaVadTensor id,
+    ggml_tensor * tensor,
+    std::string & error) {
+    if (!tensor) {
+        error = std::string("[libelizainference] failed to allocate VAD tensor metadata for ") +
+            ELIZA_VAD_TENSOR_NAMES[(size_t) id];
+        return false;
+    }
+    vad->tensors[(size_t) id] = tensor;
+    vad->tensors_by_name[ELIZA_VAD_TENSOR_NAMES[(size_t) id]] = tensor;
+    return true;
+}
+
+static bool eliza_vad_init_model_tensors(EliVad * vad, std::string & error) {
+    const auto & hp = vad->hparams;
+    if (hp.n_encoder_layers != 4 ||
+        hp.encoder_in_channels.size() != 4 ||
+        hp.encoder_out_channels.size() != 4 ||
+        hp.kernel_sizes.size() != 4 ||
+        hp.lstm_input_size <= 0 ||
+        hp.lstm_hidden_size <= 0 ||
+        hp.final_conv_in <= 0 ||
+        hp.final_conv_out != 1) {
+        error = "[libelizainference] unsupported Silero VAD GGML architecture; expected v5 16 kHz layout";
+        return false;
+    }
+
+    vad->model_meta.resize((ELIZA_VAD_TENSOR_COUNT + 8) * ggml_tensor_overhead());
+    ggml_init_params params = {
+        /*.mem_size   =*/ vad->model_meta.size(),
+        /*.mem_buffer =*/ vad->model_meta.data(),
+        /*.no_alloc   =*/ true,
+    };
+    vad->model_ctx = ggml_init(params);
+    if (!vad->model_ctx) {
+        error = "[libelizainference] failed to initialize VAD model ggml context";
+        return false;
+    }
+
+    if (!eliza_vad_put_tensor(vad, ELIZA_VAD_TENSOR_STFT_BASIS,
+            ggml_new_tensor_3d(vad->model_ctx, GGML_TYPE_F16, 256, 1, 258), error)) return false;
+
+    if (!eliza_vad_put_tensor(vad, ELIZA_VAD_TENSOR_ENC_0_WEIGHT,
+            ggml_new_tensor_3d(vad->model_ctx, GGML_TYPE_F16, hp.kernel_sizes[0], hp.encoder_in_channels[0], hp.encoder_out_channels[0]), error)) return false;
+    if (!eliza_vad_put_tensor(vad, ELIZA_VAD_TENSOR_ENC_0_BIAS,
+            ggml_new_tensor_1d(vad->model_ctx, GGML_TYPE_F32, hp.encoder_out_channels[0]), error)) return false;
+
+    if (!eliza_vad_put_tensor(vad, ELIZA_VAD_TENSOR_ENC_1_WEIGHT,
+            ggml_new_tensor_3d(vad->model_ctx, GGML_TYPE_F16, hp.kernel_sizes[1], hp.encoder_in_channels[1], hp.encoder_out_channels[1]), error)) return false;
+    if (!eliza_vad_put_tensor(vad, ELIZA_VAD_TENSOR_ENC_1_BIAS,
+            ggml_new_tensor_1d(vad->model_ctx, GGML_TYPE_F32, hp.encoder_out_channels[1]), error)) return false;
+
+    if (!eliza_vad_put_tensor(vad, ELIZA_VAD_TENSOR_ENC_2_WEIGHT,
+            ggml_new_tensor_3d(vad->model_ctx, GGML_TYPE_F16, hp.kernel_sizes[2], hp.encoder_in_channels[2], hp.encoder_out_channels[2]), error)) return false;
+    if (!eliza_vad_put_tensor(vad, ELIZA_VAD_TENSOR_ENC_2_BIAS,
+            ggml_new_tensor_1d(vad->model_ctx, GGML_TYPE_F32, hp.encoder_out_channels[2]), error)) return false;
+
+    if (!eliza_vad_put_tensor(vad, ELIZA_VAD_TENSOR_ENC_3_WEIGHT,
+            ggml_new_tensor_3d(vad->model_ctx, GGML_TYPE_F16, hp.kernel_sizes[3], hp.encoder_in_channels[3], hp.encoder_out_channels[3]), error)) return false;
+    if (!eliza_vad_put_tensor(vad, ELIZA_VAD_TENSOR_ENC_3_BIAS,
+            ggml_new_tensor_1d(vad->model_ctx, GGML_TYPE_F32, hp.encoder_out_channels[3]), error)) return false;
+
+    const int64_t hstate_dim = (int64_t) hp.lstm_hidden_size * 4;
+    if (!eliza_vad_put_tensor(vad, ELIZA_VAD_TENSOR_LSTM_WEIGHT_IH,
+            ggml_new_tensor_2d(vad->model_ctx, GGML_TYPE_F32, hp.lstm_hidden_size, hstate_dim), error)) return false;
+    if (!eliza_vad_put_tensor(vad, ELIZA_VAD_TENSOR_LSTM_WEIGHT_HH,
+            ggml_new_tensor_2d(vad->model_ctx, GGML_TYPE_F32, hp.lstm_hidden_size, hstate_dim), error)) return false;
+    if (!eliza_vad_put_tensor(vad, ELIZA_VAD_TENSOR_LSTM_BIAS_IH,
+            ggml_new_tensor_1d(vad->model_ctx, GGML_TYPE_F32, hstate_dim), error)) return false;
+    if (!eliza_vad_put_tensor(vad, ELIZA_VAD_TENSOR_LSTM_BIAS_HH,
+            ggml_new_tensor_1d(vad->model_ctx, GGML_TYPE_F32, hstate_dim), error)) return false;
+
+    if (!eliza_vad_put_tensor(vad, ELIZA_VAD_TENSOR_FINAL_CONV_WEIGHT,
+            ggml_new_tensor_2d(vad->model_ctx, GGML_TYPE_F16, hp.final_conv_in, 1), error)) return false;
+    if (!eliza_vad_put_tensor(vad, ELIZA_VAD_TENSOR_FINAL_CONV_BIAS,
+            ggml_new_tensor_1d(vad->model_ctx, GGML_TYPE_F32, 1), error)) return false;
+
+    vad->model_buffer = ggml_backend_alloc_ctx_tensors(vad->model_ctx, vad->backend);
+    if (!vad->model_buffer) {
+        error = "[libelizainference] failed to allocate VAD model tensor buffer";
+        return false;
+    }
+    if (!ggml_backend_buffer_is_host(vad->model_buffer)) {
+        error = "[libelizainference] VAD model tensor buffer is not host-readable; CPU VAD runtime expected a host buffer";
+        return false;
+    }
+    return true;
+}
+
+static ggml_tensor * eliza_vad_build_stft_layer(ggml_context * ctx0, const EliVad & vad, ggml_tensor * cur) {
+    ggml_tensor * padded = ggml_pad_reflect_1d(ctx0, cur, vad.n_context, vad.n_context);
+    ggml_tensor * stft = ggml_conv_1d(
+        ctx0,
+        vad.tensors[(size_t) ELIZA_VAD_TENSOR_STFT_BASIS],
+        padded,
+        vad.hparams.lstm_input_size,
+        0,
+        1);
+    const int64_t cutoff = vad.tensors[(size_t) ELIZA_VAD_TENSOR_STFT_BASIS]->ne[2] / 2;
+    ggml_tensor * real_part = ggml_view_2d(ctx0, stft, 4, cutoff, stft->nb[1], 0);
+    ggml_tensor * img_part = ggml_view_2d(ctx0, stft, 4, cutoff, stft->nb[1], cutoff * stft->nb[1]);
+    ggml_tensor * real_squared = ggml_mul(ctx0, real_part, real_part);
+    ggml_tensor * img_squared = ggml_mul(ctx0, img_part, img_part);
+    return ggml_sqrt(ctx0, ggml_add(ctx0, real_squared, img_squared));
+}
+
+static ggml_tensor * eliza_vad_build_encoder_layer(ggml_context * ctx0, const EliVad & vad, ggml_tensor * cur) {
+    const auto & hp = vad.hparams;
+    cur = ggml_conv_1d(ctx0, vad.tensors[(size_t) ELIZA_VAD_TENSOR_ENC_0_WEIGHT], cur, 1, 1, 1);
+    cur = ggml_add(ctx0, cur, ggml_reshape_3d(ctx0, vad.tensors[(size_t) ELIZA_VAD_TENSOR_ENC_0_BIAS], 1, hp.encoder_out_channels[0], 1));
+    cur = ggml_relu(ctx0, cur);
+
+    cur = ggml_conv_1d(ctx0, vad.tensors[(size_t) ELIZA_VAD_TENSOR_ENC_1_WEIGHT], cur, 2, 1, 1);
+    cur = ggml_add(ctx0, cur, ggml_reshape_3d(ctx0, vad.tensors[(size_t) ELIZA_VAD_TENSOR_ENC_1_BIAS], 1, hp.encoder_out_channels[1], 1));
+    cur = ggml_relu(ctx0, cur);
+
+    cur = ggml_conv_1d(ctx0, vad.tensors[(size_t) ELIZA_VAD_TENSOR_ENC_2_WEIGHT], cur, 2, 1, 1);
+    cur = ggml_add(ctx0, cur, ggml_reshape_3d(ctx0, vad.tensors[(size_t) ELIZA_VAD_TENSOR_ENC_2_BIAS], 1, hp.encoder_out_channels[2], 1));
+    cur = ggml_relu(ctx0, cur);
+
+    cur = ggml_conv_1d(ctx0, vad.tensors[(size_t) ELIZA_VAD_TENSOR_ENC_3_WEIGHT], cur, 1, 1, 1);
+    cur = ggml_add(ctx0, cur, ggml_reshape_3d(ctx0, vad.tensors[(size_t) ELIZA_VAD_TENSOR_ENC_3_BIAS], 1, hp.encoder_out_channels[3], 1));
+    return ggml_relu(ctx0, cur);
+}
+
+static ggml_tensor * eliza_vad_build_lstm_layer(ggml_context * ctx0, EliVad & vad, ggml_tensor * cur, ggml_cgraph * gf) {
+    const int64_t hdim = vad.hparams.lstm_hidden_size;
+    ggml_tensor * x_t = ggml_transpose(ctx0, cur);
+
+    ggml_tensor * inp_gate = ggml_mul_mat(ctx0, vad.tensors[(size_t) ELIZA_VAD_TENSOR_LSTM_WEIGHT_IH], x_t);
+    inp_gate = ggml_add(ctx0, inp_gate, vad.tensors[(size_t) ELIZA_VAD_TENSOR_LSTM_BIAS_IH]);
+
+    ggml_tensor * hid_gate = ggml_mul_mat(ctx0, vad.tensors[(size_t) ELIZA_VAD_TENSOR_LSTM_WEIGHT_HH], vad.h_state);
+    hid_gate = ggml_add(ctx0, hid_gate, vad.tensors[(size_t) ELIZA_VAD_TENSOR_LSTM_BIAS_HH]);
+
+    ggml_tensor * out_gate = ggml_add(ctx0, inp_gate, hid_gate);
+    const size_t hdim_size = ggml_row_size(out_gate->type, hdim);
+
+    ggml_tensor * i_t = ggml_sigmoid(ctx0, ggml_view_1d(ctx0, out_gate, hdim, 0 * hdim_size));
+    ggml_tensor * f_t = ggml_sigmoid(ctx0, ggml_view_1d(ctx0, out_gate, hdim, 1 * hdim_size));
+    ggml_tensor * g_t = ggml_tanh(ctx0, ggml_view_1d(ctx0, out_gate, hdim, 2 * hdim_size));
+    ggml_tensor * o_t = ggml_sigmoid(ctx0, ggml_view_1d(ctx0, out_gate, hdim, 3 * hdim_size));
+
+    ggml_tensor * c_out = ggml_add(ctx0, ggml_mul(ctx0, f_t, vad.c_state), ggml_mul(ctx0, i_t, g_t));
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, c_out, vad.c_state));
+
+    ggml_tensor * out = ggml_mul(ctx0, o_t, ggml_tanh(ctx0, c_out));
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, out, vad.h_state));
+    return out;
+}
+
+static ggml_cgraph * eliza_vad_build_graph(EliVad & vad) {
+    ggml_init_params params = {
+        /*.mem_size   =*/ vad.graph_meta.size(),
+        /*.mem_buffer =*/ vad.graph_meta.data(),
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx0 = ggml_init(params);
+    if (!ctx0) return nullptr;
+
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx0, ELIZA_VAD_MAX_NODES, false);
+    ggml_tensor * frame = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, vad.n_window, 1);
+    ggml_set_name(frame, "frame");
+    ggml_set_input(frame);
+
+    ggml_tensor * cur = eliza_vad_build_stft_layer(ctx0, vad, frame);
+    cur = eliza_vad_build_encoder_layer(ctx0, vad, cur);
+    cur = ggml_view_2d(ctx0, cur, 1, vad.hparams.lstm_hidden_size, cur->nb[1], 0);
+    cur = eliza_vad_build_lstm_layer(ctx0, vad, cur, gf);
+    cur = ggml_relu(ctx0, cur);
+    cur = ggml_conv_1d(ctx0, vad.tensors[(size_t) ELIZA_VAD_TENSOR_FINAL_CONV_WEIGHT], cur, 1, 0, 1);
+    cur = ggml_add(ctx0, cur, vad.tensors[(size_t) ELIZA_VAD_TENSOR_FINAL_CONV_BIAS]);
+    cur = ggml_sigmoid(ctx0, cur);
+    ggml_set_name(cur, "prob");
+    ggml_set_output(cur);
+    ggml_build_forward_expand(gf, cur);
+
+    ggml_free(ctx0);
+    return gf;
 }
 
 static std::string eliza_llama_token_piece(const llama_vocab * vocab, llama_token token) {
@@ -267,6 +652,268 @@ static std::string eliza_clean_asr_transcript(std::string transcript) {
         }
     }
     return eliza_trim_ascii(transcript);
+}
+
+static bool eliza_asr_has_text_payload(const std::string & transcript) {
+    return std::any_of(transcript.begin(), transcript.end(), [](unsigned char c) {
+        return !std::isspace(c);
+    });
+}
+
+static bool eliza_vad_init_state_and_sched(EliVad * vad, std::string & error) {
+    vad->state_meta.resize(2u * ggml_tensor_overhead());
+    ggml_init_params state_params = {
+        /*.mem_size   =*/ vad->state_meta.size(),
+        /*.mem_buffer =*/ vad->state_meta.data(),
+        /*.no_alloc   =*/ true,
+    };
+    vad->state_ctx = ggml_init(state_params);
+    if (!vad->state_ctx) {
+        error = "[libelizainference] failed to initialize VAD recurrent state context";
+        return false;
+    }
+    vad->h_state = ggml_new_tensor_1d(vad->state_ctx, GGML_TYPE_F32, vad->hparams.lstm_hidden_size);
+    vad->c_state = ggml_new_tensor_1d(vad->state_ctx, GGML_TYPE_F32, vad->hparams.lstm_hidden_size);
+    if (!vad->h_state || !vad->c_state) {
+        error = "[libelizainference] failed to allocate VAD recurrent state tensors";
+        return false;
+    }
+    ggml_set_name(vad->h_state, "h_state");
+    ggml_set_name(vad->c_state, "c_state");
+    vad->state_buffer = ggml_backend_alloc_ctx_tensors(vad->state_ctx, vad->backend);
+    if (!vad->state_buffer) {
+        error = "[libelizainference] failed to allocate VAD recurrent state buffer";
+        return false;
+    }
+    ggml_backend_buffer_clear(vad->state_buffer, 0);
+
+    vad->graph_meta.resize(
+        ggml_tensor_overhead() * ELIZA_VAD_MAX_NODES +
+        ggml_graph_overhead_custom(ELIZA_VAD_MAX_NODES, false));
+    ggml_backend_t backends[] = { vad->backend };
+    vad->sched = ggml_backend_sched_new(backends, nullptr, 1, ELIZA_VAD_MAX_NODES, false, true);
+    if (!vad->sched) {
+        error = "[libelizainference] failed to initialize VAD ggml scheduler";
+        return false;
+    }
+
+    ggml_cgraph * gf = eliza_vad_build_graph(*vad);
+    if (!gf) {
+        error = "[libelizainference] failed to build VAD graph";
+        return false;
+    }
+    if (!ggml_backend_sched_alloc_graph(vad->sched, gf)) {
+        error = "[libelizainference] failed to allocate VAD compute graph";
+        return false;
+    }
+    ggml_backend_sched_reset(vad->sched);
+    return true;
+}
+
+static bool eliza_vad_load_model(EliVad * vad, const std::string & path, std::string & error) {
+    vad->model_path = path;
+    vad->n_threads = eliza_vad_thread_count();
+
+    std::call_once(eliza_llama_backend_once, []() {
+        llama_backend_init();
+    });
+    vad->backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (!vad->backend) {
+        error = "[libelizainference] failed to initialize CPU backend for VAD";
+        return false;
+    }
+    eliza_vad_set_backend_threads(vad);
+
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        error = std::string("[libelizainference] failed to open VAD model: ") + path;
+        return false;
+    }
+
+    uint32_t magic = 0;
+    if (!eliza_vad_read_value(in, magic, error, "magic")) return false;
+    if (magic != GGML_FILE_MAGIC) {
+        error = std::string("[libelizainference] invalid VAD model magic in ") + path;
+        return false;
+    }
+
+    int32_t str_len = 0;
+    if (!eliza_vad_read_value(in, str_len, error, "model type length")) return false;
+    if (str_len <= 0 || str_len > 128) {
+        error = "[libelizainference] invalid VAD model type length";
+        return false;
+    }
+    std::string model_type((size_t) str_len, '\0');
+    if (!eliza_vad_read_bytes(in, model_type.data(), model_type.size(), error, "model type")) return false;
+    vad->model_type = model_type;
+    if (vad->model_type != "silero-16k") {
+        error = std::string("[libelizainference] unsupported VAD model type: ") + vad->model_type;
+        return false;
+    }
+
+    int32_t major = 0;
+    int32_t minor = 0;
+    int32_t patch = 0;
+    if (!eliza_vad_read_value(in, major, error, "model version major") ||
+        !eliza_vad_read_value(in, minor, error, "model version minor") ||
+        !eliza_vad_read_value(in, patch, error, "model version patch")) {
+        return false;
+    }
+    vad->model_version = std::to_string(major) + "." + std::to_string(minor) + "." + std::to_string(patch);
+
+    if (!eliza_vad_read_value(in, vad->n_window, error, "window size") ||
+        !eliza_vad_read_value(in, vad->n_context, error, "context size")) {
+        return false;
+    }
+    if (vad->n_window != ELIZA_VAD_WINDOW || vad->n_context <= 0) {
+        error = "[libelizainference] unsupported VAD model window/context; expected 512-sample 16 kHz Silero layout";
+        return false;
+    }
+
+    ElizaVadHParams & hp = vad->hparams;
+    if (!eliza_vad_read_value(in, hp.n_encoder_layers, error, "encoder layer count")) return false;
+    if (hp.n_encoder_layers <= 0 || hp.n_encoder_layers > 16) {
+        error = "[libelizainference] invalid VAD encoder layer count";
+        return false;
+    }
+    hp.encoder_in_channels.resize((size_t) hp.n_encoder_layers);
+    hp.encoder_out_channels.resize((size_t) hp.n_encoder_layers);
+    hp.kernel_sizes.resize((size_t) hp.n_encoder_layers);
+    for (int32_t i = 0; i < hp.n_encoder_layers; ++i) {
+        if (!eliza_vad_read_value(in, hp.encoder_in_channels[(size_t) i], error, "encoder input channels") ||
+            !eliza_vad_read_value(in, hp.encoder_out_channels[(size_t) i], error, "encoder output channels") ||
+            !eliza_vad_read_value(in, hp.kernel_sizes[(size_t) i], error, "encoder kernel size")) {
+            return false;
+        }
+        if (hp.encoder_in_channels[(size_t) i] <= 0 ||
+            hp.encoder_out_channels[(size_t) i] <= 0 ||
+            hp.kernel_sizes[(size_t) i] <= 0) {
+            error = "[libelizainference] invalid VAD encoder dimensions";
+            return false;
+        }
+    }
+    if (!eliza_vad_read_value(in, hp.lstm_input_size, error, "lstm input size") ||
+        !eliza_vad_read_value(in, hp.lstm_hidden_size, error, "lstm hidden size") ||
+        !eliza_vad_read_value(in, hp.final_conv_in, error, "final conv input size") ||
+        !eliza_vad_read_value(in, hp.final_conv_out, error, "final conv output size")) {
+        return false;
+    }
+
+    if (!eliza_vad_init_model_tensors(vad, error)) return false;
+
+    int loaded = 0;
+    while (true) {
+        int32_t n_dims = 0;
+        in.read(reinterpret_cast<char *>(&n_dims), sizeof(n_dims));
+        if (!in) {
+            if (in.eof()) break;
+            error = "[libelizainference] failed to read VAD tensor header";
+            return false;
+        }
+        int32_t name_len = 0;
+        int32_t ttype = 0;
+        if (!eliza_vad_read_value(in, name_len, error, "tensor name length") ||
+            !eliza_vad_read_value(in, ttype, error, "tensor type")) {
+            return false;
+        }
+        if (n_dims < 0 || n_dims > 4 || name_len <= 0 || name_len > 1024) {
+            error = "[libelizainference] invalid VAD tensor header";
+            return false;
+        }
+
+        int64_t nelements = 1;
+        std::array<int32_t, 4> ne = {{ 1, 1, 1, 1 }};
+        for (int32_t i = 0; i < n_dims; ++i) {
+            if (!eliza_vad_read_value(in, ne[(size_t) i], error, "tensor dimension")) return false;
+            if (ne[(size_t) i] <= 0 ||
+                nelements > std::numeric_limits<int64_t>::max() / ne[(size_t) i]) {
+                error = "[libelizainference] invalid VAD tensor dimensions";
+                return false;
+            }
+            nelements *= ne[(size_t) i];
+        }
+
+        std::string name((size_t) name_len, '\0');
+        if (!eliza_vad_read_bytes(in, name.data(), name.size(), error, "tensor name")) return false;
+
+        auto found = vad->tensors_by_name.find(name);
+        if (found == vad->tensors_by_name.end()) {
+            error = std::string("[libelizainference] unknown tensor in VAD model: ") + name;
+            return false;
+        }
+        ggml_tensor * tensor = found->second;
+        const ggml_type file_type = (ggml_type) ttype;
+        if (file_type != tensor->type) {
+            error = std::string("[libelizainference] VAD tensor type mismatch for ") + name;
+            return false;
+        }
+        if (ggml_nelements(tensor) != nelements) {
+            error = std::string("[libelizainference] VAD tensor element count mismatch for ") + name;
+            return false;
+        }
+        for (int i = 0; i < 4; ++i) {
+            if ((int64_t) ne[(size_t) i] != tensor->ne[i]) {
+                error = std::string("[libelizainference] VAD tensor shape mismatch for ") + name;
+                return false;
+            }
+        }
+        if (!tensor->buffer || !ggml_backend_buffer_is_host(tensor->buffer) || !tensor->data) {
+            error = std::string("[libelizainference] VAD tensor is not host-readable: ") + name;
+            return false;
+        }
+        if (!eliza_vad_read_bytes(in, tensor->data, ggml_nbytes(tensor), error, "tensor data")) return false;
+        loaded += 1;
+    }
+
+    if (loaded != (int) vad->tensors_by_name.size()) {
+        error = "[libelizainference] VAD model is incomplete; not all tensors were loaded";
+        return false;
+    }
+
+    return eliza_vad_init_state_and_sched(vad, error);
+}
+
+static int eliza_vad_process_one(
+    EliVad * vad,
+    const float * pcm,
+    float * out_probability,
+    std::string & error) {
+    ggml_cgraph * gf = eliza_vad_build_graph(*vad);
+    if (!gf) {
+        error = "[libelizainference] failed to build VAD graph";
+        return ELIZA_ERR_FFI_FAULT;
+    }
+    if (!ggml_backend_sched_alloc_graph(vad->sched, gf)) {
+        ggml_backend_sched_reset(vad->sched);
+        error = "[libelizainference] failed to allocate VAD graph";
+        return ELIZA_ERR_FFI_FAULT;
+    }
+
+    ggml_tensor * frame = ggml_graph_get_tensor(gf, "frame");
+    ggml_tensor * prob = ggml_graph_get_tensor(gf, "prob");
+    if (!frame || !prob) {
+        ggml_backend_sched_reset(vad->sched);
+        error = "[libelizainference] VAD graph missing frame/prob tensors";
+        return ELIZA_ERR_FFI_FAULT;
+    }
+
+    ggml_backend_tensor_set(frame, pcm, 0, (size_t) vad->n_window * sizeof(float));
+    eliza_vad_set_backend_threads(vad);
+    if (ggml_backend_sched_graph_compute(vad->sched, gf) != GGML_STATUS_SUCCESS) {
+        ggml_backend_sched_reset(vad->sched);
+        error = "[libelizainference] failed to compute VAD graph";
+        return ELIZA_ERR_FFI_FAULT;
+    }
+
+    float probability = 0.0f;
+    ggml_backend_tensor_get(prob, &probability, 0, sizeof(probability));
+    ggml_backend_sched_reset(vad->sched);
+    if (!std::isfinite(probability)) {
+        error = "[libelizainference] VAD graph returned a non-finite probability";
+        return ELIZA_ERR_FFI_FAULT;
+    }
+    *out_probability = std::max(0.0f, std::min(1.0f, probability));
+    return ELIZA_OK;
 }
 
 static void eliza_free_asr(EliInferenceContext * ctx) {
@@ -990,6 +1637,62 @@ int eliza_inference_cancel_tts(
     return ELIZA_OK;
 }
 
+int eliza_inference_encode_reference(
+    EliInferenceContext * ctx,
+    const float * pcm,
+    size_t n_samples,
+    int sample_rate_hz,
+    int * out_K,
+    int * out_ref_T,
+    int ** out_tokens,
+    char ** out_error) {
+    if (!ctx || !pcm || !out_K || !out_ref_T || !out_tokens) {
+        eliza_set_error(out_error, "[libelizainference] encode_reference: invalid arguments");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    if (n_samples == 0) {
+        eliza_set_error(out_error, "[libelizainference] encode_reference: n_samples must be > 0");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    if (sample_rate_hz != 24000) {
+        eliza_set_error(out_error,
+            "[libelizainference] encode_reference: sample_rate_hz must be 24000 (got " +
+                std::to_string(sample_rate_hz) +
+                "); caller is responsible for upstream resample");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx->tts_mutex);
+    if (!ctx->ov) {
+        eliza_set_error(out_error,
+            "[libelizainference] encode_reference: TTS region is not acquired; "
+            "call mmap_acquire(\"tts\") after arming voice");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+
+    int32_t * tokens = nullptr;
+    int K = 0;
+    int ref_T = 0;
+    ov_status rc = ov_encode_reference(ctx->ov, pcm, (int) n_samples,
+                                       &tokens, &K, &ref_T);
+    if (rc != OV_STATUS_OK) {
+        std::string msg = "[libelizainference] ov_encode_reference failed: ";
+        msg += ov_last_error();
+        eliza_set_error(out_error, msg);
+        if (tokens) std::free(tokens);
+        return rc == OV_STATUS_OOM ? ELIZA_ERR_OOM : ELIZA_ERR_FFI_FAULT;
+    }
+
+    *out_tokens = tokens;
+    *out_K = K;
+    *out_ref_T = ref_T;
+    return ELIZA_OK;
+}
+
+void eliza_inference_free_tokens(int * tokens) {
+    if (tokens) std::free(tokens);
+}
+
 int eliza_inference_set_verifier_callback(
     EliInferenceContext * ctx,
     eliza_verifier_cb cb,
@@ -1031,27 +1734,41 @@ void eliza_inference_emit_verifier_event(
     }
 }
 
-/* ---- Native VAD (ABI v3) ------------------------------------------- *
- *
- * The JS runtime can use the ONNX Silero path today. Native VAD is an
- * additive fused-runtime backend; until the fused target wires it,
- * advertise unsupported and return structured not-implemented errors.
- */
-
 int eliza_inference_vad_supported(void) {
-    return 0;
+    return 1;
 }
 
 EliVad * eliza_inference_vad_open(
     EliInferenceContext * ctx,
     int sample_rate_hz,
     char ** out_error) {
-    (void) ctx;
-    (void) sample_rate_hz;
-    eliza_set_error(out_error,
-        "[libelizainference] native VAD is not implemented in this build "
-        "(eliza_inference_vad_supported() == 0); use the ONNX Silero VAD path");
-    return nullptr;
+    if (!ctx) {
+        eliza_set_error(out_error, "[libelizainference] vad_open: ctx is NULL");
+        return nullptr;
+    }
+    if (sample_rate_hz != ELIZA_VAD_SAMPLE_RATE) {
+        eliza_set_error(out_error, "[libelizainference] vad_open: Silero VAD requires 16 kHz mono PCM");
+        return nullptr;
+    }
+
+    std::string model_path;
+    std::string error;
+    if (!eliza_pick_vad_file(std::filesystem::path(ctx->bundle_dir), model_path, error)) {
+        eliza_set_error(out_error, error);
+        return nullptr;
+    }
+
+    EliVad * vad = new (std::nothrow) EliVad();
+    if (!vad) {
+        eliza_set_error(out_error, "[libelizainference] out of memory allocating VAD context");
+        return nullptr;
+    }
+    if (!eliza_vad_load_model(vad, model_path, error)) {
+        eliza_vad_free(vad);
+        eliza_set_error(out_error, error);
+        return nullptr;
+    }
+    return vad;
 }
 
 int eliza_inference_vad_process(
@@ -1060,24 +1777,37 @@ int eliza_inference_vad_process(
     size_t n_samples,
     float * out_probability,
     char ** out_error) {
-    (void) vad;
-    (void) pcm;
-    (void) n_samples;
-    (void) out_probability;
-    eliza_set_error(out_error, "[libelizainference] native VAD is not implemented in this build");
-    return ELIZA_ERR_NOT_IMPLEMENTED;
+    if (!vad || !pcm || !out_probability || n_samples != ELIZA_VAD_WINDOW) {
+        eliza_set_error(out_error, "[libelizainference] vad_process: expected a 512-sample fp32 mono window");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::mutex> lock(vad->mu);
+    std::string error;
+    int rc = eliza_vad_process_one(vad, pcm, out_probability, error);
+    if (rc != ELIZA_OK) {
+        eliza_set_error(out_error, error);
+    }
+    return rc;
 }
 
 int eliza_inference_vad_reset(
     EliVad * vad,
     char ** out_error) {
-    (void) vad;
-    eliza_set_error(out_error, "[libelizainference] native VAD is not implemented in this build");
-    return ELIZA_ERR_NOT_IMPLEMENTED;
+    if (!vad) {
+        eliza_set_error(out_error, "[libelizainference] vad_reset: vad is NULL");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::mutex> lock(vad->mu);
+    if (!vad->state_buffer) {
+        eliza_set_error(out_error, "[libelizainference] vad_reset: VAD state is not initialized");
+        return ELIZA_ERR_FFI_FAULT;
+    }
+    ggml_backend_buffer_clear(vad->state_buffer, 0);
+    return ELIZA_OK;
 }
 
 void eliza_inference_vad_close(EliVad * vad) {
-    (void) vad;
+    eliza_vad_free(vad);
 }
 
 void eliza_inference_free_string(char * str) {
