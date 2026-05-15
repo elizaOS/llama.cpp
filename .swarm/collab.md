@@ -78,6 +78,7 @@ The full failure log set (71 raw failures across 9 workflows) collapses to 7 dis
 <!-- agents append here -->
 - **A** — qjl_quantize_avx2.c empty-TU. Files: ggml/src/ggml-cpu/qjl/qjl_quantize_avx2.c
 - **C** — ops.cpp unhandled enums GGML_TYPE_QJL1_256/Q4_POLAR/TBQ3_TCQ. Files: ggml/src/ggml-cpu/ops.cpp
+- **Y** — HIP conv2d-mm cuda_runtime.h. Files: ggml/src/ggml-cuda/conv2d-mm.cu (and 4 siblings with same bare include: turbo-tcq.cu, polarquant.cu, qjl.cu, fused-attn-qjl-tbq.cu — all .cu files glob-compiled by HIP and would fail the same way)
 - **B** — ggml-rpc GGML_OP_COUNT + RPC_PROTO_PATCH_VERSION. Files: ggml/include/ggml-rpc.h, ggml/src/ggml-rpc/ggml-rpc.cpp (read), ggml/include/ggml.h (read only)
 - **D** — build-cache.yml workflow file issue (duplicate job id). Files: .github/workflows/build-cache.yml
 - **E** — research-and-fix-or-flag additional CI breaks. Files in scope (NEW, not in A-D lanes): ggml/src/ggml-cpu/qjl/quants-qjl.c (Windows MSVC: `pthread.h` missing — replace `pthread_once` with portable atomic CAS), ggml/src/ggml-cpu/fused-attn-qjl-tbq.c (Linux gcc: `alloca` used without `<alloca.h>` include). Read-only investigation everywhere else.
@@ -97,6 +98,7 @@ The full failure log set (71 raw failures across 9 workflows) collapses to 7 dis
 - **U** — continuous CI watcher (5 cycles)
 - **T** — Anthropic vision multimodal crash (S's backlog #20). Files: tools/mtmd/clip.cpp
 - **V** — `-Werror=missing-prototypes` on CI (3rd-party)/ubuntu-24-llguidance (run 25900097466, SHA 13c658e46). Files: ggml/src/ggml-cpu/fused-q4-polar-dot.h (new), ggml/src/ggml-cpu/fused-attn-qjl-tbq.h (new), ggml/src/ggml-cpu/fused-q4-polar-dot.c, fused-q4-polar-dot-avx2.c, fused-q4-polar-dot-neon.c, fused-attn-qjl-tbq.c, fused-attn-qjl-tbq-avx2.c, fused-attn-qjl-tbq-neon.c, fused-hadamard-polar-dot.c, ggml/src/ggml-cpu/quants.h.
+- **X** — Android x64 AVX2 dispatch link error. Root cause: `QJL_HAVE_AVX2` / `POLARQUANT_HAVE_AVX2` set unconditionally for every x86 variant in `ggml/src/ggml-cpu/CMakeLists.txt`, but the per-TU AVX2 bodies are guarded by `#if defined(__AVX2__)` — so on the `ggml-cpu-x64` baseline variant (no `-mavx2`), the dispatcher tries to call symbols that compiled to empty stubs. Fix: gate the HAVE_* defines on `GGML_AVX2` so non-AVX2 variants fall through to the `ref` path. Files: ggml/src/ggml-cpu/CMakeLists.txt.
 
 ## Completed
 
