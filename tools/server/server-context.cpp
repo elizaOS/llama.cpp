@@ -2485,58 +2485,6 @@ private:
                         drafting.push_back(&slot);
                     }
                 }
-            } else {
-                // no speculative decoding
-                slot.i_batch = batch.n_tokens;
-
-                common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
-
-                slot.prompt.tokens.push_back(slot.sampled);
-
-                // Eliza-1 forced-token fast-forward: when the boundary detector
-                // queued spliced run tokens for this step, append them to the
-                // SAME batch and advance the sampler past each. The result is
-                // a single forward pass for slot.sampled + N forced run tokens
-                // (instead of N+1 sequential sample/accept round-trips). The
-                // last spliced token holds the logits the next free-span step
-                // reads, so i_batch points at it. We also rewrite the streamed
-                // chunk via send_partial_response so the client sees the run's
-                // bytes as a normal streaming delta — the prefill_plan is
-                // purely a server-side speedup, not a wire-format change.
-                if (!slot.prefill_spliced_tokens.empty()) {
-                    for (const llama_token tok : slot.prefill_spliced_tokens) {
-                        common_batch_add(batch, tok, slot.prompt.tokens.pos_next(), { slot.id }, true);
-                        slot.prompt.tokens.push_back(tok);
-                        common_sampler_accept(slot.smpl.get(), tok, /* accept_grammar= */ true);
-
-                        completion_token_output spliced{};
-                        spliced.tok          = tok;
-                        spliced.text_to_send = common_token_to_piece(ctx_tgt, tok, /*special=*/ false);
-                        spliced.prob         = 1.0f;
-                        slot.generated_text += spliced.text_to_send;
-                        if (slot.task->params.return_tokens) {
-                            slot.generated_tokens.push_back(tok);
-                        }
-                        slot.add_token(spliced);
-                        if (slot.task->params.stream) {
-                            send_partial_response(slot, spliced, /*is_progress=*/ false);
-                        }
-                    }
-                    slot.i_batch = batch.n_tokens - 1; // logits for the last spliced token
-                    slot.n_decoded += (int32_t) slot.prefill_spliced_tokens.size();
-                    SLT_DBG(slot, "eliza_prefill_plan: appended %zu spliced tokens to batch (i_batch=%d, n_decoded=%d)\n",
-                            slot.prefill_spliced_tokens.size(), slot.i_batch, slot.n_decoded);
-                    slot.prefill_spliced_tokens.clear();
-                    // The boundary detector already moved prefill_run_byte_anchor
-                    // to the END of the run — the splice path doesn't get to
-                    // re-detect, so update the anchor to track what we just
-                    // appended so the next-run detector sees a consistent
-                    // generated_text size.
-                    slot.prefill_run_byte_anchor = slot.generated_text.size();
-                }
-
-                SLT_DBG(slot, "slot decode token, n_ctx = %d, n_tokens = %d, truncated = %d\n",
-                        slot.n_ctx, slot.prompt.n_tokens(), slot.truncated);
             }
         }
 
@@ -2585,6 +2533,53 @@ private:
             auto & slot = *slot_ptr;
 
             slot.update_batch(batch);
+
+            // Eliza-1 forced-token fast-forward: when the boundary detector
+            // queued spliced run tokens for this step, append them to the
+            // SAME batch (right after the slot.sampled token added by
+            // update_batch) and advance the sampler past each. The result is
+            // a single forward pass for slot.sampled + N forced run tokens
+            // (instead of N+1 sequential sample/accept round-trips). The
+            // last spliced token holds the logits the next free-span step
+            // reads, so i_batch points at it. We also rewrite the streamed
+            // chunk via send_partial_response so the client sees the run's
+            // bytes as a normal streaming delta — the prefill_plan is
+            // purely a server-side speedup, not a wire-format change.
+            //
+            // Only run the splice when spec_draft is empty: with concurrent
+            // drafts the batch positions and i_batch indices are owned by
+            // the spec path and must not be perturbed.
+            if (slot.spec_draft.empty() && !slot.prefill_spliced_tokens.empty()) {
+                for (const llama_token tok : slot.prefill_spliced_tokens) {
+                    common_batch_add(batch, tok, slot.prompt.tokens.pos_next(), { slot.id }, true);
+                    slot.prompt.tokens.push_back(tok);
+                    common_sampler_accept(slot.smpl.get(), tok, /* accept_grammar= */ true);
+
+                    completion_token_output spliced{};
+                    spliced.tok          = tok;
+                    spliced.text_to_send = common_token_to_piece(ctx_tgt, tok, /*special=*/ false);
+                    spliced.prob         = 1.0f;
+                    slot.generated_text += spliced.text_to_send;
+                    if (slot.task->params.return_tokens) {
+                        slot.generated_tokens.push_back(tok);
+                    }
+                    slot.add_token(spliced);
+                    if (slot.task->params.stream) {
+                        send_partial_response(slot, spliced, /*is_progress=*/ false);
+                    }
+                }
+                slot.i_batch = batch.n_tokens - 1; // logits for the last spliced token
+                slot.n_decoded += (int32_t) slot.prefill_spliced_tokens.size();
+                SLT_DBG(slot, "eliza_prefill_plan: appended %zu spliced tokens to batch (i_batch=%d, n_decoded=%d)\n",
+                        slot.prefill_spliced_tokens.size(), slot.i_batch, slot.n_decoded);
+                slot.prefill_spliced_tokens.clear();
+                // The boundary detector already moved prefill_run_byte_anchor
+                // to the END of the run — the splice path doesn't get to
+                // re-detect, so update the anchor to track what we just
+                // appended so the next-run detector sees a consistent
+                // generated_text size.
+                slot.prefill_run_byte_anchor = slot.generated_text.size();
+            }
         }
 
         // process in chunks of params.n_batch
