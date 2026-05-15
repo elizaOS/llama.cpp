@@ -122,7 +122,6 @@ static void usage(char * argv[]) {
     printf("  --type TYPE           set test type as");
     for (int i = 0; i < GGML_TYPE_COUNT; i++) {
         ggml_type type = (ggml_type) i;
-        const auto * qfns     = ggml_get_type_traits(type);
         const auto * qfns_cpu = ggml_get_type_traits_cpu(type);
         if (ggml_type_name(type) != NULL) {
             if (qfns_cpu->from_float) {
