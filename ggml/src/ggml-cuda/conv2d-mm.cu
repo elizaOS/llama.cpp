@@ -18,7 +18,7 @@ uint32_t ceil_div(uint32_t M, uint32_t N) {
     return (M + N - 1) / N;
 }
 
-__align__(16) struct Params {
+struct __align__(16) Params {
     uint32_t Cout;
     uint32_t Cin;
     uint32_t N;
