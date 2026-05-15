@@ -50,8 +50,15 @@
 //      callers fall through to the normal forward. The hook exists so
 //      a slot pool can land without breaking the calling convention.
 
+#include <atomic>
+#include <chrono>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <string>
 
 #if defined(__linux__) || defined(__APPLE__)
 #  include <sys/mman.h>
@@ -106,15 +113,160 @@ inline void flush_hops(int /*hops*/) {
     // site stays stable when an internal buffered path is added later.
 }
 
-// LM-conditioning prefix slot lookup. Returns the slot index the given
-// frozen-voice preset id has been pinned to, or -1 when no slot is
-// reserved (callers fall through to the normal forward).
+// LM-conditioning prefix slot pool — real implementation (H2.c).
 //
-// Today the slot pool is not yet allocated — the function always
-// returns -1. This keeps the calling convention stable so the slot
-// pool can land without touching every call site in pipeline-tts.cpp.
-inline int prefix_slot(const char * /*preset_id*/) {
-    return -1;
+// Multiple concurrent TTS streams that target the same frozen-voice preset
+// share an identical LM-conditioning prefix (instruct tokens + ref-audio
+// tokens). Re-running the prefix forward on every call wastes ~28L of
+// bidirectional attention; the slot pool caches a per-preset slot id that
+// the pipeline can key into when it stores its computed prefix activations
+// elsewhere (e.g. an external KV cache or per-slot tensor pool).
+//
+// The pool itself is intentionally minimal: it owns slot ids and the
+// `preset_id` → `slot` mapping, plus LRU bookkeeping for eviction. The
+// upstream caller (`pipeline-tts.cpp`) decides what to do with the slot
+// number — what to store in it, when to invalidate, etc. The pool's only
+// promise is "stable slot id per (alive) preset" with LRU eviction.
+class PrefixSlotPool {
+public:
+    static constexpr int kDefaultCapacity = 8;
+
+    explicit PrefixSlotPool(int capacity = kDefaultCapacity)
+        : capacity_(capacity > 0 ? capacity : kDefaultCapacity)
+        , entries_(new Entry[(std::size_t) (capacity > 0 ? capacity : kDefaultCapacity)]()) {}
+
+    // Look up the slot for `preset_id`. If a slot is already reserved for
+    // this preset, return its index and bump LRU. Otherwise, allocate a
+    // fresh slot (evicting the LRU entry when the pool is full) and
+    // return that. Empty/null preset ids return -1 — the bypass path.
+    int acquire(const char * preset_id) {
+        if (!preset_id || preset_id[0] == '\0') return -1;
+        std::lock_guard<std::mutex> lk(mu_);
+        const std::uint64_t now = tick();
+        // 1. Reuse path.
+        for (int i = 0; i < capacity_; ++i) {
+            if (entries_[i].used && entries_[i].preset_id == preset_id) {
+                entries_[i].last_used = now;
+                ++entries_[i].refcount;
+                return i;
+            }
+        }
+        // 2. Allocate path. Look for an unused slot first, then evict the
+        //    LRU entry with refcount==0. If every slot is pinned, return
+        //    -1 (callers fall through to a non-slotted forward).
+        int free_idx = -1;
+        int evict_idx = -1;
+        std::uint64_t oldest_tick = UINT64_MAX;
+        for (int i = 0; i < capacity_; ++i) {
+            if (!entries_[i].used) {
+                free_idx = i;
+                break;
+            }
+            if (entries_[i].refcount == 0 && entries_[i].last_used < oldest_tick) {
+                oldest_tick = entries_[i].last_used;
+                evict_idx = i;
+            }
+        }
+        const int target = (free_idx >= 0) ? free_idx : evict_idx;
+        if (target < 0) return -1;
+        entries_[target].preset_id = preset_id;
+        entries_[target].refcount = 1;
+        entries_[target].last_used = now;
+        entries_[target].used = true;
+        return target;
+    }
+
+    // Release a slot acquired via `acquire`. Decrements the refcount;
+    // when it reaches 0 the slot becomes evictable but its contents (the
+    // caller's cached prefix activations) survive until another preset
+    // takes the slot. Safe to call with a stale/invalid index — it's a
+    // no-op when the slot id doesn't match.
+    void release(int slot, const char * preset_id) {
+        if (slot < 0 || slot >= capacity_) return;
+        std::lock_guard<std::mutex> lk(mu_);
+        Entry & e = entries_[slot];
+        if (!e.used) return;
+        if (preset_id && e.preset_id != preset_id) return;
+        if (e.refcount > 0) --e.refcount;
+    }
+
+    // Invalidate the entry mapped to `preset_id`. The slot returns to the
+    // free list on the next `acquire`. Returns true when an entry was
+    // dropped.
+    bool invalidate(const char * preset_id) {
+        if (!preset_id) return false;
+        std::lock_guard<std::mutex> lk(mu_);
+        for (int i = 0; i < capacity_; ++i) {
+            if (entries_[i].used && entries_[i].preset_id == preset_id) {
+                entries_[i].used = false;
+                entries_[i].preset_id.clear();
+                entries_[i].refcount = 0;
+                entries_[i].last_used = 0;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Drop every slot. Pinned slots (refcount > 0) are forced out — the
+    // caller is responsible for not racing this against in-flight uses.
+    void clear() {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (int i = 0; i < capacity_; ++i) {
+            entries_[i].used = false;
+            entries_[i].preset_id.clear();
+            entries_[i].refcount = 0;
+            entries_[i].last_used = 0;
+        }
+    }
+
+    int capacity() const { return capacity_; }
+
+    // Number of slots that currently hold a preset binding.
+    int size() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        int n = 0;
+        for (int i = 0; i < capacity_; ++i) {
+            if (entries_[i].used) ++n;
+        }
+        return n;
+    }
+
+private:
+    struct Entry {
+        std::string preset_id;
+        int refcount = 0;
+        std::uint64_t last_used = 0;
+        bool used = false;
+    };
+
+    std::uint64_t tick() {
+        // Monotonic logical clock — independent of wall time so eviction
+        // works in lock-step regardless of clock skew. Atomic to keep
+        // multi-acquire ordering stable.
+        return ++clock_;
+    }
+
+    const int capacity_;
+    std::unique_ptr<Entry[]> entries_;
+    mutable std::mutex mu_;
+    std::atomic<std::uint64_t> clock_{0};
+};
+
+// Process-wide default pool. The previous stub used a free function with
+// no state; preserve the function for source compatibility and route it
+// through the singleton pool.
+inline PrefixSlotPool & default_prefix_slot_pool() {
+    static PrefixSlotPool instance(PrefixSlotPool::kDefaultCapacity);
+    return instance;
+}
+
+// Convenience facade: acquire a slot for `preset_id` from the process-wide
+// pool. Returns -1 for empty/null preset ids or when every slot is pinned.
+// Callers that want explicit lifecycle control should use the pool API
+// directly via `default_prefix_slot_pool()`.
+inline int prefix_slot(const char * preset_id) {
+    return default_prefix_slot_pool().acquire(preset_id);
 }
 
 }  // namespace omnivoice_streaming

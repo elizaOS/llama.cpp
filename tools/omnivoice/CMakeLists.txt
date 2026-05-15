@@ -200,6 +200,13 @@ if(TARGET llama-server)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${OMNIVOICE_LLAMA_PRIVATE_INCLUDE_DIRS})
     target_compile_definitions(llama-server PRIVATE ${OMNIVOICE_COMPILE_DEFINITIONS})
+    # H2.c — the OmniVoice /v1/audio/speech preset-aware route used to live
+    # inline in tools/server/server.cpp. It now lives in committed source at
+    # tools/omnivoice/src/server-mount.cpp; compile it directly into the
+    # llama-server target so the eliza_omnivoice::* symbols resolve at link
+    # time without needing a separate static library.
+    target_sources(llama-server PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/server-mount.cpp)
 endif()
 
 # omnivoice-tts : full TTS pipeline CLI.
