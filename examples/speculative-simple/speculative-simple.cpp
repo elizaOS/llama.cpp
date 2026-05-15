@@ -29,6 +29,13 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    if (params.speculative.draft.mparams.path.empty()) {
+        LOG_ERR("%s: --model-draft is required for draft-model speculative decoding; "
+                "use --spec-type=dflash -md <path> or --spec-type=mtp -md <path> "
+                "to use the draft-model fallback.\n", __func__);
+        return 1;
+    }
+
     // init llama.cpp
     llama_backend_init();
     llama_numa_init(params.numa);
@@ -129,9 +136,12 @@ int main(int argc, char ** argv) {
     // target model sampling context
     common_sampler_ptr smpl(common_sampler_init(model_tgt, params.sampling));
 
-    // eval the prompt
-    llama_decode(ctx_tgt,       llama_batch_get_one(inp.data(), inp.size() - 1));
-    llama_decode(ctx_dft.get(), llama_batch_get_one(inp.data(), inp.size() - 1));
+    // eval the prompt prefix; keep the final token separate as the boundary
+    // token used to start the first speculative verification batch.
+    if (inp.size() > 1) {
+        llama_decode(ctx_tgt,       llama_batch_get_one(inp.data(), inp.size() - 1));
+        llama_decode(ctx_dft.get(), llama_batch_get_one(inp.data(), inp.size() - 1));
+    }
 
     // note: keep the last token separate!
     llama_token id_last = inp.back();
