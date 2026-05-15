@@ -1,7 +1,5 @@
 #include "conv2d-mm.cuh"
 
-#include <cuda_runtime.h>
-
 // If defined, indices are computed once and re-used by each thread
 #if __CUDA_ARCH__ < 700
 #    define USE_COLLECTIVES

@@ -98,6 +98,7 @@ The full failure log set (71 raw failures across 9 workflows) collapses to 7 dis
 - **U** — continuous CI watcher (5 cycles)
 - **T** — Anthropic vision multimodal crash (S's backlog #20). Files: tools/mtmd/clip.cpp
 - **V** — `-Werror=missing-prototypes` on CI (3rd-party)/ubuntu-24-llguidance (run 25900097466, SHA 13c658e46). Files: ggml/src/ggml-cpu/fused-q4-polar-dot.h (new), ggml/src/ggml-cpu/fused-attn-qjl-tbq.h (new), ggml/src/ggml-cpu/fused-q4-polar-dot.c, fused-q4-polar-dot-avx2.c, fused-q4-polar-dot-neon.c, fused-attn-qjl-tbq.c, fused-attn-qjl-tbq-avx2.c, fused-attn-qjl-tbq-neon.c, fused-hadamard-polar-dot.c, ggml/src/ggml-cpu/quants.h.
+- **W** — Apple Metal kargs_roll typedef redefinition. Choosing option (b) — remove Eliza's earlier ROLL duplicate (370d7f448) in favor of upstream PR #21946 (ae2d34899) which superseded it. Files: ggml/src/ggml-metal/ggml-metal-impl.h, ggml/src/ggml-metal/ggml-metal-ops.cpp, ggml/src/ggml-metal/ggml-metal-ops.h, ggml/src/ggml-metal/ggml-metal-device.m, ggml/src/ggml-metal/ggml-metal.metal.
 - **X** — Android x64 AVX2 dispatch link error. Root cause: `QJL_HAVE_AVX2` / `POLARQUANT_HAVE_AVX2` set unconditionally for every x86 variant in `ggml/src/ggml-cpu/CMakeLists.txt`, but the per-TU AVX2 bodies are guarded by `#if defined(__AVX2__)` — so on the `ggml-cpu-x64` baseline variant (no `-mavx2`), the dispatcher tries to call symbols that compiled to empty stubs. Fix: gate the HAVE_* defines on `GGML_AVX2` so non-AVX2 variants fall through to the `ref` path. Files: ggml/src/ggml-cpu/CMakeLists.txt.
 
 ## Completed
