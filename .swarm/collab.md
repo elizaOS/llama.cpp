@@ -64,6 +64,8 @@ Architectural rule (from `packages/inference/CLAUDE.md` + `AGENTS.md`): Eliza-1 
 
 <!-- agents append here if they need to communicate -->
 
+**F architectural decision (test-quantize-perf null vec_dot guard).** The `vec_dot_q` micro-benchmark in `tests/test-quantize-perf.cpp:336-351` calls `qfns_cpu->vec_dot(...)` unconditionally inside the `qfns_cpu->from_float && qfns->to_float` gate. Two Eliza-custom types (`GGML_TYPE_QJL1_256` and `GGML_TYPE_TBQ3_TCQ`) intentionally have `vec_dot = NULL` in `ggml/src/ggml-cpu/ggml-cpu.c` (lines 427-438) — both types are K-cache-only and are scored via `GGML_OP_ATTN_SCORE_QJL` / the fused attention path, never as `mul_mat` operands. Calling a null `vec_dot` is a NULL-deref → SEGFAULT. Confirmed locally via lldb on macOS arm64: `Process stopped, stop reason = EXC_BAD_ACCESS (code=1, address=0x0)` after `qjl1_256` `vec_dot_q` benchmark prints. The companion test (`tests/test-quantize-fns.cpp:186-188`) already has `if (!qfns_cpu->vec_dot) continue;` — perf is missing the equivalent guard. Fix: gate both `op_vec_dot_q` and `op_quantize_row_q_dot` on `qfns_cpu->vec_dot != NULL`. Architecturally consistent with the type-traits design (cache-only types do not advertise vec_dot) and matches fns.cpp's existing pattern; no kernel changes required.
+
 ## Backlog from agent E
 
 Tracked but NOT fixed in this pass — all blocked behind agents A-D landing their build-break fixes (the runtime tests can't even reach these failures until builds pass). Re-investigate once CI compiles end-to-end.
@@ -83,4 +85,14 @@ Tracked but NOT fixed in this pass — all blocked behind agents A-D landing the
 7. **Cross-check upstream** — `ggml-org/llama.cpp` does not ship `quants-qjl.c`, `fused-attn-qjl-tbq.c`, `qjl_quantize_avx2.c`, `ops.cpp` QJL/POLAR/TBQ cases, or the `GGML_OP_COUNT == 96` static_assert pinning. All listed failures are Eliza-only divergence introduced by commits `0d0cccf63` (fused QJL/TBQ kernel), `71fdb58d3` (QJL1_256 type traits), and `6f2451f05` (Q4_POLAR tests). No upstream regression to mirror.
 
 8. **Workflows syntactically valid?** — A representative sample (`build.yml`, `build-cache.yml`, `server.yml`, `hip-quality-check.yml`, `build-self-hosted.yml`) all parse — failures on this PR are job-content failures, not workflow YAML errors. The only "workflow file issue" is `.github/workflows/build-cache.yml` which agent D is fixing (duplicate job id `ubuntu-24-openvino-cache`).
+
+## Backlog from agent J
+
+9. **`.github/workflows/build-cache.yml` push-event 0-job failures are cosmetic-only.** The workflow YAML only declares `workflow_dispatch` + `schedule` triggers (verified at HEAD). The workflow registration (id 274822892) keeps producing empty failure runs on push events — these show up as "X .github/workflows/build-cache.yml" rows in `gh run list` distinct from the green "✓ Build Actions Cache" runs that come from `workflow_dispatch`/`schedule`. Same workflow_id and path, but `event=push` runs have 0 jobs and `total_count=0`. This is GitHub Actions infrastructure noise — the file was likely registered when a `push:` trigger existed and the registration didn't reset cleanly. Not a code issue; no actionable fix from our side. Filter the noise by name when reading CI status: only `Build Actions Cache` (the `name:` field) is the real workflow.
+
+10. **HIP quality check "Check for major VGPR spills" failure on `5560f9698`** — Pre-wave-1 failure, separate from QJL pthread.h. Job 76108848995, runs 57m47s before the VGPR-spill gate trips. This is an Eliza-specific quality gate that monitors AMD GPU register pressure on HIP kernels. Won't re-run until a new PR push triggers `pull_request`. After wave-1+2 fixes get a fresh CI run, watch this job: if it still fails on a clean build, root-cause in the AMD codegen for one of the W3-* / DFlash / QJL kernels.
+
+11. **Server / CI / CI(self-hosted) workflows haven't re-run since wave-1.** Last run was on `5560f9698` (pre-wave-1). They trigger on `pull_request` only, not push. Until PR `elizaOS/llama.cpp#8` is re-run against the new HEAD (or a fresh PR opens), we won't know whether wave-1 + wave-2 fixes unblock these matrices. Recommend re-running PR #8 once wave-2 (F/G/H/I) settles.
+
+12. **`LLM_ARCH_DFLASH_DRAFT` model-naming check now passing.** `src/models/dflash_draft.cpp` → `src/models/dflash-draft.cpp` already renamed at HEAD; CMakeLists.txt updated in 5cf489150. `code-style.yml` now triggers on `eliza/**` so any future `LLM_ARCH_*` addition that breaks the `src/models/<lowercased-suffix-with-hyphens>.cpp` convention will fail CI immediately.
 
