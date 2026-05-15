@@ -5,6 +5,8 @@ on:
   push:
     branches:
       - master
+      - main
+      - 'eliza/**'
     paths: [
       '.github/workflows/build-riscv.yml',
       '**/CMakeLists.txt',

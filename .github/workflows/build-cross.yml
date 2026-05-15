@@ -6,6 +6,8 @@ on:
   push:
     branches:
       - master
+      - main
+      - 'eliza/**'
     paths: [
       '.github/workflows/build-cross.yml',
       'ggml/src/spacemit/*',
