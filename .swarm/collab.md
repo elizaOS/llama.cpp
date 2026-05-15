@@ -34,6 +34,7 @@ If you spot a problem outside your slice that's blocking your work, claim it exp
 ## Completed
 
 <!-- agents append here after commit -->
+- **A** 858c820ad — fix(qjl): empty-TU guard in qjl_quantize_avx2.c when AVX2 disabled (added typedef stub outside `#if __AVX2__`)
 
 ## Conflicts / coordination notes
 
