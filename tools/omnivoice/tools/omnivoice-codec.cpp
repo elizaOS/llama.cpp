@@ -199,14 +199,15 @@ int main_impl(int argc, char ** argv) {
 
     const std::string out_str = (mode == 1) ? swap_ext(input_path, ".rvq") : swap_ext(input_path, ".wav");
 
-    BackendPair bp = backend_init("Codec");
+    BackendPairOwned bpo = backend_init_auto("Codec");
+    BackendPair      bp  = bpo.bp;
     if (!bp.backend) {
         return 1;
     }
 
     PipelineCodec pc = {};
     if (!pipeline_codec_load(&pc, model_path, bp)) {
-        backend_release(bp.backend, bp.cpu_backend);
+        backend_auto_free(bpo);
         return 1;
     }
 
@@ -258,7 +259,7 @@ int main_impl(int argc, char ** argv) {
     }
 
     pipeline_codec_free(&pc);
-    backend_release(bp.backend, bp.cpu_backend);
+    backend_auto_free(bpo);
     return rc;
 }
 

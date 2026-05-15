@@ -33,15 +33,26 @@ add_custom_target(omnivoice-version ALL
 )
 
 # Audio tokenizer tensor names can exceed the default GGML_MAX_NAME of 64.
-# Mirrors the original omnivoice.cpp CMakeLists.txt.
-#
-# GGML_MAX_NAME=128 must propagate PUBLICly to the linked ggml/llama targets;
-# ggml parses tensor names during GGUF load, so keeping it only on omnivoice
-# translation units leaves tokenizer GGUFs unreadable.
+# Mirrors the original omnivoice.cpp CMakeLists.txt. Apply GGML_MAX_NAME to the
+# linked ggml/llama targets too; ggml parses tensor names during GGUF load, so
+# keeping this only on omnivoice translation units leaves tokenizer GGUFs
+# unreadable.
+set(OMNIVOICE_GGML_COMPILE_DEFINITIONS GGML_MAX_NAME=128)
+foreach(_omnivoice_ggml_name_target
+        ggml ggml-base ggml-cpu ggml-blas ggml-metal ggml-vulkan ggml-cuda
+        llama common)
+    if(TARGET ${_omnivoice_ggml_name_target})
+        target_compile_definitions(${_omnivoice_ggml_name_target}
+            PUBLIC ${OMNIVOICE_GGML_COMPILE_DEFINITIONS})
+    endif()
+endforeach()
+# LLAMA_BUILD_OMNIVOICE and ELIZA_FUSE_OMNIVOICE stay scoped to omnivoice
+# targets and llama-server. The legacy ELIZA_FUSE_OMNIVOICE source guard remains
+# as a deprecation runway while the canonical merged path is LLAMA_BUILD_OMNIVOICE.
 #
 # W3-3 — OmniVoice → llama.cpp literal merge (canonical path):
 #   * Both LLAMA_BUILD_OMNIVOICE and ELIZA_FUSE_OMNIVOICE are defined on
-#     omnivoice targets so source-level `#ifdef ELIZA_FUSE_OMNIVOICE` blocks
+#     every target so source-level `#ifdef ELIZA_FUSE_OMNIVOICE` blocks
 #     (e.g. `tools/server/server.cpp`'s /v1/audio/speech route handler)
 #     continue to compile under the canonical merged path. The legacy
 #     out-of-tree graft (`omnivoice/` at fork root) is being removed in
@@ -51,14 +62,8 @@ set(OMNIVOICE_COMPILE_DEFINITIONS
     GGML_MAX_NAME=128
     LLAMA_BUILD_OMNIVOICE
     ELIZA_FUSE_OMNIVOICE)
-foreach(_omnivoice_ggml_name_target
-        ggml ggml-base ggml-cpu ggml-blas ggml-metal ggml-vulkan ggml-cuda
-        llama common)
-    if(TARGET ${_omnivoice_ggml_name_target})
-        target_compile_definitions(${_omnivoice_ggml_name_target}
-            PUBLIC GGML_MAX_NAME=128)
-    endif()
-endforeach()
+set(OMNIVOICE_LLAMA_PRIVATE_INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
 
 # Sources shared by both the static core and the shared ABI-export library.
 set(OMNIVOICE_CORE_SOURCES
@@ -87,8 +92,8 @@ target_compile_definitions(omnivoice_lib
 target_include_directories(omnivoice_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_BINARY_DIR})
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${OMNIVOICE_LLAMA_PRIVATE_INCLUDE_DIRS})
 # llama transitively pulls ggml + the backend pair chosen at parent
 # configure time. The omnivoice tree never touches backend selection
 # directly ; patch 0003 will rewrite backend.h to consume the
@@ -117,8 +122,8 @@ if(OMNIVOICE_SHARED)
     target_include_directories(omnivoice PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_BINARY_DIR})
+        ${CMAKE_CURRENT_BINARY_DIR}
+        ${OMNIVOICE_LLAMA_PRIVATE_INCLUDE_DIRS})
     target_link_libraries(omnivoice PUBLIC llama)
     set_target_properties(omnivoice PROPERTIES
         C_VISIBILITY_PRESET       hidden
@@ -153,7 +158,8 @@ target_compile_definitions(elizainference
 target_include_directories(elizainference PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_BINARY_DIR})
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${OMNIVOICE_LLAMA_PRIVATE_INCLUDE_DIRS})
 target_include_directories(elizainference PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../mtmd
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
@@ -191,7 +197,8 @@ if(TARGET llama-server)
     target_link_libraries(llama-server PRIVATE omnivoice_lib)
     target_include_directories(llama-server PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${OMNIVOICE_LLAMA_PRIVATE_INCLUDE_DIRS})
     target_compile_definitions(llama-server PRIVATE ${OMNIVOICE_COMPILE_DEFINITIONS})
 endif()
 
