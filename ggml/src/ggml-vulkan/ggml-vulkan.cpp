@@ -7951,8 +7951,16 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
         return false;
     }
 
-    // General performance issue with q3_k and q6_k due to 2-byte alignment
-    if (src0_type == GGML_TYPE_Q3_K || src0_type == GGML_TYPE_Q6_K) {
+    // q3_k and q6_k only have 2-byte alignment which makes them somewhat problematic,
+    // but on some devices its still a win to prefer MMVQ.
+    bool mmvq_q3 = device->vendor_id == VK_VENDOR_ID_NVIDIA ||
+        (device->vendor_id == VK_VENDOR_ID_INTEL && device->architecture == vk_device_architecture::INTEL_XE2);
+    if (src0_type == GGML_TYPE_Q3_K && !mmvq_q3) {
+        return false;
+    }
+    bool mmvq_q6 =
+        device->vendor_id == VK_VENDOR_ID_INTEL && device->architecture == vk_device_architecture::INTEL_XE2;
+    if (src0_type == GGML_TYPE_Q6_K && !mmvq_q6) {
         return false;
     }
 
@@ -7964,7 +7972,7 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
     // Quantization overhead is not worth it for small k
     switch (device->vendor_id) {
     case VK_VENDOR_ID_NVIDIA:
-        if (src0_type == GGML_TYPE_Q2_K || src0_type == GGML_TYPE_IQ1_S || src0_type == GGML_TYPE_IQ1_M) {
+        if (src0_type == GGML_TYPE_Q2_K || src0_type == GGML_TYPE_Q3_K || src0_type == GGML_TYPE_IQ1_S || src0_type == GGML_TYPE_IQ1_M) {
             return true;
         }
 
@@ -7995,6 +8003,12 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
             // Intel Windows proprietary driver MMVQ performance is worse than fp16, see
             // https://github.com/ggml-org/llama.cpp/issues/17628
             return false;
+        }
+
+        if (device->architecture == vk_device_architecture::INTEL_XE2) {
+            if (src0_type == GGML_TYPE_Q2_K || src0_type == GGML_TYPE_Q3_K || src0_type == GGML_TYPE_Q6_K) {
+                return true;
+            }
         }
 
         if (k < 2048) {
