@@ -105,8 +105,3 @@ void qjl_dequantize_row_neon(const qjl_block_qjl1_256 *blk, const float *prj,
 }
 
 #endif /* __ARM_NEON */
-
-/* On non-NEON targets the entire body above preprocesses out — give the
- * translation unit at least one declaration so -Werror=pedantic doesn't
- * trip on ISO C's empty-TU rule. */
-typedef int qjl_quantize_neon_tu_marker_t;

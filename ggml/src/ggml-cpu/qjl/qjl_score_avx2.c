@@ -124,8 +124,3 @@ void qjl_score_qk_avx2(const float *q_sketch,
 }
 
 #endif /* __AVX2__ */
-
-/* On non-AVX2 targets the entire body above preprocesses out — give the
- * translation unit at least one declaration so -Werror=pedantic doesn't
- * trip on ISO C's empty-TU rule. */
-typedef int qjl_score_avx2_tu_marker_t;

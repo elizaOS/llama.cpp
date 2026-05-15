@@ -366,4 +366,77 @@ int ov_duration_sec_to_tokens(const struct ov_context * ov, float duration_sec) 
     return pipeline_tts_duration_sec_to_tokens(&ov->pc, duration_sec);
 }
 
+// W3-3: encode-only entry. Runs the HuBERT-semantic + RVQ tokenizer half of
+// the codec graph on a raw 24 kHz mono fp32 PCM buffer and returns the
+// resulting per-codebook audio-token tensor. Drives the freeze-voice CLI's
+// reference-token capture step. Failure modes mirror the ov_synthesize path:
+// negative ov_status return + ov_set_error() carrying the diagnostic.
+//
+// On success, *out_tokens is a malloc-allocated int32[K * ref_T] tensor
+// owned by the caller; release with ov_tokens_free(). On failure all output
+// pointers are zeroed and the caller MUST not call ov_tokens_free().
+enum ov_status ov_encode_reference(struct ov_context * ov,
+                                   const float * pcm_24k,
+                                   int n_samples,
+                                   int32_t ** out_tokens,
+                                   int * out_K,
+                                   int * out_ref_T) {
+    if (out_tokens) *out_tokens = nullptr;
+    if (out_K)      *out_K = 0;
+    if (out_ref_T)  *out_ref_T = 0;
+
+    if (!ov) {
+        ov_set_error("ov_encode_reference : ctx is NULL");
+        return OV_STATUS_INVALID_PARAMS;
+    }
+    if (!ov->codec_loaded) {
+        ov_set_error("ov_encode_reference : codec not loaded (pass codec_path to ov_init)");
+        return OV_STATUS_INVALID_PARAMS;
+    }
+    if (!pcm_24k || n_samples <= 0) {
+        ov_set_error("ov_encode_reference : invalid PCM buffer (ptr=%p n=%d)",
+                     (const void *) pcm_24k, n_samples);
+        return OV_STATUS_INVALID_PARAMS;
+    }
+    if (!out_tokens || !out_K || !out_ref_T) {
+        ov_set_error("ov_encode_reference : out_tokens/out_K/out_ref_T must all be non-NULL");
+        return OV_STATUS_INVALID_PARAMS;
+    }
+
+    try {
+        // pipeline_codec_encode returns int32 row-major (K=8, ref_T) flat.
+        std::vector<int32_t> codes = pipeline_codec_encode(&ov->pc, pcm_24k, n_samples, /*dump_dir=*/nullptr);
+        if (codes.empty()) {
+            ov_set_error("ov_encode_reference : pipeline_codec_encode returned empty (n_samples=%d)", n_samples);
+            return OV_STATUS_GENERATE_FAILED;
+        }
+        const int K = 8; // RVQ_NUM_CODEBOOKS — kept in sync with rvq-codec.h
+        if ((int) codes.size() % K != 0) {
+            ov_set_error("ov_encode_reference : encoder returned %zu tokens, not divisible by K=%d",
+                         codes.size(), K);
+            return OV_STATUS_GENERATE_FAILED;
+        }
+        const int ref_T = (int)(codes.size() / (size_t) K);
+        const size_t bytes = (size_t) K * (size_t) ref_T * sizeof(int32_t);
+        int32_t * buf = static_cast<int32_t *>(std::malloc(bytes));
+        if (!buf) {
+            ov_set_error("ov_encode_reference : malloc(%zu) failed", bytes);
+            return OV_STATUS_OOM;
+        }
+        std::memcpy(buf, codes.data(), bytes);
+        *out_tokens = buf;
+        *out_K = K;
+        *out_ref_T = ref_T;
+        return OV_STATUS_OK;
+    } catch (const std::exception & e) {
+        ov_set_error("ov_encode_reference : %s", e.what());
+        ov_log(OV_LOG_ERROR, "[OmniVoice] ov_encode_reference: %s", e.what());
+        return OV_STATUS_GENERATE_FAILED;
+    }
+}
+
+void ov_tokens_free(int32_t * tokens) {
+    if (tokens) std::free(tokens);
+}
+
 }  // extern "C"
