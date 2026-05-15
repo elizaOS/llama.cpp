@@ -121,6 +121,14 @@ option(LLAMA_TESTS_INSTALL          "llama: install tests"                      
 option(LLAMA_BUILD_OMNIVOICE "Build the merged omnivoice TTS subtree" OFF)
 option(OMNIVOICE_SHARED      "Build libomnivoice for ABI consumers" OFF)
 
+# Kokoro-82M (StyleTTS-2 + iSTFTNet) standalone TTS subtree. Built only
+# when LLAMA_BUILD_KOKORO=ON. Produces kokoro_lib (static) + kokoro-tts
+# (standalone CLI harness) + the `/v1/audio/speech` server-mount handler.
+# The arch tag LLM_ARCH_KOKORO already lives in src/models/kokoro.cpp for
+# the K-quant publish pipeline (R8 §3.1); this option enables the actual
+# inference path. Default OFF so stock llama.cpp consumers see no change.
+option(LLAMA_BUILD_KOKORO    "Build the Kokoro-82M TTS subtree (tools/kokoro/)" OFF)
+
 # W3-3 deprecation: ELIZA_FUSE_OMNIVOICE=ON is the pre-W3-3 flag for the
 # fork-root `omnivoice/` graft. The graft is gone (see the deprecation
 # block below); turn the flag into a redirect now so the option ON state

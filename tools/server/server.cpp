@@ -20,6 +20,15 @@
 #endif // ELIZA_FUSE_OMNIVOICE
 // end // ELIZA-OMNIVOICE-AUDIO-SPEECH-ROUTE-V1
 
+// ELIZA-KOKORO-AUDIO-SPEECH-ROUTE-V1 — J2 (2026-05-15). When
+// LLAMA_BUILD_KOKORO=ON, the Kokoro fork-side TTS pipeline owns
+// `/v1/audio/speech` whenever --kokoro-model is set. Falls back to the
+// OmniVoice handler otherwise. The dispatcher lives in main() below.
+#ifdef LLAMA_BUILD_KOKORO
+#include "kokoro-server-mount.h"
+#endif // LLAMA_BUILD_KOKORO
+// end // ELIZA-KOKORO-AUDIO-SPEECH-ROUTE-V1
+
 #include <atomic>
 #include <clocale>
 #include <exception>
@@ -88,20 +97,30 @@ int main(int argc, char ** argv) {
 
     common_init();
 
-#ifdef ELIZA_FUSE_OMNIVOICE
-    // Strip omnivoice-fused-only flags before common_params_parse so the
-    // upstream parser doesn't reject them. Values feed the lazily-created
-    // OmniVoice context (see the eliza_omnivoice namespace above).
+#if defined(ELIZA_FUSE_OMNIVOICE) || defined(LLAMA_BUILD_KOKORO)
+    // Strip fused-TTS-only flags before common_params_parse so the upstream
+    // parser doesn't reject them. Values feed the lazily-created OmniVoice
+    // and Kokoro contexts (see the eliza_omnivoice / eliza_kokoro
+    // namespaces).
     {
         std::vector<char *> filtered;
         filtered.reserve((size_t)argc);
         for (int i = 0; i < argc; ++i) {
             const std::string a = argv[i];
+#ifdef ELIZA_FUSE_OMNIVOICE
             if ((a == "--omnivoice-model" || a == "--omnivoice-codec") && i + 1 < argc) {
                 if (a == "--omnivoice-model") eliza_omnivoice::g_model_path = argv[++i];
                 else                          eliza_omnivoice::g_codec_path = argv[++i];
                 continue;
             }
+#endif
+#ifdef LLAMA_BUILD_KOKORO
+            if ((a == "--kokoro-model" || a == "--kokoro-voices-dir") && i + 1 < argc) {
+                if (a == "--kokoro-model")       eliza_kokoro::g_model_path = argv[++i];
+                else                             eliza_kokoro::g_voices_dir = argv[++i];
+                continue;
+            }
+#endif
             filtered.push_back(argv[i]);
         }
         static std::vector<char *> s_filtered = filtered;
@@ -215,11 +234,24 @@ int main(int argc, char ** argv) {
     ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
     ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));
     ctx_http.post("/audio/transcriptions",     ex_wrapper(routes.post_transcriptions_oai));
-#ifdef ELIZA_FUSE_OMNIVOICE
-    // Fused omnivoice TTS — same process as the text/DFlash routes above.
-    ctx_http.post("/v1/audio/speech",          ex_wrapper(eliza_omnivoice::audio_speech_handler()));
-    ctx_http.post("/audio/speech",             ex_wrapper(eliza_omnivoice::audio_speech_handler()));
+    // Fused TTS — /v1/audio/speech dispatcher. When --kokoro-model is set
+    // and LLAMA_BUILD_KOKORO=ON, the Kokoro path owns the route; otherwise
+    // (and when LLAMA_BUILD_KOKORO=OFF), the OmniVoice path takes it.
+    // Picking the handler at registration time (vs per-request) keeps the
+    // route's hot path branch-free and lets each handler own its own
+    // server-mount mutex / context.
+#ifdef LLAMA_BUILD_KOKORO
+    if (eliza_kokoro::is_enabled()) {
+        ctx_http.post("/v1/audio/speech",      ex_wrapper(eliza_kokoro::audio_speech_handler()));
+        ctx_http.post("/audio/speech",         ex_wrapper(eliza_kokoro::audio_speech_handler()));
+    } else
 #endif
+    {
+#ifdef ELIZA_FUSE_OMNIVOICE
+        ctx_http.post("/v1/audio/speech",      ex_wrapper(eliza_omnivoice::audio_speech_handler()));
+        ctx_http.post("/audio/speech",         ex_wrapper(eliza_omnivoice::audio_speech_handler()));
+#endif
+    }
     ctx_http.post("/v1/messages",              ex_wrapper(routes.post_anthropic_messages)); // anthropic messages API
     ctx_http.post("/v1/messages/count_tokens", ex_wrapper(routes.post_anthropic_count_tokens)); // anthropic token counting
     ctx_http.post("/infill",                   ex_wrapper(routes.post_infill));
