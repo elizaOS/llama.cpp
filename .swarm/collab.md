@@ -35,6 +35,7 @@ If you spot a problem outside your slice that's blocking your work, claim it exp
 
 <!-- agents append here after commit -->
 - **A** 858c820ad — fix(qjl): empty-TU guard in qjl_quantize_avx2.c when AVX2 disabled (added typedef stub outside `#if __AVX2__`)
+- **C** 8921d3cc4 — fix(ops): add QJL1_256/Q4_POLAR/TBQ3_TCQ to the exhaustive abort-group in ggml_compute_forward_clamp (only `-Wswitch`-affected switch in ops.cpp; all others use `default:`). No other arch-specific ops.cpp under ggml/src/ggml-cpu.
 
 ## Conflicts / coordination notes
 
