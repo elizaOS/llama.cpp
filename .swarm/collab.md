@@ -104,6 +104,7 @@ The full failure log set (71 raw failures across 9 workflows) collapses to 7 dis
 - **AA** — test-shared-kv-quant-imatrix C++20 designated-init. Files: tests/CMakeLists.txt and/or tests/test-shared-kv-quant-imatrix.cpp
 - **BB** — iOS/tvOS Metal API unavailability guards. Files: ggml/src/ggml-metal/ggml-metal-device.m
 - **CC** — MSVC __attribute__((aligned))/__thread portability in fused kernels. Files: ggml/src/ggml-cpu/ggml-cpu-impl.h (add GGML_ALIGN/GGML_THREAD_LOCAL macros), ggml/src/ggml-cpu/fused-attn-qjl-tbq.c, fused-q4-polar-dot-avx2.c, fused-q4-polar-dot-neon.c, fused-attn-qjl-tbq-avx2.c, fused-attn-qjl-tbq-neon.c.
+- **DD** — test-llama-archs over-correction by Z's gate. Files: src/llama-model-loader.cpp, possibly tests/test-llama-archs.cpp
 
 ## Completed
 
