@@ -32,10 +32,51 @@
 #include "qjl_block.h"
 
 #include <math.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Portable atomic primitives for the lazy-init CAS below.
+ *
+ * MSVC's <stdatomic.h> emits `#error "C atomic support is not enabled"`
+ * unless the project is built with `/experimental:c11atomics` (only on
+ * very recent toolchains), so we cannot rely on `_Atomic` here. Use:
+ *   - MSVC:        _InterlockedCompareExchange / _InterlockedExchange
+ *                  (with MemoryBarrier() for acq/rel semantics).
+ *   - GCC/clang:   __atomic_* builtins (available everywhere we target).
+ *
+ * Both wrappers operate on a `volatile long` cell so the MSVC intrinsics
+ * see the correct width on 64-bit Windows (where `int` is 32-bit and
+ * `long` is also 32-bit). */
+#if defined(_MSC_VER)
+#include <windows.h>
+typedef volatile long qjl_atomic_int;
+static inline int qjl_atomic_load_acquire(qjl_atomic_int * p) {
+    long v = *p;
+    MemoryBarrier();
+    return (int) v;
+}
+static inline void qjl_atomic_store_release(qjl_atomic_int * p, int v) {
+    MemoryBarrier();
+    _InterlockedExchange(p, (long) v);
+}
+static inline int qjl_atomic_cas_acq_rel(qjl_atomic_int * p, int expected, int desired) {
+    long prev = _InterlockedCompareExchange(p, (long) desired, (long) expected);
+    return prev == (long) expected;
+}
+#else
+typedef volatile int qjl_atomic_int;
+static inline int qjl_atomic_load_acquire(qjl_atomic_int * p) {
+    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+}
+static inline void qjl_atomic_store_release(qjl_atomic_int * p, int v) {
+    __atomic_store_n(p, v, __ATOMIC_RELEASE);
+}
+static inline int qjl_atomic_cas_acq_rel(qjl_atomic_int * p, int expected, int desired) {
+    return __atomic_compare_exchange_n(p, &expected, desired, 0,
+                                       __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+#endif
 
 /* Confirm the two block layouts agree byte-for-byte. */
 _Static_assert(sizeof(qjl_block_qjl1_256) == sizeof(block_qjl1_256),
@@ -68,30 +109,26 @@ _Static_assert(QJL_PROJECTION_DIM == QK_QJL,
 #define QJL_INIT_RUNNING 1
 #define QJL_INIT_READY   2
 
-static _Atomic int g_qjl_prj_state = QJL_INIT_UNINIT;
+static qjl_atomic_int g_qjl_prj_state = QJL_INIT_UNINIT;
 static float *g_qjl_prj = NULL;
 
 static const float * qjl_default_projection(void) {
-    int state = atomic_load_explicit(&g_qjl_prj_state, memory_order_acquire);
+    int state = qjl_atomic_load_acquire(&g_qjl_prj_state);
     if (state == QJL_INIT_READY) {
         return g_qjl_prj;
     }
 
-    int expected = QJL_INIT_UNINIT;
-    if (atomic_compare_exchange_strong_explicit(&g_qjl_prj_state, &expected,
-                                                QJL_INIT_RUNNING,
-                                                memory_order_acq_rel,
-                                                memory_order_acquire)) {
+    if (qjl_atomic_cas_acq_rel(&g_qjl_prj_state, QJL_INIT_UNINIT, QJL_INIT_RUNNING)) {
         g_qjl_prj = (float *) malloc(sizeof(float) * QJL_DEFAULT_HEAD_DIM * QJL_DEFAULT_PROJ_DIM);
         if (g_qjl_prj != NULL) {
             qjl_make_projection_mt(g_qjl_prj, QJL_DEFAULT_HEAD_DIM, QJL_DEFAULT_PROJ_DIM, QJL_DEFAULT_SEED);
         }
-        atomic_store_explicit(&g_qjl_prj_state, QJL_INIT_READY, memory_order_release);
+        qjl_atomic_store_release(&g_qjl_prj_state, QJL_INIT_READY);
         return g_qjl_prj;
     }
 
     /* Another thread is initializing — wait for it. */
-    while (atomic_load_explicit(&g_qjl_prj_state, memory_order_acquire) != QJL_INIT_READY) {
+    while (qjl_atomic_load_acquire(&g_qjl_prj_state) != QJL_INIT_READY) {
         /* tiny pause; this loop runs at most once per process lifetime */
     }
     return g_qjl_prj;
