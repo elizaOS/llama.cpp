@@ -43,6 +43,14 @@ static inline float32x4_t expand_signs_nibble(uint8_t b, int bit_offset) {
     return vbslq_f32(mask, one, none);
 }
 
+/* Public NEON entry points. Forward-declared in fused-attn-qjl-tbq.c
+ * (the dispatcher); local prototypes here so gcc -Wmissing-prototypes
+ * accepts the definitions. */
+float qjl_score_one_neon(const float * q_sketch, const uint8_t * signs);
+void  fused_attn_v_mix_neon(int n_tokens, const float * w,
+                            const uint8_t * v_codes, const uint16_t * v_scales,
+                            float * out);
+
 float qjl_score_one_neon(const float * q_sketch, const uint8_t * signs) {
     float32x4_t acc = vdupq_n_f32(0.0f);
     for (int b = 0; b < FUSED_QJL_PACKED_BYTES; b++) {

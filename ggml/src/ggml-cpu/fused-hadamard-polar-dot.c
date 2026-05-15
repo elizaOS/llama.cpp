@@ -68,6 +68,20 @@ static inline void hadamard_inplace_2n(float * x, int total) {
     }
 }
 
+/* Public entry points. Forward-declarations here so gcc with
+ * -Wmissing-prototypes accepts the definitions. _ref is also called
+ * from the SIMD-dispatching wrapper at the bottom of this file;
+ * _hadamard is consumed by tests/test-fused-kernels.cpp. */
+double ggml_vec_dot_q4_polar_q8_0_fused_hadamard_ref(int n_pairs,
+                                                     const block_q4_polar * x,
+                                                     const block_q8_0 * y,
+                                                     bool use_qjl);
+void   ggml_vec_dot_q4_polar_q8_0_fused_hadamard(int n, float * GGML_RESTRICT s,
+                                                 size_t bs,
+                                                 const void * GGML_RESTRICT vx, size_t bx,
+                                                 const void * GGML_RESTRICT vy, size_t by,
+                                                 int nrc);
+
 /* Scalar fused-hadamard reference. Returns the sum of dot products for
  * two adjacent Q4_POLAR blocks. n_pairs is the number of (x, x+1) block
  * pairs to process. The argument vector x must contain n_pairs*2 blocks

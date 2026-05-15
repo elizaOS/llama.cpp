@@ -40,6 +40,14 @@ static inline __m256 expand_signs_byte(uint8_t b) {
     return _mm256_blendv_ps(negones, ones, _mm256_castsi256_ps(mask));
 }
 
+/* Public AVX2 entry points. Forward-declared in fused-attn-qjl-tbq.c
+ * (the dispatcher); local prototypes here so gcc -Wmissing-prototypes
+ * accepts the definitions. */
+float qjl_score_one_avx2(const float * q_sketch, const uint8_t * signs);
+void  fused_attn_v_mix_avx2(int n_tokens, const float * w,
+                            const uint8_t * v_codes, const uint16_t * v_scales,
+                            float * out);
+
 float qjl_score_one_avx2(const float * q_sketch, const uint8_t * signs) {
     __m256 acc = _mm256_setzero_ps();
     for (int b = 0; b < FUSED_QJL_PACKED_BYTES; b++) {

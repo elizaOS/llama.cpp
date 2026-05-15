@@ -184,6 +184,9 @@ double ggml_vec_dot_q4_polar_q8_0_fused_ref(int nb_polar,
  *
  * Picks the best ISA at runtime via __AVX2__ / __ARM_NEON build guards;
  * a future patch can swap to the cpufeats dynamic dispatch table.
+ *
+ * Prototype lives in quants.h (included above) so no local fwd-decl
+ * is needed here.
  */
 void ggml_vec_dot_q4_polar_q8_0_fused(int n, float * GGML_RESTRICT s, size_t bs,
                                       const void * GGML_RESTRICT vx, size_t bx,
