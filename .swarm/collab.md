@@ -37,7 +37,7 @@ If you spot a problem outside your slice that's blocking your work, claim it exp
 <!-- agents append here after commit -->
 - **A** 858c820ad — fix(qjl): empty-TU guard in qjl_quantize_avx2.c when AVX2 disabled (added typedef stub outside `#if __AVX2__`)
 - **C** 8921d3cc4 — fix(ops): add QJL1_256/Q4_POLAR/TBQ3_TCQ to the exhaustive abort-group in ggml_compute_forward_clamp (only `-Wswitch`-affected switch in ops.cpp; all others use `default:`). No other arch-specific ops.cpp under ggml/src/ggml-cpu.
-- **E** (pending) — fix(qjl): replace `pthread_once` with stdatomic CAS in `quants-qjl.c` (Windows MSVC has no `pthread.h`); add `<alloca.h>`/`<malloc.h>` portability include block to `fused-attn-qjl-tbq.c` (mirroring `ggml.c`'s pattern). Unblocks windows-2022-cuda, windows-latest-hip, windows-latest llvm-arm64, ubuntu-24-webgpu, ubuntu-24-webgpu-wasm builds. Backlog of 8 additional findings appended below.
+- **E** ff0b750bb — fix(qjl): replace `pthread_once` with stdatomic CAS in `quants-qjl.c` (Windows MSVC has no `pthread.h`); add `<alloca.h>`/`<malloc.h>` portability include block to `fused-attn-qjl-tbq.c` (mirroring `ggml.c`'s pattern). Unblocks windows-2022-cuda, windows-latest-hip, windows-latest llvm-arm64, ubuntu-24-webgpu, ubuntu-24-webgpu-wasm builds. Backlog of 8 additional findings appended below.
 
 ## Conflicts / coordination notes
 
