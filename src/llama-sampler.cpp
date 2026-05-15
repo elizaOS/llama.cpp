@@ -916,10 +916,10 @@ struct llama_sampler * llama_sampler_chain_remove(struct llama_sampler * chain, 
     return result;
 }
 
-int llama_sampler_chain_n(const struct llama_sampler * chain) {
+int32_t llama_sampler_chain_n(const struct llama_sampler * chain) {
     const auto * p = (const llama_sampler_chain *) chain->ctx;
 
-    return p->samplers.size();
+    return (int32_t) p->samplers.size();
 }
 
 //
@@ -2813,8 +2813,6 @@ static void llama_sampler_top_n_sigma_apply(struct llama_sampler * smpl, llama_t
             cur_p->data[i].logit = -INFINITY;
         }
     }
-
-    llama_sampler_softmax_impl(cur_p, true);
 }
 
 static struct llama_sampler * llama_sampler_top_n_sigma_clone(const struct llama_sampler * smpl) {
@@ -3421,6 +3419,143 @@ struct llama_sampler * llama_sampler_init_adaptive_p(
             /* .pending_token_idx = */ -1
         }
     );
+}
+
+// repeat-line
+
+struct llama_sampler_repeat_line {
+    const llama_vocab * vocab;
+
+    const int32_t     window;      // number of past segments to compare against (0 = disabled)
+    const int32_t     min_length;  // ignore segments shorter than this
+    const std::string delimiters;  // characters that end a segment
+    const float       temp_boost;  // temperature boost when loop detected
+
+    std::string              current_segment;
+    std::deque<std::string>  past_segments;
+    bool                     loop_active = false;
+
+    std::vector<char>        token_buf;
+
+    llama_sampler_repeat_line(const llama_vocab * vocab, int32_t window, int32_t min_length, const char * delimiters, float temp_boost)
+        : vocab(vocab), window(window), min_length(min_length > 0 ? min_length : 20),
+          delimiters(delimiters ? delimiters : "\n.!?:"),
+          temp_boost(temp_boost > 0.0f ? temp_boost : 0.5f), token_buf(256) {}
+};
+
+static const char * llama_sampler_repeat_line_name(const struct llama_sampler * /*smpl*/) {
+    return "repeat-line";
+}
+
+static void llama_sampler_repeat_line_accept(struct llama_sampler * smpl, llama_token token) {
+    auto * ctx = (llama_sampler_repeat_line *) smpl->ctx;
+    if (ctx->window <= 0) {
+        return;
+    }
+
+    // decode token to text
+    int len = ctx->vocab->token_to_piece(token, ctx->token_buf.data(), (int) ctx->token_buf.size(), 0, false);
+    if (len < 0) {
+        // buffer too small — resize and retry
+        ctx->token_buf.resize(-len);
+        len = ctx->vocab->token_to_piece(token, ctx->token_buf.data(), (int) ctx->token_buf.size(), 0, false);
+    }
+    if (len <= 0) {
+        return;
+    }
+
+    for (int i = 0; i < len; i++) {
+        char ch = ctx->token_buf[i];
+        ctx->current_segment += ch;
+
+        if (ctx->delimiters.find(ch) != std::string::npos) {
+            // segment complete — strip and check
+            std::string seg = ctx->current_segment;
+            // trim whitespace
+            size_t s = seg.find_first_not_of(" \t\r\n");
+            size_t e = seg.find_last_not_of(" \t\r\n");
+            seg = (s == std::string::npos) ? "" : seg.substr(s, e - s + 1);
+
+            if ((int) seg.size() >= ctx->min_length) {
+                ctx->loop_active = false;
+                for (const auto & past : ctx->past_segments) {
+                    if (past == seg) {
+                        ctx->loop_active = true;
+                        break;
+                    }
+                }
+
+                if (ctx->loop_active) {
+                    LLAMA_LOG_INFO("repeat-line: loop detected, boosting temperature by %.2f\n", (double)ctx->temp_boost);
+                } else {
+                    LLAMA_LOG_DEBUG("repeat-line: segment=%zu [%s]\n", ctx->past_segments.size(), seg.c_str());
+                }
+
+                ctx->past_segments.push_back(seg);
+                if ((int) ctx->past_segments.size() > ctx->window) {
+                    ctx->past_segments.pop_front();
+                }
+            }
+
+            ctx->current_segment.clear();
+        }
+    }
+}
+
+static void llama_sampler_repeat_line_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+    const auto * ctx = (const llama_sampler_repeat_line *) smpl->ctx;
+    if (ctx->window <= 0 || !ctx->loop_active || ctx->temp_boost <= 0.0f) {
+        return;
+    }
+    // boost temperature: scale logits by 1/(1+boost)  (higher temp = flatter distribution)
+    const float inv_temp = 1.0f / (1.0f + ctx->temp_boost);
+    LLAMA_LOG_DEBUG("repeat-line: apply boost inv_temp=%.3f\n", (double)inv_temp);
+    for (size_t i = 0; i < cur_p->size; i++) {
+        cur_p->data[i].logit *= inv_temp;
+    }
+}
+
+static void llama_sampler_repeat_line_reset(struct llama_sampler * smpl) {
+    auto * ctx = (llama_sampler_repeat_line *) smpl->ctx;
+    ctx->current_segment.clear();
+    ctx->past_segments.clear();
+    ctx->loop_active = false;
+}
+
+static struct llama_sampler * llama_sampler_repeat_line_clone(const struct llama_sampler * smpl) {
+    const auto * ctx = (const llama_sampler_repeat_line *) smpl->ctx;
+    return llama_sampler_init_repeat_line(ctx->vocab, ctx->window, ctx->min_length, ctx->delimiters.c_str(), ctx->temp_boost);
+}
+
+static void llama_sampler_repeat_line_free(struct llama_sampler * smpl) {
+    delete (llama_sampler_repeat_line *) smpl->ctx;
+}
+
+static struct llama_sampler_i llama_sampler_repeat_line_i = {
+    /* .name              = */ llama_sampler_repeat_line_name,
+    /* .accept            = */ llama_sampler_repeat_line_accept,
+    /* .apply             = */ llama_sampler_repeat_line_apply,
+    /* .reset             = */ llama_sampler_repeat_line_reset,
+    /* .clone             = */ llama_sampler_repeat_line_clone,
+    /* .free              = */ llama_sampler_repeat_line_free,
+    /* .backend_init      = */ nullptr,
+    /* .backend_accept    = */ nullptr,
+    /* .backend_apply     = */ nullptr,
+    /* .backend_set_input = */ nullptr,
+};
+
+struct llama_sampler * llama_sampler_init_repeat_line(
+        const struct llama_vocab * vocab,
+                         int32_t   window,
+                         int32_t   min_length,
+                      const char * delimiters,
+                           float   temp_boost) {
+    LLAMA_LOG_DEBUG("repeat-line: init window=%d min_length=%d delimiters=[%s] temp_boost=%.2f\n",
+        window, min_length, delimiters ? delimiters : "(null)", (double)temp_boost);
+    return new llama_sampler {
+        /* .iface = */ &llama_sampler_repeat_line_i,
+        /* .ctx   = */ new llama_sampler_repeat_line(vocab, window, min_length, delimiters, temp_boost),
+    };
 }
 
 // logit-bias

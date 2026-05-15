@@ -87,6 +87,10 @@ json task_params::to_json(bool only_metrics) const {
             {"dry_base",                  sampling.dry_base},
             {"dry_allowed_length",        sampling.dry_allowed_length},
             {"dry_penalty_last_n",        sampling.dry_penalty_last_n},
+            {"repeat_line_window",        sampling.repeat_line_window},
+            {"repeat_line_min_length",    sampling.repeat_line_min_length},
+            {"repeat_line_delimiters",    sampling.repeat_line_delimiters},
+            {"repeat_line_temp_boost",    sampling.repeat_line_temp_boost},
             {"mirostat",                  sampling.mirostat},
             {"mirostat_tau",              sampling.mirostat_tau},
             {"mirostat_eta",              sampling.mirostat_eta},
@@ -138,6 +142,10 @@ json task_params::to_json(bool only_metrics) const {
         {"dry_allowed_length",        sampling.dry_allowed_length},
         {"dry_penalty_last_n",        sampling.dry_penalty_last_n},
         {"dry_sequence_breakers",     sampling.dry_sequence_breakers},
+        {"repeat_line_window",        sampling.repeat_line_window},
+        {"repeat_line_min_length",    sampling.repeat_line_min_length},
+        {"repeat_line_delimiters",    sampling.repeat_line_delimiters},
+        {"repeat_line_temp_boost",    sampling.repeat_line_temp_boost},
         {"mirostat",                  sampling.mirostat},
         {"mirostat_tau",              sampling.mirostat_tau},
         {"mirostat_eta",              sampling.mirostat_eta},
@@ -306,11 +314,15 @@ task_params server_task::params_from_json_cmpl(
     params.sampling.penalty_repeat     = json_value(data, "repeat_penalty",      defaults.sampling.penalty_repeat);
     params.sampling.penalty_freq       = json_value(data, "frequency_penalty",   defaults.sampling.penalty_freq);
     params.sampling.penalty_present    = json_value(data, "presence_penalty",    defaults.sampling.penalty_present);
-    params.sampling.dry_multiplier     = json_value(data, "dry_multiplier",      defaults.sampling.dry_multiplier);
-    params.sampling.dry_base           = json_value(data, "dry_base",            defaults.sampling.dry_base);
-    params.sampling.dry_allowed_length = json_value(data, "dry_allowed_length",  defaults.sampling.dry_allowed_length);
-    params.sampling.dry_penalty_last_n = json_value(data, "dry_penalty_last_n",  defaults.sampling.dry_penalty_last_n);
-    params.sampling.mirostat           = json_value(data, "mirostat",            defaults.sampling.mirostat);
+    params.sampling.dry_multiplier         = json_value(data, "dry_multiplier",         defaults.sampling.dry_multiplier);
+    params.sampling.dry_base               = json_value(data, "dry_base",               defaults.sampling.dry_base);
+    params.sampling.dry_allowed_length     = json_value(data, "dry_allowed_length",     defaults.sampling.dry_allowed_length);
+    params.sampling.dry_penalty_last_n     = json_value(data, "dry_penalty_last_n",     defaults.sampling.dry_penalty_last_n);
+    params.sampling.repeat_line_window     = json_value(data, "repeat_line_window",     defaults.sampling.repeat_line_window);
+    params.sampling.repeat_line_min_length = json_value(data, "repeat_line_min_length", defaults.sampling.repeat_line_min_length);
+    params.sampling.repeat_line_delimiters = json_value(data, "repeat_line_delimiters", defaults.sampling.repeat_line_delimiters);
+    params.sampling.repeat_line_temp_boost = json_value(data, "repeat_line_temp_boost", defaults.sampling.repeat_line_temp_boost);
+    params.sampling.mirostat               = json_value(data, "mirostat",               defaults.sampling.mirostat);
     params.sampling.mirostat_tau       = json_value(data, "mirostat_tau",        defaults.sampling.mirostat_tau);
     params.sampling.mirostat_eta       = json_value(data, "mirostat_eta",        defaults.sampling.mirostat_eta);
     params.sampling.adaptive_target    = json_value(data, "adaptive_target",     defaults.sampling.adaptive_target);
@@ -662,6 +674,34 @@ task_params server_task::params_from_json_cmpl(
 
     if (params.n_cmpl > params_base.n_parallel) {
         throw std::runtime_error("n_cmpl cannot be greater than the number of slots, please increase -np");
+    }
+
+    const auto message_spans = json_value(data, "message_spans", json::array());
+    if (message_spans.is_array()) {
+        int32_t last_user_pos = -1;
+
+        for (const auto & span : message_spans) {
+            const std::string role = json_value(span, "role", std::string());
+            const int32_t pos      = json_value(span, "pos", -1);
+
+            if (role == "user") {
+                last_user_pos = pos;
+            }
+        }
+
+        if (last_user_pos >= 0) {
+            const std::string prompt = json_value(data, "prompt", std::string());
+
+            if ((size_t) last_user_pos <= prompt.size()) {
+                const std::string prefix = prompt.substr(0, (size_t) last_user_pos);
+                const auto prefix_tokens = common_tokenize(vocab, prefix, true, true);
+
+                SRV_INF("message_spans: last user boundary: byte_pos=%d, token_pos=%zu\n",
+                        last_user_pos, prefix_tokens.size());
+
+                params.checkpoint_before_last_user_token = (int32_t) prefix_tokens.size();
+            }
+        }
     }
 
     return params;
@@ -2054,7 +2094,7 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
         const int cur_lcp_len = it->tokens.get_common_prefix(prompt.tokens);
 
         if (cur_lcp_len == (int) prompt.tokens.size()) {
-            SRV_WRN("%s", " - prompt is already in the cache, skipping\n");
+            SRV_INF("%s", " - prompt is already in the cache, skipping\n");
             return nullptr;
         }
     }
@@ -2104,12 +2144,12 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+    int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
     float sim_best    = float(lcp_best) / tokens_new.size();
 
-    SRV_WRN(" - looking for better prompt, base f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
+    SRV_WRN(" - looking for better prompt, base lcp = %d, f_keep = %.3f, sim = %.3f\n", lcp_best, f_keep_best, sim_best);
 
     auto it_best = states.end();
 
@@ -2125,7 +2165,16 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             continue;
         }
 
-        if (f_keep_best < f_keep_cur && sim_best < sim_cur) {
+        // Prioritize absolute prefix reuse length. This helps promote a newly
+        // joined static prefix (e.g. after truncate-middle) over older cache entries
+        // that keep more of their own state but match fewer request tokens.
+        const bool better_match =
+            lcp_cur > lcp_best ||
+            (lcp_cur == lcp_best && sim_cur > sim_best) ||
+            (lcp_cur == lcp_best && sim_cur == sim_best && f_keep_cur > f_keep_best);
+
+        if (better_match) {
+            lcp_best    = lcp_cur;
             f_keep_best = f_keep_cur;
             sim_best    = sim_cur;
 
@@ -2134,7 +2183,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     }
 
     if (it_best != states.end()) {
-        SRV_WRN(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
+        SRV_WRN(" - found better prompt with lcp = %d, f_keep = %.3f, sim = %.3f\n", lcp_best, f_keep_best, sim_best);
 
         {
             auto & data = it_best->data.main;
@@ -2142,7 +2191,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             const size_t size = data.size();
             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
             if (n != size) {
-                SRV_WRN("failed to restore state with size %zu\n", size);
+                SRV_ERR("failed to restore state with size %zu\n", size);
 
                 return false;
             }
@@ -2211,11 +2260,11 @@ void server_prompt_cache::update() {
         }
     }
 
-    SRV_WRN(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
+    SRV_INF(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
             states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
 
     for (const auto & state : states) {
-        SRV_WRN("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
+        SRV_INF("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
                 (const void *)&state, state.n_tokens(), state.checkpoints.size(), state.size() / (1024.0 * 1024.0));
     }
 }

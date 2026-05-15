@@ -44,6 +44,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_llama_embed(params);
         case LLM_ARCH_MAINCODER:
             return new llama_model_maincoder(params);
+        case LLM_ARCH_TALKIE:
+            return new llama_model_talkie(params);
         case LLM_ARCH_DECI:
             return new llama_model_deci(params);
         case LLM_ARCH_BAICHUAN:
@@ -884,6 +886,9 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
     // add the device split buffer type if requested and available
     if (split_mode == LLAMA_SPLIT_MODE_ROW) {
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (ggml_backend_reg_name(reg) == std::string("SYCL")) {
+            throw std::runtime_error("SYCL backend does not support LLAMA_SPLIT_MODE_ROW");
+        }
         auto ggml_backend_split_buffer_type_fn = (ggml_backend_split_buffer_type_t)
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_split_buffer_type");
         if (ggml_backend_split_buffer_type_fn) {
@@ -1396,10 +1401,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 layer.ssm_beta_in_s = create_tensor(tn(LLM_TENSOR_SSM_BETA, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
         }
+        // output scales
+        if (output) {
+            // weight scale
+            if (!output_s) {
+                output_s = create_tensor(tn(LLM_TENSOR_OUTPUT, "scale"), {1}, TENSOR_NOT_REQUIRED);
+            }
+            // input scale
+            if (!output_in_s) {
+                output_in_s = create_tensor(tn(LLM_TENSOR_OUTPUT, "input_scale"), {1}, TENSOR_NOT_REQUIRED);
+            }
+        }
     }
-
     ml.done_getting_tensors();
 
+    GGML_ASSERT(!(output && tok_embd &&
+            strcmp(output->name, tok_embd->name) == 0 &&
+            output->type == GGML_TYPE_NVFP4));
     // populate tensors_by_name
     for (auto & [_, ctx_ptr] : ml.ctx_map) {
         for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
@@ -1998,7 +2016,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* kv_size_max       */ cparams.kv_dynamic ? cparams.n_ctx_seq : 0);
                     }
                 } else {
                     llama_memory_i::layer_reuse_cb reuse = nullptr;
@@ -2046,7 +2065,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 hparams.n_swa,
                                 hparams.swa_type,
                                 nullptr,
-                                nullptr);
+                                nullptr,
+                                cparams.kv_dynamic ? cparams.n_ctx_seq : 0);
                     }
                 }
             }
@@ -2307,6 +2327,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_DFLASH_DRAFT:
         case LLM_ARCH_STEP35:
+        case LLM_ARCH_TALKIE:
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_QWEN2VL:

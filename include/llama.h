@@ -378,6 +378,7 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool kv_dynamic;  // enable dynamic KV cache resizing (start small, grow on demand)
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -744,7 +745,7 @@ extern "C" {
               llama_seq_id seq_id,
                  llama_pos p0,
                  llama_pos p1,
-                       int d);
+                   int32_t d);
 
     // Returns the smallest position present in the memory for the specified sequence
     // This is typically non-zero only for SWA caches
@@ -1294,7 +1295,7 @@ extern "C" {
     LLAMA_API struct llama_sampler * llama_sampler_chain_get(      struct llama_sampler * chain, int32_t i);
 
     // the total number of samplers in the chain
-    LLAMA_API int                    llama_sampler_chain_n  (const struct llama_sampler * chain);
+    LLAMA_API int32_t                llama_sampler_chain_n  (const struct llama_sampler * chain);
 
     // after removing a sampler, the chain will no longer own it, and it will not be freed when the chain is freed
     LLAMA_API struct llama_sampler * llama_sampler_chain_remove(   struct llama_sampler * chain, int32_t i);
@@ -1332,11 +1333,11 @@ extern "C" {
     LLAMA_API struct llama_sampler * llama_sampler_init_top_n_sigma(float   n);
 
     /// @details Mirostat 1.0 algorithm described in the paper https://arxiv.org/abs/2007.14966. Uses tokens instead of words.
-    /// @param candidates A vector of `llama_token_data` containing the candidate tokens, their probabilities (p), and log-odds (logit) for the current position in the generated text.
+    /// @param n_vocab The number of tokens in the vocabulary
+    /// @param seed The sampler seed
     /// @param tau  The target cross-entropy (or surprise) value you want to achieve for the generated text. A higher value corresponds to more surprising or less predictable text, while a lower value corresponds to less surprising or more predictable text.
     /// @param eta The learning rate used to update `mu` based on the error between the target and observed surprisal of the sampled word. A larger learning rate will cause `mu` to be updated more quickly, while a smaller learning rate will result in slower updates.
     /// @param m The number of tokens considered in the estimation of `s_hat`. This is an arbitrary value that is used to calculate `s_hat`, which in turn helps to calculate the value of `k`. In the paper, they use `m = 100`, but you can experiment with different values to see how it affects the performance of the algorithm.
-    /// @param mu Maximum cross-entropy. This value is initialized to be twice the target cross-entropy (`2 * tau`) and is updated in the algorithm based on the error between the target and observed surprisal.
     LLAMA_API struct llama_sampler * llama_sampler_init_mirostat(
                              int32_t   n_vocab,
                             uint32_t   seed,
@@ -1345,10 +1346,10 @@ extern "C" {
                              int32_t   m);
 
     /// @details Mirostat 2.0 algorithm described in the paper https://arxiv.org/abs/2007.14966. Uses tokens instead of words.
+    /// @param seed The sampler seed
     /// @param candidates A vector of `llama_token_data` containing the candidate tokens, their probabilities (p), and log-odds (logit) for the current position in the generated text.
     /// @param tau  The target cross-entropy (or surprise) value you want to achieve for the generated text. A higher value corresponds to more surprising or less predictable text, while a lower value corresponds to less surprising or more predictable text.
     /// @param eta The learning rate used to update `mu` based on the error between the target and observed surprisal of the sampled word. A larger learning rate will cause `mu` to be updated more quickly, while a smaller learning rate will result in slower updates.
-    /// @param mu Maximum cross-entropy. This value is initialized to be twice the target cross-entropy (`2 * tau`) and is updated in the algorithm based on the error between the target and observed surprisal.
     LLAMA_API struct llama_sampler * llama_sampler_init_mirostat_v2(
                             uint32_t   seed,
                                float   tau,
@@ -1404,6 +1405,24 @@ extern "C" {
                              int32_t    dry_penalty_last_n,
                           const char ** seq_breakers,
                               size_t    num_breakers);
+
+    /// repeat-line: segment-level loop detection.
+    ///
+    /// detects when the model repeats the same sentence/segment (which token-level repeat_penalty cannot catch).
+    /// when a repeated segment is detected, temperature is temporarily boosted.
+    ///
+    /// params:
+    ///   vocab       - vocabulary (for token decoding)
+    ///   window      - number of past segments to compare against (0 = disabled)
+    ///   min_length  - ignore segments shorter than this (default 10, avoids false positives like "Ok.")
+    ///   delimiters  - characters that end a segment (default "\n.!?:")
+    ///   temp_boost  - temperature boost applied when a loop is detected (default 0.3)
+    LLAMA_API struct llama_sampler * llama_sampler_init_repeat_line(
+            const struct llama_vocab * vocab,
+                             int32_t   window,
+                             int32_t   min_length,
+                          const char * delimiters,
+                               float   temp_boost);
 
     /// adaptive-p: select tokens near a configurable target probability over time.
     ///

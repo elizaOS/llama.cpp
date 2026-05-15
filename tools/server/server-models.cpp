@@ -161,6 +161,30 @@ void server_model_meta::update_args(common_preset_context & ctx_preset, std::str
     args = preset.to_args(bin_path);
 }
 
+void server_model_meta::update_caps() {
+    try {
+        common_params params;
+        preset.apply_to_params(params, {
+            "LLAMA_ARG_MODEL",
+            "LLAMA_ARG_MODEL_URL",
+            "LLAMA_ARG_MMPROJ",
+            "LLAMA_ARG_MMPROJ_URL",
+            "LLAMA_ARG_HF_REPO",
+            "LLAMA_ARG_HF_REPO_FILE",
+        });
+        params.offline = true; // avoid any unwanted network call during capability detection
+        common_params_handle_models(params, LLAMA_EXAMPLE_SERVER);
+        if (params.mmproj.path.empty()) {
+            multimodal = { false, false };
+        } else {
+            multimodal = mtmd_get_cap_from_file(params.mmproj.path.c_str());
+        }
+    } catch (const std::exception & e) {
+        LOG_WRN("failed to initialize common_params for multimodal capability detection: %s\n", e.what());
+        multimodal = { false, false };
+    }
+}
+
 //
 // server_models
 //
@@ -236,6 +260,7 @@ void server_models::add_model(server_model_meta && meta) {
     }
 
     meta.update_args(ctx_preset, bin_path); // render args
+    meta.update_caps();
     std::string name = meta.name;
     mapping[name] = instance_t{
         /* subproc */ std::make_shared<subprocess_s>(),
@@ -346,8 +371,10 @@ void server_models::load_models() {
                 /* status       */ SERVER_MODEL_STATUS_UNLOADED,
                 /* last_used    */ 0,
                 /* args         */ std::vector<std::string>(),
+                /* loaded_info  */ {},
                 /* exit_code    */ 0,
                 /* stop_timeout */ DEFAULT_STOP_TIMEOUT,
+                /* multimodal   */ mtmd_caps{false, false},
             };
             add_model(std::move(meta));
         }
@@ -481,6 +508,7 @@ void server_models::load_models() {
 
             inst.meta.exit_code = 0; // clear failed state so the model can be reloaded
             inst.meta.update_args(ctx_preset, bin_path);
+            inst.meta.update_caps();
         }
 
         // add models that are new in this reload
@@ -496,8 +524,10 @@ void server_models::load_models() {
                     /* status       */ SERVER_MODEL_STATUS_UNLOADED,
                     /* last_used    */ 0,
                     /* args         */ std::vector<std::string>(),
+                    /* loaded_info  */ {},
                     /* exit_code    */ 0,
                     /* stop_timeout */ DEFAULT_STOP_TIMEOUT,
+                    /* multimodal   */ mtmd_caps{false, false},
                 };
                 add_model(std::move(meta));
                 newly_added.push_back(name);
@@ -786,56 +816,71 @@ void server_models::load(const std::string & name) {
             }
         });
 
+        std::atomic<bool> child_finished(false);
+
         std::thread stopping_thread([&]() {
-            // thread to monitor stopping signal OR child crash
+            // thread to monitor explicit stop requests; child exit is signalled via child_finished
             auto is_stopping = [this, &name]() {
                 return this->stopping_models.find(name) != this->stopping_models.end();
             };
-            auto should_wake = [&]() {
-                return is_stopping() || !subprocess_alive(child_proc.get());
-            };
+
             {
                 std::unique_lock<std::mutex> lk(this->mutex);
-                this->cv_stop.wait(lk, should_wake);
+                this->cv_stop.wait(lk, [&]() {
+                    return is_stopping() || child_finished.load(std::memory_order_acquire);
+                });
+                if (!is_stopping() || child_finished.load(std::memory_order_acquire)) {
+                    return;
+                }
             }
-            // child may have already exited (e.g. crashed) — skip shutdown sequence
-            if (!subprocess_alive(child_proc.get())) {
+
+            // child may have already exited between wake-up and shutdown handling
+            if (subprocess_alive(child_proc.get()) <= 0) {
                 return;
             }
+
             SRV_INF("stopping model instance name=%s\n", name.c_str());
-            // send interrupt to child process
             fprintf(stdin_file, "%s\n", CMD_ROUTER_TO_CHILD_EXIT);
             fflush(stdin_file);
-            // wait to stop gracefully or timeout
+
             int64_t start_time = ggml_time_ms();
             while (true) {
-                std::unique_lock<std::mutex> lk(this->mutex);
-                if (!is_stopping()) {
-                    return; // already stopped
+                if (subprocess_alive(child_proc.get()) <= 0) {
+                    return;
                 }
+
+                std::unique_lock<std::mutex> lk(this->mutex);
+                if (!is_stopping() || child_finished.load(std::memory_order_acquire)) {
+                    return;
+                }
+
                 int64_t elapsed = ggml_time_ms() - start_time;
                 if (elapsed >= stop_timeout * 1000) {
-                    // timeout, force kill
+                    lk.unlock();
                     SRV_WRN("force-killing model instance name=%s after %d seconds timeout\n", name.c_str(), stop_timeout);
                     subprocess_terminate(child_proc.get());
                     return;
                 }
-                this->cv_stop.wait_for(lk, std::chrono::seconds(1));
+
+                this->cv_stop.wait_for(lk, std::chrono::seconds(1), [&]() {
+                    return !is_stopping() || child_finished.load(std::memory_order_acquire);
+                });
             }
         });
 
-        // we reach here when the child process exits
+
         // note: we cannot join() prior to this point because it will close stdin_file
         if (log_thread.joinable()) {
             log_thread.join();
         }
 
-        // stop the timeout monitoring thread
+        child_finished.store(true, std::memory_order_release);
         {
             std::lock_guard<std::mutex> lk(this->mutex);
             stopping_models.erase(name);
             cv_stop.notify_all();
         }
+
         if (stopping_thread.joinable()) {
             stopping_thread.join();
         }
@@ -1206,14 +1251,28 @@ void server_models_routes::init_routes() {
                 status["failed"]    = true;
             }
 
+            // pi coding agent multimodal compatibility
+            json input_modalities = json::array({"text"});
+            if (meta.multimodal.inp_vision) {
+                input_modalities.push_back("image");
+            }
+            if (meta.multimodal.inp_audio) {
+                input_modalities.push_back("audio");
+            }
+            json architecture {
+                {"input_modalities",  input_modalities},
+                {"output_modalities", json::array({"text"})},
+            };
+
             json model_info = json {
-                {"id",       meta.name},
-                {"aliases",  meta.aliases},
-                {"tags",     meta.tags},
-                {"object",   "model"},    // for OAI-compat
-                {"owned_by", "llamacpp"}, // for OAI-compat
-                {"created",  t},          // for OAI-compat
-                {"status",   status},
+                {"id",           meta.name},
+                {"aliases",      meta.aliases},
+                {"tags",         meta.tags},
+                {"object",       "model"},    // for OAI-compat
+                {"owned_by",     "llamacpp"}, // for OAI-compat
+                {"created",      t},          // for OAI-compat
+                {"status",       status},
+                {"architecture", architecture},
                 // TODO: add other fields, may require reading GGUF metadata
             };
 

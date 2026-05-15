@@ -67,6 +67,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base(ggml
     switch (op) {
         case GGML_OP_ADD_ID: op_str = "add_id"; break;
         case GGML_OP_CONCAT: op_str = "concat"; break;
+        case GGML_OP_ROLL:   op_str = "roll";   break;
         default: GGML_ABORT("fatal error");
     };
 
@@ -582,6 +583,27 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rwkv(ggml_metal_
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gla(ggml_metal_library_t lib, const ggml_tensor * op) {
+    char name[256];
+
+    const int64_t C = op->ne[0];
+    const int64_t H = op->src[0]->ne[1];
+    const int64_t head_size = C / H;
+
+    GGML_ASSERT(op->src[4]->type == GGML_TYPE_F32);
+    GGML_ASSERT(C % H == 0);
+    GGML_ASSERT(head_size == 64 || head_size == 128);
+
+    snprintf(name, 256, "kernel_gla_f32_hs%d", (int)head_size);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(ggml_metal_library_t lib, const ggml_tensor * op) {
     char base[256];
     char name[256];
@@ -821,6 +843,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 nr0 = N_R0_MXFP4;
                 smem = 32*sizeof(float);
             } break;
+        case GGML_TYPE_NVFP4:
+            {
+                nsg = N_SG_NVFP4;
+                nr0 = N_R0_NVFP4;
+                smem = (32 + 128)*sizeof(float);
+            } break;
         case GGML_TYPE_Q2_K:
             {
                 nsg = N_SG_Q2_K;
@@ -1049,6 +1077,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
                 nsg = N_SG_MXFP4;
                 nr0 = N_R0_MXFP4;
                 smem = 32*sizeof(float);
+            } break;
+        case GGML_TYPE_NVFP4:
+            {
+                nsg = N_SG_NVFP4;
+                nr0 = N_R0_NVFP4;
+                smem = (32 + 128)*sizeof(float);
             } break;
         case GGML_TYPE_Q2_K:
             {
@@ -1379,6 +1413,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
         bool    has_bias,
         bool    has_scap,
         bool    has_kvpad,
+        int32_t nqptg,
         int32_t nsg) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
@@ -1392,13 +1427,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
     const int32_t ns20 = op->src[2]->nb[1]/op->src[2]->nb[0];
 
     // do bounds checks for the mask?
-    const bool bc_mask = op->src[3] && (op->src[3]->ne[1] % 8 != 0);
+    const bool bc_mask = op->src[3] && (op->src[3]->ne[1] % nqptg != 0);
 
-    snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
+    snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d%s",
             "flash_attn_ext",
             ggml_type_name(op->src[1]->type),
             dk,
-            dv);
+            dv,
+            nqptg == OP_FLASH_ATTN_EXT_NQPSG_16 ? "_q16" : "");
 
     snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d_kvpad=%d_bcm=%d_ns10=%d_ns20=%d_nsg=%d",
             base,
@@ -1913,6 +1949,27 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_2d(ggml_met
     char name[256];
 
     snprintf(base, 256, "kernel_conv_2d_%s_%s", ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type));
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_2d_dw(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_CONV_2D_DW);
+
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32);
+    GGML_ASSERT(op->type         == GGML_TYPE_F32);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_conv_2d_dw_%s_%s", ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type));
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);

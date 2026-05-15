@@ -157,9 +157,9 @@ enum common_params_sampling_config : uint64_t {
 
 enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NONE,          // no speculative decoding
-    COMMON_SPECULATIVE_TYPE_DRAFT,         // draft model
-    COMMON_SPECULATIVE_TYPE_EAGLE3,        // eagle draft model
-    COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,  // standalone draft model speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding
+    COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding based on n-grams
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
@@ -230,6 +230,10 @@ struct common_params_sampling {
     float   dry_base           = 1.75f;  // 0.0 = disabled;      multiplier * base ^ (length of sequence before token - allowed length)
     int32_t dry_allowed_length = 2;      // tokens extending repetitions beyond this receive penalty
     int32_t dry_penalty_last_n = -1;     // how many tokens to scan for repetitions (0 = disable penalty, -1 = context size)
+    int32_t repeat_line_window     = 0;           // 0 = disabled; number of past segments to compare against
+    int32_t repeat_line_min_length = 20;          // ignore segments shorter than this (avoids false positives like "Ok.")
+    std::string repeat_line_delimiters = "\n.!?:"; // characters that end a segment
+    float   repeat_line_temp_boost = 0.50f;       // temperature boost when loop detected
     float   adaptive_target    = -1.0f;  // select tokens near this probability (valid range 0.0 to 1.0; negative = disabled)
     float   adaptive_decay     = 0.90f;  // EMA decay for adaptation; history ≈ 1/(1-decay) tokens (0.0 - 0.99)
     int32_t mirostat           = 0;      // 0 = disabled, 1 = mirostat, 2 = mirostat 2.0
@@ -344,6 +348,7 @@ struct common_params_speculative_ngram_cache {
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
 
+    // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
 
     // Optional target-token-string -> draft-token-string compatibility map used by --spec-replace.
@@ -535,6 +540,7 @@ struct common_params {
     bool ctx_shift         = false; // context shift on infinite text generation
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
+    bool kv_dynamic        = false; // enable dynamic KV cache resizing
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool use_mmap          = true;  // enable mmap to use filesystem cache
@@ -609,7 +615,11 @@ struct common_params {
     std::map<std::string, std::string> default_template_kwargs;
 
     // webui configs
-    bool webui = true;
+#ifdef LLAMA_WEBUI_DEFAULT_ENABLED
+    bool webui = LLAMA_WEBUI_DEFAULT_ENABLED != 0;
+#else
+    bool webui = true; // default to enabled when not set
+#endif
     bool webui_mcp_proxy = false;
     std::string webui_config_json;
 
@@ -690,6 +700,7 @@ struct common_params {
 // initializes the logging system and prints info about the build
 void common_init();
 
+void common_params_print_info(const common_params & params);
 std::string common_params_get_system_info(const common_params & params);
 
 bool parse_cpu_range(const std::string & range, bool(&boolmask)[GGML_MAX_N_THREADS]);

@@ -252,6 +252,7 @@ option(GGML_SYCL                            "ggml: use SYCL"                    
 option(GGML_SYCL_F16                        "ggml: use 16 bit floats for sycl calculations"   OFF)
 option(GGML_SYCL_GRAPH                      "ggml: enable graphs in the SYCL backend"         ON)
 option(GGML_SYCL_HOST_MEM_FALLBACK          "ggml: allow host memory fallback in SYCL reorder (requires kernel 6.8+)" ON)
+option(GGML_SYCL_SUPPORT_LEVEL_ZERO         "ggml: use Level Zero API in SYCL backend"  ON)
 option(GGML_SYCL_DNN                        "ggml: enable oneDNN in the SYCL backend"         ON)
 set   (GGML_SYCL_TARGET "INTEL" CACHE STRING
                                             "ggml: sycl target device")
@@ -346,8 +347,8 @@ set_target_properties(ggml PROPERTIES PUBLIC_HEADER "${GGML_PUBLIC_HEADERS}")
 #if (GGML_METAL)
 #    set_target_properties(ggml PROPERTIES RESOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/ggml-metal.metal")
 #endif()
-install(TARGETS ggml LIBRARY PUBLIC_HEADER)
-install(TARGETS ggml-base LIBRARY)
+install(TARGETS ggml EXPORT ggml-targets LIBRARY PUBLIC_HEADER)
+install(TARGETS ggml-base EXPORT ggml-targets LIBRARY)
 
 if (GGML_STANDALONE)
     configure_file(${CMAKE_CURRENT_SOURCE_DIR}/ggml.pc.in
@@ -415,6 +416,9 @@ target_compile_definitions(ggml-base PRIVATE
 message(STATUS "ggml version: ${GGML_INSTALL_VERSION}")
 message(STATUS "ggml commit:  ${GGML_BUILD_COMMIT}")
 
+install(EXPORT ggml-targets
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ggml
+        NAMESPACE ggml::)
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ggml-config.cmake
               ${CMAKE_CURRENT_BINARY_DIR}/ggml-version.cmake
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ggml)

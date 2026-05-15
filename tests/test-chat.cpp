@@ -1514,6 +1514,40 @@ static void test_msgs_oaicompat_json_conversion() {
     }
 }
 
+static void test_split_by_role() {
+    LOG_DBG("%s\n", __func__);
+
+    // Empty inputs
+    assert_equals<size_t>(0, common_chat_split_by_role("", {}).size());
+    assert_equals<size_t>(0, common_chat_split_by_role("hello", {}).size());
+    assert_equals<size_t>(0, common_chat_split_by_role("", { { "user", "<|user|>" } }).size());
+
+    // Multi-role conversation, no leading/trailing content
+    {
+        const std::string prompt = "<|user|>Hi<|assistant|>Hello<|user|>Bye";
+        const auto splits = common_chat_split_by_role(prompt, {
+            { "user",      "<|user|>"      },
+            { "assistant", "<|assistant|>" },
+        });
+        assert_equals<size_t>(3, splits.size());
+
+        assert_equals<std::string>("user", splits[0].role);
+        assert_equals<size_t>(0, splits[0].pos);
+        assert_equals<size_t>(10, splits[0].len);
+        assert_equals<std::string>("<|user|>Hi", prompt.substr(splits[0].pos, splits[0].len));
+
+        assert_equals<std::string>("assistant", splits[1].role);
+        assert_equals<size_t>(10, splits[1].pos);
+        assert_equals<size_t>(18, splits[1].len);
+        assert_equals<std::string>("<|assistant|>Hello", prompt.substr(splits[1].pos, splits[1].len));
+
+        assert_equals<std::string>("user", splits[2].role);
+        assert_equals<size_t>(28, splits[2].pos);
+        assert_equals<size_t>(11, splits[2].len);
+        assert_equals<std::string>("<|user|>Bye", prompt.substr(splits[2].pos, splits[2].len));
+    }
+}
+
 static void test_tools_oaicompat_json_conversion() {
     LOG_DBG("%s\n", __func__);
     std::vector<common_chat_tool> tools{
@@ -1663,6 +1697,83 @@ static void test_convert_responses_to_chatcmpl() {
         assert_equals(true, result.contains("max_tokens"));
         assert_equals(false, result.contains("max_output_tokens"));
         assert_equals(100, result.at("max_tokens").get<int>());
+    }
+
+    // Test mixed Responses tools: convert only function tools
+    {
+        json input = json::parse(R"({
+            "input": "Hello",
+            "model": "test-model",
+            "tools": [
+                {
+                    "type": "web_search"
+                },
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "description": "Get weather for a location",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "string"
+                            }
+                        },
+                        "required": ["location"]
+                    }
+                },
+                {
+                    "type": "image_generation"
+                },
+                {
+                    "type": "mcp",
+                    "server_label": "test-server"
+                },
+                {
+                    "type": "namespace",
+                    "name": "browser"
+                }
+            ]
+        })");
+
+        json result = server_chat_convert_responses_to_chatcmpl(input);
+
+        assert_equals(true, result.contains("tools"));
+        assert_equals(true, result.at("tools").is_array());
+        assert_equals((size_t)1, result.at("tools").size());
+
+        const auto & tool = result.at("tools")[0];
+        assert_equals(std::string("function"), tool.at("type").get<std::string>());
+        assert_equals(std::string("get_weather"), tool.at("function").at("name").get<std::string>());
+        assert_equals(true, tool.at("function").at("strict").get<bool>());
+    }
+
+    // Test non-function Responses tools are ignored
+    {
+        json input = json::parse(R"({
+            "input": "Hello",
+            "model": "test-model",
+            "tools": [
+                {
+                    "type": "web_search"
+                },
+                {
+                    "type": "image_generation"
+                },
+                {
+                    "type": "mcp",
+                    "server_label": "test-server"
+                },
+                {
+                    "type": "namespace",
+                    "name": "browser"
+                }
+            ]
+        })");
+
+        json result = server_chat_convert_responses_to_chatcmpl(input);
+
+        assert_equals(false, result.contains("tools"));
     }
 }
 
@@ -4761,6 +4872,7 @@ int main(int argc, char ** argv) {
     {
         test_msg_diffs_compute();
         test_msgs_oaicompat_json_conversion();
+        test_split_by_role();
         test_tools_oaicompat_json_conversion();
         test_convert_responses_to_chatcmpl();
         test_developer_role_to_system_workaround();

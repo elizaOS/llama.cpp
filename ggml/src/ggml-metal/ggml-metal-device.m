@@ -683,7 +683,7 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
                 ![[dev->mtl_device name] containsString:@"M6"] &&
                 ![[dev->mtl_device name] containsString:@"A19"] &&
                 ![[dev->mtl_device name] containsString:@"A20"]) {
-                GGML_LOG_WARN("%s: tensor API disabled for pre-M5 and pre-A19 devices\n", __func__);
+                GGML_LOG_INFO("%s: tensor API disabled for pre-M5 and pre-A19 devices\n", __func__);
                 dev->props.has_tensor = false;
             }
 
@@ -804,6 +804,17 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
                 dev->props.use_shared_buffers = true;
             }
 
+            // Use Managed mode on discrete GPUs for cached PCIe reads
+            dev->props.use_managed_buffers = !dev->props.has_unified_memory;
+
+            // Environment variable overrides for testing
+            if (getenv("GGML_METAL_MANAGED_BUFFERS_DISABLE") != NULL) {
+                dev->props.use_managed_buffers = false;
+            }
+            if (getenv("GGML_METAL_MANAGED_BUFFERS_ENABLE") != NULL) {
+                dev->props.use_managed_buffers = true;
+            }
+
             dev->props.supports_gpu_family_apple7 = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
 
             dev->props.op_offload_min_batch_size  = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
@@ -866,6 +877,7 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             GGML_LOG_INFO("%s: has tensor            = %s\n", __func__, dev->props.has_tensor              ? "true" : "false");
             GGML_LOG_INFO("%s: use residency sets    = %s\n", __func__, dev->props.use_residency_sets      ? "true" : "false");
             GGML_LOG_INFO("%s: use shared buffers    = %s\n", __func__, dev->props.use_shared_buffers      ? "true" : "false");
+            GGML_LOG_INFO("%s: use managed buffers   = %s\n", __func__, dev->props.use_managed_buffers     ? "true" : "false");
 
 #if TARGET_OS_OSX || (TARGET_OS_IOS && __clang_major__ >= 15)
             if (@available(macOS 10.12, iOS 16.0, *)) {
@@ -1082,6 +1094,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_TRANSPOSE:
         case GGML_OP_PERMUTE:
         case GGML_OP_CONCAT:
+        case GGML_OP_ROLL:
             return true;
         case GGML_OP_ADD:
         case GGML_OP_SUB:
@@ -1131,6 +1144,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_CONV_2D:
             return ggml_is_contiguous(op->src[0]) &&
                    op->src[1]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32 &&
+                   (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32);
+        case GGML_OP_CONV_2D_DW:
+            return op->src[1]->type == GGML_TYPE_F32 &&
                    op->type == GGML_TYPE_F32 &&
                    (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32);
         case GGML_OP_UPSCALE:
@@ -1272,12 +1289,18 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
             return true;
+        case GGML_OP_GATED_LINEAR_ATTN:
+            {
+                const int64_t C = op->ne[0];
+                const int64_t H = op->src[0]->ne[1];
+                return op->src[4]->type == GGML_TYPE_F32 && C % H == 0 && (C / H == 64 || C / H == 128);
+            }
         case GGML_OP_GATED_DELTA_NET:
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
-            return has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4;
+            return has_simdgroup_reduction;
         case GGML_OP_SET:
         case GGML_OP_CPY:
         case GGML_OP_DUP:
@@ -1337,7 +1360,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 };
             }
         case GGML_OP_GET_ROWS:
-            return op->src[0]->type != GGML_TYPE_NVFP4;
+            return true;
         case GGML_OP_SET_ROWS:
             {
                 if (op->src[0]->type != GGML_TYPE_F32) {
@@ -1481,6 +1504,16 @@ static void ggml_metal_buffer_rset_free(ggml_metal_buffer_t buf) {
         if (buf->rset) {
             [buf->rset endResidency];
             [buf->rset removeAllAllocations];
+            // Symmetric pairing for ggml_metal_device_rsets_add (called from
+            // ggml_metal_buffer_rset_init): the device-side collection holds
+            // a reference to this rset so the keep-alive heartbeat thread can
+            // requestResidency on it. Without removing it here, the device's
+            // rsets->data array retains a (about-to-be-released) reference,
+            // and ggml_metal_rsets_free on device shutdown asserts
+            // [rsets->data count] == 0 deterministically. (Issue: assertion
+            // fires on macOS 15+ for any consumer that allocates buffers
+            // and then tears down the device.)
+            ggml_metal_device_rsets_rm(buf->dev, buf->rset);
             [buf->rset release];
         }
     }
@@ -1546,10 +1579,19 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
 
         if (size_aligned > 0) {
             if (props_dev->use_shared_buffers && shared) {
+                MTLResourceOptions storage_mode = props_dev->use_managed_buffers
+                    ? MTLResourceStorageModeManaged
+                    : MTLResourceStorageModeShared;
+
                 res->buffers[0].metal = [res->dev->mtl_device newBufferWithBytesNoCopy:res->all_data
                                                                   length:size_aligned
-                                                                 options:MTLResourceStorageModeShared
+                                                                 options:storage_mode
                                                              deallocator:nil];
+
+                // For Managed buffers, sync CPU→GPU after creation
+                if (props_dev->use_managed_buffers && res->buffers[0].metal) {
+                    [(id<MTLBuffer>)res->buffers[0].metal didModifyRange:NSMakeRange(0, size_aligned)];
+                }
             } else {
                 res->buffers[0].metal = [res->dev->mtl_device newBufferWithLength:size_aligned options:MTLResourceStorageModePrivate];
             }
@@ -1615,12 +1657,21 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
         res->buffers[res->n_buffers].metal = nil;
 
         if (size_aligned > 0) {
-            res->buffers[res->n_buffers].metal = [res->dev->mtl_device newBufferWithBytesNoCopy:ptr length:size_aligned options:MTLResourceStorageModeShared deallocator:nil];
+            MTLResourceOptions storage_mode = props_dev->use_managed_buffers
+                ? MTLResourceStorageModeManaged
+                : MTLResourceStorageModeShared;
+
+            res->buffers[res->n_buffers].metal = [res->dev->mtl_device newBufferWithBytesNoCopy:ptr length:size_aligned options:storage_mode deallocator:nil];
 
             if (res->buffers[res->n_buffers].metal == nil) {
                 GGML_LOG_ERROR("%s: error: failed to allocate buffer, size = %8.2f MiB\n", __func__, size_aligned / 1024.0 / 1024.0);
                 free(res);
                 return NULL;
+            }
+
+            // For Managed buffers, sync CPU→GPU after creation
+            if (props_dev->use_managed_buffers) {
+                [(id<MTLBuffer>)res->buffers[res->n_buffers].metal didModifyRange:NSMakeRange(0, size_aligned)];
             }
         }
 
@@ -1642,12 +1693,21 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
             res->buffers[res->n_buffers].metal = nil;
 
             if (size_step_aligned > 0) {
-                res->buffers[res->n_buffers].metal = [res->dev->mtl_device newBufferWithBytesNoCopy:(void *) ((uint8_t *) ptr + i) length:size_step_aligned options:MTLResourceStorageModeShared deallocator:nil];
+                MTLResourceOptions storage_mode = props_dev->use_managed_buffers
+                    ? MTLResourceStorageModeManaged
+                    : MTLResourceStorageModeShared;
+
+                res->buffers[res->n_buffers].metal = [res->dev->mtl_device newBufferWithBytesNoCopy:(void *) ((uint8_t *) ptr + i) length:size_step_aligned options:storage_mode deallocator:nil];
 
                 if (res->buffers[res->n_buffers].metal == nil) {
                     GGML_LOG_ERROR("%s: error: failed to allocate buffer, size = %8.2f MiB\n", __func__, size_step_aligned / 1024.0 / 1024.0);
                     free(res);
                     return NULL;
+                }
+
+                // For Managed buffers, sync CPU→GPU after creation
+                if (props_dev->use_managed_buffers) {
+                    [(id<MTLBuffer>)res->buffers[res->n_buffers].metal didModifyRange:NSMakeRange(0, size_step_aligned)];
                 }
             }
 
@@ -1705,6 +1765,13 @@ bool ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf) {
 void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     if (buf->is_shared) {
         memset((char *) tensor->data + offset, value, size);
+
+        // Sync Managed buffer after CPU write
+        if (buf->dev->props.use_managed_buffers) {
+            struct ggml_metal_buffer_id bid = ggml_metal_buffer_get_id(buf, tensor);
+            [(id<MTLBuffer>)bid.metal didModifyRange:NSMakeRange(bid.offs + offset, size)];
+        }
+
         return;
     }
 
@@ -1733,6 +1800,13 @@ void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor
 void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     if (buf->is_shared) {
         memcpy((char *) tensor->data + offset, data, size);
+
+        // Sync Managed buffer after CPU write
+        if (buf->dev->props.use_managed_buffers) {
+            struct ggml_metal_buffer_id bid = ggml_metal_buffer_get_id(buf, tensor);
+            [(id<MTLBuffer>)bid.metal didModifyRange:NSMakeRange(bid.offs + offset, size)];
+        }
+
         return;
     }
 
@@ -1769,9 +1843,6 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
         }
 
         [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
-                             // TODO: can check for errors here
-            GGML_UNUSED(cb);
-
             dispatch_semaphore_signal(completion_semaphore);
         }];
 
@@ -1786,6 +1857,14 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
 
 void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     if (buf->is_shared) {
+        // For Managed buffers, sync GPU→CPU then direct memcpy
+        if (buf->dev->props.use_managed_buffers) {
+            struct ggml_metal_buffer_id bid = ggml_metal_buffer_get_id(buf, tensor);
+            @autoreleasepool {
+                [(id<MTLBuffer>)bid.metal synchronizeResource];
+            }
+        }
+        // Direct memcpy (Shared or Managed after sync)
         memcpy(data, (const char *) tensor->data + offset, size);
         return;
     }
@@ -1864,7 +1943,9 @@ bool ggml_metal_buffer_cpy_tensor(ggml_metal_buffer_t buf_dst, const struct ggml
 }
 
 void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
-    if (buf->is_shared) {
+    // For Managed buffers, use GPU blit to avoid reading unsynced data
+    if (buf->is_shared && !buf->dev->props.use_managed_buffers) {
+        // True Shared mode (unified memory): direct memset OK
         memset(buf->all_data, value, buf->all_size);
         return;
     }

@@ -58,6 +58,16 @@
 #include <stdint.h>
 #include <string.h>
 
+/* alloca() is declared in different headers across platforms. Mirror
+ * the include pattern used in ggml.c / ggml-cpu.c. */
+#if defined(_MSC_VER) || defined(__MINGW32__)
+#  include <malloc.h>
+#elif defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+#  include <stdlib.h>
+#else
+#  include <alloca.h>
+#endif
+
 /* QJL canonical paper constants — must match qjl/qjl.h. */
 #define FUSED_QJL_HEAD_DIM   128
 #define FUSED_QJL_PROJ_DIM   256

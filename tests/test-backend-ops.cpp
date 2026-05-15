@@ -49,6 +49,9 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
+static int64_t g_perf_duration_usec = 1000000; // default: 1 second in microseconds
+static int     g_n_threads   = -1; // -1 means use backend default (N_THREADS)
+
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     size_t nels = ggml_nelements(tensor);
     std::vector<float> data(nels);
@@ -1128,7 +1131,11 @@ struct test_case {
     }
 
     virtual double max_nmse_err(ggml_backend_t backend) {
-        GGML_UNUSED(backend);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        // See https://github.com/ggml-org/llama.cpp/pull/22976 for explanation.
+        if (contains_f16 && strcmp(ggml_backend_reg_name(reg), "WebGPU") == 0) {
+            return std::max(max_nmse_err(), 1e-6);
+        }
         return max_nmse_err();
     }
 
@@ -1195,6 +1202,10 @@ struct test_case {
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
 
+    // Number of trailing graph nodes for perf benchmarking, default 1.
+    // Override in multi-op tests (e.g. rms_norm+mul returns 2)
+    virtual int perf_group_size() { return 1; }
+
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
 
@@ -1205,6 +1216,18 @@ struct test_case {
     std::vector<ggml_tensor *> sentinels;
 
     std::string current_op_name;
+    bool contains_f16 = false;
+
+    // Used by the WebGPU backend to relax error thresholds on ops on f16 tensors
+    void check_for_f16_tensor(ggml_context * ctx) {
+        contains_f16 = false;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_F16) {
+                contains_f16 = true;
+                break;
+            }
+        }
+    }
 
     void add_sentinel(ggml_context * ctx) {
         if (mode == MODE_PERF || mode == MODE_GRAD || mode == MODE_SUPPORT) {
@@ -1298,6 +1321,7 @@ struct test_case {
 
         ggml_tensor * out = build_graph(ctx);
         current_op_name   = op_desc(out);
+        check_for_f16_tensor(ctx);
 
         if (!matches_filter(out, op_names_filter)) {
             //printf("  %s: skipping\n", op_desc(out).c_str());
@@ -1504,48 +1528,66 @@ struct test_case {
             return false;
         }
 
+        const int group_size = perf_group_size();
+        const int n_nodes    = ggml_graph_n_nodes(gf);
+        GGML_ASSERT(group_size >= 1 && group_size <= n_nodes);
+
+        // calculate per-run memory size and flops
+        size_t   per_run_size  = 0;
+        uint64_t per_run_flops = 0;
+        bool     all_have_flops = true;
+        for (int i = n_nodes - group_size; i < n_nodes; i++) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            if (!ggml_is_view_op(node->op)) {
+                per_run_size += op_size(node);
+                if (op_flops(node) == 0) {
+                    all_have_flops = false;
+                }
+                per_run_flops += op_flops(node);
+            }
+        }
+        // if any non-view node in the group lacks flops, fall back to memory-based measurement
+        if (!all_have_flops) {
+            per_run_flops = 0;
+        }
+
         // determine number of runs
         int n_runs;
         bool is_cpu = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
-        if (op_flops(out) > 0) {
+        int64_t max_additional_runs = (ggml_graph_size(gf) - n_nodes) / group_size;
+        if (per_run_flops > 0) {
             // based on flops
             const uint64_t GFLOP = 1000 * 1000 * 1000;
             const uint64_t target_flops_cpu =   8ULL * GFLOP;
             const uint64_t target_flops_gpu = 100ULL * GFLOP;
             uint64_t target_flops = is_cpu ? target_flops_cpu : target_flops_gpu;
-            n_runs = (int)std::min<int64_t>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_flops / op_flops(out)) + 1;
+            n_runs = (int)std::min<int64_t>(max_additional_runs, target_flops / per_run_flops) + 1;
         } else {
             // based on memory size
             const size_t GB = 1ULL << 30;
             const size_t target_size_cpu =  8 * GB;
             const size_t target_size_gpu = 32 * GB;
             size_t target_size = is_cpu ? target_size_cpu : target_size_gpu;
-            n_runs = (int)std::min<int64_t>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_size / op_size(out)) + 1;
+            n_runs = (int)std::min<int64_t>(max_additional_runs, per_run_size > 0 ? (int64_t)(target_size / per_run_size) : 1) + 1;
         }
 
-        // duplicate the op
+        // duplicate only the effective group nodes for each additional run
         for (int i = 1; i < n_runs; i++) {
-            ggml_graph_add_node(gf, out);
+            for (int j = n_nodes - group_size; j < n_nodes; j++) {
+                ggml_graph_add_node(gf, ggml_graph_node(gf, j));
+            }
         }
 
         // calculate memory
-        size_t mem = n_runs * op_size(out);
-        auto tensor_op_size = [](ggml_tensor * t) {
-            size_t size = ggml_nbytes(t);
-            // add source tensors
-            for (int i = 0; i < GGML_MAX_SRC; i++) {
-                if (t->src[i] != NULL) {
-                    size += ggml_nbytes(t->src[i]);
-                }
+        // setup nodes (before the group) run once per compute call; add their size once
+        size_t setup_size = 0;
+        for (int i = 0; i < n_nodes - group_size; i++) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            if (!ggml_is_view_op(node->op)) {
+                setup_size += op_size(node);
             }
-            return size;
-        };
-        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-            if (ggml_is_view_op(ggml_graph_node(gf, i)->op) || ggml_graph_node(gf, i) == out) {
-                continue;
-            }
-            mem += tensor_op_size(ggml_graph_node(gf, i));
         }
+        size_t mem = n_runs * per_run_size + setup_size;
 
         // run
         int64_t total_time_us = 0;
@@ -1563,14 +1605,14 @@ struct test_case {
             total_time_us += end_time - start_time;
             total_mem += mem;
             total_runs += n_runs;
-        } while (total_time_us < 1000*1000); // run for at least 1 second
+        } while (total_time_us < g_perf_duration_usec); // run for at least the configured perf duration
 
         // Create test result
         double avg_time_us      = (double) total_time_us / total_runs;
-        double calculated_flops = (op_flops(out) > 0) ? (op_flops(out) * total_runs) / (total_time_us / 1e6) : 0.0;
+        double calculated_flops = (per_run_flops > 0) ? (per_run_flops * total_runs) / (total_time_us / 1e6) : 0.0;
         double calculated_bandwidth =
-            (op_flops(out) == 0) ? total_mem / (total_time_us / 1e6) / 1024.0 / 1024.0 / 1024.0 : 0.0;
-        size_t calculated_memory_kb = op_size(out) / 1024;
+            (per_run_flops == 0) ? total_mem / (total_time_us / 1e6) / 1024.0 / 1024.0 / 1024.0 : 0.0;
+        size_t calculated_memory_kb = per_run_size / 1024;
 
         test_result result(ggml_backend_name(backend), current_op_name, vars(), "perf", true, true, "", avg_time_us,
                            calculated_flops, calculated_bandwidth, calculated_memory_kb, total_runs);
@@ -1973,9 +2015,19 @@ struct test_unary : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
+        float min = -150.f;
+        float max =  150.f;
+
+        // Keep FP16 exp/expm1 inputs in-range so all backends stay finite instead of
+        // disagreeing on whether overflow saturates to max-F16 or produces +inf.
+        if (type == GGML_TYPE_F16 && (op == GGML_UNARY_OP_EXP || op == GGML_UNARY_OP_EXPM1)) {
+            min = -10.f;
+            max =  10.f;
+        }
+
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             // test extended range of values to check for NaNs in GELU
-            init_tensor_uniform(t, -150.f, 150.f);
+            init_tensor_uniform(t, min, max);
         }
     }
 
@@ -3463,6 +3515,66 @@ struct test_rms_norm_mul_add : public test_case {
     }
 };
 
+// GGML_OP_RMS_NORM + GGML_OP_MUL (fused operation)
+struct test_rms_norm_mul : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const float eps;
+    const bool broadcast;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, ne, eps, broadcast);
+    }
+
+    int perf_group_size() override { return 2; }
+
+    test_rms_norm_mul(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = {64, 5, 4, 3},
+            float eps = 1e-6f, bool broadcast = false)
+        : type(type), ne(ne), eps(eps), broadcast(broadcast) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // broadcast only on dims 1-3, dim0 must match for fusion
+        std::array<int64_t, 4> broadcast_dims = {ne[0], ne[1]*3, ne[2]*3, ne[3]*4};
+
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, broadcast ? broadcast_dims.data() : ne.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne.data());
+
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+        ggml_set_param(b);
+        ggml_set_name(b, "b");
+
+        // Use a and b early, so we don't end up with an OP_NONE between rms_norm and mul
+        a = ggml_add(ctx, a, b);
+        ggml_tensor * out = ggml_mul(ctx, ggml_rms_norm(ctx, a, eps), b);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+
+    float grad_eps() override {
+        return 1.0f;
+    }
+
+    bool grad_precise() override {
+        return true;
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_RMS_NORM (fused operation)
 struct test_add_rms_norm : public test_case {
     const ggml_type type;
@@ -4823,6 +4935,21 @@ struct test_rope : public test_case {
 
             a = ggml_view_4d(ctx, a, ne_a[0], ne_a[1], ne_a[2], ne_a[3], a->nb[1], a->nb[2], a->nb[3], 0);
             ggml_set_name(a, "view_of_a");
+        } else if (v == 2) {
+            // second-half slice along dim 0 (mimics build_rope_2d in clip.cpp).
+            // The non-zero view offset (ne_a[0] * elem_size) often produces a
+            // non-aligned buffer offset, which exercises backends' alignment paths.
+            auto ne = ne_a; ne[0] *= 2;
+            a = ggml_new_tensor(ctx, type, 4, ne.data());
+            if (forward) {
+                ggml_set_param(a);
+            }
+            ggml_set_name(a, "a");
+
+            a = ggml_view_4d(ctx, a, ne_a[0], ne_a[1], ne_a[2], ne_a[3],
+                             a->nb[1], a->nb[2], a->nb[3],
+                             ne_a[0] * ggml_element_size(a));
+            ggml_set_name(a, "view_of_a");
         } else {
             a = ggml_new_tensor(ctx, type, 4, ne_a.data());
             if (forward) {
@@ -4885,8 +5012,6 @@ struct test_rope : public test_case {
             } else {
                 out = ggml_rope_ext_back(ctx, a, pos, freq, n_dims, mode, 0, 10000.0f, fs, ef, af, 1.0f, 1.0f);
             }
-
-            // TODO: add test with a non-contiguous view as input ; this case is needed for build_rope_2d in clip.cpp
         }
         ggml_set_name(out, "out");
 
@@ -8219,6 +8344,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 32, 1));
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 32, 4));
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 128, 4));
+    test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 128, 1, 1));
+    test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 128, 32, 1));
+    test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 128, 32, 4));
+
+    // FWHT tests
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 64, 1, 64));
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 256, 1, 256));
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 32, 128));
 
     // FWHT tests
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));
@@ -8646,6 +8780,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                 }
 
                                 test_cases.emplace_back(new test_rope(type, { 64, 128, 2, 1},  64, GGML_ROPE_TYPE_NEOX, 512, fs, ef, af, ff, v, fw)); // neox (falcon 40B)
+                            }
+
+                            // build_rope_2d-style: ROPE on a non-contiguous view
+                            // that starts at a non-zero offset along dim 0
+                            // (e.g. gemma4v vision second-half view).
+                            for (int rmode : { GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_IMROPE, GGML_ROPE_TYPE_VISION }) {
+                                test_cases.emplace_back(new test_rope(type, { 36, 16, 2457, 1}, 36, rmode, 512, fs, ef, af, ff, 2, fw));
                             }
                         }
 
@@ -9153,6 +9294,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
 
+
+    // qwen3.5-122b-a10b (256 experts, 8 active, FFN=1024, hidden=3072, IQ2_S/IQ3_XXS/Q6_K)
+    for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
+        for (ggml_type type_a : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_Q6_K}) {
+            for (ggml_type type_b : {GGML_TYPE_F32}) {
+                // gate/up: 3072 -> 1024
+                test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 256, 8, false, 1024, bs, 3072));
+                // down: 1024 -> 3072
+                test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 256, 8, false, 3072, bs, 1024));
+            }
+        }
+    }
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {
         for (ggml_type type_a : {GGML_TYPE_MXFP4}) {
@@ -9201,6 +9354,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     test_cases.emplace_back(new test_conv_2d_dw({512, 512, 256, 1}, {3, 3, 1, 256}, 1, 1, 1, false));
     test_cases.emplace_back(new test_conv_2d_dw({512, 512, 256, 1}, {3, 3, 1, 256}, 1, 1, 1, true));
+    test_cases.emplace_back(new test_conv_2d_dw({112, 112, 32,  1}, {3, 3, 1, 32},  1, 1, 1, false));
+    test_cases.emplace_back(new test_conv_2d_dw({112, 112, 32,  1}, {3, 3, 1, 32},  1, 1, 1, true));
+    test_cases.emplace_back(new test_conv_2d_dw({56,  56,  128, 1}, {5, 5, 1, 128}, 2, 2, 1, false));
+    test_cases.emplace_back(new test_conv_2d_dw({56,  56,  128, 1}, {5, 5, 1, 128}, 2, 2, 1, true));
 
     for (ggml_type kernel_type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
         test_cases.emplace_back(new test_conv_transpose_2d({256, 256, 256, 1}, {3, 3, 16, 256}, 1, kernel_type));
@@ -9295,6 +9452,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+
+    // RMS_NORM + MUL fused
+    for (auto hidden_size : {128, 1024, 4096}) {
+        for (auto broadcast : {false, true}) {
+            test_cases.emplace_back(new test_rms_norm_mul(GGML_TYPE_F32, { hidden_size, 1, 1, 1 }, 1e-6f,  broadcast));
+            test_cases.emplace_back(new test_rms_norm_mul(GGML_TYPE_F32, { hidden_size, 64, 1, 1 }, 1e-6f, broadcast));
+            test_cases.emplace_back(new test_rms_norm_mul(GGML_TYPE_F32, { hidden_size, 512, 1, 1 }, 1e-6f, broadcast));
+        }
+    }
 
     return test_cases;
 }
@@ -9579,7 +9745,7 @@ static void show_test_coverage() {
 
 static void usage(char ** argv) {
     printf("Usage: %s [mode] [-o <op,..>] [-b <backend>] [-p <params regex>] [--output <console|sql|csv>] [--list-ops]", argv[0]);
-    printf(" [--show-coverage] [--test-file <path>]\n");
+    printf(" [--show-coverage] [--test-file <path>] [--perf-duration <seconds>] [--threads <n>]\n");
     printf("    valid modes:\n");
     printf("      - test (default, compare with CPU backend for correctness)\n");
     printf("      - grad (compare gradients from backpropagation with method of finite differences)\n");
@@ -9591,6 +9757,8 @@ static void usage(char ** argv) {
     printf("    --list-ops lists all available GGML operations\n");
     printf("    --show-coverage shows test coverage\n");
     printf("    --test-file reads test operators from a test file generated by llama-export-graph-ops\n");
+    printf("    --perf-duration sets perf mode minimum run duration in seconds (default: 1)\n");
+    printf("    --threads sets backend n_threads (default: from backend)\n");
 }
 
 int main(int argc, char ** argv) {
@@ -9654,6 +9822,31 @@ int main(int argc, char ** argv) {
                 usage(argv);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--perf-duration") == 0) {
+            if (i + 1 < argc) {
+                int perf_sec = atoi(argv[++i]);
+                if (perf_sec <= 0) {
+                    fprintf(stderr, "error: --perf-duration must be a positive integer (seconds)\n");
+                    usage(argv);
+                    return 1;
+                }
+                g_perf_duration_usec = (int64_t)perf_sec * 1000000LL;
+            } else {
+                usage(argv);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--threads") == 0 || strcmp(argv[i], "-t") == 0) {
+            if (i + 1 < argc) {
+                g_n_threads = atoi(argv[++i]);
+                if (g_n_threads <= 0) {
+                    fprintf(stderr, "error: --threads must be a positive integer\n");
+                    usage(argv);
+                    return 1;
+                }
+            } else {
+                usage(argv);
+                return 1;
+            }
         } else {
             usage(argv);
             return 1;
@@ -9697,7 +9890,8 @@ int main(int argc, char ** argv) {
         auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
         if (ggml_backend_set_n_threads_fn) {
             // TODO: better value for n_threads
-            ggml_backend_set_n_threads_fn(backend, N_THREADS);
+            const int n_threads_to_use = (g_n_threads > 0) ? g_n_threads : (int) N_THREADS;
+            ggml_backend_set_n_threads_fn(backend, n_threads_to_use);
         }
 
         size_t free, total;  // NOLINT

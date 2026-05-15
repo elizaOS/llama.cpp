@@ -37,6 +37,20 @@
 #include "vendors/cuda.h"
 #endif // defined(GGML_USE_HIP)
 
+template<int q8_1_layout_block_size>
+struct block_q8_1_layout {
+    static_assert(q8_1_layout_block_size % QK8_1 == 0, "q8_1 layout block size must contain whole q8_1 blocks");
+
+    static constexpr int q8_1_blocks = q8_1_layout_block_size / QK8_1;
+
+    // Scales for all q8_1 blocks in the layout group are stored before the quantized values.
+    half2   ds[q8_1_blocks];
+    int32_t qs[q8_1_layout_block_size / sizeof(int32_t)];
+};
+
+static_assert(sizeof(block_q8_1_layout<QK8_1>) == sizeof(block_q8_1), "Unexpected block_q8_1 layout size");
+static_assert(sizeof(block_q8_1_layout<4 * QK8_1>) == 4 * sizeof(block_q8_1), "Unexpected q8_1 x4 layout size");
+
 #define STRINGIZE_IMPL(...) #__VA_ARGS__
 #define STRINGIZE(...) STRINGIZE_IMPL(__VA_ARGS__)
 
@@ -1131,7 +1145,7 @@ int ggml_cuda_get_device();
 struct ggml_cuda_pool {
     virtual ~ggml_cuda_pool() = default;
 
-    virtual void * alloc(size_t size, size_t * actual_size) = 0;
+    virtual void * alloc(size_t size, size_t * actual_size, bool overallocate = false) = 0;
     virtual void free(void * ptr, size_t size) = 0;
 };
 
@@ -1157,16 +1171,16 @@ struct ggml_cuda_pool_alloc {
     }
 
     // size is in number of elements
-    T * alloc(size_t size) {
+    T * alloc(size_t size, bool overallocate = false) {
         GGML_ASSERT(pool != nullptr);
         GGML_ASSERT(ptr == nullptr);
-        ptr = (T *) pool->alloc(size * sizeof(T), &this->actual_size);
+        ptr = (T *) pool->alloc(size * sizeof(T), &this->actual_size, overallocate);
         return ptr;
     }
 
-    T * alloc(ggml_cuda_pool & pool, size_t size) {
+    T * alloc(ggml_cuda_pool & pool, size_t size, bool overallocate = false) {
         this->pool = &pool;
-        return alloc(size);
+        return alloc(size, overallocate);
     }
 
     T * get() {
@@ -1232,10 +1246,6 @@ struct ggml_cuda_concurrent_event {
     int                                          n_streams = 0;
     std::unordered_map<const ggml_tensor *, int> stream_mapping;
 
-    // Original order of nodes in this concurrent region (before interleaving)
-    // Used to restore grouping for fusion within streams
-    std::vector<const ggml_tensor *> original_order;
-
     const ggml_tensor * join_node;
 
     ggml_cuda_concurrent_event() = default;
@@ -1258,7 +1268,6 @@ struct ggml_cuda_concurrent_event {
     , fork_event(other.fork_event)
     , n_streams(other.n_streams)
     , stream_mapping(std::move(other.stream_mapping))
-    , original_order(std::move(other.original_order))
     , join_node(other.join_node) {
         other.fork_event = nullptr;
     }
@@ -1281,6 +1290,11 @@ struct ggml_cuda_concurrent_event {
             const int64_t       t_start = (int64_t) t->data;
             const int64_t       t_end   = t_start + ggml_nbytes(t);
 
+            // skip empty tensors
+            if (t_end == t_start) {
+                continue;
+            }
+
             // skip tensors that overlap with join_node's buffer.
             if ((t_start <= join_start && join_start < t_end) || (join_start <= t_start && t_start < join_end)) {
                 continue;
@@ -1301,6 +1315,11 @@ struct ggml_cuda_concurrent_event {
             const ggml_tensor * t = tensor->view_src ? tensor->view_src : tensor;
             const int64_t       t_start = (int64_t) t->data;
             const int64_t       t_end   = t_start + ggml_nbytes(t);
+
+            // skip empty tensors
+            if (t_end == t_start) {
+                continue;
+            }
 
             // skip tensors that overlap with join_node's buffer
             if ((t_start <= join_start && join_start < t_end) || (join_start <= t_start && t_start < join_end)) {

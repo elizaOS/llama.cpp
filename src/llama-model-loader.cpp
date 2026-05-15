@@ -527,6 +527,17 @@ llama_model_loader::llama_model_loader(
         trace = atoi(getenv("LLAMA_TRACE"));
     }
 
+    #ifdef _WIN32
+        // Cap at MSVC's hard limit of 8192 - https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/setmaxstdio?view=msvc-160
+        #define _GGML_STDIO_TARGET 2048
+        int _setmaxstdio_ret = _setmaxstdio(_GGML_STDIO_TARGET);
+        if (_setmaxstdio_ret == -1) {
+            LLAMA_LOG_INFO("%s: failed to set max stdio to %d. (setmaxstdio returned -1)\n", __func__, _GGML_STDIO_TARGET);
+        } else {
+            LLAMA_LOG_INFO("%s: max stdio successfully set to %d\n", __func__, _setmaxstdio_ret);
+        }
+    #endif // _WIN32
+
     if (param_overrides_p != nullptr) {
         for (const struct llama_model_kv_override * p = param_overrides_p; p->key[0] != 0; p++) {
             kv_overrides.insert({std::string(p->key), *p});
@@ -698,7 +709,9 @@ llama_model_loader::llama_model_loader(
     }
 
     n_kv      = gguf_get_n_kv(metadata);
-    n_tensors = weights_map.size();
+    n_tensors = files.empty()
+        ? gguf_get_n_tensors(metadata)
+        : weights_map.size();
 
     fver = (enum llama_fver) gguf_get_version(metadata);
 
@@ -1220,6 +1233,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         const int64_t tid = gguf_find_tensor(metadata, tn.str().c_str());
         if (tid != -1) {
             type = gguf_get_tensor_type(metadata, tid);
+        } else if (no_alloc) {
+            if (flags & TENSOR_NOT_REQUIRED) {
+                return nullptr;
+            }
+
+            throw std::runtime_error(format("missing tensor '%s'", tn.str().c_str()));
         }
 
         // for tensors that are not required some of the dimensions can be invalid:
@@ -1245,6 +1264,16 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
         GGML_ASSERT(buft != nullptr);
         ggml_context * ctx = ctx_for_buft(buft);
+
+        if (flags & TENSOR_DUPLICATED) {
+            ggml_tensor * t = ggml_get_tensor(ctx, tn.str().c_str());
+            if (t) {
+                return t;
+            }
+        } else {
+            n_created++;
+        }
+
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
         return ret;

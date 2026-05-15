@@ -503,6 +503,9 @@ class ModelBase:
                             tensors_to_remove += [base_name + n for n in ("_packed", "_shape", "_scale")]
                             if (base_name + "_zero_point") in self.model_tensors:
                                 tensors_to_remove.append(base_name + "_zero_point")
+                elif quant_format == "nvfp4-pack-quantized":
+                    # Don't error from compressed-tensors, we'll handle them  in _generate_nvfp4_tensors
+                    pass
                 else:
                     raise NotImplementedError(f"Quant format {quant_format!r} for method {quant_method!r} is not yet supported")
             elif quant_method == "modelopt":
@@ -744,10 +747,12 @@ class ModelBase:
         del experts, merged
 
     def prepare_tensors(self):
-        # detect NVFP4 quantization (ModelOpt format)
-        quant_algo = (self.hparams.get("quantization_config") or {}).get("quant_algo")
-        quant_method = (self.hparams.get("quantization_config") or {}).get("quant_method")
-        quant_layers = (self.hparams.get("quantization_config") or {}).get("quantized_layers") or {}
+        # detect NVFP4 quantization (ModelOpt and Compressed-tensors formats)
+        quantization_config = self.hparams.get("quantization_config") or {}
+        quant_algo = quantization_config.get("quant_algo")
+        quant_method = quantization_config.get("quant_method")
+        quant_format = quantization_config.get("format")
+        quant_layers = quantization_config.get("quantized_layers") or {}
         quant_config_file = self.dir_model / "hf_quant_config.json"
 
         if (not quant_algo or not quant_layers) and quant_config_file.is_file():
@@ -759,21 +764,46 @@ class ModelBase:
                 if quant_method is None:
                     self.hparams.setdefault("quantization_config", {})["quant_method"] = producer_name
                 quant_algo = quant_config.get("quant_algo", quant_algo)
+                quant_method = quant_config.get("quant_method", quant_method)
+                quant_format = quant_config.get("format", quant_format)
                 quant_layers = quant_config.get("quantized_layers", quant_layers) or {}
 
         # Some models use per-tensor quant_algo (e.g. "MIXED_PRECISION" with
         # per-layer NVFP4/FP8) instead of a single global "NVFP4" value.
         if quant_algo != "NVFP4":
-            if any(v.get("quant_algo") == "NVFP4" for v in quant_layers.values() if isinstance(v, dict)):
+            if quant_method == "compressed-tensors" and quant_format == "nvfp4-pack-quantized":
+                quant_algo = "NVFP4"
+            elif any(v.get("quant_algo") == "NVFP4" for v in quant_layers.values() if isinstance(v, dict)):
                 quant_algo = "NVFP4"
 
         self._is_nvfp4 = quant_algo == "NVFP4"
+        nvfp4_compressed_tensors = quant_method == "compressed-tensors" and quant_format == "nvfp4-pack-quantized"
         self._is_mxfp4 = quant_method == "mxfp4"
 
         # NVFP4 weights are repacked and written directly to gguf_writer.
         # This must run before dequant_model so NVFP4 tensors are removed
         # from model_tensors, leaving only non-NVFP4 (e.g. FP8) for dequant.
         if self._is_nvfp4:
+            if nvfp4_compressed_tensors:
+                # Convert compressed-tensors 'global' scales into the reciprocal
+                def inverse_scale(gen):
+                    def load():
+                        scale = LazyTorchTensor.to_eager(gen()).float()
+                        return torch.where(torch.isfinite(scale) & (scale > 0), 1.0 / scale, torch.ones_like(scale))
+                    return load
+                # Change the compressed-tensors names to the ModelOpt names for handling consistently later
+                for name in list(self.model_tensors.keys()):
+                    if name.endswith(".weight_packed"):
+                        if name.removesuffix("_packed") not in self.model_tensors:
+                            self.model_tensors[name.removesuffix("_packed")] = self.model_tensors.pop(name)
+                    elif name.endswith(".weight_global_scale"):
+                        scale2_name = name.replace(".weight_global_scale", ".weight_scale_2")
+                        if scale2_name not in self.model_tensors:
+                            self.model_tensors[scale2_name] = inverse_scale(self.model_tensors.pop(name))
+                    elif name.endswith(".input_global_scale"):
+                        input_scale_name = name.replace(".input_global_scale", ".input_scale")
+                        if input_scale_name not in self.model_tensors:
+                            self.model_tensors[input_scale_name] = inverse_scale(self.model_tensors.pop(name))
             self._generate_nvfp4_tensors()
 
         self.dequant_model()
@@ -967,15 +997,8 @@ class ModelBase:
                 config = json.load(f)
             return config
 
-        try:
-            # for security reason, we don't allow loading remote code by default
-            # if a model need remote code, we will fallback to config.json
-            config = AutoConfig.from_pretrained(dir_model, trust_remote_code=False).to_dict()
-        except Exception as e:
-            logger.warning(f"Failed to load model config from {dir_model}: {e}")
-            logger.warning("Trying to load config.json instead")
-            with open(dir_model / "config.json", "r", encoding="utf-8") as f:
-                config = json.load(f)
+        with open(dir_model / "config.json", "r", encoding="utf-8") as f:
+            config = json.load(f)
         if "llm_config" in config:
             # rename for InternVL
             config["text_config"] = config["llm_config"]
@@ -1573,6 +1596,9 @@ class TextModel(ModelBase):
         if chkhsh == "62f6fb0a6fd5098caeabb19b07a5c1099cafc8b9c40eab6ea89ece4ec02fbc57":
             # ref: https://huggingface.co/sarvamai/sarvam-30b
             res = "sarvam-moe"
+        if chkhsh == "f728162c1315c26e40249849799b4ba3fe584c32084b4795b03eb295e63cb5af":
+            # ref: https://huggingface.co/lewtun/talkie-1930-13b-it-hf
+            res = "talkie"
 
         if res is None:
             logger.warning("\n")
@@ -2865,8 +2891,12 @@ class LlamaModel(TextModel):
         # fix for SmolVLM2, missing `num_attention_heads` in config.json
         if self.hf_arch == "VLlama3ForCausalLM":
             self.hparams["num_attention_heads"] = self.hparams.get("num_attention_heads", 32)
-        hparams = ModelBase.load_hparams(self.dir_model, is_mistral_format=False)
-        self.origin_hf_arch = hparams.get('architectures', [None])[0]
+        # Mistral consolidated format has no config.json; origin_hf_arch is HF-only.
+        if self.is_mistral_format:
+            self.origin_hf_arch = None
+        else:
+            hparams = ModelBase.load_hparams(self.dir_model, is_mistral_format=False)
+            self.origin_hf_arch = hparams.get('architectures', [None])[0]
 
     def set_vocab(self):
         if self.origin_hf_arch == "GlmasrModel":
@@ -5106,6 +5136,9 @@ class Qwen3OmniMmprojModel(Qwen3VLVisionModel, Qwen25AudioModel):
 
         if name.startswith("model.visual."):
             name = name.replace("model.visual.", "visual.", 1)
+
+        if name.startswith("thinker.audio_tower."):
+            name = name.replace("thinker.audio_tower.", "audio_tower.", 1)
 
         if "visual." not in name and "audio_tower." not in name:
             return None
@@ -8445,6 +8478,49 @@ class MaincoderModel(TextModel):
 
         if (head_dim := self.hparams.get("head_dim")) is not None:
             self.gguf_writer.add_rope_dimension_count(head_dim)
+
+
+@ModelBase.register("TalkieForCausalLM")
+class TalkieModel(TextModel):
+    model_arch = gguf.MODEL_ARCH.TALKIE
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        # Talkie used F.rms_norm without an explicit eps
+        self.gguf_writer.add_layer_norm_rms_eps(torch.finfo(torch.float32).eps)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        prefix = f"model.blocks.{bid}." if bid is not None else ""
+        suffix = name.removeprefix(prefix)
+
+        if suffix == "attn_gain.a_g":
+            yield self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_OUT, bid, ".scale"), data_torch
+            return
+        elif suffix == "mlp_gain.a_g":
+            yield self.format_tensor_name(gguf.MODEL_TENSOR.FFN_DOWN, bid, ".scale"), data_torch
+            return
+        elif suffix == "lm_head_gain.w_g":
+            self.gguf_writer.add_logit_scale(LazyTorchTensor.to_eager(data_torch).item())
+            return
+        elif suffix in ("attn.attn_query.weight", "attn.attn_key.weight"):
+            # absorb inverse rope
+            head_dim = self.hparams["head_dim"]
+            shape = data_torch.shape
+            data_torch = torch.reshape(data_torch, (-1, head_dim, shape[-1]))
+            signs = torch.ones((1, head_dim, 1), dtype=data_torch.dtype)
+            signs[:, head_dim // 2 :, :] = -1
+            if self.lazy:
+                signs = LazyTorchTensor.from_eager(signs)
+            # (n_head, head_dim, n_in) -> (n_out, n_in)
+            data_torch = torch.reshape(data_torch * signs, shape)
+        elif suffix == "attn.head_gain.head_g":
+            # allow head gain to broadcast
+            data_torch = data_torch.unsqueeze(-1)
+
+        if not name.endswith(".weight"):
+            name += ".weight"
+
+        yield from super().modify_tensors(data_torch, name, bid)
 
 
 @ModelBase.register("MambaForCausalLM", "MambaLMHeadModel", "FalconMambaForCausalLM")
@@ -13409,7 +13485,7 @@ class PixtralModel(LlavaVisionModel):
         self.gguf_writer.add_vision_use_silu(True)
 
         # spatial_merge_size
-        if self.find_vparam(["mm_projector_id"]) == "patch_merge":
+        if self.find_vparam(["mm_projector_id"], optional=True) == "patch_merge":
             self.gguf_writer.add_vision_spatial_merge_size(
                 self.find_vparam(["spatial_merge_size"])
             )
@@ -13417,8 +13493,12 @@ class PixtralModel(LlavaVisionModel):
     def map_tensor_name(self, name: str, try_suffixes: Sequence[str] = (".weight", ".bias")) -> str:
         if name == "vision_language_adapter.w_in.weight":
             return "mm.1.weight"
+        elif name == "vision_language_adapter.w_in.bias":
+            return "mm.1.bias"
         elif name == "vision_language_adapter.w_out.weight":
             return "mm.2.weight"
+        elif name == "vision_language_adapter.w_out.bias":
+            return "mm.2.bias"
         return super().map_tensor_name(name, try_suffixes)
 
 

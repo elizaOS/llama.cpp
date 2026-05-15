@@ -164,3 +164,6 @@ void fused_attn_v_mix_avx2(int n_tokens, const float * w,
 }
 
 #endif /* __AVX2__ */
+
+/* Avoid ISO C "empty translation unit" pedantic error when __AVX2__ is undefined. */
+typedef int fused_attn_qjl_tbq_avx2_iso_c_tu_stub;

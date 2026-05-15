@@ -227,31 +227,94 @@ struct gguf_context {
     void * data = nullptr;
 };
 
-struct gguf_reader {
-    gguf_reader(FILE * file) : file(file) {
-        // read the remaining bytes once and update on each read
-        nbytes_remain = file_remain(file);
-    }
+// Source abstraction for the gguf reader. Two backends:
+//   - gguf_file_source:   reads from a FILE * (used by gguf_init_from_file{,_ptr})
+//   - gguf_buffer_source: reads from an in-memory blob (used by gguf_init_from_buffer)
+struct gguf_source {
+    virtual ~gguf_source() = default;
+    // Returns total remaining bytes from the current cursor position.
+    virtual uint64_t remain() const = 0;
+    // Read `size` raw bytes into `dst`, advancing the cursor. Returns bytes read.
+    virtual size_t   read_raw(void * dst, size_t size) = 0;
+    // Returns the current absolute byte offset from start of source, or -1 on error.
+    virtual int64_t  tell() const = 0;
+    // Advances the cursor to absolute byte offset `off`. Returns 0 on success.
+    virtual int      seek(int64_t off) = 0;
+};
 
-    // helper for remaining bytes in a file
-    static uint64_t file_remain(FILE * file) {
+struct gguf_file_source : gguf_source {
+    FILE * file;
+    explicit gguf_file_source(FILE * f) : file(f) {}
+
+    uint64_t remain() const override {
         const int64_t cur = gguf_ftell(file);
         if (cur < 0) {
             return 0;
         }
         if (gguf_fseek(file, 0, SEEK_END) != 0) {
             gguf_fseek(file, cur, SEEK_SET);
-
             return 0;
         }
         const int64_t end = gguf_ftell(file);
         if (end < 0) {
             gguf_fseek(file, cur, SEEK_SET);
-
             return 0;
         }
         gguf_fseek(file, cur, SEEK_SET);
         return static_cast<uint64_t>(end - cur);
+    }
+
+    size_t read_raw(void * dst, size_t size) override {
+        return fread(dst, 1, size, file);
+    }
+
+    int64_t tell() const override {
+        return gguf_ftell(file);
+    }
+
+    int seek(int64_t off) override {
+        return gguf_fseek(file, off, SEEK_SET);
+    }
+};
+
+struct gguf_buffer_source : gguf_source {
+    const uint8_t * data;
+    size_t          size;
+    size_t          pos;
+
+    gguf_buffer_source(const void * d, size_t s) : data(static_cast<const uint8_t *>(d)), size(s), pos(0) {}
+
+    uint64_t remain() const override {
+        return pos > size ? 0 : static_cast<uint64_t>(size - pos);
+    }
+
+    size_t read_raw(void * dst, size_t n) override {
+        const size_t avail = size > pos ? size - pos : 0;
+        const size_t to_read = n < avail ? n : avail;
+        if (to_read > 0) {
+            std::memcpy(dst, data + pos, to_read);
+            pos += to_read;
+        }
+        return to_read;
+    }
+
+    int64_t tell() const override {
+        return static_cast<int64_t>(pos);
+    }
+
+    int seek(int64_t off) override {
+        if (off < 0 || static_cast<size_t>(off) > size) {
+            return -1;
+        }
+        pos = static_cast<size_t>(off);
+        return 0;
+    }
+};
+
+struct gguf_reader {
+    gguf_reader(gguf_source & src) : src(src) {
+        // read the remaining bytes once and update on each read
+        nbytes_remain = src.remain();
     }
 
     template <typename T>
@@ -260,7 +323,7 @@ struct gguf_reader {
         if (nbytes_remain < size) {
             return false;
         }
-        const size_t nread = fread(&dst, 1, size, file);
+        const size_t nread = src.read_raw(&dst, size);
         nbytes_remain -= nread;
         return nread == size;
     }
@@ -340,11 +403,11 @@ struct gguf_reader {
             return false;
         }
         if (size > nbytes_remain) {
-            GGML_LOG_ERROR("%s: string length %" PRIu64 " exceeds remaining file size %" PRIu64 " bytes\n", __func__, size, nbytes_remain);
+            GGML_LOG_ERROR("%s: string length %" PRIu64 " exceeds remaining input size %" PRIu64 " bytes\n", __func__, size, nbytes_remain);
             return false;
         }
         dst.resize(static_cast<size_t>(size));
-        const size_t nread = fread(dst.data(), 1, size, file);
+        const size_t nread = src.read_raw(dst.data(), size);
         nbytes_remain -= nread;
         return nread == size;
     }
@@ -353,13 +416,13 @@ struct gguf_reader {
         if (size > nbytes_remain) {
             return false;
         }
-        const size_t nread = fread(dst, 1, size, file);
+        const size_t nread = src.read_raw(dst, size);
         nbytes_remain -= nread;
         return nread == size;
     }
 
 private:
-    FILE * file;
+    gguf_source & src;
 
     mutable uint64_t nbytes_remain;
 };
@@ -394,12 +457,30 @@ bool gguf_read_emplace_helper(const struct gguf_reader & gr, std::vector<struct 
     return true;
 }
 
+// Internal: read a gguf_context from any gguf_source. Used by the file and
+// buffer entry points below.
+static struct gguf_context * gguf_init_from_source(struct gguf_source & src, struct gguf_init_params params);
+
 struct gguf_context * gguf_init_from_file_ptr(FILE * file, struct gguf_init_params params) {
     if (!file) {
         return nullptr;
     }
 
-    const struct gguf_reader gr(file);
+    gguf_file_source src(file);
+    return gguf_init_from_source(src, params);
+}
+
+struct gguf_context * gguf_init_from_buffer(const void * data, size_t size, struct gguf_init_params params) {
+    if (!data || size == 0) {
+        return nullptr;
+    }
+
+    gguf_buffer_source src(data, size);
+    return gguf_init_from_source(src, params);
+}
+
+static struct gguf_context * gguf_init_from_source(struct gguf_source & src, struct gguf_init_params params) {
+    const struct gguf_reader gr(src);
     struct gguf_context * ctx = new gguf_context;
 
     bool ok = true;
@@ -700,14 +781,14 @@ struct gguf_context * gguf_init_from_file_ptr(FILE * file, struct gguf_init_para
     GGML_ASSERT(int64_t(ctx->info.size()) == n_tensors);
 
     // we require the data section to be aligned, so take into account any padding
-    if (gguf_fseek(file, GGML_PAD(gguf_ftell(file), ctx->alignment), SEEK_SET) != 0) {
+    if (src.seek(GGML_PAD(src.tell(), ctx->alignment)) != 0) {
         GGML_LOG_ERROR("%s: failed to seek to beginning of data section\n", __func__);
         gguf_free(ctx);
         return nullptr;
     }
 
     // store the current file offset - this is where the data section starts
-    ctx->offset = gguf_ftell(file);
+    ctx->offset = src.tell();
 
     // compute the total size of the data section, taking into account the alignment
     {

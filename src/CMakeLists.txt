@@ -40,7 +40,7 @@ add_library(llama
             unicode.h
             ${LLAMA_MODELS_SOURCES}
             # milady: DFlash draft model
-            models/dflash_draft.cpp
+            models/dflash-draft.cpp
             )
 
 set_target_properties(llama PROPERTIES

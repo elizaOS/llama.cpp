@@ -2,6 +2,7 @@
 
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
+#include "ggml-threading.h"
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <type_traits>
 
 // ggml_compute_forward_dup
 
@@ -290,6 +292,14 @@ static void ggml_compute_forward_dup_to_q(
     const int ir1 = MIN(ir0 + dr, nr);
 
     if (ggml_is_contiguous(dst) &&
+            ggml_is_contiguous(src0) &&
+            std::is_same<src_t, float>::value &&
+            dst->type == GGML_TYPE_IQ4_NL) {
+        if (ith == 0) {
+            ggml_quantize_chunk_mt(dst->type, (const float *) src0->data, dst->data, 0, ggml_nrows(src0), ne00, nullptr, nth);
+        }
+        ggml_barrier(params->threadpool);
+    } else if (ggml_is_contiguous(dst) &&
             nb00 == sizeof(src_t) &&
             ggml_get_type_traits_cpu(dst->type)->from_float) {
         // casting non-quantized types --> intermediate f32 --> quantized
@@ -4113,7 +4123,6 @@ static void ggml_compute_forward_l2_norm_f32(
     const ggml_tensor * src0 = dst->src[0];
 
     GGML_ASSERT(ggml_are_same_shape(src0, dst));
-
     GGML_ASSERT(src0->nb[0] == sizeof(float));
 
     const int ith = params->ith;
@@ -4123,26 +4132,21 @@ static void ggml_compute_forward_l2_norm_f32(
 
     float eps;
     memcpy(&eps, dst->op_params, sizeof(float));
-
     GGML_ASSERT(eps >= 0.0f);
 
-    // TODO: optimize
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
             for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
+
                 const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+                float * y = (float *) ((char *)  dst->data + i01*nb1  + i02*nb2  + i03*nb3);
 
-                ggml_float sum = 0.0;
-                for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    sum += (ggml_float)(x[i00] * x[i00]);
-                }
+                float sum = 0.0f;
+                ggml_vec_dot_f32(ne00, &sum, 0, x, 0, x, 0, 1);
 
-                float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
+                const float scale = 1.0f / fmaxf(sqrtf(sum), eps);
 
-                memcpy(y, x, ne00 * sizeof(float));
-
-                const float scale = 1.0f/fmaxf(sqrtf(sum), eps);
-
+                ggml_vec_cpy_f32(ne00, y, x);
                 ggml_vec_scale_f32(ne00, y, scale);
             }
         }
@@ -5640,6 +5644,9 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_TQ2_0:
         case GGML_TYPE_TBQ3_0:
         case GGML_TYPE_TBQ4_0:
+        case GGML_TYPE_QJL1_256:
+        case GGML_TYPE_Q4_POLAR:
+        case GGML_TYPE_TBQ3_TCQ:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:

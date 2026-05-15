@@ -125,7 +125,7 @@ static void usage(char * argv[]) {
         const auto * qfns     = ggml_get_type_traits(type);
         const auto * qfns_cpu = ggml_get_type_traits_cpu(type);
         if (ggml_type_name(type) != NULL) {
-            if (qfns_cpu->from_float && qfns->to_float) {
+            if (qfns_cpu->from_float) {
                 printf(" %s", ggml_type_name(type));
             }
         }
@@ -270,7 +270,30 @@ int main(int argc, char * argv[]) {
             continue;
         }
 
-        if (qfns_cpu->from_float && qfns->to_float) {
+        const bool have_from_float = (qfns_cpu->from_float != nullptr);
+        const bool have_to_float   = (qfns->to_float   != nullptr);
+        if (have_from_float && !have_to_float && params.op_quantize_row_q) {
+            printf("%s\n", ggml_type_name(type));
+            ggml_quantize_init(type);
+
+            printf("  quantize_row_q\n");
+            for (size_t size : params.test_sizes) {
+                if (size % ggml_blck_size(type) != 0) {
+                    continue;
+                }
+                printf("    %zu values (%.2f MB)\n", size, 4*size/(float)(1024*1024));
+                auto quantize_fn = [&](void) -> float {
+                    qfns_cpu->from_float(test_data1, test_q1, size);
+                    return test_q1[0];
+                };
+                size_t quantized_size = ggml_row_size(type, size);
+                benchmark_function(size, quantized_size, iterations, quantize_fn);
+            }
+            printf("\n");
+            continue;
+        }
+
+        if (have_from_float && have_to_float) {
             printf("%s\n", ggml_type_name(type));
 
             ggml_quantize_init(type);
@@ -318,7 +341,13 @@ int main(int argc, char * argv[]) {
                 printf("\n");
             }
 
-            if (params.op_quantize_row_q_dot) {
+            // K-cache-only types (e.g. GGML_TYPE_QJL1_256, GGML_TYPE_TBQ3_TCQ)
+            // intentionally have qfns_cpu->vec_dot == NULL — they are never
+            // mul_mat operands and are scored via the fused attention path
+            // (GGML_OP_ATTN_SCORE_QJL) instead. The vec_dot-based perf rows
+            // are meaningless for them and calling NULL is a segfault. Match
+            // the guard used in tests/test-quantize-fns.cpp:186-188.
+            if (params.op_quantize_row_q_dot && qfns_cpu->vec_dot) {
                 printf("  quantize_row_q_dot\n");
                 for (size_t size : params.test_sizes) {
                     printf("    %zu values (%.2f MB)\n", size, 4*size/(float)(1024*1024));
@@ -333,7 +362,7 @@ int main(int argc, char * argv[]) {
                 printf("\n");
             }
 
-            if (params.op_vec_dot_q) {
+            if (params.op_vec_dot_q && qfns_cpu->vec_dot) {
                 printf("  vec_dot_q\n");
                 qfns_cpu->from_float(test_data1, test_q1, largest);
                 qfns_cpu->from_float(test_data2, test_q2, largest);

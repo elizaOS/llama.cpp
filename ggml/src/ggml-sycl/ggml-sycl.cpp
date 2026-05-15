@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <float.h>
 #include <limits>
+#include <optional>
 #include <stdint.h>
 #include <stdio.h>
 #include <vector>
@@ -30,8 +31,17 @@
 #include <regex>
 
 #include <sycl/sycl.hpp>
+#include <sycl/backend.hpp>
+#ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO
+#include <level_zero/ze_api.h>
+#endif
 #if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
 #    include <sycl/ext/oneapi/experimental/async_alloc/async_alloc.hpp>
+#endif
+#if SYCL_EXT_ONEAPI_VIRTUAL_MEM
+#    include <sycl/ext/oneapi/virtual_mem/physical_mem.hpp>
+#    include <sycl/ext/oneapi/virtual_mem/virtual_mem.hpp>
+#    define GGML_SYCL_USE_VMM
 #endif
 #include <sycl/half_type.hpp>
 
@@ -66,8 +76,11 @@ int g_ggml_sycl_debug = 0;
 int g_ggml_sycl_disable_optimize = 0;
 int g_ggml_sycl_disable_graph = 0;
 int g_ggml_sycl_disable_dnn = 0;
+int g_ggml_sycl_enable_vmm = 1;
 int g_ggml_sycl_prioritize_dmmv = 0;
 int g_ggml_sycl_use_async_mem_op = 0;
+int g_ggml_sycl_enable_level_zero = 0;
+int g_ggml_sycl_use_async_mem_op_requested = 1;
 int g_ggml_sycl_enable_flash_attention = 1;
 
 
@@ -90,12 +103,29 @@ static ggml_sycl_device_info ggml_sycl_init() {
 //     GGML_LOG_INFO("%s: SYCL_USE_XMX: no\n", __func__);
 // #endif
     for (int i = 0; i < info.device_count; ++i) {
-        info.devices[i].vmm = 0;
         dpct::device_info prop;
         sycl::device device = dpct::dev_mgr::instance().get_device(i);
 
         SYCL_CHECK(CHECK_TRY_ERROR(dpct::get_device_info(
             prop, device)));
+
+#if !defined(GGML_SYCL_USE_VMM)
+        info.devices[i].vmm = 0;
+#else
+        info.devices[i].vmm = device.has(sycl::aspect::ext_oneapi_virtual_mem);
+        if (info.devices[i].vmm) {
+            // NB: SYCL's get_mem_granularity always returns the _minimum_ granularity,
+            // but the L0 API requires a larger page size for allocs above 2 MiB and
+            // rejects non-multiples with UR_RESULT_ERROR_INVALID_VALUE [sic].
+            // Here we clamp it to 2 MiB for simplicity, but other devices may require
+            // calling zeVirtualMemQueryPageSize or yet unexposed public API.
+            const size_t physical_page = 2ull << 20; // 2 MiB
+            info.devices[i].vmm_granularity = std::max<size_t>(
+                sycl::ext::oneapi::experimental::get_mem_granularity(
+                    device, sycl::context(device)),
+                physical_page);
+        }
+#endif
 
         info.default_tensor_split[i] = total_vram;
         total_vram += prop.get_global_mem_size();
@@ -222,7 +252,29 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_disable_optimize = get_sycl_env("GGML_SYCL_DISABLE_OPT", 0);
         g_ggml_sycl_disable_graph = get_sycl_env("GGML_SYCL_DISABLE_GRAPH", 1);
         g_ggml_sycl_disable_dnn = get_sycl_env("GGML_SYCL_DISABLE_DNN", 0);
+        g_ggml_sycl_enable_vmm = get_sycl_env("GGML_SYCL_ENABLE_VMM", 1);
         g_ggml_sycl_prioritize_dmmv = get_sycl_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
+#ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO
+        g_ggml_sycl_enable_level_zero = get_sycl_env("GGML_SYCL_ENABLE_LEVEL_ZERO", 1);
+#else
+        g_ggml_sycl_enable_level_zero = 0;
+#endif
+        if (g_ggml_sycl_enable_level_zero) {
+            // Verify all GPU devices use the Level Zero backend before enabling L0 APIs.
+            // Only check GPU devices; CPU devices use OpenCL and would otherwise
+            // disable Level Zero for the GPUs on systems without ONEAPI_DEVICE_SELECTOR set.
+            for (unsigned int i = 0; i < dpct::dev_mgr::instance().device_count(); i++) {
+                auto & q = dpct::dev_mgr::instance().get_device(i).default_queue();
+                if (!q.get_device().is_gpu()) {
+                    continue;
+                }
+                if (q.get_backend() != sycl::backend::ext_oneapi_level_zero) {
+                    GGML_LOG_WARN("SYCL GPU device %d does not use Level Zero backend, disabling Level Zero memory API\n", i);
+                    g_ggml_sycl_enable_level_zero = 0;
+                    break;
+                }
+            }
+        }
 
 #ifdef SYCL_FLASH_ATTN
         g_ggml_sycl_enable_flash_attention = get_sycl_env("GGML_SYCL_ENABLE_FLASH_ATTN", 1);
@@ -253,6 +305,16 @@ static void ggml_check_sycl() try {
 #else
         GGML_LOG_INFO("  GGML_SYCL_DNNL: no\n");
 #endif
+#if defined(GGML_SYCL_SUPPORT_LEVEL_ZERO)
+        GGML_LOG_INFO("  GGML_SYCL_SUPPORT_LEVEL_ZERO: yes\n");
+#else
+        GGML_LOG_INFO("  GGML_SYCL_SUPPORT_LEVEL_ZERO: no\n");
+#endif
+#if defined(GGML_SYCL_USE_VMM)
+        GGML_LOG_INFO("  GGML_SYCL_USE_VMM: yes\n");
+#else
+        GGML_LOG_INFO("  GGML_SYCL_USE_VMM: no\n");
+#endif
 
         GGML_LOG_INFO("Running with Environment Variables:\n");
         GGML_LOG_INFO("  GGML_SYCL_DEBUG: %d\n", g_ggml_sycl_debug);
@@ -262,12 +324,24 @@ static void ggml_check_sycl() try {
 #else
         GGML_LOG_INFO("  GGML_SYCL_DISABLE_GRAPH: graph disabled by compile flag\n");
 #endif
+#ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO
+        GGML_LOG_INFO("  GGML_SYCL_ENABLE_LEVEL_ZERO: %d\n", g_ggml_sycl_enable_level_zero);
+#else
+        GGML_LOG_INFO("  GGML_SYCL_ENABLE_LEVEL_ZERO: Level Zero disabled by compile flag\n");
+#endif
 #if GGML_SYCL_DNNL
         GGML_LOG_INFO("  GGML_SYCL_DISABLE_DNN: %d\n", g_ggml_sycl_disable_dnn);
 #else
         GGML_LOG_INFO("  GGML_SYCL_DISABLE_DNN: DNN disabled by compile flag\n");
 #endif
+#if defined(GGML_SYCL_USE_VMM)
+        GGML_LOG_INFO("  GGML_SYCL_ENABLE_VMM: %d\n", g_ggml_sycl_enable_vmm);
+#else
+        GGML_LOG_INFO("  GGML_SYCL_ENABLE_VMM: virtual memory extension is not available\n");
+#endif
         GGML_LOG_INFO("  GGML_SYCL_PRIORITIZE_DMMV: %d\n", g_ggml_sycl_prioritize_dmmv);
+        g_ggml_sycl_use_async_mem_op_requested = get_sycl_env("GGML_SYCL_USE_ASYNC_MEM_OP", 1);
+        GGML_LOG_INFO("  GGML_SYCL_USE_ASYNC_MEM_OP: %d\n", g_ggml_sycl_use_async_mem_op_requested);
 
 #ifdef SYCL_FLASH_ATTN
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_FLASH_ATTN: %d\n", g_ggml_sycl_enable_flash_attention);
@@ -283,11 +357,11 @@ static void ggml_check_sycl() try {
         fprintf(stderr, "%s: SYCL_USE_XMX: no\n", __func__);
 #endif
 */
-        // Currently, we only use async malloc / free when graphs are enabled as it is required for the calls to be
-        // properly recorded. As this SYCL extension matures it may be beneficial to enable as the default path and in
-        // other places.
+        // Async USM allocation/free is also useful outside the graph path: it avoids the host waits in the reorder
+        // staging path while preserving queue ordering semantics. Graph support still depends on the extension being
+        // available, but it no longer needs to control the non-graph fast path.
 #if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
-        g_ggml_sycl_use_async_mem_op = !g_ggml_sycl_disable_graph;
+        g_ggml_sycl_use_async_mem_op = g_ggml_sycl_use_async_mem_op_requested || !g_ggml_sycl_disable_graph;
         if (g_ggml_sycl_use_async_mem_op) {
             for (unsigned int i = 0; i < dpct::dev_mgr::instance().device_count(); ++i) {
                 if (!dpct::dev_mgr::instance().get_device(i).has(sycl::aspect::ext_oneapi_async_memory_alloc)) {
@@ -371,7 +445,7 @@ struct ggml_backend_sycl_buffer_context {
     ~ggml_backend_sycl_buffer_context() {
         if (dev_ptr != nullptr) {
             ggml_sycl_set_device(device);
-            SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(dev_ptr, *stream)));
+            SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_free_device(dev_ptr, *stream)));
         }
 
         //release extra used by tensors
@@ -504,8 +578,43 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+#ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO
+static bool ggml_sycl_is_l0_discrete_gpu(sycl::queue &q) {
+    if (!q.get_device().is_gpu() || q.get_backend() != sycl::backend::ext_oneapi_level_zero) {
+        return false;
+    }
+
+    ze_device_handle_t ze_dev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_device());
+    ze_device_properties_t props = {};
+    props.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES;
+    ze_result_t r = zeDeviceGetProperties(ze_dev, &props);
+    return r == ZE_RESULT_SUCCESS && !(props.flags & ZE_DEVICE_PROPERTY_FLAG_INTEGRATED);
+}
+#endif
+
 static void dev2dev_memcpy(sycl::queue &q_dst, sycl::queue &q_src, void *ptr_dst,
                     const void *ptr_src, size_t size) {
+#ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO
+    // Use Level Zero direct copy for dGPU-to-dGPU transfers.
+    const bool l0_copy_supported =
+        ggml_sycl_is_l0_discrete_gpu(q_dst) && ggml_sycl_is_l0_discrete_gpu(q_src);
+    if (g_ggml_sycl_enable_level_zero && l0_copy_supported) {
+        auto ze_ctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q_dst.get_context());
+        auto ze_dev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q_dst.get_device());
+        ze_command_queue_desc_t cq_desc = {ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC, nullptr, 0, 0,
+                                           0, ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS, ZE_COMMAND_QUEUE_PRIORITY_NORMAL};
+        ze_command_list_handle_t cl;
+        ze_result_t r = zeCommandListCreateImmediate(ze_ctx, ze_dev, &cq_desc, &cl);
+        if (r == ZE_RESULT_SUCCESS) {
+            r = zeCommandListAppendMemoryCopy(cl, ptr_dst, ptr_src, size, nullptr, 0, nullptr);
+            zeCommandListDestroy(cl);
+            if (r == ZE_RESULT_SUCCESS) {
+                return;
+            }
+        }
+    }
+#endif
+    // Host-staged copy
     char *host_buf = (char *)malloc(size);
     q_src.memcpy(host_buf, (const char *)ptr_src, size).wait();
     q_dst.memcpy((char *)ptr_dst, host_buf, size).wait();
@@ -675,8 +784,7 @@ ggml_backend_sycl_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
     size = std::max(size, (size_t)1); // syclMalloc returns null for size 0
 
     void * dev_ptr;
-    SYCL_CHECK(CHECK_TRY_ERROR(dev_ptr = (void *)sycl::malloc_device(
-                                    size, *stream)));
+    SYCL_CHECK(CHECK_TRY_ERROR(dev_ptr = (void *)ggml_sycl_malloc_device(size, *stream)));
     if (!dev_ptr) {
       GGML_LOG_ERROR("%s: can't allocate %lu Bytes of memory on device\n", __func__, size);
       return nullptr;
@@ -691,14 +799,21 @@ catch (sycl::exception const &exc) {
 }
 
 static size_t ggml_backend_sycl_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
-    return 128;
+    return SYCL_BUFFER_ALIGNMENT;
     GGML_UNUSED(buft);
 }
 
 static size_t ggml_backend_sycl_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
-    return dpct::get_current_device().get_max_mem_alloc_size();
+    ggml_backend_sycl_buffer_type_context * ctx = (ggml_backend_sycl_buffer_type_context *) buft->context;
+    size_t max_size = dpct::dev_mgr::instance().get_device(ctx->device).get_max_mem_alloc_size();
 
-    GGML_UNUSED(buft);
+    const char * relaxed_limits = getenv("UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS");
+    if (relaxed_limits == nullptr || strcmp(relaxed_limits, "1") != 0) {
+        constexpr size_t max_size_without_relaxed_limits = 4ull * 1024ull * 1024ull * 1024ull;
+        max_size = std::min(max_size, max_size_without_relaxed_limits);
+    }
+
+    return max_size;
 }
 
 static size_t ggml_backend_sycl_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
@@ -917,18 +1032,10 @@ ggml_backend_sycl_split_buffer_init_tensor(ggml_backend_buffer_t buffer,
             size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
         }
 
-        // FIXME: do not crash if SYCL Buffer alloc fails
-        // currently, init_tensor cannot fail, it needs to be fixed in ggml-backend first
         ggml_sycl_set_device(i);
         const queue_ptr stream = ctx->streams[i];
         char * buf;
-        /*
-        DPCT1009:208: SYCL uses exceptions to report errors and does not use the
-        error codes. The original code was commented out and a warning string
-        was inserted. You need to rewrite this code.
-        */
-        SYCL_CHECK(CHECK_TRY_ERROR(buf = (char *)sycl::malloc_device(
-                                        size, *stream)));
+        SYCL_CHECK(CHECK_TRY_ERROR(buf = (char *)ggml_sycl_malloc_device(size, *stream)));
         if (!buf) {
             char err_buf[1024];
             snprintf(err_buf, 1023, "%s: can't allocate %lu Bytes of memory on device\n", __func__, size);
@@ -1122,7 +1229,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_split_buffer_type_alloc_buffer(gg
 }
 
 static size_t ggml_backend_sycl_split_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
-    return 128;
+    return SYCL_BUFFER_ALIGNMENT;
     GGML_UNUSED(buft);
 }
 
@@ -1168,12 +1275,13 @@ static ggml_backend_buffer_type_i ggml_backend_sycl_split_buffer_type_interface 
     /* .is_host          = */ ggml_backend_sycl_split_buffer_type_is_host,
 };
 
-ggml_backend_buffer_type_t ggml_backend_sycl_split_buffer_type(const float * tensor_split) {
+ggml_backend_buffer_type_t ggml_backend_sycl_split_buffer_type(int main_device, const float * tensor_split) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
 
     GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_split_buffer_type\n");
     ggml_check_sycl();
+    GGML_UNUSED(main_device);
     // FIXME: this is not thread safe
     static std::map<std::array<float, GGML_SYCL_MAX_DEVICES>, struct ggml_backend_buffer_type> buft_map;
 
@@ -1306,7 +1414,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         for (int i = 0; i < MAX_SYCL_BUFFERS; ++i) {
             ggml_sycl_buffer & b = buffer_pool[i];
             if (b.ptr != nullptr) {
-                SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(b.ptr, *qptr)));
+                SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_free_device(b.ptr, *qptr)));
                 pool_size -= b.size;
             }
         }
@@ -1374,9 +1482,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         void * ptr;
         size_t look_ahead_size = (size_t) (1.05 * size);
 
-        SYCL_CHECK(
-            CHECK_TRY_ERROR(ptr = (void *)sycl::malloc_device(
-                                look_ahead_size, *qptr)));
+        SYCL_CHECK(CHECK_TRY_ERROR(ptr = (void *)ggml_sycl_malloc_device(look_ahead_size, *qptr)));
         if (!ptr) {
             GGML_LOG_ERROR("%s: can't allocate %lu Bytes of memory on device/GPU\n", __func__, look_ahead_size);
             return nullptr;
@@ -1404,10 +1510,125 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
             }
         }
         GGML_LOG_WARN("WARNING: sycl buffer pool full, increase MAX_sycl_BUFFERS\n");
-        SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(ptr, *qptr)));
+        SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_free_device(ptr, *qptr)));
         pool_size -= size;
     }
 };
+
+// pool with virtual memory management
+#if defined(GGML_SYCL_USE_VMM)
+struct ggml_sycl_pool_vmm : public ggml_sycl_pool {
+    static const size_t SYCL_POOL_VMM_MAX_SIZE = 1ull << 35; // 32 GB
+
+    int           device;
+    sycl::context ctx;
+    sycl::device  dev;
+
+    uintptr_t pool_addr = 0;
+    size_t    pool_used = 0;
+    size_t    pool_size = 0;
+    size_t    granularity;
+
+    // physical_mem owns the commits (unlike cuMemMap)
+    struct mapping {
+        sycl::ext::oneapi::experimental::physical_mem phys;
+        void * map_ptr;
+    };
+    std::vector<mapping> mappings;
+
+    explicit ggml_sycl_pool_vmm(queue_ptr qptr_, int device_) :
+        device(device_),
+        ctx(qptr_->get_context()),
+        dev(qptr_->get_device()),
+        granularity(ggml_sycl_info().devices[device_].vmm_granularity) {
+    }
+
+    ~ggml_sycl_pool_vmm() {
+        if (pool_addr == 0) {
+            return;
+        }
+
+        // Per spec, unmap must (a) match the exact (ptr, size) of an earlier
+        // physical_mem::map() call and (b) precede destruction of the
+        // physical_mem objects (their dtors won't unmap).
+        for (auto & m : mappings) {
+            SYCL_CHECK(CHECK_TRY_ERROR(sycl::ext::oneapi::experimental::unmap(
+                m.map_ptr, m.phys.size(), ctx)));
+        }
+        SYCL_CHECK(CHECK_TRY_ERROR(sycl::ext::oneapi::experimental::free_virtual_mem(
+            pool_addr, SYCL_POOL_VMM_MAX_SIZE, ctx)));
+    }
+
+    void * alloc(size_t size, size_t * actual_size) override {
+        // round up the allocation size to the alignment to ensure that all allocations are aligned for all data types
+        size = GGML_PAD(size, SYCL_BUFFER_ALIGNMENT);
+
+        size_t avail = pool_size - pool_used;
+
+        if (size > avail) {
+            // round up to the next multiple of the granularity
+            size_t reserve_size = GGML_PAD(size - avail, granularity);
+
+            GGML_ASSERT(pool_size + reserve_size <= SYCL_POOL_VMM_MAX_SIZE);
+
+            // allocate more physical memory
+            std::optional<sycl::ext::oneapi::experimental::physical_mem> phys;
+            SYCL_CHECK(CHECK_TRY_ERROR(phys.emplace(dev, ctx, reserve_size)));
+
+            // reserve virtual address space (if not already reserved)
+            if (pool_addr == 0) {
+                SYCL_CHECK(CHECK_TRY_ERROR(
+                    pool_addr = sycl::ext::oneapi::experimental::reserve_virtual_mem(
+                        SYCL_POOL_VMM_MAX_SIZE, ctx)));
+            }
+
+            // map at the end of the pool
+            void * map_ptr = nullptr;
+            SYCL_CHECK(CHECK_TRY_ERROR(
+                map_ptr = phys->map(pool_addr + pool_size, reserve_size,
+                                    sycl::ext::oneapi::experimental::address_access_mode::read_write)));
+
+            // stash these so we could unmap this exact range in dtor
+            mappings.push_back({
+                std::move(*phys),
+                map_ptr,
+            });
+
+            // add to the pool
+            pool_size += reserve_size;
+
+#ifdef DEBUG_SYCL_MALLOC
+            GGML_LOG_INFO("sycl pool[%d]: size increased to %llu MB (reserved %llu MB)\n",
+                          device, (unsigned long long) (pool_size/1024/1024),
+                          (unsigned long long) (reserve_size/1024/1024));
+#endif
+        }
+
+        GGML_ASSERT(pool_addr != 0);
+
+        void * ptr = reinterpret_cast<void *>(pool_addr + pool_used);
+        *actual_size = size;
+        pool_used += size;
+
+#ifdef DEBUG_SYCL_MALLOC
+        GGML_LOG_INFO("sycl pool[%d]: allocated %llu bytes at %p\n", device, (unsigned long long) size, ptr);
+#endif
+
+        return ptr;
+    }
+
+    void free(void * ptr, size_t size) override {
+#ifdef DEBUG_SYCL_MALLOC
+        GGML_LOG_INFO("sycl pool[%d]: freed %llu bytes at %p\n", device, (unsigned long long) size, ptr);
+#endif
+
+        pool_used -= size;
+
+        // all deallocations must be in reverse order of the allocations
+        GGML_ASSERT(ptr == reinterpret_cast<void *>(pool_addr + pool_used));
+    }
+};
+#endif // defined(GGML_SYCL_USE_VMM)
 
 struct ggml_sycl_pool_host : public ggml_sycl_pool {
     queue_ptr qptr;
@@ -1489,19 +1710,18 @@ std::unique_ptr<ggml_sycl_pool> ggml_backend_sycl_context::new_pool_for_host(que
 }
 
 std::unique_ptr<ggml_sycl_pool> ggml_backend_sycl_context::new_pool_for_device(queue_ptr qptr, int device) {
-    // TBD: NO VMM support
-    // if (ggml_sycl_info().devices[device].vmm) {
-    //     return std::unique_ptr<ggml_sycl_pool>(new ggml_sycl_pool_vmm(device));
-    // }
-   return std::unique_ptr<ggml_sycl_pool>(new ggml_sycl_pool_leg(qptr, device));
+#if defined(GGML_SYCL_USE_VMM)
+    if (g_ggml_sycl_enable_vmm && ggml_sycl_info().devices[device].vmm) {
+        return std::unique_ptr<ggml_sycl_pool>(new ggml_sycl_pool_vmm(qptr, device));
+    }
+#endif // defined(GGML_SYCL_USE_VMM)
+    return std::unique_ptr<ggml_sycl_pool>(new ggml_sycl_pool_leg(qptr, device));
 }
+
 
 std::unique_ptr<ggml_sycl_fattn_kv_buffers> ggml_backend_sycl_context::new_fattn_kv_buffers(queue_ptr qptr, int device) {
     return std::unique_ptr<ggml_sycl_fattn_kv_buffers>(new ggml_sycl_fattn_kv_buffers(qptr, device));
 }
-
-// TBD pool with virtual memory management
-// struct ggml_sycl_pool_vmm : public ggml_sycl_pool
 
 /// kernels
 typedef void (*ggml_sycl_op_mul_mat_t)(
@@ -1938,6 +2158,9 @@ static void argsort_f32_i32_sycl(const float *x, int *dst, const int ncols,
     } else {
         GGML_ABORT("fatal error");
     }
+
+    // Ensure all kernels finish execution before proceeding further
+    stream->wait();
 }
 
 static void top_k_f32_sycl(
@@ -2325,21 +2548,25 @@ inline void ggml_sycl_op_mul_mat_sycl(
         const float * src0_ddf_i = src0->type == GGML_TYPE_F32 ? (const float *) src0_dd_i : src0_ddq_as_f32.get();
         const float * src1_ddf1_i = src1->type == GGML_TYPE_F32 ? (const float *) src1_ddf_i : src1_ddq_as_f32.get();
 
-#if GGML_SYCL_DNNL
-        if (!g_ggml_sycl_disable_dnn) {
-            DnnlGemmWrapper::row_gemm(ctx, row_diff, src1_ncols, ne10, src0_ddf_i,
-                                      DnnlGemmWrapper::to_dt<float>(), src1_ddf1_i, DnnlGemmWrapper::to_dt<float>(),
-                                      dst_dd_i, DnnlGemmWrapper::to_dt<float>(), stream);
-        }
-        else
-#endif
         {
-            const float alpha = 1.0f;
-            const float beta  = 0.0f;
-            SYCL_CHECK(CHECK_TRY_ERROR(oneapi::mkl::blas::column_major::gemm(
-                *stream, oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans, row_diff,
-                src1_ncols, ne10, dpct::get_value(&alpha, *stream), src0_ddf_i, ne00, src1_ddf1_i, ne10,
-                dpct::get_value(&beta, *stream), dst_dd_i, ldc)));
+            const int64_t gemm_flops = (int64_t)row_diff * src1_ncols * ne10;
+            const bool use_mkl_direct = gemm_flops < 256 * 256 * 256;
+#if GGML_SYCL_DNNL
+            if (!g_ggml_sycl_disable_dnn && !use_mkl_direct) {
+                DnnlGemmWrapper::row_gemm(ctx, row_diff, src1_ncols, ne10, src0_ddf_i,
+                                          DnnlGemmWrapper::to_dt<float>(), src1_ddf1_i, DnnlGemmWrapper::to_dt<float>(),
+                                          dst_dd_i, DnnlGemmWrapper::to_dt<float>(), stream);
+            }
+            else
+#endif
+            {
+                const float alpha = 1.0f;
+                const float beta  = 0.0f;
+                SYCL_CHECK(CHECK_TRY_ERROR(oneapi::mkl::blas::column_major::gemm(
+                    *stream, oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans, row_diff,
+                    src1_ncols, ne10, dpct::get_value(&alpha, *stream), src0_ddf_i, ne00, src1_ddf1_i, ne10,
+                    dpct::get_value(&beta, *stream), dst_dd_i, ldc)));
+            }
         }
     }
     GGML_UNUSED(dst);
@@ -3388,6 +3615,7 @@ static bool ggml_sycl_supports_dmmv(enum ggml_type type) {
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
             return true;
         default:
             return false;
@@ -3405,7 +3633,7 @@ static inline void * sycl_ext_malloc_device(dpct::queue_ptr stream, size_t size)
     // If async allocation extension is not available, use_async should always be false.
     GGML_ASSERT(!use_async);
 #endif
-    return sycl::malloc(size, *stream, sycl::usm::alloc::device);
+    return ggml_sycl_malloc_device(size, *stream);
 }
 
 static inline void sycl_ext_free(dpct::queue_ptr stream, void * ptr) {
@@ -3419,7 +3647,7 @@ static inline void sycl_ext_free(dpct::queue_ptr stream, void * ptr) {
     // If async allocation extension is not available, use_async should always be false.
     GGML_ASSERT(!use_async);
 #endif
-    sycl::free(ptr, *stream);
+    ggml_sycl_free_device(ptr, *stream);
 }
 
 // RAII wrapper for temporary reorder buffers with optional host memory fallback.
@@ -3751,8 +3979,13 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
 
 
 static bool can_use_dequantize_mul_mat_vec(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // The F16/BF16 qk=1 kernel iterates with stride 2*DMMV_X, requiring ne[0] to be
+    // a multiple of 2*DMMV_X. Quantized types use block-structured kernels that only
+    // need ne[0] % DMMV_X == 0.
+    const int64_t dmmv_x_required = (src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F16) ?
+                                    2*GGML_SYCL_DMMV_X : GGML_SYCL_DMMV_X;
     return ggml_sycl_supports_dmmv(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-           src0->ne[0] % GGML_SYCL_DMMV_X == 0 && src1->ne[1] == 1;
+           src0->ne[0] % dmmv_x_required == 0 && src1->ne[1] == 1;
 }
 
 static bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {

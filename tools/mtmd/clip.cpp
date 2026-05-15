@@ -169,7 +169,7 @@ struct clip_ctx {
             throw std::runtime_error("failed to initialize CPU backend");
         }
         if (ctx_params.use_gpu) {
-            auto backend_name = std::getenv("MTMD_BACKEND_DEVICE");
+            auto * backend_name = std::getenv("MTMD_BACKEND_DEVICE");
             if (backend_name != nullptr) {
                 backend = ggml_backend_init_by_name(backend_name, nullptr);
                 if (!backend) {
@@ -300,7 +300,8 @@ ggml_tensor * clip_graph::build_vit(
             norm_type norm_t,
             ffn_op_type ffn_t,
             ggml_tensor * learned_pos_embd,
-            std::function<ggml_tensor *(ggml_tensor *, const clip_layer &)> add_pos
+            std::function<ggml_tensor *(ggml_tensor *, const clip_layer &)> add_pos,
+            const build_vit_opts & opts
         ) {
     if (learned_pos_embd) {
         inp = ggml_add(ctx0, inp, learned_pos_embd);
@@ -427,7 +428,7 @@ ggml_tensor * clip_graph::build_vit(
             }
 
             cur = build_attn(layer.o_w, layer.o_b,
-                Qcur, Kcur, Vcur, nullptr, kq_scale, il);
+                Qcur, Kcur, Vcur, opts.attn_mask, kq_scale, il);
             cb(cur, "attn_out", il);
         }
 
@@ -663,6 +664,9 @@ ggml_tensor * clip_graph::build_attn(
 
         k = ggml_cast(ctx0, k, GGML_TYPE_F16);
         v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+        if (kq_mask) {
+            kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
+        }
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, 0.0f, 0.0f);
         ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
@@ -994,7 +998,7 @@ struct clip_model_loader {
     bool has_audio  = false;
 
     // TODO @ngxson : we should not pass clip_ctx here, it should be clip_model
-    clip_model_loader(const char * fname) : fname(fname) {
+    clip_model_loader(const char * fname, bool skip_tensors = false) : fname(fname) {
         struct ggml_context * meta = nullptr;
 
         struct gguf_init_params params = {
@@ -1040,7 +1044,7 @@ struct clip_model_loader {
         }
 
         // tensors
-        {
+        if (!skip_tensors) {
             for (int i = 0; i < n_tensors; ++i) {
                 const char * name = gguf_get_tensor_name(ctx_gguf.get(), i);
                 const size_t offset = gguf_get_tensor_offset(ctx_gguf.get(), i);
@@ -2927,6 +2931,14 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
     return {ctx_vision, ctx_audio};
 }
 
+struct clip_cap clip_get_cap(const char * fname) {
+    clip_cap res;
+    clip_model_loader loader(fname, /* skip_tensors= */ true);
+    res.has_vision = loader.has_vision;
+    res.has_audio  = loader.has_audio;
+    return res;
+}
+
 struct clip_image_size * clip_image_size_init() {
     struct clip_image_size * load_image_size = new struct clip_image_size();
     load_image_size->width = 448;
@@ -3889,13 +3901,39 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                 set_input_i32("rel_pos_indices_local", rel_pos_indices_local);
                 set_input_i32("rel_pos_indices_global", rel_pos_indices_global);
             } break;
+        case PROJECTOR_TYPE_QWEN3A:
+            {
+                // Block-diagonal attention mask: [n_pos, n_pos], column-major.
+                // 0.0 for (query, key) pairs in the same 25-token conv chunk,
+                // -inf across chunks — matches cu_seqlens local attention in Python.
+                // NOTE: only QWEN3A's graph (tools/mtmd/models/qwen3a.cpp) actually
+                // registers an "attn_mask" graph input. The siglip / internvl /
+                // nemotron-v2-vl / mobilenetv5 graphs used by GEMMA3, GEMMA3NV,
+                // IDEFICS3, INTERNVL, NEMOTRON_V2_VL do NOT — fanning those
+                // projector types into this case (as upstream PR #23073 did)
+                // crashed clip_image_batch_encode at "Failed to get tensor
+                // attn_mask" the first time any of those models was asked to
+                // process an image (e.g. the Anthropic vision base64 test).
+                const int n_frames         = image_size_width;
+                const int chunk_size       = 200;
+                const int tokens_per_chunk = 25;
+                const int n_pos            = (n_frames / chunk_size) * tokens_per_chunk;
+                std::vector<float> mask(n_pos * n_pos, -INFINITY);
+                for (int q = 0; q < n_pos; q++) {
+                    int start = (q / tokens_per_chunk) * tokens_per_chunk;
+                    int end   = start + tokens_per_chunk;
+                    for (int k = start; k < end; k++) {
+                        mask[k + n_pos * q] = 0.0f;
+                    }
+                }
+                set_input_f32("attn_mask", mask);
+            } break;
         case PROJECTOR_TYPE_GEMMA3:
         case PROJECTOR_TYPE_GEMMA3NV:
         case PROJECTOR_TYPE_IDEFICS3:
         case PROJECTOR_TYPE_INTERNVL:
         case PROJECTOR_TYPE_NEMOTRON_V2_VL:
         case PROJECTOR_TYPE_QWEN2A:
-        case PROJECTOR_TYPE_QWEN3A:
         case PROJECTOR_TYPE_GLMA:
         case PROJECTOR_TYPE_ULTRAVOX:
         case PROJECTOR_TYPE_LFM2:
@@ -3908,7 +3946,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         case PROJECTOR_TYPE_HUNYUANOCR:
         case PROJECTOR_TYPE_YASA2:
             {
-                // do nothing
+                // do nothing — these graphs do not register an "attn_mask" input
             } break;
         case PROJECTOR_TYPE_HUNYUANVL:
             {
@@ -4282,21 +4320,6 @@ bool clip_has_vision_encoder(const struct clip_ctx * ctx) {
 
 bool clip_has_audio_encoder(const struct clip_ctx * ctx) {
     return ctx->model.modality == CLIP_MODALITY_AUDIO;
-}
-
-bool clip_has_whisper_encoder(const struct clip_ctx * ctx) {
-    switch (ctx->proj_type()) {
-        case PROJECTOR_TYPE_ULTRAVOX:
-        case PROJECTOR_TYPE_QWEN2A:
-        case PROJECTOR_TYPE_QWEN3A:
-        case PROJECTOR_TYPE_GLMA:
-        case PROJECTOR_TYPE_VOXTRAL:
-        case PROJECTOR_TYPE_MERALION:
-        case PROJECTOR_TYPE_MUSIC_FLAMINGO:
-            return true;
-        default:
-            return false;
-    }
 }
 
 bool clip_encode_float_image (struct clip_ctx * ctx, int n_threads, float * img, int h, int w, float * vec) {

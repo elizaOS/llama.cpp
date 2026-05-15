@@ -36,7 +36,14 @@ env:
   CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON"
 
 jobs:
+  webui-build:
+    name: Build WebUI
+    uses: ./.github/workflows/webui-build.yml
+
   macOS-cpu:
+    needs:
+      - webui-build
+
     strategy:
       matrix:
         include:
@@ -63,6 +70,12 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+
+      - name: Download WebUI build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: webui-build
+          path: tools/server/public/
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
@@ -100,6 +113,9 @@ jobs:
           name: llama-bin-macos-${{ matrix.build }}.tar.gz
 
   ubuntu-cpu:
+    needs:
+      - webui-build
+
     strategy:
       matrix:
         include:
@@ -118,6 +134,12 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+
+      - name: Download WebUI build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: webui-build
+          path: tools/server/public/
 
       - name: ccache
         if: ${{ matrix.build != 's390x' }}
@@ -169,6 +191,9 @@ jobs:
           name: llama-bin-ubuntu-${{ matrix.build }}.tar.gz
 
   ubuntu-vulkan:
+    needs:
+      - webui-build
+
     strategy:
       matrix:
         include:
@@ -185,6 +210,12 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+
+      - name: Download WebUI build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: webui-build
+          path: tools/server/public/
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
@@ -237,6 +268,9 @@ jobs:
           name: llama-bin-ubuntu-vulkan-${{ matrix.build }}.tar.gz
 
   android-arm64:
+    needs:
+      - webui-build
+
     runs-on: ubuntu-latest
 
     env:
@@ -248,6 +282,12 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+
+      - name: Download WebUI build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: webui-build
+          path: tools/server/public/
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
@@ -306,6 +346,9 @@ jobs:
           name: llama-bin-android-arm64.tar.gz
 
   ubuntu-24-openvino:
+    needs:
+      - webui-build
+
     runs-on: ubuntu-24.04
 
     outputs:
@@ -326,6 +369,12 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+
+      - name: Download WebUI build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: webui-build
+          path: tools/server/public/
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
@@ -385,7 +434,84 @@ jobs:
           path: llama-${{ steps.tag.outputs.name }}-bin-ubuntu-openvino-${{ env.OPENVINO_VERSION_MAJOR }}-x64.tar.gz
           name: llama-bin-ubuntu-openvino-${{ env.OPENVINO_VERSION_MAJOR }}-x64.tar.gz
 
+  ubuntu-22-cuda:
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        cuda: ['12.4']
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.16
+        with:
+          key: ubuntu-22-cmake-cuda-${{ matrix.cuda }}
+          evict-old-files: 1d
+
+      - name: Dependencies
+        id: depends
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.0-1_all.deb
+          sudo dpkg -i cuda-keyring_1.0-1_all.deb
+          sudo apt-get update -y
+          sudo apt-get install -y cuda-toolkit-${{ matrix.cuda }} build-essential libcurl4-openssl-dev
+
+      - name: Build
+        id: cmake_build
+        run: |
+          export PATH=/usr/local/cuda-${{ matrix.cuda }}/bin:$PATH
+          export LD_LIBRARY_PATH=/usr/local/cuda-${{ matrix.cuda }}/lib64:$LD_LIBRARY_PATH
+          cmake -B build \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="60;61;70;75;80;86;89;90" \
+            ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release -j $(nproc)
+
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          zip -r llama-${{ steps.tag.outputs.name }}-bin-ubuntu-cuda-${{ matrix.cuda }}-x64.zip ./build/bin/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-ubuntu-cuda-${{ matrix.cuda }}-x64.zip
+          name: llama-bin-ubuntu-cuda-${{ matrix.cuda }}-x64.zip
+
+      - name: Copy and pack Cuda runtime
+        run: |
+          cp /usr/local/cuda-${{ matrix.cuda }}/lib64/libcublas.so.12 ./build/bin/
+          cp /usr/local/cuda-${{ matrix.cuda }}/lib64/libcublasLt.so.12 ./build/bin/
+          cp /usr/local/cuda-${{ matrix.cuda }}/lib64/libcudart.so.12 ./build/bin/
+          zip -r cudart-llama-${{ steps.tag.outputs.name }}-bin-ubuntu-cuda-${{ matrix.cuda }}-x64.zip ./build/bin/*
+          rm ./build/bin/libcublas.so.12
+          rm ./build/bin/libcublasLt.so.12
+          rm ./build/bin/libcudart.so.12
+
+      - name: Upload Cuda runtime
+        uses: actions/upload-artifact@v4
+        with:
+          path: cudart-llama-${{ steps.tag.outputs.name }}-bin-ubuntu-cuda-${{ matrix.cuda }}-x64.zip
+          name: cudart-llama-bin-ubuntu-cuda-${{ matrix.cuda }}-x64.zip
+
   windows-cpu:
+    needs:
+      - webui-build
+
     runs-on: windows-2025
 
     strategy:
@@ -399,6 +525,12 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+
+      - name: Download WebUI build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: webui-build
+          path: tools/server/public/
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
@@ -438,6 +570,9 @@ jobs:
           name: llama-bin-win-cpu-${{ matrix.arch }}.zip
 
   windows:
+    needs:
+      - webui-build
+
     runs-on: windows-2025
 
     env:
@@ -460,6 +595,12 @@ jobs:
       - name: Clone
         id: checkout
         uses: actions/checkout@v6
+
+      - name: Download WebUI build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: webui-build
+          path: tools/server/public/
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
@@ -520,6 +661,9 @@ jobs:
           name: llama-bin-win-${{ matrix.backend }}-${{ matrix.arch }}.zip
 
   windows-cuda:
+    needs:
+      - webui-build
+
     runs-on: windows-2022
 
     strategy:
@@ -530,6 +674,12 @@ jobs:
       - name: Clone
         id: checkout
         uses: actions/checkout@v6
+
+      - name: Download WebUI build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: webui-build
+          path: tools/server/public/
 
       - name: Install ccache
         uses: ggml-org/ccache-action@v1.2.21
@@ -591,6 +741,9 @@ jobs:
           name: cudart-llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
 
   windows-sycl:
+    needs:
+      - webui-build
+
     runs-on: windows-2022
 
     defaults:
@@ -600,6 +753,7 @@ jobs:
     env:
       WINDOWS_BASEKIT_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/b60765d1-2b85-4e85-86b6-cb0e9563a699/intel-deep-learning-essentials-2025.3.3.18_offline.exe
       WINDOWS_DPCPP_MKL: intel.oneapi.win.cpp-dpcpp-common:intel.oneapi.win.mkl.devel:intel.oneapi.win.dnnl:intel.oneapi.win.tbb.devel
+      LEVEL_ZERO_SDK_URL: https://github.com/oneapi-src/level-zero/releases/download/v1.28.2/level-zero-win-sdk-1.28.2.zip
       ONEAPI_ROOT: "C:/Program Files (x86)/Intel/oneAPI"
       ONEAPI_INSTALLER_VERSION: "2025.3.3"
 
@@ -620,6 +774,19 @@ jobs:
         if: steps.cache-sycl.outputs.cache-hit != 'true'
         run: |
           scripts/install-oneapi.bat $WINDOWS_BASEKIT_URL $WINDOWS_DPCPP_MKL
+
+      - name: Install Level Zero SDK
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "${{ env.LEVEL_ZERO_SDK_URL }}" -OutFile "level-zero-win-sdk.zip"
+          Expand-Archive -Path "level-zero-win-sdk.zip" -DestinationPath "C:/level-zero-sdk" -Force
+          "LEVEL_ZERO_V1_SDK_PATH=C:/level-zero-sdk" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Download WebUI build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: webui-build
+          path: tools/server/public/
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
@@ -655,6 +822,13 @@ jobs:
           cp "${{ env.ONEAPI_ROOT }}/compiler/latest/bin/ur_adapter_opencl.dll" ./build/bin
           cp "${{ env.ONEAPI_ROOT }}/compiler/latest/bin/ur_loader.dll" ./build/bin
           cp "${{ env.ONEAPI_ROOT }}/compiler/latest/bin/ur_win_proxy_loader.dll" ./build/bin
+          ZE_LOADER_DLL=$(find "${{ env.ONEAPI_ROOT }}" "$LEVEL_ZERO_V1_SDK_PATH" -iname ze_loader.dll -print -quit 2>/dev/null || true)
+          if [ -n "$ZE_LOADER_DLL" ]; then
+            echo "Using Level Zero loader: $ZE_LOADER_DLL"
+            cp "$ZE_LOADER_DLL" ./build/bin
+          else
+            echo "Level Zero loader DLL not found in oneAPI or SDK; relying on system driver/runtime"
+          fi
 
           cp "${{ env.ONEAPI_ROOT }}/compiler/latest/bin/sycl8.dll" ./build/bin
           cp "${{ env.ONEAPI_ROOT }}/compiler/latest/bin/svml_dispmd.dll" ./build/bin
@@ -681,6 +855,9 @@ jobs:
           name: llama-bin-win-sycl-x64.zip
 
   ubuntu-24-sycl:
+    needs:
+      - webui-build
+
     strategy:
       matrix:
         build: [fp32, fp16]
@@ -695,6 +872,8 @@ jobs:
     env:
       ONEAPI_ROOT: /opt/intel/oneapi/
       ONEAPI_INSTALLER_VERSION: "2025.3.3"
+      LEVEL_ZERO_VERSION: "1.28.2"
+      LEVEL_ZERO_UBUNTU_VERSION: "u24.04"
 
     steps:
       - name: Clone
@@ -717,6 +896,20 @@ jobs:
           cd /tmp
           wget https://registrationcenter-download.intel.com/akdlm/IRC_NAS/56f7923a-adb8-43f3-8b02-2b60fcac8cab/intel-deep-learning-essentials-2025.3.3.16_offline.sh -O intel-deep-learning-essentials_offline.sh
           sudo bash intel-deep-learning-essentials_offline.sh -s -a --silent --eula accept
+
+      - name: Install Level Zero SDK
+        shell: bash
+        run: |
+          cd /tmp
+          wget -q "https://github.com/oneapi-src/level-zero/releases/download/v${LEVEL_ZERO_VERSION}/level-zero_${LEVEL_ZERO_VERSION}%2B${LEVEL_ZERO_UBUNTU_VERSION}_amd64.deb" -O level-zero.deb
+          wget -q "https://github.com/oneapi-src/level-zero/releases/download/v${LEVEL_ZERO_VERSION}/level-zero-devel_${LEVEL_ZERO_VERSION}%2B${LEVEL_ZERO_UBUNTU_VERSION}_amd64.deb" -O level-zero-devel.deb
+          sudo apt-get install -y ./level-zero.deb ./level-zero-devel.deb
+
+      - name: Download WebUI build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: webui-build
+          path: tools/server/public/
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
@@ -757,6 +950,9 @@ jobs:
           name: llama-bin-ubuntu-sycl-${{ matrix.build }}-x64.tar.gz
 
   ubuntu-22-rocm:
+    needs:
+      - webui-build
+
     runs-on: ubuntu-22.04
 
     strategy:
@@ -772,6 +968,12 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+
+      - name: Download WebUI build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: webui-build
+          path: tools/server/public/
 
       - name: Free up disk space
         uses: ggml-org/free-disk-space@v1.3.1
@@ -860,6 +1062,9 @@ jobs:
           name: llama-bin-ubuntu-rocm-${{ env.ROCM_VERSION_SHORT }}-${{ matrix.build }}.tar.gz
 
   windows-hip:
+    needs:
+      - webui-build
+
     runs-on: windows-2022
 
     env:
@@ -875,6 +1080,12 @@ jobs:
       - name: Clone
         id: checkout
         uses: actions/checkout@v6
+
+      - name: Download WebUI build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: webui-build
+          path: tools/server/public/
 
       - name: Grab rocWMMA package
         id: grab_rocwmma
@@ -1122,6 +1333,7 @@ jobs:
     runs-on: ubuntu-slim
 
     needs:
+      - webui-build
       - windows
       - windows-cpu
       - windows-cuda
@@ -1136,6 +1348,9 @@ jobs:
       - macOS-cpu
       - ios-xcode-build
       - openEuler-cann
+
+    outputs:
+      tag_name: ${{ steps.tag.outputs.name }}
 
     steps:
       - name: Clone
@@ -1262,3 +1477,15 @@ jobs:
                 });
               }
             }
+
+  webui-publish:
+    if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
+
+    needs:
+      - release
+
+    uses: ./.github/workflows/webui-publish.yml
+    with:
+      version_tag: ${{ needs.release.outputs.tag_name }}
+    secrets:
+      hf_token: ${{ secrets.HF_TOKEN_WEBUI_STATIC_OUTPUT }}
