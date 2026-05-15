@@ -43,7 +43,8 @@ struct common_speculative_config {
 
 static bool common_speculative_are_compatible(
     const llama_model * model_tgt,
-    const llama_model * model_dft) {
+    const llama_model * model_dft,
+    common_speculative_type spec_type) {
     const llama_vocab * vocab_tgt = llama_model_get_vocab(model_tgt);
     const llama_vocab * vocab_dft = llama_model_get_vocab(model_dft);
 
@@ -78,7 +79,8 @@ static bool common_speculative_are_compatible(
     }
 
     const llama_rope_type rope_type_tgt = llama_model_rope_type(model_tgt);
-    if (rope_type_tgt == LLAMA_ROPE_TYPE_MROPE || rope_type_tgt == LLAMA_ROPE_TYPE_IMROPE) {
+    if (spec_type == COMMON_SPECULATIVE_TYPE_DRAFT &&
+        (rope_type_tgt == LLAMA_ROPE_TYPE_MROPE || rope_type_tgt == LLAMA_ROPE_TYPE_IMROPE)) {
         LOG_WRN("%s: target model uses M-RoPE, which is not currently compatible with "
                 "speculative decoding because the target batch validator requires strict "
                 "monotone positions and rejects the boundary-token re-feed pattern. "
@@ -165,8 +167,11 @@ struct common_speculative_state_draft : public common_speculative_impl {
 
     std::vector<common_sampler_ptr> smpls;
 
-    common_speculative_state_draft(const common_params_speculative & params, uint32_t n_seq)
-        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT, n_seq)
+    common_speculative_state_draft(
+            common_speculative_type type,
+            const common_params_speculative & params,
+            uint32_t n_seq)
+        : common_speculative_impl(type, n_seq)
         , params(params.draft)
     {
         auto * ctx_dft = this->params.ctx_dft;
@@ -203,7 +208,8 @@ struct common_speculative_state_draft : public common_speculative_impl {
             smpl.reset(common_sampler_init(llama_get_model(ctx_dft), params));
         }
 
-        const bool vocab_cmpt = common_speculative_are_compatible(llama_get_model(ctx_tgt), llama_get_model(ctx_dft));
+        const bool vocab_cmpt = common_speculative_are_compatible(
+                llama_get_model(ctx_tgt), llama_get_model(ctx_dft), type);
         LOG_DBG("%s: vocab_cmpt = %d\n", __func__, vocab_cmpt);
 
         if (!vocab_cmpt) {
@@ -953,7 +959,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 break;
             case COMMON_SPECULATIVE_TYPE_DRAFT:
             case COMMON_SPECULATIVE_TYPE_DFLASH: {
-                impls.push_back(std::make_unique<common_speculative_state_draft>(config.params, n_seq));
+                impls.push_back(std::make_unique<common_speculative_state_draft>(config.type, config.params, n_seq));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_EAGLE3: {

@@ -33,10 +33,18 @@ add_custom_target(omnivoice-version ALL
 )
 
 # Audio tokenizer tensor names can exceed the default GGML_MAX_NAME of 64.
-# Mirrors the original omnivoice.cpp CMakeLists.txt. Attached PRIVATE on
-# every omnivoice target rather than redefined globally — keeps the
-# LLAMA_BUILD_OMNIVOICE wedge self-contained and additive.
+# Mirrors the original omnivoice.cpp CMakeLists.txt. Apply it to the linked
+# ggml/llama targets too; ggml parses tensor names during GGUF load, so keeping
+# this only on omnivoice translation units leaves tokenizer GGUFs unreadable.
 set(OMNIVOICE_COMPILE_DEFINITIONS GGML_MAX_NAME=128)
+foreach(_omnivoice_ggml_name_target
+        ggml ggml-base ggml-cpu ggml-blas ggml-metal ggml-vulkan ggml-cuda
+        llama common)
+    if(TARGET ${_omnivoice_ggml_name_target})
+        target_compile_definitions(${_omnivoice_ggml_name_target}
+            PUBLIC ${OMNIVOICE_COMPILE_DEFINITIONS})
+    endif()
+endforeach()
 
 # Sources shared by both the static core and the shared ABI-export library.
 set(OMNIVOICE_CORE_SOURCES
@@ -128,3 +136,18 @@ target_include_directories(omnivoice-test-abi-c PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(omnivoice-test-abi-c PRIVATE omnivoice_lib)
+
+# omnivoice-dac-parity : focused CPU numerical parity harness for
+# dac_conv_t1d's ggml_conv_transpose_1d migration (elizaOS/eliza#7660).
+# The default run uses deterministic synthetic DAC block shapes; pass
+# `--gguf <omnivoice-tokenizer.gguf>` to exercise real conv_t1 weights.
+add_executable(omnivoice-dac-parity tests/dac-parity.cpp)
+target_compile_features(omnivoice-dac-parity PRIVATE cxx_std_17)
+target_include_directories(omnivoice-dac-parity PRIVATE
+    ${CMAKE_SOURCE_DIR}/ggml/include
+    ${CMAKE_SOURCE_DIR}/ggml/src)
+target_link_libraries(omnivoice-dac-parity PRIVATE ggml ggml-cpu ggml-base)
+
+if(BUILD_TESTING)
+    add_test(NAME omnivoice-dac-parity COMMAND omnivoice-dac-parity --no-real)
+endif()
