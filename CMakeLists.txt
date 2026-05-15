@@ -424,9 +424,9 @@ if(ELIZA_FUSE_OMNIVOICE)
         OUTPUT_NAME elizainference
         POSITION_INDEPENDENT_CODE ON)
 
-    # The fused HTTP server IS `llama-server`. The kernel-patch
-    # `server-omnivoice-route.mjs` adds a `POST /v1/audio/speech` route to
-    # tools/server/server.cpp, guarded by `#ifdef ELIZA_FUSE_OMNIVOICE`,
+    # The fused HTTP server IS `llama-server`. tools/server/server.cpp
+    # carries the `POST /v1/audio/speech` route in committed source under
+    # namespace `eliza_omnivoice`, guarded by `#ifdef ELIZA_FUSE_OMNIVOICE`,
     # backed by omnivoice-core's `ov_synthesize`. So the same process that
     # serves `/completion` + `/v1/chat/completions` + the DFlash spec loop
     # also serves TTS — one process, one llama.cpp build, one GGML pin
