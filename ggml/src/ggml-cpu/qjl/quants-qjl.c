@@ -32,7 +32,7 @@
 #include "qjl_block.h"
 
 #include <math.h>
-#include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -60,17 +60,40 @@ _Static_assert(QJL_PROJECTION_DIM == QK_QJL,
 #define QJL_DEFAULT_PROJ_DIM 256
 #define QJL_DEFAULT_SEED     42ULL
 
-static pthread_once_t g_qjl_prj_once = PTHREAD_ONCE_INIT;
+/* Portable lazy init: three-state CAS (UNINIT -> RUNNING -> READY).
+ * pthread_once isn't available on MSVC; C11 atomics are. Readers spin
+ * briefly while another thread runs the initializer — a few-microsecond
+ * one-time hit per process, which matches pthread_once semantics. */
+#define QJL_INIT_UNINIT  0
+#define QJL_INIT_RUNNING 1
+#define QJL_INIT_READY   2
+
+static _Atomic int g_qjl_prj_state = QJL_INIT_UNINIT;
 static float *g_qjl_prj = NULL;
 
-static void qjl_default_projection_init(void) {
-    g_qjl_prj = (float *) malloc(sizeof(float) * QJL_DEFAULT_HEAD_DIM * QJL_DEFAULT_PROJ_DIM);
-    if (g_qjl_prj == NULL) return;
-    qjl_make_projection_mt(g_qjl_prj, QJL_DEFAULT_HEAD_DIM, QJL_DEFAULT_PROJ_DIM, QJL_DEFAULT_SEED);
-}
-
 static const float * qjl_default_projection(void) {
-    pthread_once(&g_qjl_prj_once, qjl_default_projection_init);
+    int state = atomic_load_explicit(&g_qjl_prj_state, memory_order_acquire);
+    if (state == QJL_INIT_READY) {
+        return g_qjl_prj;
+    }
+
+    int expected = QJL_INIT_UNINIT;
+    if (atomic_compare_exchange_strong_explicit(&g_qjl_prj_state, &expected,
+                                                QJL_INIT_RUNNING,
+                                                memory_order_acq_rel,
+                                                memory_order_acquire)) {
+        g_qjl_prj = (float *) malloc(sizeof(float) * QJL_DEFAULT_HEAD_DIM * QJL_DEFAULT_PROJ_DIM);
+        if (g_qjl_prj != NULL) {
+            qjl_make_projection_mt(g_qjl_prj, QJL_DEFAULT_HEAD_DIM, QJL_DEFAULT_PROJ_DIM, QJL_DEFAULT_SEED);
+        }
+        atomic_store_explicit(&g_qjl_prj_state, QJL_INIT_READY, memory_order_release);
+        return g_qjl_prj;
+    }
+
+    /* Another thread is initializing — wait for it. */
+    while (atomic_load_explicit(&g_qjl_prj_state, memory_order_acquire) != QJL_INIT_READY) {
+        /* tiny pause; this loop runs at most once per process lifetime */
+    }
     return g_qjl_prj;
 }
 
