@@ -804,9 +804,16 @@ static size_t ggml_backend_sycl_buffer_type_get_alignment(ggml_backend_buffer_ty
 }
 
 static size_t ggml_backend_sycl_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
-    return dpct::get_current_device().get_max_mem_alloc_size();
+    ggml_backend_sycl_buffer_type_context * ctx = (ggml_backend_sycl_buffer_type_context *) buft->context;
+    size_t max_size = dpct::dev_mgr::instance().get_device(ctx->device).get_max_mem_alloc_size();
 
-    GGML_UNUSED(buft);
+    const char * relaxed_limits = getenv("UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS");
+    if (relaxed_limits == nullptr || strcmp(relaxed_limits, "1") != 0) {
+        constexpr size_t max_size_without_relaxed_limits = 4ull * 1024ull * 1024ull * 1024ull;
+        max_size = std::min(max_size, max_size_without_relaxed_limits);
+    }
+
+    return max_size;
 }
 
 static size_t ggml_backend_sycl_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
@@ -1268,12 +1275,13 @@ static ggml_backend_buffer_type_i ggml_backend_sycl_split_buffer_type_interface 
     /* .is_host          = */ ggml_backend_sycl_split_buffer_type_is_host,
 };
 
-ggml_backend_buffer_type_t ggml_backend_sycl_split_buffer_type(const float * tensor_split) {
+ggml_backend_buffer_type_t ggml_backend_sycl_split_buffer_type(int main_device, const float * tensor_split) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
 
     GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_split_buffer_type\n");
     ggml_check_sycl();
+    GGML_UNUSED(main_device);
     // FIXME: this is not thread safe
     static std::map<std::array<float, GGML_SYCL_MAX_DEVICES>, struct ggml_backend_buffer_type> buft_map;
 

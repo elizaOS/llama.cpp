@@ -886,6 +886,9 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
     // add the device split buffer type if requested and available
     if (split_mode == LLAMA_SPLIT_MODE_ROW) {
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (ggml_backend_reg_name(reg) == std::string("SYCL")) {
+            throw std::runtime_error("SYCL backend does not support LLAMA_SPLIT_MODE_ROW");
+        }
         auto ggml_backend_split_buffer_type_fn = (ggml_backend_split_buffer_type_t)
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_split_buffer_type");
         if (ggml_backend_split_buffer_type_fn) {
