@@ -115,6 +115,14 @@ static inline double centroid_dot_neon(const uint8_t * qs, const float * yhat) {
     return (double) vaddvq_f32(acc);
 }
 
+/* Public NEON entry point. Forward-declared in fused-q4-polar-dot.c
+ * (the dispatcher) but the prototype lives here too so gcc with
+ * -Wmissing-prototypes doesn't reject the definition. */
+double ggml_vec_dot_q4_polar_q8_0_fused_neon(int nb_polar,
+                                             const block_q4_polar * x,
+                                             const block_q8_0 * y,
+                                             bool use_qjl);
+
 double ggml_vec_dot_q4_polar_q8_0_fused_neon(int nb_polar,
                                              const block_q4_polar * x,
                                              const block_q8_0 * y,
