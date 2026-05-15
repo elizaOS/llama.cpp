@@ -47,8 +47,8 @@ static __device__ __forceinline__ void dequantize_q1_0_g128(const void * vx, con
     v.y = bit_1 ? d : neg_d;
 }
 
-static __device__ __forceinline__ void dequantize_q1_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
-    const block_q1_0 * x = (const block_q1_0 *) vx;
+static __device__ __forceinline__ void dequantize_q1_0_g32(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_q1_0_g32 * x = (const block_q1_0_g32 *) vx;
 
     const float d = x[ib].d;
 

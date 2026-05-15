@@ -64,8 +64,3 @@ void qjl_score_qk_neon(const float *q_sketch,
 }
 
 #endif /* __ARM_NEON */
-
-/* On non-NEON targets the entire body above preprocesses out — give the
- * translation unit at least one declaration so -Werror=pedantic doesn't
- * trip on ISO C's empty-TU rule. */
-typedef int qjl_score_neon_tu_marker_t;

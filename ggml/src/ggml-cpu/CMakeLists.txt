@@ -141,6 +141,9 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         endif()
     endif()
 
+    # ELIZA-CPU-SIMD-PATCH-V1 QJL pthread link dependency
+    target_link_libraries(${GGML_CPU_NAME} PRIVATE Threads::Threads)
+
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)
 

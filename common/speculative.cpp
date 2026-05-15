@@ -44,6 +44,29 @@ struct common_speculative_config {
 static bool common_speculative_are_compatible(
     const llama_model * model_tgt,
     const llama_model * model_dft) {
+    // M-RoPE rejection guard. The spec-decode harness re-feeds the boundary
+    // token (the last token of the accepted prefix) alongside the K drafts
+    // so the target can score them. On M-RoPE bodies, the position-validation
+    // path in src/llama-batch.cpp requires *strict* monotone advancement
+    // (`KV_max < first_new_pos`) — but the boundary re-feed lands at
+    // `first_new_pos == KV_max`, so every drafted batch is rejected and
+    // acceptance collapses (~9% in the wild; see elizaOS/eliza#7631).
+    // Rather than silently degenerate to <1 t/s with a per-batch error
+    // loop, reject the body+drafter pair here. The server then emits the
+    // existing "speculative decoding not supported by this context"
+    // warning and falls back to body-only inference at full throughput.
+    // This guard only fires on M-RoPE / I-MRoPE target models — every
+    // other rope type is unaffected.
+    const llama_rope_type rope_tgt = llama_model_rope_type(model_tgt);
+    if (rope_tgt == LLAMA_ROPE_TYPE_MROPE || rope_tgt == LLAMA_ROPE_TYPE_IMROPE) {
+        LOG_WRN("%s: target model uses M-RoPE — speculative decoding is not "
+                "currently supported for M-RoPE bodies due to a strict "
+                "monotone-position requirement in src/llama-batch.cpp that "
+                "rejects the harness's boundary-token re-feed pattern. "
+                "See elizaOS/eliza#7631.\n", __func__);
+        return false;
+    }
+
     const llama_vocab * vocab_tgt = llama_model_get_vocab(model_tgt);
     const llama_vocab * vocab_dft = llama_model_get_vocab(model_dft);
 
