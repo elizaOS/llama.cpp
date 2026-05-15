@@ -247,8 +247,15 @@ llama_build_and_test(test-vulkan-uma.cpp)
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 
-llama_build_and_test(test-model-load-buffer.cpp LABEL "model" ARGS "${MODEL_DEST}")
-set_tests_properties(test-model-load-buffer PROPERTIES FIXTURES_REQUIRED test-download-model)
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    # test-model-load-buffer uses llama_model::memory_breakdown() directly,
+    # which is an internal C++ method not exported with LLAMA_API. On Windows
+    # shared-lib builds (e.g. CI sycl), the symbol is not visible to consumers
+    # of llama.dll → LNK2019. Match the gate used by other internal-symbol
+    # tests above (test-sampling, test-grammar-*, etc).
+    llama_build_and_test(test-model-load-buffer.cpp LABEL "model" ARGS "${MODEL_DEST}")
+    set_tests_properties(test-model-load-buffer PROPERTIES FIXTURES_REQUIRED test-download-model)
+endif()
 
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

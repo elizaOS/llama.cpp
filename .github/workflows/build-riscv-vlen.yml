@@ -1,0 +1,85 @@
+name: CI (riscv VLEN matrix)
+
+# Cross-compile llama.cpp's quantization vec_dot tests for RISC-V on
+# ubuntu-24.04 (amd64) and run them under qemu-user at VLEN=128, 256,
+# 512, 1024. This is the only practical way for us to validate the
+# RVV vl512/vl1024 kernels ported from upstream PR #22754 — the
+# native ubuntu-24.04-riscv runner is fixed at VLEN=128.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+      - main
+      - 'eliza/**'
+    paths:
+      - '.github/workflows/build-riscv-vlen.yml'
+      - 'ggml/src/ggml-cpu/arch/riscv/**'
+      - 'ggml/src/ggml-cpu/ggml-cpu-impl.h'
+      - 'tests/test-quantize-fns.cpp'
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/build-riscv-vlen.yml'
+      - 'ggml/src/ggml-cpu/arch/riscv/**'
+      - 'ggml/src/ggml-cpu/ggml-cpu-impl.h'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  cross-qemu-vlen:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        vlen: [128, 256, 512, 1024]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install RISC-V cross toolchain and qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-14-riscv64-linux-gnu g++-14-riscv64-linux-gnu \
+            qemu-user qemu-user-static \
+            cmake ninja-build
+          sudo update-alternatives --install /usr/bin/riscv64-linux-gnu-gcc \
+            riscv64-linux-gnu-gcc /usr/bin/riscv64-linux-gnu-gcc-14 100
+          sudo update-alternatives --install /usr/bin/riscv64-linux-gnu-g++ \
+            riscv64-linux-gnu-g++ /usr/bin/riscv64-linux-gnu-g++-14 100
+          riscv64-linux-gnu-gcc --version | head -1
+          qemu-riscv64 --version | head -1
+
+      - name: Configure (cross, RVV 1.0)
+        run: |
+          cmake -B build-riscv64 -G Ninja \
+            -DCMAKE_C_COMPILER=riscv64-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=riscv64-linux-gnu-g++ \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=riscv64 \
+            -DGGML_NATIVE=OFF \
+            -DGGML_RVV=ON \
+            -DCMAKE_C_FLAGS="-march=rv64gcv -mabi=lp64d -static" \
+            -DCMAKE_CXX_FLAGS="-march=rv64gcv -mabi=lp64d -static" \
+            -DCMAKE_EXE_LINKER_FLAGS="-static" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLAMA_BUILD_TESTS=ON \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TOOLS=OFF
+
+      - name: Build test-quantize-fns
+        run: cmake --build build-riscv64 -j $(nproc) --target test-quantize-fns
+
+      - name: Run test-quantize-fns at VLEN=${{ matrix.vlen }}
+        run: |
+          qemu-riscv64 -cpu rv64,v=true,zvfh=true,vlen=${{ matrix.vlen }} \
+            ./build-riscv64/bin/test-quantize-fns 2>&1 | tee /tmp/qfns-${{ matrix.vlen }}.log
+          # Fail the job if test-quantize-fns reports any FAIL line.
+          if grep -E "FAIL|FAILED" /tmp/qfns-${{ matrix.vlen }}.log; then
+            echo "::error::test-quantize-fns reported failures at VLEN=${{ matrix.vlen }}"
+            exit 1
+          fi

@@ -108,6 +108,7 @@ The full failure log set (71 raw failures across 9 workflows) collapses to 7 dis
 - **DD** — test-llama-archs over-correction by Z's gate. Files: src/llama-model-loader.cpp, possibly tests/test-llama-archs.cpp
 - **GG** — broad wave-11 CI triage (excl. Apple ios-xcode dup-symbols [EE] / Vulkan test-llama-archs decode [FF])
 - **FF** — Vulkan test-llama-archs decode crash. Files: tests/test-llama-archs.cpp, possibly src/llama-model-loader.cpp
+- **HH** — dflash-draft test-llama-archs missing tensor. Files: tests/test-llama-archs.cpp
 
 ## Completed
 
@@ -249,3 +250,13 @@ Tracked but NOT fixed in this pass — all blocked behind agents A-D landing the
 
 21. **Loongarch64 + RISC-V SpaceMIT cross-build link failure on `ggml_vec_dot_q1_0_g128_q8_0` / `_g32_q8_0` ALREADY FIXED at HEAD.** Surfaced in CI (cross) run 25899129240 and CI (riscv) related runs against sha `e47b9ef21`. Root cause was missing `#define`s in `ggml/src/ggml-cpu/arch-fallback.h` for the Eliza-added Q1_0_g32 (enum 200) and Q1_0_g128 (enum 201) variants under `__loongarch64`, `__riscv`, `__POWERPC__`, `__s390x__`, `__wasm__`, and `GGML_CPU_GENERIC` branches. Agents R (commit `02a182db8`) and an earlier concurrent agent (commit `8a38d708d`) both landed the matching aliases for all 6 arch branches. The wave-4 CI runs at `44515c9a8` will be the first push-event CI exercise of this fix on the cross matrices. If they still fail, the suspect is that the loongarch toolchain pre-defines `__loongarch64__` (with trailing underscores) rather than `__loongarch64` — adjust the `arch-fallback.h` guard accordingly. No work required for now; monitor the next cross run.
 
+
+## Live agents (II)
+
+- **II** — SYCL Windows `test-model-load-buffer.exe` LNK2019 on `llama_model::memory_breakdown()`. Root cause: test uses internal C++ method not exported with `LLAMA_API` on Windows shared-lib builds — same class as existing tests at tests/CMakeLists.txt:151-152 already-gated behind `if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)`. Fix: same gate around test-model-load-buffer. Files: tests/CMakeLists.txt.
+
+## Completed (II)
+
+- **II** `5fbb7991b` — Gated `test-model-load-buffer` behind `NOT WIN32 OR NOT BUILD_SHARED_LIBS` in `tests/CMakeLists.txt`. Test uses internal `llama_model::memory_breakdown()` C++ method, not exported via `LLAMA_API` from `llama.dll`. Fixes `CI (sycl) / windows-latest-sycl` LNK2019. Mirrors existing gate at line 151 used by test-sampling / test-grammar-* / test-chat which consume internal symbols.
+
+- **HH** `5311271ca` — fix(tests): skip `LLM_ARCH_DFLASH_DRAFT` in `test-llama-archs::arch_supported()`. CI `test-llama-archs` (test #25 Vulkan, #26 3rd-party) on SHA `7c70cd14b` aborts during model load with `llama_model_load: error loading model: missing tensor 'dflash_fc.weight'` → `llama_model_load_from_file_impl: failed to load model` → `encountered runtime error: failed to create llama model`. After Z's wave-9 gate (`8c1885b6c`) and DD's mirror (`0f2998990`), the model loader's `create_tensor` synthesis branch only counts/synthesizes tensors that exist in the gguf metadata. `LLM_ARCH_DFLASH_DRAFT` is Eliza-specific (`src/models/dflash-draft.cpp`) and registers two required tensors at `src/llama-arch.cpp:560-561` — `dflash_fc` and `dflash_hidden_norm` — but the test fixture's sparse gguf only seeds 8 wavtokenizer-shaped placeholders (`conv*d.weight`, `posnet.*.conv*.weight`, `convnext.*.dw.weight × 2`). The dflash arch's load path hits a required-tensor presence check before the `n_created`/`n_tensors` balance can be reached, so it errors out with the missing-tensor abort rather than the count mismatch other archs would have produced. Per the brief, option (b) matches the existing pattern for QWEN35/QWEN35MOE one block above (which DD/FF gated for the analogous reason). DFLASH_DRAFT is a speculative draft head, not the test's primary subject; the synthesis branch was never designed to invent required tensors. Added a third gate inside `arch_supported()` next to the QWEN35 one. If/when the loader's synth path is broadened to cover required tensors (option c) or the fixture seeds `dflash_fc.weight`/`dflash_hidden_norm` (option a), the gate can drop. Files: `tests/test-llama-archs.cpp`.
