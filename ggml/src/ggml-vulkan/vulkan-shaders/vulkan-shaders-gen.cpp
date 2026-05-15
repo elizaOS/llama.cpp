@@ -1041,6 +1041,32 @@ void process_shaders() {
 
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 
+    // ELIZA-VK-DISPATCH-PATCH-V1 BEGIN — register eliza turbo / qjl / polar
+    // standalone shaders. Each entry causes vulkan-shaders-gen to compile the
+    // matching .comp via glslc (staged into vulkan-shaders/ by
+    // kernel-patches/vulkan-kernels.mjs) and emit `<name>_data[]` + `<name>_len`
+    // symbols into ggml-vulkan-shaders.hpp. The shader sources are
+    // self-contained TUs — no defines are required.
+    string_to_spv("eliza_turbo3",         "turbo3.comp",         {});
+    string_to_spv("eliza_turbo4",         "turbo4.comp",         {});
+    string_to_spv("eliza_turbo3_tcq",     "turbo3_tcq.comp",     {});
+    string_to_spv("eliza_qjl",            "qjl.comp",            {});
+    string_to_spv("eliza_qjl_get_rows",   "qjl_get_rows.comp",   {});
+    string_to_spv("eliza_qjl_mul_mv",     "qjl_mul_mv.comp",     {});
+    string_to_spv("eliza_polar",          "polar.comp",          {});
+    string_to_spv("eliza_polar_preht",    "polar_preht.comp",    {});
+    string_to_spv("eliza_polar_get_rows", "polar_get_rows.comp", {});
+    // Multi-block-per-workgroup variants (BLOCKS_PER_WG / TOKENS_PER_WG is a
+    // constant_id=0 spec constant set at pipeline-create). One SPV family per
+    // kernel; the runtime picks a device-tuned amortisation factor.
+    string_to_spv("eliza_turbo3_multi",     "turbo3_multi.comp",     {});
+    string_to_spv("eliza_turbo4_multi",     "turbo4_multi.comp",     {});
+    string_to_spv("eliza_turbo3_tcq_multi", "turbo3_tcq_multi.comp", {});
+    string_to_spv("eliza_qjl_multi",        "qjl_multi.comp",        {});
+    // Fused attention (QJL-K score + V-mix, online softmax): TBQ3-V + Polar-V.
+    string_to_spv("eliza_fused_attn_qjl_tbq",   "fused_attn_qjl_tbq.comp",   {});
+    string_to_spv("eliza_fused_attn_qjl_polar", "fused_attn_qjl_polar.comp", {});
+    // ELIZA-VK-DISPATCH-PATCH-V1 END
     for (auto &c : compiles) {
         c.wait();
     }

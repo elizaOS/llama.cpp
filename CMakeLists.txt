@@ -457,3 +457,84 @@ if(ELIZA_FUSE_OMNIVOICE)
 endif()
 # ----------------------------------------------------------------------
 # end # ELIZA-OMNIVOICE-FUSION-GRAFT-V1
+
+
+# ELIZA-KOKORO-FUSION-GRAFT-V1
+# ----------------------------------------------------------------------
+# Source-level fusion of the Kokoro-82M TTS engine into the same
+# libelizainference target the OmniVoice graft built above. See
+# plugins/plugin-local-inference/native/reports/porting/2026-05-14/
+# kokoro-llama-cpp-feasibility.md for the design (no new GGML op, no
+# new model arch, free-standing ggml_backend graph mirroring OmniVoice's
+# PipelineTTS).
+#
+# The Kokoro sources are staged by prepare.mjs into the same
+# omnivoice/src/ directory as the OmniVoice port so they share the
+# GGML_MAX_NAME=128 bump and the gguf-weights.h / weight-ctx.h /
+# backend.h helpers.
+#
+# This block requires ELIZA_FUSE_OMNIVOICE=ON: Kokoro reuses the
+# omnivoice-core build context and the OmniVoice FFI dispatcher
+# (eliza_pick_kokoro_files() is called from eliza_load_tts() before
+# falling through to OmniVoice's own picker).
+# ----------------------------------------------------------------------
+
+if(ELIZA_FUSE_KOKORO)
+    if(NOT ELIZA_FUSE_OMNIVOICE)
+        message(FATAL_ERROR
+            "ELIZA_FUSE_KOKORO=ON requires ELIZA_FUSE_OMNIVOICE=ON: the "
+            "Kokoro graft compiles into the same omnivoice-core static "
+            "library and reuses its backend/weight-ctx helpers.")
+    endif()
+
+    file(GLOB ELIZA_KOKORO_SOURCES
+        CONFIGURE_DEPENDS
+        ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice/src/kokoro-*.cpp)
+    file(GLOB ELIZA_KOKORO_HEADERS
+        CONFIGURE_DEPENDS
+        ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice/src/kokoro-*.h)
+
+    if(NOT ELIZA_KOKORO_SOURCES)
+        message(FATAL_ERROR
+            "ELIZA_FUSE_KOKORO=ON but no sources under "
+            "omnivoice/src/kokoro-*.cpp. Re-run "
+            "packages/app-core/scripts/omnivoice-fuse/prepare.mjs.")
+    endif()
+
+    # Compile Kokoro sources straight into the existing omnivoice-core
+    # static library so they share its compile flags + GGML_MAX_NAME=128
+    # bump + include path set. Avoids a parallel kokoro-core target with
+    # a duplicate set of link rules to maintain.
+    target_sources(omnivoice-core PRIVATE ${ELIZA_KOKORO_SOURCES})
+
+    # Also compile them into the shared `elizainference` library so the
+    # FFI symbol set is co-resident with the OmniVoice symbols (one
+    # dlopen, one ABI surface; AGENTS.md §4 one-process rule).
+    if(TARGET elizainference)
+        target_sources(elizainference PRIVATE ${ELIZA_KOKORO_SOURCES})
+        target_compile_definitions(elizainference PRIVATE ELIZA_FUSE_KOKORO)
+    endif()
+
+    # llama-server already links omnivoice-core (above); the Kokoro
+    # sources are now compiled into that archive, so the route in
+    # tools/server/server.cpp gated on `#ifdef ELIZA_FUSE_KOKORO` picks
+    # up the new dispatcher without an additional target_link_libraries.
+    if(TARGET llama-server)
+        target_compile_definitions(llama-server PRIVATE ELIZA_FUSE_KOKORO)
+    endif()
+
+    # Optional: install the Python convert script alongside
+    # convert_hf_to_gguf.py so deployments that ship the binary also
+    # ship the GGUF generator.
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice/tools/convert_kokoro_to_gguf.py)
+        install(
+            FILES ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice/tools/convert_kokoro_to_gguf.py
+            PERMISSIONS
+                OWNER_READ OWNER_WRITE OWNER_EXECUTE
+                GROUP_READ GROUP_EXECUTE
+                WORLD_READ WORLD_EXECUTE
+            DESTINATION ${CMAKE_INSTALL_BINDIR})
+    endif()
+endif()
+# ----------------------------------------------------------------------
+# end # ELIZA-KOKORO-FUSION-GRAFT-V1

@@ -535,14 +535,15 @@ static int main_impl(int argc, char ** argv) {
                               chunk_duration_sec, chunk_threshold_sec, seed_resolved, dump_dir, output_path, wav_fmt);
     }
 
-    BackendPair bp = backend_init("LM");
+    BackendPairOwned bpo = backend_init_auto("LM");
+    BackendPair      bp  = bpo.bp;
     if (!bp.backend) {
         return 1;
     }
 
     PipelineTTS pt = {};
     if (!pipeline_tts_load(&pt, model_path, bp, use_fa, clamp_fp16)) {
-        backend_release(bp.backend, bp.cpu_backend);
+        backend_auto_free(bpo);
         return 1;
     }
 
@@ -619,9 +620,9 @@ static int main_impl(int argc, char ** argv) {
 
     // Shared cleanup for both debug paths (--llm-test and --maskgit-test).
     // The TTS path returns earlier through run_tts_via_ov, which manages
-    // its own ov_free / backend_release pair.
+    // its own ov_free / BackendPairOwned lifecycle.
     pipeline_tts_free(&pt);
-    backend_release(bp.backend, bp.cpu_backend);
+    backend_auto_free(bpo);
     return rc;
 }
 

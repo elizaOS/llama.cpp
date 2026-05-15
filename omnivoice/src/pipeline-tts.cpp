@@ -1289,6 +1289,34 @@ static RefEncoded tts_encode_ref(PipelineTTS *       pt,
     return r;
 }
 
+std::vector<int32_t> pipeline_tts_encode_reference(PipelineTTS * pt,
+                                                   PipelineCodec * pc,
+                                                   const float * ref_audio_24k,
+                                                   int ref_n_samples,
+                                                   int * out_K,
+                                                   int * out_ref_T,
+                                                   const char * dump_dir) {
+    if (!pt || !pc || !ref_audio_24k || ref_n_samples <= 0) {
+        ov_set_error("pipeline_tts_encode_reference : invalid arguments");
+        return {};
+    }
+
+    RefEncoded re = tts_encode_ref(pt, pc, ref_audio_24k, ref_n_samples,
+                                   "", true, dump_dir);
+    if (!re.has_ref || re.ref_codes.empty()) {
+        ov_set_error("pipeline_tts_encode_reference : reference encoding failed");
+        return {};
+    }
+
+    if (out_K) {
+        *out_K = pt->lm.num_audio_codebook;
+    }
+    if (out_ref_T) {
+        *out_ref_T = re.ref_T;
+    }
+    return re.ref_codes;
+}
+
 ov_status pipeline_tts_synthesize(PipelineTTS *         pt,
                                   PipelineCodec *       pc,
                                   const BPETokenizer *  tok,

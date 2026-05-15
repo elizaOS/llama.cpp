@@ -31,17 +31,28 @@
 
 bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair bp) {
     *pc                    = {};
-    // The DAC decoder previously used a private col2im_1d op that had no Metal
-    // kernel, causing the Metal command buffer to deadlock waiting for CPU work
-    // that never signalled completion.  The decoder has since been ported to
-    // ggml_conv_transpose_1d (GGML_OP_CONV_TRANSPOSE_1D), which has native
-    // Metal shaders (kernel_conv_transpose_1d_f16_f32 / f32_f32) and is
-    // dispatched via the Metal op table in ggml-metal-ops.cpp.  The blanket
-    // CPU fallback is no longer needed: run the full codec on the requested
-    // backend so Metal inference benefits from GPU-accelerated ConvTranspose1d.
-    pc->bp                 = bp;
-    pc->backend            = bp.backend;
-    ggml_backend_t backend = bp.backend;
+    // Keep the MaskGIT/LM path on the selected accelerator, but pin the
+    // audio tokenizer / DAC codec to CPU on Apple Metal. The merged eliza
+    // ggml Metal DAC decode graph has been observed to stall immediately
+    // after "[TTS] Decode"; using CPU here keeps one fused process and one
+    // model lifecycle while avoiding the bad Metal codec scheduler path.
+    BackendPair codec_bp = bp;
+    const char * requested_backend =
+        bp.backend ? ggml_backend_name(bp.backend) : "(null)";
+    const bool requested_metal =
+        requested_backend &&
+        (std::strncmp(requested_backend, "MTL", 3) == 0 ||
+         std::strstr(requested_backend, "Metal") != nullptr);
+    if (requested_metal && bp.cpu_backend) {
+        codec_bp.backend = bp.cpu_backend;
+        codec_bp.has_gpu = false;
+        ov_log(OV_LOG_INFO,
+               "[PipelineCodec] Metal codec fallback: requested=%s selected=%s reason=merged-ggml-dac-decode-stall",
+               requested_backend, ggml_backend_name(codec_bp.backend));
+    }
+    pc->bp                 = codec_bp;
+    pc->backend            = codec_bp.backend;
+    ggml_backend_t backend = codec_bp.backend;
 
     if (!gf_load(&pc->gguf, gguf_path)) {
         return false;
@@ -191,7 +202,7 @@ bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair
     // Scheduler: routes ops the GPU backend cannot run (e.g. K-quant
     // get_rows on CUDA) to the CPU backend. 4096 nodes covers HuBERT 12L
     // + DAC encoder + DAC decoder graphs.
-    pc->sched = backend_sched_new(bp, 4096);
+    pc->sched = backend_sched_new(codec_bp, 4096);
     if (!pc->sched) {
         pipeline_codec_free(pc);
         return false;

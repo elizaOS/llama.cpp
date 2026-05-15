@@ -47,8 +47,9 @@ struct DACResUnit {
 // Decoder block: snake1 -> conv_t1 (upsample) -> 3 res_units
 struct DACBlock {
     DACSnake             s1;
-    // ConvTranspose1d weight in eliza ggml's native [K, OC, IC] layout.
-    // Source-side layout is (IC, OC, K), represented by ggml as ne=(K, OC, IC).
+    // ConvTranspose1d weight pre-permuted to ggml [IC, K*OC] for mul_mat.
+    // source layout (IC, OC, K) is repacked at load time so col2im_1d gets the
+    // expected [K*OC, T_in] column matrix where k varies faster than oc.
     struct ggml_tensor * ctw;  // [K, OC, IC] bf16
     struct ggml_tensor * ctb;  // [OC] f32
     DACResUnit           ru[DAC_RES_UNITS];
