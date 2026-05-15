@@ -207,26 +207,42 @@ add_library(ggml-base
             ggml-quants.c
             ggml-quants.h
             polar_centroids.h
-            gguf.cpp
-            # ELIZA-WINDOWS-QJL-IN-GGML-BASE
-            # PE/COFF requires every imported symbol to be resolved at
-            # link time; the QJL definitions in ggml-cpu/qjl/ are referenced
-            # from ggml.c (ggml-base), so on Windows shared-lib builds they
-            # must also live in ggml-base. Linux/macOS use the original
-            # ggml-cpu placement and ignore this duplicate. The list mirrors
-            # QJL_GGML_BASE_LINK_FILES in kernel-patches/cpu-simd-kernels.mjs.
-            ggml-cpu/qjl/quants-qjl.c
-            ggml-cpu/qjl/qjl_dispatch.c
-            ggml-cpu/qjl/qjl_projection.c
-            ggml-cpu/qjl/qjl_quantize_ref.c
-            ggml-cpu/qjl/qjl_quantize_avx2.c
-            ggml-cpu/qjl/qjl_quantize_neon.c
-            ggml-cpu/qjl/qjl_score_ref.c
-            ggml-cpu/qjl/qjl_score_i8_ref.c
-            ggml-cpu/qjl/qjl_score_avx2.c
-            ggml-cpu/qjl/qjl_score_avxvnni.c
-            ggml-cpu/qjl/qjl_score_neon.c
-            ggml-cpu/qjl/qjl_score_dotprod.c)
+            gguf.cpp)
+
+# ELIZA-SHARED-QJL-IN-GGML-BASE
+# ggml.c (built into ggml-base) references the QJL dequantize/quantize
+# symbols via the type_traits table (`.to_float = dequantize_row_qjl1_256`
+# etc.). For shared-library builds (Linux .so, Windows .dll, Apple .dylib),
+# `libggml-base` is linked as a shared lib in isolation — its symbols must
+# resolve at lib-link time, NOT defer to the final-executable link. So
+# every shared build needs the QJL TUs inside ggml-base. Without this,
+# `libggml-base.so/.dylib` ends up with undefined `_dequantize_row_qjl1_256`,
+# `_quantize_qjl1_256`, `_quantize_row_qjl1_256_ref` (referenced from the
+# `_type_traits` global and from `ggml_quantize_chunk`), and the link fails
+# (Linux/Android/iOS shared .dylib all hit this).
+# For static-library builds (e.g. Apple xcframework which sets
+# BUILD_SHARED_LIBS=OFF and then runs `xcrun libtool -static` to combine
+# libggml-base.a + libggml-cpu.a), including QJL TUs in BOTH archives
+# produces duplicate symbols that `clang++ -Wl,-force_load,combined.a`
+# rejects. In the static path, the final link of consumers pulls in
+# ggml-cpu transitively (`target_link_libraries(ggml PUBLIC ggml-cpu)`)
+# so the symbols still resolve from ggml-cpu alone.
+# The list mirrors QJL_GGML_BASE_LINK_FILES in kernel-patches/cpu-simd-kernels.mjs.
+if (BUILD_SHARED_LIBS OR WIN32)
+    target_sources(ggml-base PRIVATE
+        ggml-cpu/qjl/quants-qjl.c
+        ggml-cpu/qjl/qjl_dispatch.c
+        ggml-cpu/qjl/qjl_projection.c
+        ggml-cpu/qjl/qjl_quantize_ref.c
+        ggml-cpu/qjl/qjl_quantize_avx2.c
+        ggml-cpu/qjl/qjl_quantize_neon.c
+        ggml-cpu/qjl/qjl_score_ref.c
+        ggml-cpu/qjl/qjl_score_i8_ref.c
+        ggml-cpu/qjl/qjl_score_avx2.c
+        ggml-cpu/qjl/qjl_score_avxvnni.c
+        ggml-cpu/qjl/qjl_score_neon.c
+        ggml-cpu/qjl/qjl_score_dotprod.c)
+endif()
 target_include_directories(ggml-base PRIVATE ggml-cpu ggml-cpu/qjl ggml-cpu/qjl/include)
 
 set_target_properties(ggml-base PROPERTIES

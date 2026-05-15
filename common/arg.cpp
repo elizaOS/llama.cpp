@@ -400,6 +400,8 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_Q5_1,
     GGML_TYPE_TBQ3_0,
     GGML_TYPE_TBQ4_0,
+    GGML_TYPE_TBQ3_K,
+    GGML_TYPE_TBQ4_K,
     // ELIZA-KV-CACHE-TYPES-V1 — Eliza-1 QJL K-cache + PolarQuant V-cache (full ggml
     // type traits in ggml.c; K uses the GGML_OP_ATTN_SCORE_QJL graph route)
     GGML_TYPE_QJL1_256,

@@ -284,6 +284,18 @@ typedef struct {
 } block_tbq4_0;
 static_assert(sizeof(block_tbq4_0) == sizeof(ggml_half) + QK_TBQ/2, "wrong tbq4_0 block size/padding");
 
+typedef struct {
+    uint8_t qs[QK_K * 3 / 8]; // upstream-style 3-bit codes over a QK_K block
+    ggml_half d;              // L2 norm before TurboQuant rotation
+} block_tbq3_k;
+static_assert(sizeof(block_tbq3_k) == sizeof(ggml_half) + QK_K * 3 / 8, "wrong tbq3_k block size/padding");
+
+typedef struct {
+    uint8_t qs[QK_K / 2]; // upstream-style 4-bit codes over a QK_K block
+    ggml_half d;          // L2 norm before TurboQuant rotation
+} block_tbq4_k;
+static_assert(sizeof(block_tbq4_k) == sizeof(ggml_half) + QK_K / 2, "wrong tbq4_k block size/padding");
+
 // QJL: 1-bit Quantized JL Transform K-cache compression. One block stores
 // the packed signs of Π·k for one cached key vector together with the bf16
 // L2 norm of the original key. Layout matches qjl_block_qjl1_256 in the

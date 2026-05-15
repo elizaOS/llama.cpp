@@ -166,3 +166,7 @@ double ggml_vec_dot_q4_polar_q8_0_fused_neon(int nb_polar,
 }
 
 #endif /* __ARM_NEON */
+
+/* Prevent ISO C empty-translation-unit pedantic error when compiled on
+ * non-NEON targets (entire body is gated above). */
+typedef int fused_q4_polar_dot_neon_iso_c_tu_stub;

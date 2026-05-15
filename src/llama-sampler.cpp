@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <deque>
 #include <numeric>
 #include <random>
 #include <unordered_map>
