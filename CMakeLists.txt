@@ -118,10 +118,24 @@ option(LLAMA_TESTS_INSTALL          "llama: install tests"                      
 # llama.cpp, producing the libomnivoice shared library (when
 # OMNIVOICE_SHARED is also set) and the omnivoice-tts / omnivoice-codec
 # CLI tools. Default OFF so stock llama.cpp consumers see no change.
-# NOTE: until patch 0002 vendors tools/omnivoice/, enabling this flag
-# is a hard error - see the guard near the bottom of this file.
 option(LLAMA_BUILD_OMNIVOICE "Build the merged omnivoice TTS subtree" OFF)
 option(OMNIVOICE_SHARED      "Build libomnivoice for ABI consumers" OFF)
+
+# W3-3 deprecation: ELIZA_FUSE_OMNIVOICE=ON is the pre-W3-3 flag for the
+# fork-root `omnivoice/` graft. The graft is gone (see the deprecation
+# block below); turn the flag into a redirect now so the option ON state
+# is visible to add_subdirectory(tools) — which runs the merged tree's
+# CMakeLists at `tools/omnivoice/CMakeLists.txt`.
+if(ELIZA_FUSE_OMNIVOICE AND NOT LLAMA_BUILD_OMNIVOICE)
+    message(WARNING
+        "ELIZA_FUSE_OMNIVOICE=ON is deprecated as of W3-3 (OmniVoice → "
+        "llama.cpp literal merge). It now redirects to "
+        "LLAMA_BUILD_OMNIVOICE=ON which builds the merged tools/omnivoice/ "
+        "tree. Update your build flags to LLAMA_BUILD_OMNIVOICE=ON before "
+        "the next release.")
+    set(LLAMA_BUILD_OMNIVOICE ON CACHE BOOL
+        "Build the merged omnivoice TTS subtree" FORCE)
+endif()
 
 # 3rd party libs
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
@@ -230,8 +244,8 @@ if (LLAMA_BUILD_OMNIVOICE)
     if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/omnivoice/CMakeLists.txt")
         message(FATAL_ERROR
             "LLAMA_BUILD_OMNIVOICE=ON but tools/omnivoice/CMakeLists.txt is missing. "
-            "Re-vendor the omnivoice subtree (see ../llama.cpp-omnivoice-merge/PLAN.md "
-            "patch 0002), then re-run cmake.")
+            "The merged tree should be present in any v1.0.1-eliza+ checkout. "
+            "Verify the fork is at the v1.0.1-eliza tag or later.")
     endif()
     # When LLAMA_BUILD_TOOLS=ON the tools/ subdirectory above already
     # adds omnivoice. Only add it directly from here for the
@@ -327,33 +341,9 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 
 
-# ELIZA-OMNIVOICE-FUSION-GRAFT-V1 (DEPRECATED — W3-3 merged path is canonical)
-# ----------------------------------------------------------------------
-# The legacy fork-root `omnivoice/` graft was the pre-W3-3 build path:
-# `packages/app-core/scripts/omnivoice-fuse/prepare.mjs` cloned the
-# upstream omnivoice.cpp at build time, copied src/ + tools/ into
-# `<llama.cpp>/omnivoice/`, and this block compiled the result.
-#
-# W3-3 moved the OmniVoice sources INTO the fork at `tools/omnivoice/`
-# (literal merge — see VOICE_WAVE_3.md §4 W3-3). The canonical merged
-# build now flows entirely through `LLAMA_BUILD_OMNIVOICE` and
-# `tools/omnivoice/CMakeLists.txt`. The libelizainference shared lib
-# and the llama-server /v1/audio/speech mount are produced there.
-#
-# Setting `ELIZA_FUSE_OMNIVOICE=ON` (the pre-W3-3 flag) now just enables
-# the canonical merged path — this is a one-release deprecation runway
-# so existing build callers keep working without code changes.
-# ----------------------------------------------------------------------
-
-if(ELIZA_FUSE_OMNIVOICE AND NOT LLAMA_BUILD_OMNIVOICE)
-    message(WARNING
-        "ELIZA_FUSE_OMNIVOICE=ON is deprecated as of W3-3 (OmniVoice → "
-        "llama.cpp literal merge). It now redirects to "
-        "LLAMA_BUILD_OMNIVOICE=ON which builds the merged tools/omnivoice/ "
-        "tree. Update your build flags to LLAMA_BUILD_OMNIVOICE=ON before "
-        "the next release.")
-    set(LLAMA_BUILD_OMNIVOICE ON CACHE BOOL
-        "Build the merged omnivoice TTS subtree" FORCE)
-endif()
-# ----------------------------------------------------------------------
-# end # ELIZA-OMNIVOICE-FUSION-GRAFT-V1 (deprecated; merged path canonical)
+# ELIZA-OMNIVOICE-FUSION-GRAFT-V1 (REMOVED — W3-3 merged path is canonical)
+# The pre-W3-3 legacy graft block lived here. The merged build is now
+# self-contained inside `tools/omnivoice/CMakeLists.txt`. The
+# `ELIZA_FUSE_OMNIVOICE` deprecation redirect lives near the top of
+# this file (next to the LLAMA_BUILD_OMNIVOICE option declaration) so
+# the option ON state is visible when add_subdirectory(tools) runs.
