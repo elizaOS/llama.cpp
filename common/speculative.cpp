@@ -78,8 +78,16 @@ static bool common_speculative_are_compatible(
         return false;
     }
 
+    // M-RoPE bodies are incompatible with the draft-batch position-stepping
+    // pattern used by common_speculative_state_draft: it advances 1-D positions
+    // via dp.n_past + i, which collides with the body's M-RoPE batch validator
+    // (src/llama-batch.cpp) requiring strict monotone X < Y positions. DFLASH
+    // is an alias for DRAFT (see common.h: "behaves like DRAFT when -md is
+    // provided") and dispatches through the same impl, so it hits the same
+    // rejection loop. Reject both upfront rather than degenerating to ~9%
+    // acceptance with per-batch errors. See elizaOS/eliza#7631.
     const llama_rope_type rope_type_tgt = llama_model_rope_type(model_tgt);
-    if (spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE &&
+    if ((spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE || spec_type == COMMON_SPECULATIVE_TYPE_DFLASH) &&
         (rope_type_tgt == LLAMA_ROPE_TYPE_MROPE || rope_type_tgt == LLAMA_ROPE_TYPE_IMROPE)) {
         LOG_WRN("%s: target model uses M-RoPE, which is not currently compatible with "
                 "speculative decoding because the target batch validator requires strict "
