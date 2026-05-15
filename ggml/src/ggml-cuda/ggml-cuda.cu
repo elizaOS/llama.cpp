@@ -338,6 +338,16 @@ static ggml_cuda_device_info ggml_cuda_init() {
         }
     }
 
+#ifdef GGML_USE_NCCL
+    if (info.device_count > 1) {
+        int dev_ids[GGML_CUDA_MAX_DEVICES];
+        for (int id = 0; id < info.device_count; ++id) {
+            dev_ids[id] = id;
+        }
+        NCCL_CHECK(ncclCommInitAll(info.comms, info.device_count, dev_ids));
+    }
+#endif // GGML_USE_NCCL
+
     return info;
 }
 
