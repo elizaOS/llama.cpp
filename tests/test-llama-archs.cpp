@@ -415,19 +415,18 @@ static bool arch_supported(const llm_arch arch) {
 #endif // GGML_USE_WEBGPU
 
     // FIXME hybrid-memory archs whose `inp_rs->s_copy` graph input ends up
-    // without a backend-allocated buffer on Vulkan/llvmpipe, causing
+    // without a backend-allocated buffer, causing
     // `llm_graph_input_mem_hybrid::set_input` to hit a
     // `GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer))`
-    // failure inside `llama_decode` (CI vulkan-llvmpipe run 25905414293).
-    // The same arch family is already gated under WebGPU above; Vulkan
-    // exhibits the same buffer-assignment bug. Tracked separately from the
-    // test harness — re-enable once the graph allocator places s_copy
-    // correctly on the Vulkan backend.
-#ifdef GGML_USE_VULKAN
+    // failure inside `llama_decode`. Originally observed on Vulkan
+    // (CI vulkan-llvmpipe run 25905414293) and then also on ARM64 CPU
+    // cross-build (CI 3rd-party ubuntu-24-llguidance run 25914303467).
+    // Same arch family is already gated under WebGPU above. Tracked
+    // separately from the test harness — re-enable once the graph
+    // allocator places s_copy correctly across backends.
     if (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) {
         return false;
     }
-#endif // GGML_USE_VULKAN
 
     return true;
 }
