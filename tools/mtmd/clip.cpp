@@ -3901,16 +3901,19 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                 set_input_i32("rel_pos_indices_local", rel_pos_indices_local);
                 set_input_i32("rel_pos_indices_global", rel_pos_indices_global);
             } break;
-        case PROJECTOR_TYPE_GEMMA3:
-        case PROJECTOR_TYPE_GEMMA3NV:
-        case PROJECTOR_TYPE_IDEFICS3:
-        case PROJECTOR_TYPE_INTERNVL:
-        case PROJECTOR_TYPE_NEMOTRON_V2_VL:
         case PROJECTOR_TYPE_QWEN3A:
             {
                 // Block-diagonal attention mask: [n_pos, n_pos], column-major.
                 // 0.0 for (query, key) pairs in the same 25-token conv chunk,
                 // -inf across chunks — matches cu_seqlens local attention in Python.
+                // NOTE: only QWEN3A's graph (tools/mtmd/models/qwen3a.cpp) actually
+                // registers an "attn_mask" graph input. The siglip / internvl /
+                // nemotron-v2-vl / mobilenetv5 graphs used by GEMMA3, GEMMA3NV,
+                // IDEFICS3, INTERNVL, NEMOTRON_V2_VL do NOT — fanning those
+                // projector types into this case (as upstream PR #23073 did)
+                // crashed clip_image_batch_encode at "Failed to get tensor
+                // attn_mask" the first time any of those models was asked to
+                // process an image (e.g. the Anthropic vision base64 test).
                 const int n_frames         = image_size_width;
                 const int chunk_size       = 200;
                 const int tokens_per_chunk = 25;
@@ -3925,6 +3928,11 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                 }
                 set_input_f32("attn_mask", mask);
             } break;
+        case PROJECTOR_TYPE_GEMMA3:
+        case PROJECTOR_TYPE_GEMMA3NV:
+        case PROJECTOR_TYPE_IDEFICS3:
+        case PROJECTOR_TYPE_INTERNVL:
+        case PROJECTOR_TYPE_NEMOTRON_V2_VL:
         case PROJECTOR_TYPE_QWEN2A:
         case PROJECTOR_TYPE_GLMA:
         case PROJECTOR_TYPE_ULTRAVOX:
@@ -3938,7 +3946,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         case PROJECTOR_TYPE_HUNYUANOCR:
         case PROJECTOR_TYPE_YASA2:
             {
-                // do nothing
+                // do nothing — these graphs do not register an "attn_mask" input
             } break;
         case PROJECTOR_TYPE_HUNYUANVL:
             {
