@@ -158,3 +158,7 @@ void fused_attn_v_mix_neon(int n_tokens, const float * w,
 }
 
 #endif /* __ARM_NEON */
+
+/* Prevent ISO C empty-translation-unit pedantic error when compiled on
+ * non-NEON targets (entire body is gated above). */
+typedef int fused_attn_qjl_tbq_neon_iso_c_tu_stub;
