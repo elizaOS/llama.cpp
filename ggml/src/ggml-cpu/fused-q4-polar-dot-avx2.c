@@ -32,6 +32,7 @@
 #include "quants.h"
 
 #include "polar_centroids.h"
+#include "fused-q4-polar-dot.h"
 
 #include <immintrin.h>
 #include <math.h>

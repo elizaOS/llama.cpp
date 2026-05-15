@@ -55,33 +55,12 @@
 #include "quants.h"
 
 #include "polar_centroids.h"
+#include "fused-q4-polar-dot.h"
 
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
-
-/* SIMD + scalar fused-dot entry points. The scalar version is
- * declared here so the parity test can call it directly without
- * pulling in the full ABI wrapper. SIMD definitions are guarded by
- * __AVX2__ / __ARM_NEON and provide their own external linkage. */
-double ggml_vec_dot_q4_polar_q8_0_fused_ref(int nb_polar,
-                                            const block_q4_polar * x,
-                                            const block_q8_0 * y,
-                                            bool use_qjl);
-#if defined(__AVX2__)
-double ggml_vec_dot_q4_polar_q8_0_fused_avx2(int nb_polar,
-                                             const block_q4_polar * x,
-                                             const block_q8_0 * y,
-                                             bool use_qjl);
-#endif
-
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-double ggml_vec_dot_q4_polar_q8_0_fused_neon(int nb_polar,
-                                             const block_q4_polar * x,
-                                             const block_q8_0 * y,
-                                             bool use_qjl);
-#endif
 
 /* ---------------- scalar fused reference ---------------- */
 

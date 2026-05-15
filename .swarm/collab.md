@@ -88,6 +88,7 @@ CI started reporting concrete failures across 3rd-party, virtgpu, cann, apple, h
 - **R** — CI (apple) iOS/tvOS/visionOS build linker failure: `_ggml_vec_dot_q1_0_g32_q8_0` / `_ggml_vec_dot_q1_0_g128_q8_0` undefined under arm64. Root cause: Apple Xcode generator without `CMAKE_OSX_ARCHITECTURES` set leaves `CMAKE_SYSTEM_PROCESSOR` empty → `GGML_SYSTEM_ARCH=UNKNOWN` → `-DGGML_CPU_GENERIC` and no `arch/arm/quants.c` in sources, so the only definitions of those Eliza-added Q1_0_g32/g128 NEON kernels are out-of-build, while `ggml-cpu.c` `type_traits_cpu` still references the public names. `arch-fallback.h` aliases the upstream `_q1_0_q8_0_generic → _q1_0_q8_0` but never added the new g32/g128 aliases. Files: ggml/src/ggml-cpu/arch-fallback.h.
 - **U** — continuous CI watcher (5 cycles)
 - **T** — Anthropic vision multimodal crash (S's backlog #20). Files: tools/mtmd/clip.cpp
+- **V** — `-Werror=missing-prototypes` on CI (3rd-party)/ubuntu-24-llguidance (run 25900097466, SHA 13c658e46). Files: ggml/src/ggml-cpu/fused-q4-polar-dot.h (new), ggml/src/ggml-cpu/fused-attn-qjl-tbq.h (new), ggml/src/ggml-cpu/fused-q4-polar-dot.c, fused-q4-polar-dot-avx2.c, fused-q4-polar-dot-neon.c, fused-attn-qjl-tbq.c, fused-attn-qjl-tbq-avx2.c, fused-attn-qjl-tbq-neon.c, fused-hadamard-polar-dot.c, ggml/src/ggml-cpu/quants.h.
 
 ## Completed
 

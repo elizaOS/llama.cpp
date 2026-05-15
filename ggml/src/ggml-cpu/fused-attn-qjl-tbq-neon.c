@@ -16,6 +16,7 @@
 #include "simd-mappings.h"
 #include "ggml-quants.h"
 #include "quants.h"
+#include "fused-attn-qjl-tbq.h"
 
 #include <arm_neon.h>
 #include <math.h>

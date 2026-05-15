@@ -17,6 +17,7 @@
 #include "simd-mappings.h"
 #include "ggml-quants.h"
 #include "quants.h"
+#include "fused-attn-qjl-tbq.h"
 
 #include <immintrin.h>
 #include <math.h>

@@ -52,6 +52,7 @@
 #include "simd-mappings.h"
 #include "ggml-quants.h"
 #include "quants.h"
+#include "fused-attn-qjl-tbq.h"
 
 #include <math.h>
 #include <stdbool.h>
@@ -151,19 +152,7 @@ static inline float qjl_score_one_ref(const float * qs, const uint8_t * signs) {
     return acc;
 }
 
-/* SIMD inner-loop entry points. Each per-ISA TU defines these and
- * carries its own ifdef guard. */
-#if defined(__AVX2__)
-float qjl_score_one_avx2(const float * q_sketch, const uint8_t * signs);
-void  fused_attn_v_mix_avx2(int n_tokens, const float * w, const uint8_t * v_codes,
-                            const uint16_t * v_scales, float * out);
-#endif
-
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-float qjl_score_one_neon(const float * q_sketch, const uint8_t * signs);
-void  fused_attn_v_mix_neon(int n_tokens, const float * w, const uint8_t * v_codes,
-                            const uint16_t * v_scales, float * out);
-#endif
+/* SIMD inner-loop entry points are declared in fused-attn-qjl-tbq.h. */
 
 /* Reference V-mix path. Walks one tbq3_0 block per token and accumulates
  * w[t] * dequant_V[t] into out (head_dim long). v_codes is laid out as
@@ -181,9 +170,9 @@ void  fused_attn_v_mix_neon(int n_tokens, const float * w, const uint8_t * v_cod
  * block_tbq3_0 struct but the fused op interface here takes them as
  * separate buffers so the SIMD path can stride independently.
  */
-void fused_attn_v_mix_ref(int n_tokens, const float * w,
-                          const uint8_t * v_codes, const uint16_t * v_scales,
-                          float * out) {
+static void fused_attn_v_mix_ref(int n_tokens, const float * w,
+                                 const uint8_t * v_codes, const uint16_t * v_scales,
+                                 float * out) {
     /* out is FUSED_QJL_HEAD_DIM long, accumulator. Caller pre-zeroes. */
     for (int t = 0; t < n_tokens; t++) {
         const float wt = w[t];
@@ -218,15 +207,15 @@ void fused_attn_v_mix_ref(int n_tokens, const float * w,
  *
  * Returns nothing; out is set.
  */
-void fused_attn_qjl_tbq_ref(int n_tokens,
-                            const float * q_sketch,
-                            const uint8_t * k_signs,
-                            const uint16_t * k_norms,
-                            const uint8_t * v_codes,
-                            const uint16_t * v_scales,
-                            float sm_scale,
-                            float * scratch,
-                            float * out) {
+static void fused_attn_qjl_tbq_ref(int n_tokens,
+                                   const float * q_sketch,
+                                   const uint8_t * k_signs,
+                                   const uint16_t * k_norms,
+                                   const uint8_t * v_codes,
+                                   const uint16_t * v_scales,
+                                   float sm_scale,
+                                   float * scratch,
+                                   float * out) {
     const float scl_base = 1.2533141373155003f / (float) FUSED_QJL_PROJ_DIM;
 
     /* Pass 1a: score per token. */

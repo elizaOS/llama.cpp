@@ -46,6 +46,7 @@
 #include "quants.h"
 
 #include "polar_centroids.h"
+#include "fused-q4-polar-dot.h"
 
 #include <math.h>
 #include <stdbool.h>
@@ -72,10 +73,10 @@ static inline void hadamard_inplace_2n(float * x, int total) {
  * two adjacent Q4_POLAR blocks. n_pairs is the number of (x, x+1) block
  * pairs to process. The argument vector x must contain n_pairs*2 blocks
  * and y must contain n_pairs*2*4 Q8_0 blocks (8 chunks per pair). */
-double ggml_vec_dot_q4_polar_q8_0_fused_hadamard_ref(int n_pairs,
-                                                     const block_q4_polar * x,
-                                                     const block_q8_0 * y,
-                                                     bool use_qjl) {
+static double ggml_vec_dot_q4_polar_q8_0_fused_hadamard_ref(int n_pairs,
+                                                            const block_q4_polar * x,
+                                                            const block_q8_0 * y,
+                                                            bool use_qjl) {
     const int n_q8_per_polar = QK_POLAR / QK8_0;
     const int total = 2 * QK_POLAR;
     const float inv_d_pair = 1.0f / (float) total;
@@ -191,9 +192,7 @@ void ggml_vec_dot_q4_polar_q8_0_fused_hadamard(int n, float * GGML_RESTRICT s,
     double acc = ggml_vec_dot_q4_polar_q8_0_fused_hadamard_ref(n_pairs, x, y, use_qjl);
 
     if (nb_polar & 1) {
-        /* Tail block: re-use scalar fused dot. */
-        extern double ggml_vec_dot_q4_polar_q8_0_fused_ref(int, const block_q4_polar *,
-                                                           const block_q8_0 *, bool);
+        /* Tail block: re-use scalar fused dot (declared in fused-q4-polar-dot.h). */
         const block_q4_polar * x_tail = x + (n_pairs * 2);
         const block_q8_0 * y_tail = y + (n_pairs * 2) * (QK_POLAR / QK8_0);
         acc += ggml_vec_dot_q4_polar_q8_0_fused_ref(1, x_tail, y_tail, use_qjl);
