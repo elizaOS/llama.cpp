@@ -158,7 +158,7 @@ enum common_params_sampling_config : uint64_t {
 enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NONE,          // no speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,  // standalone draft model speculative decoding
-    COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding (upstream PR #18039 — not yet ported)
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding based on n-grams
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
@@ -166,6 +166,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
     COMMON_SPECULATIVE_TYPE_DFLASH,        // draft-model speculative decoding (DFlash flavor; behaves like DRAFT
                                            // when -md is provided — exists so consumers spelling "dflash" parse).
+    COMMON_SPECULATIVE_TYPE_MTP,           // Multi-Token Prediction (upstream PR #22673 — not yet ported, has known Vulkan/prefill bugs)
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 

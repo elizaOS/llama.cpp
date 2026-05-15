@@ -30,7 +30,12 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
     // dflash: elizaOS alias for the draft-model speculative decoding path.
     // Preserved so existing AOSP/desktop CLI and dflash-server.ts work unchanged.
-    {"dflash",        COMMON_SPECULATIVE_TYPE_DFLASH}
+    {"dflash",        COMMON_SPECULATIVE_TYPE_DFLASH},
+    // mtp: Multi-Token Prediction (upstream PR #22673). Accepted by the parser so users
+    // get a clear fail-fast diagnostic from init() rather than an "unknown speculative type"
+    // error. The actual MTP graph wiring (qwen35/qwen35moe model changes, draft-context
+    // memory layout, prefill path) is not yet ported — see common_speculative_init().
+    {"mtp",           COMMON_SPECULATIVE_TYPE_MTP}
 };
 
 struct common_speculative_config {
@@ -872,6 +877,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram-mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram-cache";
         case COMMON_SPECULATIVE_TYPE_DFLASH:        return "dflash";
+        case COMMON_SPECULATIVE_TYPE_MTP:           return "mtp";
         default:                                    return "unknown";
     }
 }
@@ -924,8 +930,8 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_draft_simple = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE));
         bool has_dflash       = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DFLASH));
         has_draft_simple = has_draft_simple || has_dflash;
-        // bool has_mtp = false; // TODO: add MTP here
-        bool has_draft_eagle3 = false; // TODO PR-18039: if params.speculative.eagle3
+        bool has_mtp          = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_MTP));
+        bool has_draft_eagle3 = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3));
 
         bool has_ngram_cache   = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_CACHE));
         bool has_ngram_simple  = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE));
@@ -934,11 +940,46 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_ngram_mod     = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MOD));
 
         // when adding a new type - update here the logic above
-        // Bump: DFLASH was added to the enum (between NGRAM_CACHE and
-        // COUNT) so COUNT is now 9. DFLASH dispatches through has_draft
-        // (see enum comment: "behaves like DRAFT when -md is provided")
-        // so it doesn't need a separate has_* bool here.
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 9);
+        // History:
+        //   COUNT == 8: original upstream set (NONE/DRAFT_SIMPLE/DRAFT_EAGLE3/NGRAM_*).
+        //   COUNT == 9: added DFLASH (elizaOS alias for draft-model path).
+        //   COUNT == 10: added MTP (upstream PR #22673 — placeholder, see has_mtp branch below).
+        // DFLASH dispatches through has_draft (see enum comment: "behaves like DRAFT when
+        // -md is provided") so it doesn't need a separate has_* bool here.
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 10);
+
+        // EAGLE3 is upstream PR #18039 (still draft, mergeable=false as of 2026-05).
+        // We accept the CLI flag so users get an actionable error rather than a silent noop
+        // (the existing common_speculative_impl_draft_eagle3 stub does nothing — see below).
+        // To actually port this we need:
+        //   - LLM_ARCH_EAGLE3 (src/llama-arch.{h,cpp})
+        //   - llm_build_eagle3_encode / llm_build_eagle3_decode (src/models/eagle3.cpp)
+        //   - model.fc, model.target_tok_embd, hparams.eagle3_target_hidden_size
+        //   - encode_eagle3_features wiring in llama-context
+        //   - GGML_TENSOR_FLAG_SYNC for GPU sync between target and draft
+        //   - convert_hf_to_gguf.py EAGLE3 export path
+        // Total ~1100 LOC across 25 files; needs an EAGLE3-trained GGUF drafter to validate.
+        if (has_draft_eagle3) {
+            LOG_ERR("%s: --spec-type=draft-eagle3 is not yet implemented in this build.\n", __func__);
+            LOG_ERR("%s:   Upstream tracking: https://github.com/ggml-org/llama.cpp/pull/18039\n", __func__);
+            LOG_ERR("%s:   Use --spec-type=dflash with a draft model (-md <path>) for now.\n", __func__);
+            return nullptr;
+        }
+
+        // MTP is upstream PR #22673 (1932 LOC, 48 files). Has known bugs as of 2026-05:
+        //   - Vulkan backend produces garbage output (mbednarek360 report)
+        //   - Prefill path bug (am17an acknowledged, fix pending)
+        //   - --sm tensor crashes (ninjas28 report)
+        // It also touches our flagship qwen35.cpp / qwen35moe.cpp / qwen3next.cpp with
+        // large diffs, so a blind merge risks breaking the existing model paths.
+        // Wired here to fail fast with a useful message rather than silently doing nothing.
+        if (has_mtp) {
+            LOG_ERR("%s: --spec-type=mtp is not yet implemented in this build.\n", __func__);
+            LOG_ERR("%s:   Upstream tracking: https://github.com/ggml-org/llama.cpp/pull/22673\n", __func__);
+            LOG_ERR("%s:   Upstream has known Vulkan / prefill / sm-tensor bugs — not safe to land yet.\n", __func__);
+            LOG_ERR("%s:   Use --spec-type=dflash with a draft model (-md <path>) for now.\n", __func__);
+            return nullptr;
+        }
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -972,10 +1013,8 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         if (has_draft_simple) {
             configs.push_back(common_speculative_config(has_dflash ? COMMON_SPECULATIVE_TYPE_DFLASH : COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE, params));
         }
-        // TODO: add MTP here
-        if (has_draft_eagle3) {
-            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params));
-        }
+        // has_mtp and has_draft_eagle3 are handled above with early-return error paths.
+        // Once those upstream PRs land cleanly and we port them, add config push_backs here.
     }
 
     std::vector<std::unique_ptr<common_speculative_impl>> impls = {};
