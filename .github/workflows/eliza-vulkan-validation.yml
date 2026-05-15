@@ -1,0 +1,139 @@
+name: Eliza Vulkan Validation
+
+# Eliza-specific Vulkan backend parity job. Distinct from upstream
+# build-vulkan.yml: this one actually runs test-backend-ops on Vulkan
+# (filtered to a reasonable subset for llvmpipe) and surfaces the
+# PASS/FAIL counts as a build artifact so we can review Vulkan
+# regressions before merging shader or kernel changes.
+#
+# Runs on llvmpipe (Mesa software rasterizer). For real-GPU validation,
+# wire in a self-hosted runner with an NVIDIA/AMD/Intel GPU later and
+# add it as a second job in this file.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/eliza-vulkan-validation.yml'
+      - 'ggml/src/ggml-vulkan/**'
+      - 'ggml/include/**'
+      - 'src/**'
+      - 'tests/test-backend-ops.cpp'
+      - 'tests/test-quantize-fns.cpp'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  GGML_NLOOP: 3
+  GGML_N_THREADS: 1
+  LLAMA_LOG_COLORS: 0
+  LLAMA_LOG_PREFIX: 1
+  LLAMA_LOG_TIMESTAMPS: 1
+
+jobs:
+  ubuntu-vulkan-llvmpipe-validation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: eliza-vulkan-validation-ubuntu-24
+          evict-old-files: 1d
+          save: ${{ github.event_name == 'push' }}
+
+      - name: System dependencies
+        run: |
+          sudo add-apt-repository -y ppa:kisak/kisak-mesa
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            build-essential mesa-vulkan-drivers vulkan-tools \
+            libvulkan-dev glslang-tools spirv-tools \
+            libssl-dev
+
+      - name: Vulkan SDK
+        id: vulkan_sdk_version
+        run: |
+          echo "VULKAN_SDK_VERSION=$(curl https://vulkan.lunarg.com/sdk/latest/linux.txt)" >> "$GITHUB_ENV"
+
+      - name: Cache Vulkan SDK
+        uses: actions/cache@v5
+        id: cache-sdk
+        with:
+          path: ./vulkan_sdk
+          key: vulkan-sdk-${{ env.VULKAN_SDK_VERSION }}-${{ runner.os }}
+
+      - name: Install Vulkan SDK
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        uses: ./.github/actions/linux-setup-vulkan
+        with:
+          path: ./vulkan_sdk
+          version: ${{ env.VULKAN_SDK_VERSION }}
+
+      - name: Configure
+        run: |
+          source ./vulkan_sdk/setup-env.sh
+          cmake -B build-vulkan \
+            -DGGML_VULKAN=ON \
+            -DGGML_METAL=OFF \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=ON \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: |
+          source ./vulkan_sdk/setup-env.sh
+          cmake --build build-vulkan -j $(nproc) \
+            --target llama-cli llama-completion \
+                     test-backend-ops test-quantize-fns
+
+      - name: Confirm Vulkan device
+        run: |
+          source ./vulkan_sdk/setup-env.sh
+          vulkaninfo --summary | head -40
+
+      - name: test-quantize-fns (CPU; smoke for Eliza custom quants)
+        run: |
+          ./build-vulkan/bin/test-quantize-fns | tee /tmp/quantize-fns.log
+          # Must mention the Eliza-divergent quant types.
+          for t in qjl1_256 q4_polar tbq3_0 tbq4_0 tbq3_tcq; do
+            grep -q "Testing $t" /tmp/quantize-fns.log \
+              || (echo "MISSING quant: $t" && exit 1)
+          done
+
+      - name: test-backend-ops on Vulkan (filtered subset)
+        env:
+          GGML_VK_VISIBLE_DEVICES: '0'
+          GGML_VK_DISABLE_F16: '1'
+          GGML_VK_DISABLE_COOPMAT: '1'
+        run: |
+          source ./vulkan_sdk/setup-env.sh
+          # Filter to ops that matter most for inference correctness.
+          # Full sweep is too slow on llvmpipe (~hours).
+          for op in MUL_MAT MUL_MAT_ID ADD MUL SOFT_MAX RMS_NORM CPY ROPE FLASH_ATTN_EXT; do
+            echo "=== $op ==="
+            timeout 600 ./build-vulkan/bin/test-backend-ops \
+              -b Vulkan0 -o "$op" \
+              2>&1 | tee -a /tmp/backend-ops.log || true
+          done
+          # Summary lines for the artifact viewer.
+          echo "=== FAIL SUMMARY ==="
+          grep -E "Backend Vulkan0:.*FAIL|tests passed|Failing tests:" \
+            /tmp/backend-ops.log || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eliza-vulkan-validation-logs
+          path: |
+            /tmp/quantize-fns.log
+            /tmp/backend-ops.log
+          retention-days: 14
