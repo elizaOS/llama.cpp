@@ -19,6 +19,7 @@
 #include "ov-error.h"
 #include "pipeline-codec.h"
 #include "prompt-tts.h"
+#include "streaming-opts.h"
 #include "text-chunker.h"
 #include "voice-design.h"
 
@@ -634,7 +635,23 @@ std::vector<int32_t> pipeline_tts_generate(PipelineTTS *         pt,
     ov_log(OV_LOG_INFO, "[TTS] Prompt: B'=%d K=%d S=%d c_len=%d u_len=%d", prompt.B_prime, prompt.K, prompt.S_max,
            prompt.c_len, prompt.u_len);
 
-    return maskgit_generate(pt, &prompt, mg_cfg, T, dump_dir, ctr_lo_inout);
+    std::vector<int32_t> result = maskgit_generate(pt, &prompt, mg_cfg, T, dump_dir, ctr_lo_inout);
+
+    // W3-3 streaming optimization: release the MaskGIT transient scratch
+    // pages back to the kernel now that the iterative decode is done. The
+    // prompt.input_ids buffer alone holds B'=2 cond+uncond rows times K=8
+    // codebooks times S_max=~1500 i32 = ~96 KB per call; the larger F16
+    // attention-mask scratch inside maskgit_generate's MaskgitBatchedCtx
+    // is the real win (~1.17 GB transient peak documented in
+    // packages/shared/src/local-inference/voice-budget.ts). The cache
+    // here is best-effort: the kernel may keep the pages if they are
+    // touched again soon, but the next chunk of a long-form synthesis
+    // pays a 'first-touch zero-fill' instead of holding dirty pages.
+    (void) omnivoice_streaming::release_scratch(
+        prompt.input_ids.data(),
+        prompt.input_ids.size() * sizeof(int32_t));
+
+    return result;
 }
 
 // Cooperative cancel context threaded into the long-form helpers. cb is the
