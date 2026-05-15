@@ -50,7 +50,7 @@ struct DACBlock {
     // ConvTranspose1d weight pre-permuted to ggml [IC, K*OC] for mul_mat.
     // source layout (IC, OC, K) is repacked at load time so col2im_1d gets the
     // expected [K*OC, T_in] column matrix where k varies faster than oc.
-    struct ggml_tensor * ctw;  // [IC, K*OC] bf16
+    struct ggml_tensor * ctw;  // [K, OC, IC] bf16
     struct ggml_tensor * ctb;  // [OC] f32
     DACResUnit           ru[DAC_RES_UNITS];
     int                  in_ch;
@@ -135,14 +135,12 @@ static void dac_load_passthrough(struct ggml_tensor * dst, const GGUFModel & gf,
     ggml_backend_tensor_set(dst, src, 0, ggml_nbytes(dst));
 }
 
-// Pre-permute the ConvTranspose1d weight from source layout (IC, OC, K) to
-// the [IC, K*OC] layout col2im_1d expects (k varies faster than oc inside
-// the K*OC axis). The destination is GGML_TYPE_F16 to align with every
-// other DAC conv weight ; widening goes through F32 transiently so any
-// source dtype (F32, F16, BF16, Q8_0, Q4_K, ...) loads identically.
-//
-//   src flat[ic*OC*K + oc*K + k] = w[ic][oc][k]   source-side row-major
-//   dst flat[(oc*K + k)*IC + ic] = w[ic][oc][k]   ggml row-major, ne=(IC, K*OC)
+// Load ConvTranspose1d weights in eliza ggml's native kernel layout.
+// Source-side layout is (IC, OC, K), represented by ggml as ne=(K, OC, IC).
+// eliza ggml already ships GGML_OP_CONV_TRANSPOSE_1D for CPU/CUDA/Metal/
+// Vulkan, while omnivoice's fork used a private col2im_1d op. Keeping the
+// native layout lets the fused build share the patched eliza ggml without
+// adding a second custom op.
 static void dac_load_ctw(struct ggml_tensor * dst, const GGUFModel & gf, const std::string & name) {
     struct ggml_tensor * mt = ggml_get_tensor(gf.meta, name.c_str());
     if (!mt) {
@@ -150,22 +148,22 @@ static void dac_load_ctw(struct ggml_tensor * dst, const GGUFModel & gf, const s
     }
     GGML_ASSERT(dst->type == GGML_TYPE_F16);
 
-    // ggml ne = (K, OC, IC) since source-side shape is (IC, OC, K) row-major.
-    const int    K   = (int) mt->ne[0];
-    const int    OC  = (int) mt->ne[1];
-    const int    IC  = (int) mt->ne[2];
-    const int    KOC = K * OC;
-    const size_t n   = (size_t) IC * (size_t) OC * (size_t) K;
+    const int    K  = (int) mt->ne[0];
+    const int    OC = (int) mt->ne[1];
+    const int    IC = (int) mt->ne[2];
+    const size_t n  = (size_t) IC * (size_t) OC * (size_t) K;
 
-    GGML_ASSERT(dst->ne[0] == IC && dst->ne[1] == KOC);
+    GGML_ASSERT(dst->ne[0] == K && dst->ne[1] == OC && dst->ne[2] == IC);
 
-    const void *       raw = gf_get_data(gf, name.c_str());
+    const void * raw = gf_get_data(gf, name.c_str());
+    if (mt->type == GGML_TYPE_F16) {
+        ggml_backend_tensor_set(dst, raw, 0, n * sizeof(ggml_fp16_t));
+        return;
+    }
+
     std::vector<float> f32(n);
-
     if (mt->type == GGML_TYPE_F32) {
         memcpy(f32.data(), raw, n * sizeof(float));
-    } else if (mt->type == GGML_TYPE_F16) {
-        ggml_fp16_to_fp32_row((const ggml_fp16_t *) raw, f32.data(), (int64_t) n);
     } else if (mt->type == GGML_TYPE_BF16) {
         const uint16_t * p = (const uint16_t *) raw;
         for (size_t i = 0; i < n; i++) {
@@ -180,14 +178,8 @@ static void dac_load_ctw(struct ggml_tensor * dst, const GGUFModel & gf, const s
     }
 
     std::vector<ggml_fp16_t> packed(n);
-    for (int ic = 0; ic < IC; ic++) {
-        for (int oc = 0; oc < OC; oc++) {
-            for (int k = 0; k < K; k++) {
-                size_t src_idx  = (size_t) ic * OC * K + (size_t) oc * K + k;
-                size_t dst_idx  = (size_t) (oc * K + k) * IC + ic;
-                packed[dst_idx] = ggml_fp32_to_fp16(f32[src_idx]);
-            }
-        }
+    for (size_t i = 0; i < n; i++) {
+        packed[i] = ggml_fp32_to_fp16(f32[i]);
     }
     ggml_backend_tensor_set(dst, packed.data(), 0, n * sizeof(ggml_fp16_t));
 }
@@ -233,7 +225,7 @@ static bool dac_load(DACDecoder * d, const GGUFModel & gf, ggml_backend_t backen
 
         std::string pfx = "acoustic_decoder.block." + std::to_string(i);
         dac_alloc_snake(ctx, &b.s1, b.in_ch);
-        b.ctw = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, b.in_ch, b.kernel * b.out_ch);
+        b.ctw = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, b.kernel, b.out_ch, b.in_ch);
         b.ctb = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, b.out_ch);
 
         for (int r = 0; r < DAC_RES_UNITS; r++) {
@@ -335,11 +327,10 @@ static struct ggml_tensor * dac_conv1d(struct ggml_context * ctx,
     return y;
 }
 
-// ConvTranspose1d via GEMM + col2im_1d
-// w:   pre-permuted [IC, K*OC] bf16
-// b:   [OC] f32 or NULL
-// x:   [T_in, IC]
-// Returns [T_in * stride, OC] when output_pad = stride % 2 is honored via right-pad.
+// ConvTranspose1d using eliza ggml's native GGML_OP_CONV_TRANSPOSE_1D.
+// The upstream omnivoice fork used a private col2im_1d op with padding.
+// eliza's native op requires p0=0, so we crop pad samples from both ends
+// and then apply output_pad to match the original length contract.
 static struct ggml_tensor * dac_conv_t1d(struct ggml_context * ctx,
                                          struct ggml_tensor *  w,
                                          struct ggml_tensor *  b,
@@ -348,16 +339,21 @@ static struct ggml_tensor * dac_conv_t1d(struct ggml_context * ctx,
                                          int                   pad,
                                          int                   oc,
                                          int                   output_pad) {
-    (void) oc;
-    // ggml_col2im_1d was removed in the upstream/master merge (79079c25e).
-    // Shaw's d629a3768 ("conv_transpose_1d now has Metal kernel") names
-    // ggml_conv_transpose_1d as the replacement primitive; the CPU-side body
-    // wasn't migrated. This collapses the legacy 5-step body into the single
-    // upstream call.
-    struct ggml_tensor * y = ggml_conv_transpose_1d(ctx, w, x, stride, pad, /*dilation*/ 1);
+    struct ggml_tensor * y = ggml_conv_transpose_1d(ctx, w, x, stride, 0, 1);
+    y = ggml_reshape_2d(ctx, y, y->ne[0], y->ne[1]);
+
+    if (pad > 0) {
+        const int64_t cropped = y->ne[0] - 2 * (int64_t) pad;
+        GGML_ASSERT(cropped > 0);
+        GGML_ASSERT(y->ne[1] == oc);
+        y = ggml_view_2d(ctx, y, cropped, y->ne[1], y->nb[1], (size_t) pad * y->nb[0]);
+        y = ggml_cont(ctx, y);
+    }
+
     if (output_pad > 0) {
         y = ggml_pad(ctx, y, output_pad, 0, 0, 0);
     }
+
     if (b) {
         struct ggml_tensor * b2d = ggml_reshape_2d(ctx, b, 1, b->ne[0]);
         y                        = ggml_add(ctx, y, b2d);
