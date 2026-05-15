@@ -209,16 +209,22 @@ add_library(ggml-base
             polar_centroids.h
             gguf.cpp)
 
-# ELIZA-WINDOWS-QJL-IN-GGML-BASE
-# PE/COFF requires every imported symbol to be resolved at link time; the
-# QJL definitions in ggml-cpu/qjl/ are referenced from ggml.c (ggml-base),
-# so on Windows shared-lib builds they must also live in ggml-base. On
-# other platforms the QJL sources live exclusively in libggml-cpu — adding
-# them here too would create duplicate symbols when downstream packagers
-# combine the static archives (e.g. Apple xcframework libtool -static of
-# libggml-base.a + libggml-cpu.a triggers ld duplicate symbol errors). The
-# list mirrors QJL_GGML_BASE_LINK_FILES in kernel-patches/cpu-simd-kernels.mjs.
-if (WIN32)
+# ELIZA-NON-APPLE-QJL-IN-GGML-BASE
+# ggml.c (built into ggml-base) references the QJL dequantize/quantize
+# symbols via the type_traits table (`.to_float = dequantize_row_qjl1_256`
+# etc.). On Windows (PE/COFF) every imported symbol must resolve at link
+# time, so the QJL TUs must live in ggml-base. On Linux ELF shared libs
+# the same is required by default ld behaviour when downstream targets
+# (e.g. `llama-gguf`, `llama-gguf-hash`) link against `libggml-base.so`
+# WITHOUT also linking `libggml-cpu` — undefined symbols in ggml-base
+# propagate to those binaries and break the build.
+# On Apple, however, the xcframework build pipeline runs `libtool -static`
+# to combine `libggml-base.a + libggml-cpu.a`; if QJL TUs live in BOTH
+# archives the result contains duplicate symbols and the subsequent
+# `clang++ -Wl,-force_load,combined.a` step fails. So Apple is the one
+# platform where QJL must NOT live in ggml-base.
+# The list mirrors QJL_GGML_BASE_LINK_FILES in kernel-patches/cpu-simd-kernels.mjs.
+if (NOT APPLE)
     target_sources(ggml-base PRIVATE
         ggml-cpu/qjl/quants-qjl.c
         ggml-cpu/qjl/qjl_dispatch.c
