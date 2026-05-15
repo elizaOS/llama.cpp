@@ -108,6 +108,7 @@ The full failure log set (71 raw failures across 9 workflows) collapses to 7 dis
 - **DD** — test-llama-archs over-correction by Z's gate. Files: src/llama-model-loader.cpp, possibly tests/test-llama-archs.cpp
 - **GG** — broad wave-11 CI triage (excl. Apple ios-xcode dup-symbols [EE] / Vulkan test-llama-archs decode [FF])
 - **FF** — Vulkan test-llama-archs decode crash. Files: tests/test-llama-archs.cpp, possibly src/llama-model-loader.cpp
+- **HH** — dflash-draft test-llama-archs missing tensor. Files: tests/test-llama-archs.cpp
 
 ## Completed
 
@@ -249,3 +250,7 @@ Tracked but NOT fixed in this pass — all blocked behind agents A-D landing the
 
 21. **Loongarch64 + RISC-V SpaceMIT cross-build link failure on `ggml_vec_dot_q1_0_g128_q8_0` / `_g32_q8_0` ALREADY FIXED at HEAD.** Surfaced in CI (cross) run 25899129240 and CI (riscv) related runs against sha `e47b9ef21`. Root cause was missing `#define`s in `ggml/src/ggml-cpu/arch-fallback.h` for the Eliza-added Q1_0_g32 (enum 200) and Q1_0_g128 (enum 201) variants under `__loongarch64`, `__riscv`, `__POWERPC__`, `__s390x__`, `__wasm__`, and `GGML_CPU_GENERIC` branches. Agents R (commit `02a182db8`) and an earlier concurrent agent (commit `8a38d708d`) both landed the matching aliases for all 6 arch branches. The wave-4 CI runs at `44515c9a8` will be the first push-event CI exercise of this fix on the cross matrices. If they still fail, the suspect is that the loongarch toolchain pre-defines `__loongarch64__` (with trailing underscores) rather than `__loongarch64` — adjust the `arch-fallback.h` guard accordingly. No work required for now; monitor the next cross run.
 
+
+## Live agents (II)
+
+- **II** — SYCL Windows `test-model-load-buffer.exe` LNK2019 on `llama_model::memory_breakdown()`. Root cause: test uses internal C++ method not exported with `LLAMA_API` on Windows shared-lib builds — same class as existing tests at tests/CMakeLists.txt:151-152 already-gated behind `if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)`. Fix: same gate around test-model-load-buffer. Files: tests/CMakeLists.txt.
