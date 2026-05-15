@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 #include <string>
+#include <stdexcept>
 #include <vector>
 #include <cinttypes>
 
@@ -65,7 +66,23 @@ struct server_grammar_trigger {
     server_grammar_trigger() = default;
     server_grammar_trigger(const common_grammar_trigger & value) : value(value) {}
     server_grammar_trigger(const json & in) {
-        value.type = (common_grammar_trigger_type) in.at("type").get<int>();
+        const auto & type = in.at("type");
+        if (type.is_string()) {
+            const std::string type_str = type.get<std::string>();
+            if (type_str == "token") {
+                value.type = COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN;
+            } else if (type_str == "word") {
+                value.type = COMMON_GRAMMAR_TRIGGER_TYPE_WORD;
+            } else if (type_str == "pattern") {
+                value.type = COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN;
+            } else if (type_str == "pattern_full" || type_str == "pattern-full") {
+                value.type = COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL;
+            } else {
+                throw std::runtime_error("Unknown grammar trigger type: " + type_str);
+            }
+        } else {
+            value.type = (common_grammar_trigger_type) type.get<int>();
+        }
         value.value = in.at("value").get<std::string>();
         if (value.type == COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN) {
             value.token = (llama_token) in.at("token").get<int>();
