@@ -11385,3 +11385,168 @@ void ggml_compute_forward_fwht(const ggml_compute_params * params, ggml_tensor *
             }
     }
 }
+
+// ---------------------------------------------------------------------------
+// ggml_compute_forward_istft
+//
+// Inverse STFT with Hann window + overlap-add.  Matches librosa.istft with
+// center=False, window='hann', dtype=float32.
+//
+// src0 (mag_phase): F32, shape [2, F, T, 1]   F = n_fft/2+1
+//   ne[0] = 2 (channel: 0=mag, 1=phase)
+//   ne[1] = F = n_fft/2+1
+//   ne[2] = T = number of frames
+//
+// src1 (window): optional F32 [win_length] pre-computed Hann.  When NULL a
+//   periodic Hann window is synthesized internally.
+//
+// dst: F32 [N] where N = (T-1)*hop_length + win_length
+//
+// Multi-thread strategy: each thread owns a disjoint subset of frames.
+// Overlap-add into shared dst+norm buffers requires an atomic accumulation
+// step; we use a simple barrier: thread 0 zeroes dst once, barrier, all
+// threads accumulate independently into non-overlapping output segments when
+// hop_length >= win_length (non-overlapping case), otherwise we fall back to
+// single-thread.  For the Kokoro n_fft=20/hop=5 case (highly overlapping)
+// we always use single-thread to avoid false sharing overhead.
+// ---------------------------------------------------------------------------
+
+static void ggml_compute_forward_istft_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];  // mag_phase [2, F, T]
+    const ggml_tensor * src1 = dst->src[1];  // window [win_length], optional
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+
+    const int32_t * p = (const int32_t *) dst->op_params;
+    const int n_fft      = p[0];
+    const int hop_length = p[1];
+    const int win_length = p[2];
+    const int F          = n_fft / 2 + 1;
+
+    // T (frames) lives in ne[2] when the tensor is laid out [2, F, T]
+    const int T = (int) src0->ne[2];
+
+    GGML_ASSERT(F == (int) src0->ne[1]);
+
+    const int n_out = (T - 1) * hop_length + win_length;
+    GGML_ASSERT(n_out == (int) dst->ne[0]);
+
+    // Only thread 0 runs the iSTFT (the overlap-add requires coordination and
+    // for Kokoro's tiny n_fft=20 the kernel is < 1ms anyway).
+    if (params->ith != 0) {
+        return;
+    }
+
+    const float * mag_data   = (const float *) src0->data;
+    float       * out_data   = (float *)       dst->data;
+
+    // Build / borrow the Hann window.
+    std::vector<float> win_local;
+    const float * win_ptr = nullptr;
+    if (src1 != nullptr) {
+        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+        GGML_ASSERT((int) src1->ne[0] == win_length);
+        win_ptr = (const float *) src1->data;
+    } else {
+        // Periodic Hann — same as numpy.hanning with symmetric=False.
+        win_local.resize((size_t) win_length);
+        const double scale = 2.0 * M_PI / (double) win_length;
+        for (int i = 0; i < win_length; ++i) {
+            win_local[(size_t)i] = (float)(0.5 - 0.5 * std::cos(scale * (double)i));
+        }
+        win_ptr = win_local.data();
+    }
+
+    // Zero output and OLA normalizer.
+    std::vector<float> norm((size_t) n_out, 0.0f);
+    std::fill(out_data, out_data + n_out, 0.0f);
+
+    // Temporary per-frame real + imag and IDFT output.
+    std::vector<float> re((size_t) F), im((size_t) F), frame((size_t) n_fft);
+
+    // src0 strides: data is laid out [2, F, T] in row-major C order when
+    // contiguous, so element at [ch, f, t] = data[ch*F*T + f*T + t].
+    // nb[] stores byte strides: nb[0]=elem_size, nb[1]=row_stride, nb[2]=...
+    const int64_t st_ch = src0->nb[2] / sizeof(float);  // stride over channel (ne[2]=T dimension)
+    const int64_t st_f  = src0->nb[1] / sizeof(float);  // stride over F dimension
+    const int64_t st_t  = src0->nb[0] / sizeof(float);  // stride over T (innermost in ggml)
+
+    // NOTE: ggml tensor dimensions are column-major: ne[0] is the fastest
+    // varying. Our mag_phase is declared [2, F, T], but ggml stores as
+    // ne[0]=T, ne[1]=F, ne[2]=2 (the last dimension listed is the slowest).
+    // So element at [chan, freq, frame] => data[chan * ne[1]*ne[0] + freq * ne[0] + frame].
+    const int T_ne  = (int) src0->ne[0];   // frames (fastest in storage)
+    const int F_ne  = (int) src0->ne[1];   // freq bins
+    const int CH_ne = (int) src0->ne[2];   // 2 (mag/phase)
+
+    GGML_ASSERT(CH_ne == 2);
+    GGML_ASSERT(F_ne  == F);
+    GGML_ASSERT(T_ne  == T);
+
+    const float * mag_base   = mag_data;                         // channel 0
+    const float * phase_base = mag_data + (int64_t) F * T;       // channel 1
+
+    const double inv_n = 1.0 / (double) n_fft;
+
+    for (int t = 0; t < T; ++t) {
+        // Unpack polar → rectangular for this frame.
+        for (int f = 0; f < F; ++f) {
+            const float mag_v   = mag_base  [(int64_t) f * T + t];
+            const float phase_v = phase_base[(int64_t) f * T + t];
+            re[(size_t) f] = mag_v * std::cos(phase_v);
+            im[(size_t) f] = mag_v * std::sin(phase_v);
+        }
+
+        // Naive IDFT for the frame (Hermitian-symmetric input → real output).
+        // O(n_fft^2) — fine for Kokoro's n_fft=20.
+        for (int k = 0; k < n_fft; ++k) {
+            double acc = (double) re[0];                // DC
+            if ((n_fft & 1) == 0) {
+                // Nyquist
+                const double sign = (k & 1) ? -1.0 : 1.0;
+                acc += sign * (double) re[F - 1];
+            }
+            const int interior_end = F - ((n_fft & 1) == 0 ? 1 : 0);
+            for (int f = 1; f < interior_end; ++f) {
+                const double angle = 2.0 * M_PI * (double) f * (double) k * inv_n;
+                acc += 2.0 * ((double) re[f] * std::cos(angle) -
+                              (double) im[f] * std::sin(angle));
+            }
+            frame[(size_t) k] = (float)(acc * inv_n);
+        }
+
+        // Overlap-add with the Hann window.
+        const int off = t * hop_length;
+        for (int k = 0; k < win_length; ++k) {
+            const int idx = off + k;
+            if (idx >= n_out) break;
+            const float w = win_ptr[k];
+            out_data[(size_t) idx] += frame[(size_t)(k % n_fft)] * w;
+            norm    [(size_t) idx] += w * w;
+        }
+    }
+
+    // Normalize by OLA window energy.
+    for (int i = 0; i < n_out; ++i) {
+        if (norm[(size_t) i] > 1e-8f) {
+            out_data[(size_t) i] /= norm[(size_t) i];
+        }
+    }
+}
+
+void ggml_compute_forward_istft(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            ggml_compute_forward_istft_f32(params, dst);
+            break;
+        default:
+            GGML_ABORT("ggml_istft: only F32 src supported");
+    }
+}

@@ -898,6 +898,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_snake_f16;
     vk_pipeline pipeline_snake_bf16;
     vk_pipeline pipeline_pool2d_f32;
+    vk_pipeline pipeline_istft_f32;
     vk_pipeline pipeline_rwkv_wkv6_f32;
     vk_pipeline pipeline_rwkv_wkv7_f32;
     // [size_idx][kda] where size_idx: 0=d32, 1=d64, 2=d128
@@ -1537,6 +1538,21 @@ struct vk_op_pool2d_push_constants {
     int32_t k0; int32_t k1;
     int32_t s0; int32_t s1;
     int32_t p0; int32_t p1;
+};
+
+struct vk_op_istft_push_constants {
+    uint32_t n_fft;
+    uint32_t hop_length;
+    uint32_t win_length;
+    uint32_t T;          // number of frames (IDFT pass)
+};
+
+struct vk_op_istft_ola_push_constants {
+    uint32_t n_fft;
+    uint32_t hop_length;
+    uint32_t win_length;
+    uint32_t T;
+    uint32_t n_out;      // total output samples (OLA pass)
 };
 
 struct vk_op_rwkv_wkv6_push_constants {
@@ -4951,6 +4967,10 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_snake_bf16, "snake_bf16", snake_bf16_len, snake_bf16_data, "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_pool2d_f32, "pool2d_f32", pool2d_f32_len, pool2d_f32_data, "main", 2, sizeof(vk_op_pool2d_push_constants), {512, 1, 1}, {}, 1);
+
+    // iSTFT: single-pass, one thread per output sample (2 bindings: mag_phase, dst)
+    // Window is computed from push-constant win_length — no window tensor binding.
+    ggml_vk_create_pipeline(device, device->pipeline_istft_f32, "istft_f32", istft_f32_len, istft_f32_data, "main", 2, sizeof(vk_op_istft_ola_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_rwkv_wkv6_f32, "rwkv_wkv6_f32", rwkv_wkv6_f32_len, rwkv_wkv6_f32_data, "main", 7, sizeof(vk_op_rwkv_wkv6_push_constants), {1, 1, 1}, {device->subgroup_size}, 1);
 
@@ -10239,6 +10259,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_pool2d_f32;
         }
         return nullptr;
+    case GGML_OP_ISTFT:
+        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_istft_f32;
+        }
+        return nullptr;
     case GGML_OP_RWKV_WKV6:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_rwkv_wkv6_f32;
@@ -10790,6 +10815,18 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             elements = { nr, n_t, n_s };
         }
         break;
+    case GGML_OP_ISTFT:
+        {
+            // One thread per output sample.  n_out = dst->ne[0].
+            const uint32_t n_out = (uint32_t) dst->ne[0];
+            if (n_out > 262144) {
+                elements = { 512, 512, CEIL_DIV(n_out, 262144) };
+            } else if (n_out > 256) {
+                elements = { 256, CEIL_DIV(n_out, 256), 1 };
+            } else {
+                elements = { n_out, 1, 1 };
+            }
+        } break;
     default:
         elements = { (uint32_t)ggml_nelements(src0), 1, 1 };
         break;
@@ -12518,6 +12555,31 @@ static void ggml_vk_pool_2d(ggml_backend_vk_context * ctx, vk_context& subctx, c
         op,
         k0, k1, s0, s1, p0, p1,
     });
+}
+
+static void ggml_vk_istft(ggml_backend_vk_context * ctx, vk_context& subctx,
+                          const ggml_tensor * src0, const ggml_tensor * /* src1 */, ggml_tensor * dst) {
+    // src0: mag_phase [T, F, 2]  (ne[0]=T, ne[1]=F, ne[2]=2)
+    // Window is computed on-the-fly inside the shader from win_length push constant.
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+
+    const int32_t * op_params = (const int32_t *) dst->op_params;
+    const uint32_t n_fft      = (uint32_t) op_params[0];
+    const uint32_t hop_length = (uint32_t) op_params[1];
+    const uint32_t win_length = (uint32_t) op_params[2];
+    const uint32_t T          = (uint32_t) src0->ne[0];
+    const uint32_t n_out      = (uint32_t) dst->ne[0];
+
+    vk_op_istft_ola_push_constants pc{};
+    pc.n_fft      = n_fft;
+    pc.hop_length = hop_length;
+    pc.win_length = win_length;
+    pc.T          = T;
+    pc.n_out      = n_out;
+
+    // 2-binding dispatch: src0=mag_phase, dst (no window tensor — built in shader)
+    ggml_vk_op_f32<vk_op_istft_ola_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_ISTFT, std::move(pc));
 }
 
 static void ggml_vk_conv_2d(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * src0,
@@ -14306,6 +14368,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
     case GGML_OP_POOL_2D:
         ggml_vk_pool_2d(ctx, compute_ctx, src0, node);
+
+        break;
+    case GGML_OP_ISTFT:
+        ggml_vk_istft(ctx, compute_ctx, src0, src1, node);
 
         break;
     case GGML_OP_CONV_2D:
@@ -17160,6 +17226,14 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_POOL_2D:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_ISTFT:
+            {
+                if (!ggml_is_contiguous(op->src[0]) || op->src[0]->type != GGML_TYPE_F32) return false;
+                const int32_t * pp = (const int32_t *) op->op_params;
+                const int n_fft = pp[0];
+                // shared memory limit: n_fft must be <= 2048 for the IDFT kernel
+                return (n_fft > 0 && n_fft <= 2048);
+            }
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
             return true; // all inputs are contiguous, see ggml.c
@@ -18026,6 +18100,11 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             const int32_t p1 = tensor->op_params[6];
 
             tensor_clone = ggml_pool_2d(ggml_ctx, src_clone[0], op, k0, k1, s0, s1, p0, p1);
+        } else if (tensor->op == GGML_OP_ISTFT) {
+            const int32_t n_fft      = tensor->op_params[0];
+            const int32_t hop_length = tensor->op_params[1];
+            const int32_t win_length = tensor->op_params[2];
+            tensor_clone = ggml_istft(ggml_ctx, src_clone[0], src_clone[1], n_fft, hop_length, win_length);
         } else if (tensor->op == GGML_OP_CONV_2D) {
             const int32_t s0 = tensor->op_params[0];
             const int32_t s1 = tensor->op_params[1];

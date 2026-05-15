@@ -601,6 +601,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_ISTFT,
+
         GGML_OP_COUNT,
     };
 
@@ -2240,6 +2242,30 @@ extern "C" {
             int                   s1,
             float                 p0,
             float                 p1);
+
+    // ggml_istft
+    //
+    // Inverse short-time Fourier transform with a Hann analysis window and
+    // overlap-add synthesis.  Encodes the (mag, phase) spectrogram produced by
+    // iSTFTNet decoders into a 1-D time-domain waveform.
+    //
+    // src0 shape: [2, F, T, 1]   F = n_fft/2+1, T = number of frames
+    //              dim 0 = 0:mag / 1:phase  (interleaved channel-first)
+    //
+    // Output shape: [N, 1, 1, 1] where N = (T-1)*hop_length + win_length
+    //
+    // op_params layout (int32):
+    //   [0] n_fft        [1] hop_length      [2] win_length
+    //
+    // The window tensor (src1) must be a 1-D F32 tensor of length win_length
+    // pre-computed with a Hann window.  Pass NULL for a default periodic Hann.
+    GGML_API struct ggml_tensor * ggml_istft(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mag_phase,  // [2, F, T] F=n_fft/2+1
+            struct ggml_tensor  * window,     // [win_length] Hann, or NULL
+            int                   n_fft,
+            int                   hop_length,
+            int                   win_length);
 
     enum ggml_scale_mode {
         GGML_SCALE_MODE_NEAREST  = 0,

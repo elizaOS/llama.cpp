@@ -521,14 +521,73 @@ kokoro_status kokoro_synthesize(
         n_frames);
 
     // 5. Inverse STFT → PCM.
-    istft_hann(
-        mag,
-        phase,
-        model->hparams.istft_n_fft,
-        model->hparams.istft_hop_length,
-        model->hparams.istft_win_length,
-        n_frames,
-        out.samples);
+    //
+    // Preferred path: run iSTFT as a native GGML_OP_ISTFT graph op so the
+    // computation is dispatched to the active backend (Vulkan, CUDA, Metal).
+    // Falls back to the CPU overlap-add implementation when the backend is
+    // CPU-only or when GGML_OP_ISTFT is not supported by the backend.
+    {
+        const int n_fft      = model->hparams.istft_n_fft;
+        const int hop_length = model->hparams.istft_hop_length;
+        const int win_length = model->hparams.istft_win_length;
+        const int F          = n_fft / 2 + 1;
+        const int n_out      = (n_frames - 1) * hop_length + win_length;
+
+        // Build a tiny graph: mag_phase_tensor → ggml_istft → pcm_tensor.
+        // mag_phase_tensor shape: ne[0]=n_frames (T), ne[1]=F, ne[2]=2.
+        bool used_native_op = false;
+        {
+            ggml_init_params ip = {
+                /*.mem_size   =*/ 4 * 1024 * 1024,
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context * gctx = ggml_init(ip);
+            if (gctx) {
+                const int64_t ne_mp[4] = { (int64_t) n_frames, (int64_t) F, 2, 1 };
+                ggml_tensor * mp = ggml_new_tensor(gctx, GGML_TYPE_F32, 4, ne_mp);
+                ggml_tensor * pcm = ggml_istft(gctx, mp, /*window=*/nullptr,
+                                               n_fft, hop_length, win_length);
+                ggml_cgraph * gf = ggml_new_graph_custom(gctx, 64, false);
+                ggml_build_forward_expand(gf, pcm);
+
+                ggml_gallocr_t alloc = ggml_gallocr_new(
+                    ggml_backend_get_default_buffer_type(model->backend));
+
+                if (alloc && ggml_gallocr_alloc_graph(alloc, gf)) {
+                    // Pack mag/phase into the [T, F, 2] tensor.
+                    // mag goes into channel 0 (base offset 0), phase into
+                    // channel 1 (base offset F*T floats).
+                    const size_t ch_stride = (size_t) F * (size_t) n_frames;
+                    std::vector<float> mp_data(2 * ch_stride);
+                    for (int f = 0; f < F; ++f) {
+                        for (int t = 0; t < n_frames; ++t) {
+                            mp_data[              f * n_frames + t] = mag  [(size_t)(f * n_frames + t)];
+                            mp_data[ch_stride + f * n_frames + t]  = phase[(size_t)(f * n_frames + t)];
+                        }
+                    }
+                    ggml_backend_tensor_set(mp, mp_data.data(), 0,
+                                            mp_data.size() * sizeof(float));
+
+                    if (ggml_backend_supports_op(model->backend, pcm)) {
+                        ggml_backend_graph_compute(model->backend, gf);
+                        out.samples.resize((size_t) n_out);
+                        ggml_backend_tensor_get(pcm, out.samples.data(), 0,
+                                                (size_t) n_out * sizeof(float));
+                        used_native_op = true;
+                    }
+                }
+                if (alloc) ggml_gallocr_free(alloc);
+                ggml_free(gctx);
+            }
+        }
+
+        if (!used_native_op) {
+            // CPU fallback: existing overlap-add iSTFT.
+            istft_hann(mag, phase, n_fft, hop_length, win_length,
+                       n_frames, out.samples);
+        }
+    }
 
     return KOKORO_OK;
 }
@@ -539,6 +598,14 @@ int kokoro_sample_rate(const kokoro_model * model) noexcept {
 
 const kokoro_hparams * kokoro_get_hparams(const kokoro_model * model) noexcept {
     return model ? &model->hparams : nullptr;
+}
+
+// Exposed for kokoro-predictor.cpp / kokoro-decoder.cpp — they look up
+// trained tensors by name from the loader-owned ggml_context. Keeping
+// this internal-by-convention (not in kokoro.h) preserves the public
+// surface while giving the sibling TUs a stable handle.
+ggml_context * kokoro_model_ggml_ctx(const kokoro_model * model) {
+    return model ? model->ctx : nullptr;
 }
 
 } // namespace eliza_kokoro
