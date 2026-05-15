@@ -62,6 +62,8 @@ set(OMNIVOICE_COMPILE_DEFINITIONS
     GGML_MAX_NAME=128
     LLAMA_BUILD_OMNIVOICE
     ELIZA_FUSE_OMNIVOICE)
+set(OMNIVOICE_LLAMA_PRIVATE_INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
 
 # Sources shared by both the static core and the shared ABI-export library.
 set(OMNIVOICE_CORE_SOURCES
@@ -90,8 +92,8 @@ target_compile_definitions(omnivoice_lib
 target_include_directories(omnivoice_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_BINARY_DIR})
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${OMNIVOICE_LLAMA_PRIVATE_INCLUDE_DIRS})
 # llama transitively pulls ggml + the backend pair chosen at parent
 # configure time. The omnivoice tree never touches backend selection
 # directly ; patch 0003 will rewrite backend.h to consume the
@@ -120,8 +122,8 @@ if(OMNIVOICE_SHARED)
     target_include_directories(omnivoice PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_BINARY_DIR})
+        ${CMAKE_CURRENT_BINARY_DIR}
+        ${OMNIVOICE_LLAMA_PRIVATE_INCLUDE_DIRS})
     target_link_libraries(omnivoice PUBLIC llama)
     set_target_properties(omnivoice PROPERTIES
         C_VISIBILITY_PRESET       hidden
@@ -156,7 +158,8 @@ target_compile_definitions(elizainference
 target_include_directories(elizainference PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_BINARY_DIR})
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${OMNIVOICE_LLAMA_PRIVATE_INCLUDE_DIRS})
 target_include_directories(elizainference PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../mtmd
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
@@ -194,7 +197,8 @@ if(TARGET llama-server)
     target_link_libraries(llama-server PRIVATE omnivoice_lib)
     target_include_directories(llama-server PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${OMNIVOICE_LLAMA_PRIVATE_INCLUDE_DIRS})
     target_compile_definitions(llama-server PRIVATE ${OMNIVOICE_COMPILE_DEFINITIONS})
 endif()
 
