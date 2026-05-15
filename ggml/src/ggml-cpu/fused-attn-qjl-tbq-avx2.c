@@ -152,7 +152,7 @@ void fused_attn_v_mix_avx2(int n_tokens, const float * w,
             const int blk = t * (FUSED_QJL_HEAD_DIM / FUSED_TBQ_BLOCK) + c;
             const uint8_t * codes = v_codes + (size_t) blk * (FUSED_TBQ_BLOCK * 3 / 8);
             const float d = GGML_CPU_FP16_TO_FP32(v_scales[blk]);
-            float decoded[FUSED_TBQ_BLOCK] __attribute__((aligned(32)));
+            GGML_ALIGN(32) float decoded[FUSED_TBQ_BLOCK];
             tbq3_decode_block_avx2(codes, d, decoded);
             float * out_chunk = out + c * FUSED_TBQ_BLOCK;
             for (int i = 0; i < FUSED_TBQ_BLOCK; i += 8) {

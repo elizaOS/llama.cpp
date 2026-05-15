@@ -42,6 +42,19 @@ struct ggml_compute_params {
 
 #endif
 
+// Portable per-variable alignment and thread-local storage class for the
+// Eliza-added fused kernels (fused-attn-qjl-tbq*, fused-q4-polar-dot*).
+// MSVC rejects GCC's `__attribute__((aligned(N)))` and `__thread` keywords;
+// it requires `__declspec(align(N))` / `__declspec(thread)` placed BEFORE
+// the type. Use these macros so the kernel source stays single-form.
+#if defined(_MSC_VER)
+#  define GGML_ALIGN(N)       __declspec(align(N))
+#  define GGML_THREAD_LOCAL   __declspec(thread)
+#else
+#  define GGML_ALIGN(N)       __attribute__((aligned(N)))
+#  define GGML_THREAD_LOCAL   __thread
+#endif
+
 // __FMA__ and __F16C__ are not defined in MSVC, however they are implied with AVX2/AVX512
 #if defined(_MSC_VER) && (defined(__AVX2__) || defined(__AVX512F__))
 #ifndef __FMA__

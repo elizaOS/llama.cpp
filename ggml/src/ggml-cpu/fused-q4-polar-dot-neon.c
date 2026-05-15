@@ -126,7 +126,7 @@ double ggml_vec_dot_q4_polar_q8_0_fused_neon(int nb_polar,
     float qjl_signs[QK_POLAR];
     if (use_qjl) polar_qjl_signs(qjl_signs);
 
-    float yhat[QK_POLAR] __attribute__((aligned(16)));
+    GGML_ALIGN(16) float yhat[QK_POLAR];
     double acc_total = 0.0;
 
     for (int b = 0; b < nb_polar; b++) {

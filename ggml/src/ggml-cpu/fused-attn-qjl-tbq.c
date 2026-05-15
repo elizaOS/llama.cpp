@@ -361,8 +361,8 @@ void ggml_compute_forward_fused_attn_qjl_tbq(
         /* K side: contiguous signs/norms staging, per-thread. */
         const char * pk_plane = (const char *) pk->data
             + i3 * pk->nb[3] + hk * pk->nb[2];
-        static __thread uint8_t  k_signs_buf[256 * 1024];   /* bytes */
-        static __thread uint16_t k_norms_buf[8 * 1024];     /* tokens */
+        static GGML_THREAD_LOCAL uint8_t  k_signs_buf[256 * 1024];   /* bytes */
+        static GGML_THREAD_LOCAL uint16_t k_norms_buf[8 * 1024];     /* tokens */
         GGML_ASSERT((size_t) n_kv_tokens * 32 <= sizeof(k_signs_buf));
         GGML_ASSERT((size_t) n_kv_tokens     <= sizeof(k_norms_buf) / sizeof(uint16_t));
         for (int t = 0; t < n_kv_tokens; t++) {
@@ -375,8 +375,8 @@ void ggml_compute_forward_fused_attn_qjl_tbq(
         /* V side: tbq3_0, FUSED_TBQ_PER_TOKEN blocks/token, per-thread. */
         const char * pv_plane = (const char *) pv->data
             + i3 * pv->nb[3] + hk * pv->nb[2];
-        static __thread uint8_t  v_codes_buf[8 * 1024 * 4 * 12];
-        static __thread uint16_t v_scales_buf[8 * 1024 * 4];
+        static GGML_THREAD_LOCAL uint8_t  v_codes_buf[8 * 1024 * 4 * 12];
+        static GGML_THREAD_LOCAL uint16_t v_scales_buf[8 * 1024 * 4];
         const size_t n_v_blocks = (size_t) n_kv_tokens * FUSED_TBQ_PER_TOKEN;
         GGML_ASSERT(n_v_blocks * 12 <= sizeof(v_codes_buf));
         GGML_ASSERT(n_v_blocks      <= sizeof(v_scales_buf) / sizeof(uint16_t));
