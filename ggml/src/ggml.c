@@ -941,6 +941,22 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_tbq4_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_tbq4_0_ref,
     },
+    [GGML_TYPE_TBQ3_K] = {
+        .type_name                = "tbq3_k",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_tbq3_k),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_tbq3_k,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_tbq3_k_ref,
+    },
+    [GGML_TYPE_TBQ4_K] = {
+        .type_name                = "tbq4_k",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_tbq4_k),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_tbq4_k,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_tbq4_k_ref,
+    },
     [GGML_TYPE_TBQ3_TCQ] = {
         // TurboQuant TCQ-3 K-cache: 128-element block, fp16 norm + 6-bit
         // initial-state prefix + 128*3-bit Viterbi-encoded symbol stream
@@ -7989,6 +8005,8 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_TQ2_0:    result = quantize_tq2_0     (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TBQ3_0:   result = quantize_tbq3_0    (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TBQ4_0:   result = quantize_tbq4_0    (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TBQ3_K:   result = quantize_tbq3_k    (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TBQ4_K:   result = quantize_tbq4_k    (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TBQ3_TCQ: result = quantize_tbq3_tcq  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_QJL1_256: result = quantize_qjl1_256  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_POLAR: result = quantize_q4_polar   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

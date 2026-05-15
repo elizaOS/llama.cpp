@@ -44,6 +44,18 @@ static const float k_tbq4_codebook[16] = {
      1.2557391f,  1.6175243f,  2.0685055f,  2.7321365f,
 };
 
+static const float k_tbq3_boundaries[7] = {
+    -1.7480f, -1.0500f, -0.5006f, 0.0000f,
+     0.5006f,  1.0500f,  1.7480f,
+};
+
+static const float k_tbq4_boundaries[15] = {
+    -2.4008f, -1.8435f, -1.4371f, -1.0993f,
+    -0.7996f, -0.5225f, -0.2583f,  0.0000f,
+     0.2583f,  0.5225f,  0.7996f,  1.0993f,
+     1.4371f,  1.8435f,  2.4008f,
+};
+
 static const int8_t k_tbq_signs[QK_TBQ] = {
      1, -1,  1,  1, -1,  1, -1, -1,
      1,  1, -1,  1, -1, -1,  1, -1,
@@ -141,6 +153,202 @@ static inline uint8_t tbq_best_index(int n, const float * codebook, float x) {
     }
 
     return (uint8_t) ((x - codebook[lo] <= codebook[hi] - x) ? lo : hi);
+}
+
+static inline uint8_t tbq_boundary_index(int n, const float * boundaries, float x) {
+    for (int i = 0; i < n - 1; ++i) {
+        if (x < boundaries[i]) {
+            return (uint8_t) i;
+        }
+    }
+    return (uint8_t) (n - 1);
+}
+
+#if defined(_MSC_VER)
+#define TBQK_TLS __declspec(thread)
+#elif defined(__GNUC__) || defined(__clang__)
+#define TBQK_TLS __thread
+#else
+#define TBQK_TLS
+#endif
+
+static inline uint64_t tbqk_splitmix64_next(uint64_t * state) {
+    uint64_t z = (*state += 0x9e3779b97f4a7c15ULL);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
+static void tbqk_generate_gaussian(float * out, int64_t n, uint64_t seed) {
+    uint64_t state = seed;
+    int64_t i = 0;
+    for (; i + 1 < n; i += 2) {
+        const double u1 = ((double)(tbqk_splitmix64_next(&state) >> 11) + 0.5) / (double)(1ULL << 53);
+        const double u2 = ((double)(tbqk_splitmix64_next(&state) >> 11) + 0.5) / (double)(1ULL << 53);
+        const double r  = sqrt(-2.0 * log(u1));
+        const double th = 2.0 * 3.14159265358979323846 * u2;
+        out[i + 0] = (float)(r * cos(th));
+        out[i + 1] = (float)(r * sin(th));
+    }
+    if (i < n) {
+        const double u1 = ((double)(tbqk_splitmix64_next(&state) >> 11) + 0.5) / (double)(1ULL << 53);
+        const double u2 = ((double)(tbqk_splitmix64_next(&state) >> 11) + 0.5) / (double)(1ULL << 53);
+        const double r  = sqrt(-2.0 * log(u1));
+        const double th = 2.0 * 3.14159265358979323846 * u2;
+        out[i] = (float)(r * cos(th));
+    }
+}
+
+static void tbqk_householder_qr(float * a, float * q, int64_t d) {
+    float * tau = (float *) malloc(d * sizeof(float));
+    float * r_sign = (float *) malloc(d * sizeof(float));
+    GGML_ASSERT(tau != NULL && r_sign != NULL);
+
+    for (int64_t k = 0; k < d; ++k) {
+        float norm_sq = 0.0f;
+        for (int64_t i = k; i < d; ++i) {
+            const float v = a[i + k*d];
+            norm_sq += v*v;
+        }
+
+        const float norm = sqrtf(norm_sq);
+        const float alpha = a[k + k*d];
+        const float sign_alpha = alpha >= 0.0f ? 1.0f : -1.0f;
+        const float u1 = alpha + sign_alpha*norm;
+
+        r_sign[k] = -sign_alpha;
+
+        const float vtv = u1*u1 + (norm_sq - alpha*alpha);
+        if (vtv < 1e-30f) {
+            tau[k] = 0.0f;
+            continue;
+        }
+        tau[k] = 2.0f / vtv;
+        a[k + k*d] = u1;
+
+        for (int64_t j = k + 1; j < d; ++j) {
+            float dot = u1 * a[k + j*d];
+            for (int64_t i = k + 1; i < d; ++i) {
+                dot += a[i + k*d] * a[i + j*d];
+            }
+            dot *= tau[k];
+            a[k + j*d] -= dot*u1;
+            for (int64_t i = k + 1; i < d; ++i) {
+                a[i + j*d] -= dot*a[i + k*d];
+            }
+        }
+    }
+
+    memset(q, 0, d*d*sizeof(float));
+    for (int64_t i = 0; i < d; ++i) {
+        q[i + i*d] = 1.0f;
+    }
+
+    for (int64_t k = d - 1; k >= 0; --k) {
+        if (tau[k] == 0.0f) {
+            continue;
+        }
+        const float u1 = a[k + k*d];
+        for (int64_t j = 0; j < d; ++j) {
+            float dot = u1 * q[k + j*d];
+            for (int64_t i = k + 1; i < d; ++i) {
+                dot += a[i + k*d] * q[i + j*d];
+            }
+            dot *= tau[k];
+            q[k + j*d] -= dot*u1;
+            for (int64_t i = k + 1; i < d; ++i) {
+                q[i + j*d] -= dot*a[i + k*d];
+            }
+        }
+    }
+
+    for (int64_t j = 0; j < d; ++j) {
+        if (r_sign[j] < 0.0f) {
+            for (int64_t i = 0; i < d; ++i) {
+                q[i + j*d] = -q[i + j*d];
+            }
+        }
+    }
+
+    free(tau);
+    free(r_sign);
+}
+
+static TBQK_TLS float * tbqk_q_col = NULL;
+static TBQK_TLS float * tbqk_q_row = NULL;
+static TBQK_TLS int64_t tbqk_q_dim = 0;
+
+static const float * tbqk_get_q_col(int64_t d) {
+    if (tbqk_q_col != NULL && tbqk_q_dim == d) {
+        return tbqk_q_col;
+    }
+
+    free(tbqk_q_col);
+    free(tbqk_q_row);
+    tbqk_q_col = (float *) malloc(d*d*sizeof(float));
+    tbqk_q_row = (float *) malloc(d*d*sizeof(float));
+    float * a = (float *) malloc(d*d*sizeof(float));
+    GGML_ASSERT(tbqk_q_col != NULL && tbqk_q_row != NULL && a != NULL);
+
+    tbqk_generate_gaussian(a, d*d, 0x517cc1b727220a95ULL);
+    tbqk_householder_qr(a, tbqk_q_col, d);
+    for (int64_t i = 0; i < d; ++i) {
+        for (int64_t j = 0; j < d; ++j) {
+            tbqk_q_row[i*d + j] = tbqk_q_col[i + j*d];
+        }
+    }
+
+    tbqk_q_dim = d;
+    free(a);
+    return tbqk_q_col;
+}
+
+static const float * tbqk_get_q_row(int64_t d) {
+    tbqk_get_q_col(d);
+    return tbqk_q_row;
+}
+
+static void tbqk_matvec_row(float * y, const float * m, const float * x, int64_t d) {
+    for (int64_t i = 0; i < d; ++i) {
+        const float * row = m + i*d;
+        float sum = 0.0f;
+        for (int64_t j = 0; j < d; ++j) {
+            sum += row[j] * x[j];
+        }
+        y[i] = sum;
+    }
+}
+
+static void tbqk_matvec_t(float * y, const float * m, const float * x, int64_t d) {
+    for (int64_t j = 0; j < d; ++j) {
+        const float * col = m + j*d;
+        float sum = 0.0f;
+        for (int64_t i = 0; i < d; ++i) {
+            sum += col[i] * x[i];
+        }
+        y[j] = sum;
+    }
+}
+
+static inline void tbqk_pack_3bit(uint8_t * dst, const uint8_t * idx, int64_t n) {
+    for (int64_t g = 0; g < n/8; ++g) {
+        uint32_t bits = 0;
+        for (int j = 0; j < 8; ++j) {
+            bits |= ((uint32_t)(idx[g*8 + j] & 0x7)) << (j*3);
+        }
+        dst[g*3 + 0] = (uint8_t)(bits & 0xff);
+        dst[g*3 + 1] = (uint8_t)((bits >> 8) & 0xff);
+        dst[g*3 + 2] = (uint8_t)((bits >> 16) & 0xff);
+    }
+}
+
+static inline void tbqk_unpack_3bit(uint8_t * idx, const uint8_t * src, int64_t n) {
+    for (int64_t g = 0; g < n/8; ++g) {
+        const uint32_t bits = (uint32_t) src[g*3 + 0] | ((uint32_t) src[g*3 + 1] << 8) | ((uint32_t) src[g*3 + 2] << 16);
+        for (int j = 0; j < 8; ++j) {
+            idx[g*8 + j] = (uint8_t)((bits >> (j*3)) & 0x7);
+        }
+    }
 }
 
 static inline void tbq_decode_rotated_3(const block_tbq3_0 * x, float * y) {
@@ -2687,6 +2895,84 @@ void quantize_row_tbq4_0_ref(const float * GGML_RESTRICT x, block_tbq4_0 * GGML_
     }
 }
 
+void quantize_row_tbq3_k_ref(const float * GGML_RESTRICT x, block_tbq3_k * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+    float unit[QK_K];
+    float rotated[QK_K];
+    uint8_t idx[QK_K];
+    const float * q = tbqk_get_q_row(128);
+    const float scale = sqrtf((float) QK_K);
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float * xb = x + i*QK_K;
+        float norm_sq = 0.0f;
+        for (int j = 0; j < QK_K; ++j) {
+            norm_sq += xb[j]*xb[j];
+        }
+
+        float norm = sqrtf(norm_sq);
+        if (norm < 1e-10f) {
+            norm = 1e-10f;
+        }
+
+        const float inv_norm = 1.0f / norm;
+        for (int j = 0; j < QK_K; ++j) {
+            unit[j] = xb[j] * inv_norm;
+        }
+        for (int j = 0; j < QK_K; j += 128) {
+            tbqk_matvec_row(rotated + j, q, unit + j, 128);
+        }
+        for (int j = 0; j < QK_K; ++j) {
+            idx[j] = tbq_boundary_index(8, k_tbq3_boundaries, rotated[j] * scale);
+        }
+
+        tbqk_pack_3bit(y[i].qs, idx, QK_K);
+        y[i].d = GGML_FP32_TO_FP16(norm);
+    }
+}
+
+void quantize_row_tbq4_k_ref(const float * GGML_RESTRICT x, block_tbq4_k * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+    float unit[QK_K];
+    float rotated[QK_K];
+    const float * q = tbqk_get_q_row(128);
+    const float scale = sqrtf((float) QK_K);
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float * xb = x + i*QK_K;
+        float norm_sq = 0.0f;
+        for (int j = 0; j < QK_K; ++j) {
+            norm_sq += xb[j]*xb[j];
+        }
+
+        float norm = sqrtf(norm_sq);
+        if (norm < 1e-10f) {
+            norm = 1e-10f;
+        }
+
+        const float inv_norm = 1.0f / norm;
+        for (int j = 0; j < QK_K; ++j) {
+            unit[j] = xb[j] * inv_norm;
+        }
+        for (int j = 0; j < QK_K; j += 128) {
+            tbqk_matvec_row(rotated + j, q, unit + j, 128);
+        }
+
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+        for (int j = 0; j < QK_K; ++j) {
+            const uint8_t code = tbq_boundary_index(16, k_tbq4_boundaries, rotated[j] * scale);
+            if ((j & 1) == 0) {
+                y[i].qs[j/2] = code;
+            } else {
+                y[i].qs[j/2] |= (uint8_t)(code << 4);
+            }
+        }
+        y[i].d = GGML_FP32_TO_FP16(norm);
+    }
+}
+
 size_t quantize_tq1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     (void)quant_weights; // not used
     const size_t row_size = ggml_row_size(GGML_TYPE_TQ1_0, n_per_row);
@@ -2712,6 +2998,20 @@ size_t quantize_tbq4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
     (void) quant_weights;
     const size_t row_size = ggml_row_size(GGML_TYPE_TBQ4_0, n_per_row);
     quantize_row_tbq4_0_ref(src, dst, (int64_t) nrow*n_per_row);
+    return nrow * row_size;
+}
+
+size_t quantize_tbq3_k(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void) quant_weights;
+    const size_t row_size = ggml_row_size(GGML_TYPE_TBQ3_K, n_per_row);
+    quantize_row_tbq3_k_ref(src, dst, (int64_t) nrow*n_per_row);
+    return nrow * row_size;
+}
+
+size_t quantize_tbq4_k(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void) quant_weights;
+    const size_t row_size = ggml_row_size(GGML_TYPE_TBQ4_K, n_per_row);
+    quantize_row_tbq4_k_ref(src, dst, (int64_t) nrow*n_per_row);
     return nrow * row_size;
 }
 
@@ -2794,6 +3094,53 @@ void dequantize_row_tbq4_0(const block_tbq4_0 * GGML_RESTRICT x, float * GGML_RE
         tbq_decode_rotated_4(&x[i], rotated);
         tbq_uncondition_block(rotated);
         memcpy(y + i*QK_TBQ, rotated, sizeof(rotated));
+    }
+}
+
+void dequantize_row_tbq3_k(const block_tbq3_k * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+    float rotated[QK_K];
+    float unit[QK_K];
+    uint8_t idx[QK_K];
+    const float * q = tbqk_get_q_col(128);
+    const float scale = 1.0f / sqrtf((float) QK_K);
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float norm = GGML_FP16_TO_FP32(x[i].d);
+        tbqk_unpack_3bit(idx, x[i].qs, QK_K);
+        for (int j = 0; j < QK_K; ++j) {
+            rotated[j] = k_tbq3_codebook[idx[j]] * scale;
+        }
+        for (int j = 0; j < QK_K; j += 128) {
+            tbqk_matvec_t(unit + j, q, rotated + j, 128);
+        }
+        for (int j = 0; j < QK_K; ++j) {
+            y[i*QK_K + j] = unit[j] * norm;
+        }
+    }
+}
+
+void dequantize_row_tbq4_k(const block_tbq4_k * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+    float rotated[QK_K];
+    float unit[QK_K];
+    const float * q = tbqk_get_q_col(128);
+    const float scale = 1.0f / sqrtf((float) QK_K);
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float norm = GGML_FP16_TO_FP32(x[i].d);
+        for (int j = 0; j < QK_K; ++j) {
+            const uint8_t code = (j & 1) == 0 ? (x[i].qs[j/2] & 0x0f) : ((x[i].qs[j/2] >> 4) & 0x0f);
+            rotated[j] = k_tbq4_codebook[code] * scale;
+        }
+        for (int j = 0; j < QK_K; j += 128) {
+            tbqk_matvec_t(unit + j, q, rotated + j, 128);
+        }
+        for (int j = 0; j < QK_K; ++j) {
+            y[i*QK_K + j] = unit[j] * norm;
+        }
     }
 }
 

@@ -167,6 +167,8 @@ int main(int argc, char * argv[]) {
                 type == GGML_TYPE_IQ3_XXS ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS_XXS :
                 type == GGML_TYPE_TBQ3_0  ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
                 type == GGML_TYPE_TBQ4_0  ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
+                type == GGML_TYPE_TBQ3_K  ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
+                type == GGML_TYPE_TBQ4_K  ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
                 type == GGML_TYPE_TBQ3_TCQ ? MAX_QUANTIZATION_TOTAL_ERROR_TBQ3_TCQ :
                 type == GGML_TYPE_NVFP4    ? MAX_QUANTIZATION_TOTAL_ERROR_FP4 :
                 type == GGML_TYPE_Q4_POLAR ? MAX_QUANTIZATION_TOTAL_ERROR_POLAR : MAX_QUANTIZATION_TOTAL_ERROR;
@@ -192,7 +194,8 @@ int main(int argc, char * argv[]) {
                                             type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_S
                                           ? MAX_DOT_PRODUCT_ERROR_LOWBIT
                                           : (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_Q1_0_g32 || type == GGML_TYPE_Q1_0_g128 ||
-                                             type == GGML_TYPE_TBQ3_0 || type == GGML_TYPE_TBQ4_0)
+                                             type == GGML_TYPE_TBQ3_0 || type == GGML_TYPE_TBQ4_0 ||
+                                             type == GGML_TYPE_TBQ3_K || type == GGML_TYPE_TBQ4_K)
                                           ? MAX_DOT_PRODUCT_ERROR_BINARY
                                           : type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0
                                           ? MAX_DOT_PRODUCT_ERROR_TERNARY
