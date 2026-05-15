@@ -128,6 +128,46 @@ jobs:
           grep -E "Backend Vulkan0:.*FAIL|tests passed|Failing tests:" \
             /tmp/backend-ops.log || true
 
+      - name: test-backend-ops Eliza custom-quant parity (Vulkan)
+        env:
+          GGML_VK_VISIBLE_DEVICES: '0'
+          GGML_VK_DISABLE_F16: '1'
+          GGML_VK_DISABLE_COOPMAT: '1'
+        run: |
+          source ./vulkan_sdk/setup-env.sh
+          # Eliza custom quants (Q1_0_g32/g128, TBQ3_0/4_0, TBQ3_K/4_K,
+          # QJL1_256, Q4_POLAR, TBQ3_TCQ). These have CPU+Metal kernels
+          # but no Vulkan kernels yet. The harness emits one
+          # "not supported" line per (op,type,shape) — that is the
+          # intended baseline. If a future PR adds a Vulkan kernel for
+          # any of these types, this step will start emitting real
+          # PASS/FAIL lines automatically because supports_op() will
+          # return true and the test harness will compare against CPU.
+          #
+          # We do NOT fail the job on "not supported" lines (expected).
+          # We DO fail on any "FAIL" line for these types — that would
+          # signal a Vulkan kernel that diverges from the CPU reference.
+          for op in GET_ROWS CPY MUL_MAT; do
+            echo "=== $op (Eliza custom quants) ==="
+            timeout 300 ./build-vulkan/bin/test-backend-ops \
+              -b Vulkan0 -o "$op" \
+              2>&1 | tee -a /tmp/eliza-custom-quants.log || true
+          done
+          # Count skip/pass/fail among lines mentioning custom quant
+          # type names. The grep patterns target the type prefixes used
+          # in the test_case::vars() output.
+          echo "=== Eliza custom-quant summary ==="
+          for t in q1_0_g32 q1_0_g128 tbq3_0 tbq4_0 tbq3_k tbq4_k qjl1_256 q4_polar tbq3_tcq; do
+            n_skip=$(grep -c "type=$t.*not supported" /tmp/eliza-custom-quants.log || true)
+            n_fail=$(grep -c "type=$t.*FAIL"          /tmp/eliza-custom-quants.log || true)
+            n_pass=$(grep -c "type=$t.*OK"            /tmp/eliza-custom-quants.log || true)
+            echo "  $t: skip=$n_skip pass=$n_pass fail=$n_fail"
+            if [ "$n_fail" -gt 0 ]; then
+              echo "::error::Vulkan kernel divergence for type=$t (see /tmp/eliza-custom-quants.log)"
+              exit 1
+            fi
+          done
+
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -136,4 +176,5 @@ jobs:
           path: |
             /tmp/quantize-fns.log
             /tmp/backend-ops.log
+            /tmp/eliza-custom-quants.log
           retention-days: 14
