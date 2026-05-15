@@ -1888,14 +1888,6 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
-struct pending_host_write {
-    void * dst;
-    size_t dst_stride;
-    std::vector<uint8_t> src_data;
-    size_t size;
-    size_t n_copies;
-};
-
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -1907,7 +1899,7 @@ struct ggml_backend_vk_context {
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
-    std::vector<pending_host_write> pending_host_writes;
+    bool needs_host_barrier {};
     bool almost_ready_fence_pending {};
     // Set before op_add and unset after op_rms_norm to indicate that the add should
     // write partial sums to accumulate the square of the vector components
@@ -6733,6 +6725,19 @@ static vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx) {
 
         ctx->compute_ctx = result;
         ggml_vk_ctx_begin(ctx->device, result);
+
+        if (ctx->needs_host_barrier) {
+            vk::MemoryBarrier barrier{
+                vk::AccessFlagBits::eHostWrite,
+                vk::AccessFlagBits::eShaderRead
+            };
+            result->s->buffer->buf.pipelineBarrier(
+                vk::PipelineStageFlagBits::eHost,
+                vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer,
+                {}, barrier, nullptr, nullptr
+            );
+            ctx->needs_host_barrier = false;
+        }
     }
 
     if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
@@ -13963,17 +13968,18 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
     if (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
         GGML_ASSERT(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
 
-        std::vector<uint8_t> src_data(size * n_copies);
-        if (stride_data == size) {
-            memcpy(src_data.data(), data, size * n_copies);
+        uint8_t* dst = (uint8_t*)buf->ptr + dst_offset;
+
+        if (stride_data == size && stride_tensor == size) {
+            memcpy(dst, data, size * n_copies);
         } else {
             for (size_t i = 0; i < n_copies; i++) {
-                memcpy(src_data.data() + i * size, (const uint8_t*)data + i * stride_data, size);
+                memcpy(dst + i * stride_tensor,
+                       (const uint8_t*)data + i * stride_data, size);
             }
         }
 
-        ctx->pending_host_writes.emplace_back(
-            (uint8_t*)buf->ptr + dst_offset, stride_tensor, std::move(src_data), size, n_copies);
+        ctx->needs_host_barrier = true;
         return;
     }
 
@@ -14202,24 +14208,14 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         }
     }
 
-    for (auto& w : ctx->pending_host_writes) {
-        if (w.dst_stride == w.size) {
-            memcpy(w.dst, w.src_data.data(), w.size * w.n_copies);
-        } else {
-            for (size_t i = 0; i < w.n_copies; i++) {
-                memcpy((uint8_t*)w.dst + i * w.dst_stride,
-                       w.src_data.data() + i * w.size, w.size);
-            }
-        }
-    }
-    ctx->pending_host_writes.clear();
-
     if (do_transfer) {
         for (auto& cpy : compute_ctx->out_memcpys) {
             memcpy(cpy.dst, cpy.src, cpy.n);
         }
         ctx->compute_ctx.reset();
     }
+
+    ctx->needs_host_barrier = false;
 }
 
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
