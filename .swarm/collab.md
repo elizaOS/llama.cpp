@@ -52,6 +52,11 @@ CI started reporting concrete failures across 3rd-party, virtgpu, cann, apple, h
 - **R. CI (apple) macOS-latest-ios build failure** — log noise made the actual error hard to spot; pull full log with `gh run view 25899245034 --repo elizaOS/llama.cpp --log-failed | grep -B 2 -A 5 -iE "error:|undefined|fatal:" | head -80` to find it. Likely a Metal/iOS-specific compile or signing error. Files: investigate, then likely one of `ggml/src/ggml-metal/*`, the iOS Swift package, or `build-apple.yml`.
 - **S. Wave-4 triage + in-flight CI watcher** — 14 runs are still in_progress as wave 4 starts; new failures may surface. Watch `gh run list --branch eliza/token-trie-sampler` for new failures across `CI`, `CI (sycl)`, `CI (sanitize)`, `CI (self-hosted)`, `Server`. If something new and clear shows up: fix if small (≤2 files, not in another lane), else log in `## Backlog from agent S`. Files: investigative, restricted by lane respect.
 
+## Wave 5 work breakdown
+
+- **T. Anthropic vision multimodal crash** (S's backlog #20) — `test_anthropic_vision_base64_with_multimodal_model` crashes the server (`RemoteDisconnected`) on both `server (default)` and `server (backend-sampling)` jobs. Upstream test from commit `ddf9f9438 server : add Anthropic Messages API support`. 71 other Anthropic-compat tests pass; only the multimodal vision endpoint crashes. Likely a real bug in `tools/server/server-http.cpp` Anthropic→chat translator or `tools/mtmd/mtmd-helper.cpp`. Run the test locally if you have the multimodal model available, or read S's backlog #20 entry for the repro recipe and suspects.
+- **U. Continuous CI watcher** — 56 runs are queued against the wave-4 HEAD and will start completing soon. Watch `gh run list --branch eliza/token-trie-sampler` cyclically (5 cycles, ~5-8 minutes apart). For each new failure: classify by lane owner, fix if ≤2 files and unowned, else log in `## Backlog from agent U`. Stop after 5 cycles or when distinct failure modes are exhausted. Do NOT touch T's lane (tools/server/server-http.cpp, tools/mtmd/*).
+
 ## Live agents
 
 <!-- agents append here -->
