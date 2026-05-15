@@ -272,6 +272,9 @@ static void common_params_fit_impl(
             if (projected_free_per_device[0] >= margins[0]) {
                 LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of free device memory, no changes needed\n",
                     __func__, projected_free_per_device[0]/MiB, margins[0]/MiB);
+                if (cparams->n_ctx == 0) {
+                    cparams->n_ctx = hp_nct;
+                }
                 return;
             }
         } else {
@@ -284,6 +287,9 @@ static void common_params_fit_impl(
             }
             if (!changes_needed) {
                 LOG_TRC("%s: targets for free memory can be met on all devices, no changes needed\n", __func__);
+                if (cparams->n_ctx == 0) {
+                    cparams->n_ctx = hp_nct;
+                }
                 return;
             }
         }

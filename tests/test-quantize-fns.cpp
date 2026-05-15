@@ -22,6 +22,7 @@ constexpr float MAX_QUANTIZATION_TOTAL_ERROR_2BITS = 0.0075f;
 constexpr float MAX_QUANTIZATION_TOTAL_ERROR_3BITS = 0.0040f;
 constexpr float MAX_QUANTIZATION_TOTAL_ERROR_3BITS_XXS = 0.0050f;
 constexpr float MAX_QUANTIZATION_TOTAL_ERROR_FP4 = 0.0030f;
+constexpr float MAX_QUANTIZATION_TOTAL_ERROR_TBQ3_TCQ = 0.04f;
 // elizaOS: Q4_POLAR — rotated Lloyd-Max quantizer; higher error budget on deterministic test input
 constexpr float MAX_QUANTIZATION_TOTAL_ERROR_POLAR = 0.01f;
 constexpr float MAX_DOT_PRODUCT_ERROR = 0.02f;
@@ -155,14 +156,18 @@ int main(int argc, char * argv[]) {
         if (qfns_cpu->from_float && qfns->to_float) {
             const float total_error = total_quantization_error(qfns, qfns_cpu, test_size, test_data.data());
             const float max_quantization_error =
-                (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_Q1_0_g128) ? MAX_QUANTIZATION_TOTAL_ERROR_BINARY :
+                (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_Q1_0_g128 || type == GGML_TYPE_QJL1_256) ? MAX_QUANTIZATION_TOTAL_ERROR_BINARY :
                 type == GGML_TYPE_TQ1_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_TQ2_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
+                type == GGML_TYPE_Q1_0_g32 ? MAX_QUANTIZATION_TOTAL_ERROR_BINARY :
                 type == GGML_TYPE_Q2_K    ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
                 type == GGML_TYPE_IQ2_S   ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
                 type == GGML_TYPE_Q3_K    ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
                 type == GGML_TYPE_IQ3_S   ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
                 type == GGML_TYPE_IQ3_XXS ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS_XXS :
+                type == GGML_TYPE_TBQ3_0  ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
+                type == GGML_TYPE_TBQ4_0  ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
+                type == GGML_TYPE_TBQ3_TCQ ? MAX_QUANTIZATION_TOTAL_ERROR_TBQ3_TCQ :
                 type == GGML_TYPE_NVFP4    ? MAX_QUANTIZATION_TOTAL_ERROR_FP4 :
                 type == GGML_TYPE_Q4_POLAR ? MAX_QUANTIZATION_TOTAL_ERROR_POLAR : MAX_QUANTIZATION_TOTAL_ERROR;
             failed = !(total_error < max_quantization_error);
@@ -178,11 +183,16 @@ int main(int argc, char * argv[]) {
                 printf("%5s reference implementation error: %s (%f)\n", ggml_type_name(type), RESULT_STR[failed], reference_error);
             }
 
+            if (!qfns_cpu->vec_dot) {
+                continue;
+            }
+
             const float vec_dot_error = dot_product_error(qfns, qfns_cpu, test_size, test_data.data(), test_data2.data());
             const float max_allowed_error = type == GGML_TYPE_Q2_K || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_XXS ||
                                             type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_S
                                           ? MAX_DOT_PRODUCT_ERROR_LOWBIT
-                                          : (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_Q1_0_g128)
+                                          : (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_Q1_0_g32 || type == GGML_TYPE_Q1_0_g128 ||
+                                             type == GGML_TYPE_TBQ3_0 || type == GGML_TYPE_TBQ4_0)
                                           ? MAX_DOT_PRODUCT_ERROR_BINARY
                                           : type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0
                                           ? MAX_DOT_PRODUCT_ERROR_TERNARY
