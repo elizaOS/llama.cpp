@@ -1029,7 +1029,8 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
     for (const common_speculative_config & config : configs) {
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(config.type).c_str());
-        switch (config.type) {
+        try {
+            switch (config.type) {
             case COMMON_SPECULATIVE_TYPE_NONE:
                 break;
             case COMMON_SPECULATIVE_TYPE_DFLASH: {
@@ -1082,8 +1083,12 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 impls.push_back(std::move(state));
                 break;
             }
-            default:
-                break;
+                default:
+                    break;
+            }
+        } catch (const std::exception & e) {
+            LOG_ERR("%s: disabling speculative implementation '%s': %s\n",
+                    __func__, common_speculative_type_to_str(config.type).c_str(), e.what());
         }
     }
 
@@ -1112,7 +1117,10 @@ void common_speculative_free(common_speculative * spec) {
 common_speculative_draft_params & common_speculative_get_draft_params(
         common_speculative * spec,
         llama_seq_id seq_id) {
-    GGML_ASSERT(spec);
+    static common_speculative_draft_params disabled_dparams;
+    if (spec == nullptr) {
+        return disabled_dparams;
+    }
     GGML_ASSERT(seq_id < (llama_seq_id) spec->dparams.size());
 
     return spec->dparams[seq_id];
@@ -1226,13 +1234,14 @@ void common_speculative_draft(common_speculative * spec) {
 }
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
-    if (n_accepted == 0) {
+    if (spec == nullptr || n_accepted == 0) {
         return;
     }
 
     common_speculative_impl * impl = spec->impl_last[seq_id];
-
-    GGML_ASSERT(impl);
+    if (impl == nullptr) {
+        return;
+    }
 
     {
         common_time_meas tm(impl->t_accept_us, !impl->gen_perf);
