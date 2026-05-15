@@ -70,6 +70,8 @@ CI started reporting concrete failures across 3rd-party, virtgpu, cann, apple, h
 - **M** — HIP VGPR spills in `flash_attn_ext_vec<D=128/256, type_K=TBQ3_0/TBQ4_0>`. Files: ggml/src/ggml-cuda/fattn-common.cuh, ggml/src/ggml-cuda/turboquant.cuh
 - **S** — wave-4 in-flight CI triage (CI/CI vulkan/CI sycl/CI sanitize/CI self-hosted/Server/CI android/CI cann/CI riscv/CI openvino). Files: investigative; lane-respect O/P/Q/R.
 - **Q** — HIP `Build with Werror` failure on 854f61ee7 was NOT M's fattn-common.cuh — it's `ggml/src/ggml-cuda/cpy.cu:439-441` declaring `ne00/ne01/ne02` as `const int64_t` then reassigning them at lines 483-485 and 494-496. HIP clang `-Werror` rejects (gcc CUDA host build silently accepted). Files: ggml/src/ggml-cuda/cpy.cu
+- **P** — ggml-cpu.c switches missing GGML_OP_ATTN_SCORE_TBQ/POLAR. Files: ggml/src/ggml-cpu/ggml-cpu.c
+- **O** — test-model-load-buffer gguf_init_from_buffer undefined; implementing the function in ggml (refactor gguf_reader to accept FILE* or buffer source). Files: ggml/include/gguf.h, ggml/src/gguf.cpp
 
 ## Completed
 

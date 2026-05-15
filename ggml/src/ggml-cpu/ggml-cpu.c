@@ -2040,6 +2040,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_attn_score_qjl(params, tensor);
             } break;
+        case GGML_OP_ATTN_SCORE_TBQ:
+        case GGML_OP_ATTN_SCORE_POLAR:
+            {
+                // ELIZA-TBQ-POLAR-ATTN-DISPATCH-V1
+                // TBQ and POLAR attention score forward are GPU-only ops (Metal kernels
+                // live under ggml/src/ggml-metal/). The CPU backend never produces these
+                // ops directly — they are routed via the Metal backend or lowered to
+                // GGML_OP_ATTN_SCORE_QJL / FLASH_ATTN_EXT on CPU graphs. If we reach
+                // here, the graph builder put a Metal-only op on the CPU backend by
+                // mistake. Abort explicitly so the failure is visible.
+                GGML_ABORT("attn_score_tbq / attn_score_polar: no CPU implementation; route via Metal backend or use attn_score_qjl / flash_attn_ext on CPU graphs");
+            } break;
         case GGML_OP_FUSED_ATTN_QJL_TBQ:
             {
                 ggml_compute_forward_fused_attn_qjl_tbq(params, tensor);
@@ -2433,6 +2445,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = MIN(n_threads, n_heads);
             } break;
         case GGML_OP_ATTN_SCORE_QJL:
+        case GGML_OP_ATTN_SCORE_TBQ:
+        case GGML_OP_ATTN_SCORE_POLAR:
         case GGML_OP_FUSED_ATTN_QJL_TBQ:
             {
                 // ELIZA-CPU-THREAD-PARALLELISM-V1
@@ -2441,6 +2455,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 // space over ith/nth — each task owns disjoint score rows
                 // / head outputs, no shared scratch race (the fused op
                 // takes a per-task wdata slice; see the work-size case).
+                // TBQ / POLAR variants are Metal-only and abort in the
+                // compute_forward dispatcher; they are listed here so the
+                // n_tasks default-branch abort doesn't fire first and so
+                // the n_tasks contract stays uniform across the family.
                 n_tasks = n_threads;
             } break;
         case GGML_OP_WIN_PART:
