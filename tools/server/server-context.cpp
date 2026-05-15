@@ -860,6 +860,16 @@ private:
                 return false;
             }
 
+            // Upstream PR #22660: for SWA draft models, force swa_full on the
+            // draft context so prefix reuse (seq_rm + seq_add) works beyond
+            // the SWA window during speculation. Without this, the draft has
+            // to re-decode from the window edge on every long-context request
+            // and acceptance length degrades sharply.
+            if (llama_model_n_swa(model_dft.get()) > 0 && !params_dft.swa_full) {
+                SRV_INF("%s", "draft model uses SWA - enabling swa_full for the draft context\n");
+                params_dft.swa_full = true;
+            }
+
             auto cparams = common_context_params_to_llama(params_dft);
             ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
 
