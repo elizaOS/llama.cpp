@@ -7652,6 +7652,58 @@ static const ggml_type other_types[] = {
     GGML_TYPE_BF16,
 };
 
+// Eliza-specific custom quant types (IDs 42-50). These have CPU + Metal
+// (+ partial CUDA) implementations but no Vulkan kernels today. They are
+// intentionally tested as their own group so:
+//   1. CPU/Metal regressions in our quant code are caught immediately
+//      (via the dequant + cpy paths).
+//   2. The day someone wires up Vulkan support for any of these, the
+//      backend-vs-CPU parity comparison runs automatically without any
+//      test plumbing change — `ggml_backend_supports_op` flips to true
+//      for that type and the existing test harness compares outputs.
+// Until Vulkan ports land, every line below for Vulkan will print
+// "not supported" — which is the intended baseline. Do not delete these
+// tests when adding Vulkan support; just remove them from the unsupported
+// switch defaults in ggml-vulkan.cpp and the harness will start comparing.
+//
+// QJL1_256, Q4_POLAR, TBQ3_TCQ are K-cache-only (no GET_ROWS path on CPU
+// either), so they are listed only for CPY (which they support via
+// `from_float`). The standard quants (Q1_0_g32/g128, TBQ3_0, TBQ4_0,
+// TBQ3_K, TBQ4_K) get full GET_ROWS + CPY coverage.
+static const ggml_type eliza_custom_quant_types_get_rows[] = {
+    GGML_TYPE_Q1_0_g32,
+    GGML_TYPE_Q1_0_g128,
+    GGML_TYPE_TBQ3_0,
+    GGML_TYPE_TBQ4_0,
+    GGML_TYPE_TBQ3_K,
+    GGML_TYPE_TBQ4_K,
+};
+
+static const ggml_type eliza_custom_quant_types_cpy[] = {
+    GGML_TYPE_Q1_0_g32,
+    GGML_TYPE_Q1_0_g128,
+    GGML_TYPE_TBQ3_0,
+    GGML_TYPE_TBQ4_0,
+    GGML_TYPE_TBQ3_K,
+    GGML_TYPE_TBQ4_K,
+    GGML_TYPE_QJL1_256,
+    GGML_TYPE_Q4_POLAR,
+    GGML_TYPE_TBQ3_TCQ,
+};
+
+// Mul-mat: only the types that register a vec_dot in the CPU traits table.
+// QJL1_256 and TBQ3_TCQ are intentionally absent (no vec_dot - they are
+// scored via dedicated GGML_OP_ATTN_SCORE_QJL / fused attention paths).
+static const ggml_type eliza_custom_quant_types_mul_mat[] = {
+    GGML_TYPE_Q1_0_g32,
+    GGML_TYPE_Q1_0_g128,
+    GGML_TYPE_TBQ3_0,
+    GGML_TYPE_TBQ4_0,
+    GGML_TYPE_TBQ3_K,
+    GGML_TYPE_TBQ4_K,
+    GGML_TYPE_Q4_POLAR,
+};
+
 #ifdef _MSC_VER
 // Workaround long compile time with msvc
 #pragma optimize("", off)
@@ -7740,6 +7792,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (bool v : {false, true}) {
             test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 256, 5, 4, b, 1, v));
         }
+    }
+
+    // Eliza custom quants: GET_ROWS parity. Block sizes vary (32 / 128 /
+    // 256) so we pick row width 256 which is a multiple of all of them.
+    // On CPU+Metal these run for real; on Vulkan the harness prints
+    // "not supported" until a Vulkan kernel is wired up.
+    for (ggml_type type : eliza_custom_quant_types_get_rows) {
+        test_cases.emplace_back(new test_get_rows(type, 256, 5, 4, 1, 1, false));
+        test_cases.emplace_back(new test_get_rows(type, 256, 5, 4, 1, 1, true));
     }
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
@@ -8146,6 +8207,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_cpy(type_src, type_dst, {256, 2, 3, 4}, {1, 0, 2, 3})); // cpy not-contiguous
         }
     }
+
+    // Eliza custom quants: CPY parity.
+    //   F32 -> custom_quant  (quantize path)  -- exercises from_float
+    //   custom_quant -> F32  (dequantize path) -- exercises to_float
+    // Vulkan currently rejects both directions for these types in
+    // ggml_backend_vk_device_supports_op; the harness prints
+    // "not supported" until a Vulkan kernel is wired up.
+    for (ggml_type type_dst : eliza_custom_quant_types_cpy) {
+        test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, type_dst, {256, 4, 4, 4}));
+    }
+    for (ggml_type type_src : eliza_custom_quant_types_cpy) {
+        // Skip QJL/POLAR/TCQ for the dequant-to-F32 path: their to_float
+        // is defined but only via cache-attention codepaths, not the
+        // generic ggml_compute_forward_dup_q path. The standard quants
+        // (g32/g128/TBQ3_0/TBQ4_0/K-variants) are full participants.
+        if (type_src == GGML_TYPE_QJL1_256 ||
+            type_src == GGML_TYPE_Q4_POLAR ||
+            type_src == GGML_TYPE_TBQ3_TCQ) {
+            continue;
+        }
+        test_cases.emplace_back(new test_cpy(type_src, GGML_TYPE_F32, {256, 4, 4, 4}));
+    }
+
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_I32, {256, 2, 3, 4}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_I32, {256, 2, 3, 4}, {1, 0, 2, 3}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_F32, {256, 2, 3, 4}));
@@ -8377,6 +8461,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 256, { 1,  1}, {1, 1}));
         }
+    }
+
+    // Eliza custom quants: MUL_MAT parity (CPU + Metal run for real;
+    // Vulkan prints "not supported" until a kernel is wired up). k=256 is
+    // a multiple of every custom-quant block size (32 / 128 / 256), so we
+    // can use a single shape across the whole list.
+    for (ggml_type type_a : eliza_custom_quant_types_mul_mat) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 1, 256, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 4, 256, {1, 1}, {1, 1}));
     }
 
 #if 0

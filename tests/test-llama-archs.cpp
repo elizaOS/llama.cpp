@@ -428,6 +428,21 @@ static bool arch_supported(const llm_arch arch) {
         return false;
     }
 
+    // Eliza-specific speculative draft arch. After wave-9/10 (Z `8c1885b6c` +
+    // DD `0f2998990`), the model loader no longer synthesizes zero-placeholder
+    // tensors on the `files.empty() && tid == -1 && !no_alloc` path for
+    // required tensors. `LLM_ARCH_DFLASH_DRAFT` registers `dflash_fc.weight`
+    // and `dflash_hidden_norm` as required (src/llama-arch.cpp:560-561), but
+    // the test fixture's sparse gguf only lists 8 wavtokenizer-shaped
+    // placeholders, so model load aborts with
+    // `error loading model: missing tensor 'dflash_fc.weight'`. The arch is
+    // an Eliza-specific draft head for speculative decoding (see
+    // src/models/dflash-draft.cpp) and is not the test's primary subject;
+    // skip it here using the same pattern as QWEN35/QWEN35MOE above.
+    if (arch == LLM_ARCH_DFLASH_DRAFT) {
+        return false;
+    }
+
     return true;
 }
 
