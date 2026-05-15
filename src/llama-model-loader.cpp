@@ -1270,7 +1270,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             if (t) {
                 return t;
             }
-        } else {
+        } else if (tid != -1) {
+            // Only count tensors that were actually present in the gguf metadata.
+            // n_tensors == gguf_get_n_tensors(metadata) for files.empty(), so synthesized
+            // placeholders (tid == -1, no_alloc=false) must not be counted — otherwise the
+            // done_getting_tensors check fails for callers (e.g. test-llama-archs) that
+            // pass a sparse gguf and rely on the loader to fill in the arch's other tensors.
             n_created++;
         }
 
