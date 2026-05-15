@@ -104,13 +104,14 @@ option(LLAMA_SANITIZE_UNDEFINED "llama: enable undefined sanitizer" OFF)
 option(LLAMA_BUILD_COMMON "llama: build common utils library" ${LLAMA_STANDALONE})
 
 # extra artifacts
-option(LLAMA_BUILD_TESTS    "llama: build tests"          ${LLAMA_STANDALONE})
-option(LLAMA_BUILD_TOOLS    "llama: build tools"          ${LLAMA_STANDALONE})
-option(LLAMA_BUILD_EXAMPLES "llama: build examples"       ${LLAMA_STANDALONE})
-option(LLAMA_BUILD_SERVER   "llama: build server example" ${LLAMA_STANDALONE})
-option(LLAMA_BUILD_WEBUI    "llama: build the embedded Web UI for server"  ON)
-option(LLAMA_TOOLS_INSTALL  "llama: install tools"        ${LLAMA_TOOLS_INSTALL_DEFAULT})
-option(LLAMA_TESTS_INSTALL  "llama: install tests"        ON)
+option(LLAMA_BUILD_TESTS            "llama: build tests"                                                                            ${LLAMA_STANDALONE})
+option(LLAMA_BUILD_TOOLS            "llama: build tools"                                                                            ${LLAMA_STANDALONE})
+option(LLAMA_BUILD_EXAMPLES         "llama: build examples"                                                                         ${LLAMA_STANDALONE})
+option(LLAMA_BUILD_SERVER           "llama: build server example"                                                                   ${LLAMA_STANDALONE})
+option(LLAMA_BUILD_WEBUI            "llama: build the embedded Web UI for server"                                                   ON)
+option(LLAMA_USE_PREBUILT_WEBUI     "llama: use prebuilt WebUI from HF Bucket when available (requires LLAMA_BUILD_WEBUI=ON)"       ON)
+option(LLAMA_TOOLS_INSTALL          "llama: install tools"                                                                          ${LLAMA_TOOLS_INSTALL_DEFAULT})
+option(LLAMA_TESTS_INSTALL          "llama: install tests"                                                                          ON)
 
 # omnivoice.cpp merged subtree: opt-in. When enabled, tools/omnivoice/
 # is compiled against the same GGML + backend selection as the rest of

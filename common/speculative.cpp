@@ -21,8 +21,8 @@
 
 const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
-    {"draft",         COMMON_SPECULATIVE_TYPE_DRAFT},
-    {"eagle3",        COMMON_SPECULATIVE_TYPE_EAGLE3},
+    {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
+    {"draft-eagle3",  COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3},
     {"ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
@@ -79,7 +79,7 @@ static bool common_speculative_are_compatible(
     }
 
     const llama_rope_type rope_type_tgt = llama_model_rope_type(model_tgt);
-    if (spec_type == COMMON_SPECULATIVE_TYPE_DRAFT &&
+    if (spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE &&
         (rope_type_tgt == LLAMA_ROPE_TYPE_MROPE || rope_type_tgt == LLAMA_ROPE_TYPE_IMROPE)) {
         LOG_WRN("%s: target model uses M-RoPE, which is not currently compatible with "
                 "speculative decoding because the target batch validator requires strict "
@@ -160,14 +160,14 @@ struct common_speculative_impl {
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted) = 0;
 };
 
-struct common_speculative_state_draft : public common_speculative_impl {
+struct common_speculative_impl_draft_simple : public common_speculative_impl {
     common_params_speculative_draft params;
 
     llama_batch batch;
 
     std::vector<common_sampler_ptr> smpls;
 
-    common_speculative_state_draft(
+    common_speculative_impl_draft_simple(
             common_speculative_type type,
             const common_params_speculative & params,
             uint32_t n_seq)
@@ -225,7 +225,7 @@ struct common_speculative_state_draft : public common_speculative_impl {
         }
     }
 
-    ~common_speculative_state_draft() override {
+    ~common_speculative_impl_draft_simple() override {
         llama_batch_free(batch);
     }
 
@@ -359,11 +359,11 @@ struct common_speculative_state_draft : public common_speculative_impl {
     }
 };
 
-struct common_speculative_state_eagle3 : public common_speculative_impl {
+struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     //common_params_speculative_eagle3 params;
 
-    common_speculative_state_eagle3(const common_params_speculative & /*params*/, uint32_t n_seq)
-        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_EAGLE3, n_seq) {}
+    common_speculative_impl_draft_eagle3(const common_params_speculative & /*params*/, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, n_seq) {}
 
     void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
         // noop
@@ -384,13 +384,13 @@ struct common_speculative_state_eagle3 : public common_speculative_impl {
 };
 
 // state of self-speculation (simple implementation, not ngram-map)
-struct common_speculative_state_ngram_simple : public common_speculative_impl {
+struct common_speculative_impl_ngram_simple : public common_speculative_impl {
     common_params_speculative_ngram_map params;
 
     // shared across all sequences
     common_ngram_simple_config config;
 
-    common_speculative_state_ngram_simple(
+    common_speculative_impl_ngram_simple(
             const common_params_speculative & params, uint32_t n_seq,
             common_ngram_simple_config config)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE, n_seq)
@@ -424,13 +424,13 @@ struct common_speculative_state_ngram_simple : public common_speculative_impl {
     }
 };
 
-struct common_speculative_state_ngram_map_k : public common_speculative_impl {
+struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
     common_params_speculative_ngram_map params;
 
     // n_seq configs
     std::vector<common_ngram_map> config;
 
-    common_speculative_state_ngram_map_k(
+    common_speculative_impl_ngram_map_k(
             const common_params_speculative & params,
             const common_ngram_map & config,
             uint32_t n_seq)
@@ -472,7 +472,7 @@ struct common_speculative_state_ngram_map_k : public common_speculative_impl {
     }
 };
 
-struct common_speculative_state_ngram_mod : public common_speculative_impl {
+struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     common_params_speculative_ngram_mod params;
 
     // shared across all sequences
@@ -494,7 +494,7 @@ struct common_speculative_state_ngram_mod : public common_speculative_impl {
 
     std::vector<seq_info> sinfos;
 
-    common_speculative_state_ngram_mod(
+    common_speculative_impl_ngram_mod(
             const common_params_speculative & params,
             uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_MOD, n_seq)
@@ -640,7 +640,7 @@ struct common_speculative_state_ngram_mod : public common_speculative_impl {
     }
 };
 
-struct common_speculative_state_ngram_cache : public common_speculative_impl {
+struct common_speculative_impl_ngram_cache : public common_speculative_impl {
     common_params_speculative_ngram_cache params;
 
     uint16_t n_draft;
@@ -658,7 +658,7 @@ struct common_speculative_state_ngram_cache : public common_speculative_impl {
 
     std::vector<seq_info> sinfos;
 
-    common_speculative_state_ngram_cache(
+    common_speculative_impl_ngram_cache(
             const common_params_speculative & params,
             uint32_t n_seq,
             uint16_t n_draft,
@@ -794,7 +794,7 @@ static common_ngram_map get_common_ngram_map(
     return common_ngram_map(size_key, size_value, key_only, min_hits);
 }
 
-static common_speculative_state_ngram_cache create_state_ngram_cache(
+static common_speculative_impl_ngram_cache create_state_ngram_cache(
         const common_speculative_config & config,
         uint32_t n_seq,
         const std::string & path_static,
@@ -805,7 +805,7 @@ static common_speculative_state_ngram_cache create_state_ngram_cache(
     bool save_static = false;
     bool save_dynamic = false;
 
-    common_speculative_state_ngram_cache state(config.params, n_seq, n_draft, path_static, path_dynamic, save_static, save_dynamic);
+    common_speculative_impl_ngram_cache state(config.params, n_seq, n_draft, path_static, path_dynamic, save_static, save_dynamic);
 
     return state;
 }
@@ -837,8 +837,8 @@ const char * common_speculative_all_types_str() {
 std::string common_speculative_type_to_str(common_speculative_type type) {
     switch (type) {
         case COMMON_SPECULATIVE_TYPE_NONE:          return "none";
-        case COMMON_SPECULATIVE_TYPE_DRAFT:         return "draft";
-        case COMMON_SPECULATIVE_TYPE_EAGLE3:        return "eagle3";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return "draft-simple";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
         case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   return "ngram-map-k";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
@@ -892,10 +892,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
     {
         uint32_t enabled_configs = common_get_enabled_speculative_configs(params.types);
 
-        bool has_dflash = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DFLASH));
-        bool has_draft = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT)) || has_dflash;
-        bool has_draft_model = !params.draft.mparams.path.empty();
+        bool has_draft_model_path = !params.draft.mparams.path.empty();
 
+        bool has_draft_simple = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE));
+        bool has_dflash       = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DFLASH));
+        has_draft_simple = has_draft_simple || has_dflash;
         // bool has_mtp = false; // TODO: add MTP here
         bool has_draft_eagle3 = false; // TODO PR-18039: if params.speculative.eagle3
 
@@ -931,22 +932,22 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         if (has_ngram_cache) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE, params));
         }
-        if (has_draft) {
-            if (!has_draft_model) {
+        if (has_draft_simple) {
+            if (!has_draft_model_path) {
                 LOG_WRN("%s: draft model is not specified - cannot use 'draft' type\n", __func__);
-                has_draft = false;
+                has_draft_simple = false;
             }
-        } else if (has_draft_model) {
+        } else if (has_draft_model_path) {
             LOG_WRN("%s: draft model is specified but 'draft' speculative type is not explicitly enabled - enabling it\n", __func__);
-            has_draft = true;
+            has_draft_simple = true;
         }
 
-        if (has_draft) {
-            configs.push_back(common_speculative_config(has_dflash ? COMMON_SPECULATIVE_TYPE_DFLASH : COMMON_SPECULATIVE_TYPE_DRAFT, params));
+        if (has_draft_simple) {
+            configs.push_back(common_speculative_config(has_dflash ? COMMON_SPECULATIVE_TYPE_DFLASH : COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE, params));
         }
         // TODO: add MTP here
         if (has_draft_eagle3) {
-            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_EAGLE3, params));
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params));
         }
     }
 
@@ -957,13 +958,16 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         switch (config.type) {
             case COMMON_SPECULATIVE_TYPE_NONE:
                 break;
-            case COMMON_SPECULATIVE_TYPE_DRAFT:
             case COMMON_SPECULATIVE_TYPE_DFLASH: {
-                impls.push_back(std::make_unique<common_speculative_state_draft>(config.type, config.params, n_seq));
+                impls.push_back(std::make_unique<common_speculative_impl_draft_simple>(config.type, config.params, n_seq));
                 break;
             }
-            case COMMON_SPECULATIVE_TYPE_EAGLE3: {
-                impls.push_back(std::make_unique<common_speculative_state_eagle3>(config.params, n_seq));
+            case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE: {
+                impls.push_back(std::make_unique<common_speculative_impl_draft_simple>(config.type, config.params, n_seq));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3: {
+                impls.push_back(std::make_unique<common_speculative_impl_draft_eagle3>(config.params, n_seq));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {
@@ -976,7 +980,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                     /* .size_ngram = */ ngram_size_key,
                     /* .size_mgram = */ mgram_size_value
                 };
-                auto state = std::make_unique<common_speculative_state_ngram_simple>(
+                auto state = std::make_unique<common_speculative_impl_ngram_simple>(
                     /* .params = */ config.params,
                     /* .n_seq  = */ n_seq,
                     /* .state  = */ config_simple
@@ -987,13 +991,13 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
             case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: {
                 impls.push_back(
-                        std::make_unique<common_speculative_state_ngram_map_k>(
+                        std::make_unique<common_speculative_impl_ngram_map_k>(
                             config.params, get_common_ngram_map(config.type, config.params.ngram_map_k), n_seq));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_MOD: {
                 impls.push_back(
-                        std::make_unique<common_speculative_state_ngram_mod>(config.params, n_seq));
+                        std::make_unique<common_speculative_impl_ngram_mod>(config.params, n_seq));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE: {
@@ -1001,7 +1005,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                         config, n_seq,
                         params.ngram_cache.lookup_cache_static,
                         params.ngram_cache.lookup_cache_dynamic);
-                impls.push_back(std::make_unique<common_speculative_state_ngram_cache>(state));
+                impls.push_back(std::make_unique<common_speculative_impl_ngram_cache>(state));
                 break;
             }
             default:
@@ -1010,7 +1014,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
     }
 
     if (impls.empty()) {
-        LOG_WRN("%s", "no implementations specified for speculative decoding\n");
+        LOG_WRN("%s: no implementations specified for speculative decoding\n", __func__);
         return nullptr;
     }
 
