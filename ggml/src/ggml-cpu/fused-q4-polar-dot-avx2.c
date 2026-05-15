@@ -204,3 +204,6 @@ double ggml_vec_dot_q4_polar_q8_0_fused_avx2(int nb_polar,
 }
 
 #endif /* __AVX2__ */
+
+/* Avoid ISO C "empty translation unit" pedantic error when __AVX2__ is undefined. */
+typedef int fused_q4_polar_dot_avx2_iso_c_tu_stub;

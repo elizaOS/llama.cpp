@@ -289,8 +289,23 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
     return sum;
 }
 
+// NOTE: TBQ decode produces a per-thread `float[QK_TBQ]` buffer and runs a fully-unrolled
+// length-32 fast Hadamard transform. When this function is __forceinline__d into the outer
+// flash_attn_ext_vec kernel, the outer #pragma unroll over `i_KQ_0 = 0..nthreads_KQ` (up to
+// 8 iterations) plus the inner #pragma unroll over `k_KQ_0` (up to 4 iterations for D=256)
+// keeps dozens of 32-float decode buffers live simultaneously, blowing AMD's 256-VGPR-per-
+// thread budget by 4-20x (CI observed 1100-5300 total VGPRs incl. spill for D=128/256).
+//
+// On HIP we mark this __noinline__ so the decode/FHT stays a real function call and the
+// transient `float block[32]` buffer cannot be replicated across unrolled call sites. On
+// NVIDIA we keep the original __forceinline__ since CUDA targets have larger register files
+// and the AMD-specific issue does not manifest.
 template <typename block_tbq, int D, int nthreads>
+#ifdef GGML_USE_HIP
+static __device__ __attribute__((noinline)) float vec_dot_fattn_vec_KQ_tbq(
+#else
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq(
+#endif
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
 
     const block_tbq * K_tbq = (const block_tbq *) K_c;
@@ -304,7 +319,8 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq(
 
     float sum = 0.0f;
 
-#pragma unroll
+    // Intentionally not #pragma unroll'd on HIP: the per-iteration `float block[QK_TBQ]`
+    // decode buffer + length-32 FHT is too heavy to keep multiple copies live.
     for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
         const int i_half2 = k_KQ_0 + lane*cpy_ne;
         const int i_elem = 2*i_half2;
@@ -633,8 +649,14 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     }
 }
 
+// See comment on vec_dot_fattn_vec_KQ_tbq: __noinline__ on HIP to prevent the outer kernel
+// from replicating the 32-float decode buffer across its unrolled V-iteration loop.
 template <typename block_tbq, typename T, int ne>
+#ifdef GGML_USE_HIP
+static __device__ __attribute__((noinline)) void dequantize_V_tbq(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+#else
 static __device__ __forceinline__ void dequantize_V_tbq(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+#endif
     const block_tbq * x = (const block_tbq *) vx;
 
     const int64_t ib = i0 / QK_TBQ;
