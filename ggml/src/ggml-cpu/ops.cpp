@@ -11444,6 +11444,11 @@ static void ggml_compute_forward_istft_f32(
     const float * mag_data   = (const float *) src0->data;
     float       * out_data   = (float *)       dst->data;
 
+    // MSVC does not define M_PI by default (it lives behind _USE_MATH_DEFINES);
+    // declare a local constant so the Windows-SYCL / Server-Windows builds
+    // compile without depending on the math.h extension.
+    static constexpr double K_PI = 3.14159265358979323846;
+
     // Build / borrow the Hann window.
     std::vector<float> win_local;
     const float * win_ptr = nullptr;
@@ -11454,7 +11459,7 @@ static void ggml_compute_forward_istft_f32(
     } else {
         // Periodic Hann — same as numpy.hanning with symmetric=False.
         win_local.resize((size_t) win_length);
-        const double scale = 2.0 * M_PI / (double) win_length;
+        const double scale = 2.0 * K_PI / (double) win_length;
         for (int i = 0; i < win_length; ++i) {
             win_local[(size_t)i] = (float)(0.5 - 0.5 * std::cos(scale * (double)i));
         }
@@ -11505,7 +11510,7 @@ static void ggml_compute_forward_istft_f32(
             }
             const int interior_end = F - ((n_fft & 1) == 0 ? 1 : 0);
             for (int f = 1; f < interior_end; ++f) {
-                const double angle = 2.0 * M_PI * (double) f * (double) k * inv_n;
+                const double angle = 2.0 * K_PI * (double) f * (double) k * inv_n;
                 acc += 2.0 * ((double) re[f] * std::cos(angle) -
                               (double) im[f] * std::sin(angle));
             }
