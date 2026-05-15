@@ -108,7 +108,7 @@ The full failure log set (71 raw failures across 9 workflows) collapses to 7 dis
 ## Completed
 
 <!-- agents append here after commit -->
-- **CC** <pending-sha> — fix(fused-kernels/msvc): add GGML_ALIGN(N) and GGML_THREAD_LOCAL macros in ggml-cpu-impl.h (GCC `__attribute__((aligned))`/`__thread` vs MSVC `__declspec(align)`/`__declspec(thread)`); replace 4 alignment sites + 4 thread-local sites across 5 fused-* TUs so the Windows-SYCL build (MSVC cl.exe) accepts the per-thread scratch buffers and stack-aligned arrays. macOS arm64 verifies clean.
+- **CC** 898588a9e — fix(fused-kernels/msvc): add GGML_ALIGN(N) and GGML_THREAD_LOCAL macros in ggml-cpu-impl.h (GCC `__attribute__((aligned))`/`__thread` vs MSVC `__declspec(align)`/`__declspec(thread)`); replace 4 alignment sites + 4 thread-local sites across 5 fused-* TUs so the Windows-SYCL build (MSVC cl.exe) accepts the per-thread scratch buffers and stack-aligned arrays. macOS arm64 verifies clean.
 - **A** 858c820ad — fix(qjl): empty-TU guard in qjl_quantize_avx2.c when AVX2 disabled (added typedef stub outside `#if __AVX2__`)
 - **C** 8921d3cc4 — fix(ops): add QJL1_256/Q4_POLAR/TBQ3_TCQ to the exhaustive abort-group in ggml_compute_forward_clamp (only `-Wswitch`-affected switch in ops.cpp; all others use `default:`). No other arch-specific ops.cpp under ggml/src/ggml-cpu.
 - **E** ff0b750bb — fix(qjl): replace `pthread_once` with stdatomic CAS in `quants-qjl.c` (Windows MSVC has no `pthread.h`); add `<alloca.h>`/`<malloc.h>` portability include block to `fused-attn-qjl-tbq.c` (mirroring `ggml.c`'s pattern). Unblocks windows-2022-cuda, windows-latest-hip, windows-latest llvm-arm64, ubuntu-24-webgpu, ubuntu-24-webgpu-wasm builds. Backlog of 8 additional findings appended below.
