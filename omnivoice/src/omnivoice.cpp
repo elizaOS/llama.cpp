@@ -25,6 +25,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 // Internal definition of the opaque handle. C++ types are fine here
 // because nothing in this struct ever crosses the public ABI boundary :
@@ -324,6 +325,49 @@ enum ov_status ov_synthesize(struct ov_context * ov, const struct ov_tts_params 
         if (out) {
             ov_audio_free(out);
         }
+        return OV_STATUS_GENERATE_FAILED;
+    }
+}
+
+enum ov_status ov_encode_reference(struct ov_context * ov,
+                                   const float * pcm,
+                                   int n_samples,
+                                   int32_t ** out_tokens,
+                                   int * out_K,
+                                   int * out_ref_T) {
+    if (!ov || !pcm || n_samples <= 0 || !out_tokens || !out_K || !out_ref_T) {
+        ov_set_error("ov_encode_reference : invalid arguments");
+        return OV_STATUS_INVALID_PARAMS;
+    }
+    if (!ov->codec_loaded) {
+        ov_set_error("ov_encode_reference : codec not loaded (pass codec_path to ov_init)");
+        ov_log(OV_LOG_ERROR, "[OmniVoice] ov_encode_reference requires a codec-loaded handle");
+        return OV_STATUS_INVALID_PARAMS;
+    }
+
+    try {
+        int K = 0;
+        int ref_T = 0;
+        std::vector<int32_t> tokens =
+            pipeline_tts_encode_reference(&ov->pt, &ov->pc, pcm, n_samples,
+                                          &K, &ref_T, nullptr);
+        if (tokens.empty() || K <= 0 || ref_T <= 0) {
+            return OV_STATUS_GENERATE_FAILED;
+        }
+        const size_t n_tokens = tokens.size();
+        int32_t * copy = (int32_t *) std::malloc(n_tokens * sizeof(int32_t));
+        if (!copy) {
+            ov_set_error("ov_encode_reference : out of memory");
+            return OV_STATUS_GENERATE_FAILED;
+        }
+        std::memcpy(copy, tokens.data(), n_tokens * sizeof(int32_t));
+        *out_tokens = copy;
+        *out_K = K;
+        *out_ref_T = ref_T;
+        return OV_STATUS_OK;
+    } catch (const std::exception & e) {
+        ov_set_error("%s", e.what());
+        ov_log(OV_LOG_ERROR, "[OmniVoice] %s", e.what());
         return OV_STATUS_GENERATE_FAILED;
     }
 }

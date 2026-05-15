@@ -157,6 +157,17 @@ bool pipeline_tts_resolve_instruct(const VoiceDesign * vd,
 // of truth shared by every CLI / API entry that exposes --duration.
 int pipeline_tts_duration_sec_to_tokens(const PipelineCodec * pc, float duration_sec);
 
+// Encode a 24 kHz mono reference waveform into row-major [K, ref_T] RVQ
+// tokens using the same HuBERT + codec preprocessing path as synthesis.
+// Returns an empty vector and sets ov_last_error on failure.
+std::vector<int32_t> pipeline_tts_encode_reference(PipelineTTS *     pt,
+                                                   PipelineCodec *   pc,
+                                                   const float *     ref_audio_24k,
+                                                   int               ref_n_samples,
+                                                   int *             out_K,
+                                                   int *             out_ref_T,
+                                                   const char *      dump_dir = nullptr);
+
 // Public TTS synthesis entry. Resolves the instruct string against vd, picks
 // between the single-shot, chunked auto-voice and voice-cloning paths from
 // the params struct, and fills `out` with mono float PCM at the codec sample

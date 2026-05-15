@@ -252,6 +252,17 @@ OV_API void ov_tts_default_params(struct ov_tts_params * p);
 // `out` empty. Requires a codec-loaded handle.
 OV_API enum ov_status ov_synthesize(struct ov_context * ov, const struct ov_tts_params * params, struct ov_audio * out);
 
+// Encode a 24 kHz mono fp32 reference waveform through the OmniVoice
+// tokenizer and return row-major [K, ref_T] int32 RVQ tokens. The returned
+// buffer is malloc-allocated by the library and must be released with free()
+// by callers that bind this low-level OmniVoice ABI directly.
+OV_API enum ov_status ov_encode_reference(struct ov_context * ov,
+                                          const float * pcm,
+                                          int n_samples,
+                                          int32_t ** out_tokens,
+                                          int * out_K,
+                                          int * out_ref_T);
+
 // Convert a duration in seconds to a frame count using the bundled codec
 // frame rate (sample_rate / hop_length). Clamps to a minimum of one
 // frame. Requires a codec-loaded handle.
