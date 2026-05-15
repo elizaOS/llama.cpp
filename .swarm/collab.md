@@ -57,6 +57,14 @@ CI started reporting concrete failures across 3rd-party, virtgpu, cann, apple, h
 - **T. Anthropic vision multimodal crash** (S's backlog #20) — `test_anthropic_vision_base64_with_multimodal_model` crashes the server (`RemoteDisconnected`) on both `server (default)` and `server (backend-sampling)` jobs. Upstream test from commit `ddf9f9438 server : add Anthropic Messages API support`. 71 other Anthropic-compat tests pass; only the multimodal vision endpoint crashes. Likely a real bug in `tools/server/server-http.cpp` Anthropic→chat translator or `tools/mtmd/mtmd-helper.cpp`. Run the test locally if you have the multimodal model available, or read S's backlog #20 entry for the repro recipe and suspects.
 - **U. Continuous CI watcher** — 56 runs are queued against the wave-4 HEAD and will start completing soon. Watch `gh run list --branch eliza/token-trie-sampler` cyclically (5 cycles, ~5-8 minutes apart). For each new failure: classify by lane owner, fix if ≤2 files and unowned, else log in `## Backlog from agent U`. Stop after 5 cycles or when distinct failure modes are exhausted. Do NOT touch T's lane (tools/server/server-http.cpp, tools/mtmd/*).
 
+## Wave 6 work breakdown
+
+- **V. Missing-prototypes errors in Eliza fused kernels** — `-Werror=missing-prototypes` failures on the latest HEAD (`13c658e46`, run id 25900097466, ubuntu-24-llguidance):
+  - `ggml/src/ggml-cpu/fused-q4-polar-dot-neon.c:118` — `ggml_vec_dot_q4_polar_q8_0_fused_neon` (non-static, no header decl)
+  - `ggml/src/ggml-cpu/fused-attn-qjl-tbq.c:184` — `fused_attn_v_mix_ref` (likely meant `static`)
+  - `ggml/src/ggml-cpu/fused-attn-qjl-tbq.c:221` — `fused_attn_qjl_tbq_ref` (likely meant `static`)
+  Fix: either (a) add `static` if the function is file-local (most likely for the `_ref` variants — they sound like reference impls used only inside the same TU), (b) add a header declaration in a sibling `*.h` and include it. Also SWEEP the rest of `ggml/src/ggml-cpu/` for similar Eliza-only sources with non-static C functions that lack header declarations. Files: `ggml/src/ggml-cpu/fused-q4-polar-dot-neon.c`, `ggml/src/ggml-cpu/fused-attn-qjl-tbq.c`, possibly a new/existing header, plus any siblings discovered during sweep.
+
 ## Live agents
 
 <!-- agents append here -->
