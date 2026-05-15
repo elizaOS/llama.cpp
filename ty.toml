@@ -14,6 +14,11 @@ exclude = [
 include = [
     "./tools/server/tests/**",
     "./scripts/snapdragon/qdc/**",
+    # tools/kokoro tooling imports the upstream `kokoro` Python package
+    # for reference-activation dumping; that package isn't in CI, so the
+    # type-checker can't resolve it. It runs only against an installed
+    # kokoro env, not under CI.
+    "./tools/kokoro/tools/**",
 ]
 
 [overrides.rules]

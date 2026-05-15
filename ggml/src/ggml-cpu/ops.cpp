@@ -11468,13 +11468,6 @@ static void ggml_compute_forward_istft_f32(
     // Temporary per-frame real + imag and IDFT output.
     std::vector<float> re((size_t) F), im((size_t) F), frame((size_t) n_fft);
 
-    // src0 strides: data is laid out [2, F, T] in row-major C order when
-    // contiguous, so element at [ch, f, t] = data[ch*F*T + f*T + t].
-    // nb[] stores byte strides: nb[0]=elem_size, nb[1]=row_stride, nb[2]=...
-    const int64_t st_ch = src0->nb[2] / sizeof(float);  // stride over channel (ne[2]=T dimension)
-    const int64_t st_f  = src0->nb[1] / sizeof(float);  // stride over F dimension
-    const int64_t st_t  = src0->nb[0] / sizeof(float);  // stride over T (innermost in ggml)
-
     // NOTE: ggml tensor dimensions are column-major: ne[0] is the fastest
     // varying. Our mag_phase is declared [2, F, T], but ggml stores as
     // ne[0]=T, ne[1]=F, ne[2]=2 (the last dimension listed is the slowest).

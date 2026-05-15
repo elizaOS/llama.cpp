@@ -186,9 +186,12 @@ void ggml_cuda_op_istft(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     istft_normalize_kernel<<<blocks_n, CUDA_ISTFT_BLOCK_SIZE, 0, stream>>>(
         out_data, d_norm, n_out);
 
-    // Free temporaries (device-side; stream-ordered via event in caller).
-    CUDA_CHECK(cudaFreeAsync(d_norm, stream));
+    // Free temporaries. cudaFree is the portable form (HIP lacks
+    // cudaFreeAsync on older toolkits); sync on the stream first so the
+    // pending kernels finish before we release the device buffers.
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaFree(d_norm));
     if (src1 == nullptr) {
-        CUDA_CHECK(cudaFreeAsync(d_win, stream));
+        CUDA_CHECK(cudaFree(d_win));
     }
 }
