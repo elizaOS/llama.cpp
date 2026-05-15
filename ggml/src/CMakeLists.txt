@@ -209,22 +209,26 @@ add_library(ggml-base
             polar_centroids.h
             gguf.cpp)
 
-# ELIZA-NON-APPLE-QJL-IN-GGML-BASE
+# ELIZA-SHARED-QJL-IN-GGML-BASE
 # ggml.c (built into ggml-base) references the QJL dequantize/quantize
 # symbols via the type_traits table (`.to_float = dequantize_row_qjl1_256`
-# etc.). On Windows (PE/COFF) every imported symbol must resolve at link
-# time, so the QJL TUs must live in ggml-base. On Linux ELF shared libs
-# the same is required by default ld behaviour when downstream targets
-# (e.g. `llama-gguf`, `llama-gguf-hash`) link against `libggml-base.so`
-# WITHOUT also linking `libggml-cpu` — undefined symbols in ggml-base
-# propagate to those binaries and break the build.
-# On Apple, however, the xcframework build pipeline runs `libtool -static`
-# to combine `libggml-base.a + libggml-cpu.a`; if QJL TUs live in BOTH
-# archives the result contains duplicate symbols and the subsequent
-# `clang++ -Wl,-force_load,combined.a` step fails. So Apple is the one
-# platform where QJL must NOT live in ggml-base.
+# etc.). For shared-library builds (Linux .so, Windows .dll, Apple .dylib),
+# `libggml-base` is linked as a shared lib in isolation — its symbols must
+# resolve at lib-link time, NOT defer to the final-executable link. So
+# every shared build needs the QJL TUs inside ggml-base. Without this,
+# `libggml-base.so/.dylib` ends up with undefined `_dequantize_row_qjl1_256`,
+# `_quantize_qjl1_256`, `_quantize_row_qjl1_256_ref` (referenced from the
+# `_type_traits` global and from `ggml_quantize_chunk`), and the link fails
+# (Linux/Android/iOS shared .dylib all hit this).
+# For static-library builds (e.g. Apple xcframework which sets
+# BUILD_SHARED_LIBS=OFF and then runs `xcrun libtool -static` to combine
+# libggml-base.a + libggml-cpu.a), including QJL TUs in BOTH archives
+# produces duplicate symbols that `clang++ -Wl,-force_load,combined.a`
+# rejects. In the static path, the final link of consumers pulls in
+# ggml-cpu transitively (`target_link_libraries(ggml PUBLIC ggml-cpu)`)
+# so the symbols still resolve from ggml-cpu alone.
 # The list mirrors QJL_GGML_BASE_LINK_FILES in kernel-patches/cpu-simd-kernels.mjs.
-if (NOT APPLE)
+if (BUILD_SHARED_LIBS OR WIN32)
     target_sources(ggml-base PRIVATE
         ggml-cpu/qjl/quants-qjl.c
         ggml-cpu/qjl/qjl_dispatch.c
