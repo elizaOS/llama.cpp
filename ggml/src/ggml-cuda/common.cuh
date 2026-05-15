@@ -37,6 +37,20 @@
 #include "vendors/cuda.h"
 #endif // defined(GGML_USE_HIP)
 
+template<int q8_1_layout_block_size>
+struct block_q8_1_layout {
+    static_assert(q8_1_layout_block_size % QK8_1 == 0, "q8_1 layout block size must contain whole q8_1 blocks");
+
+    static constexpr int q8_1_blocks = q8_1_layout_block_size / QK8_1;
+
+    // Scales for all q8_1 blocks in the layout group are stored before the quantized values.
+    half2   ds[q8_1_blocks];
+    int32_t qs[q8_1_layout_block_size / sizeof(int32_t)];
+};
+
+static_assert(sizeof(block_q8_1_layout<QK8_1>) == sizeof(block_q8_1), "Unexpected block_q8_1 layout size");
+static_assert(sizeof(block_q8_1_layout<4 * QK8_1>) == 4 * sizeof(block_q8_1), "Unexpected q8_1 x4 layout size");
+
 #define STRINGIZE_IMPL(...) #__VA_ARGS__
 #define STRINGIZE(...) STRINGIZE_IMPL(__VA_ARGS__)
 
