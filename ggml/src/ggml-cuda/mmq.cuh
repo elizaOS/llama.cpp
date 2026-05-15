@@ -352,88 +352,88 @@ static constexpr __device__ int mmq_get_nwarps_device() {
 //             Controls register allocation and spill behavior.
 // enabled:    whether the host tile selection loop may pick this (type, mmq_x) combination.
 //             Disabled tiles are also skipped in device code via if constexpr.
-struct mmq_config {
+struct mmq_launch_config {
     int  min_blocks;
     bool enabled;
 };
 
-#define GGML_CUDA_MMQ_CONFIG_CASE(type_, mmq_x_, min_blocks_, enabled_) \
+#define GGML_CUDA_MMQ_LAUNCH_CASE(type_, mmq_x_, min_blocks_, enabled_) \
     if (type == (type_) && mmq_x == (mmq_x_)) {              \
-        return mmq_config{(min_blocks_), (enabled_)};         \
+        return mmq_launch_config{(min_blocks_), (enabled_)};         \
     }
 
 // CDNA4 (gfx950, MI350X/MI355X): wavefront64, 1536 VGPRs/CU across 4 SIMDs.
 // No per-type overrides yet - needs benchmarking on actual hardware.
-static constexpr __host__ __device__ mmq_config mmq_get_config_cdna4(
+static constexpr __host__ __device__ mmq_launch_config mmq_get_config_cdna4(
         const ggml_type type, const int mmq_x) {
     GGML_UNUSED(type);
     GGML_UNUSED(mmq_x);
-    return mmq_config{2, true};
+    return mmq_launch_config{2, true};
 }
 
 // CDNA3 (gfx942, MI300): wavefront64, 512 VGPRs/SIMD.
 // No per-type overrides yet - needs benchmarking on actual hardware.
-static constexpr __host__ __device__ mmq_config mmq_get_config_cdna3(
+static constexpr __host__ __device__ mmq_launch_config mmq_get_config_cdna3(
         const ggml_type type, const int mmq_x) {
     GGML_UNUSED(type);
     GGML_UNUSED(mmq_x);
-    return mmq_config{2, true};
+    return mmq_launch_config{2, true};
 }
 
 // CDNA2 (gfx90a, MI210): wavefront64, 512 VGPRs/SIMD.
 // Default min_blocks=2 targets <=256 VGPRs/wave (2 waves/SIMD).
 // Overrides below tested on gfx90a (MI210).
-static constexpr __host__ __device__ mmq_config mmq_get_config_cdna2(
+static constexpr __host__ __device__ mmq_launch_config mmq_get_config_cdna2(
         const ggml_type type, const int mmq_x) {
     // IQ3_XXS mmq_x=112: 260 VGPRs total -> only 1 wave/SIMD (10% occupancy). Disable.
-    GGML_CUDA_MMQ_CONFIG_CASE(GGML_TYPE_IQ3_XXS, 112, 1, false);
+    GGML_CUDA_MMQ_LAUNCH_CASE(GGML_TYPE_IQ3_XXS, 112, 1, false);
     // IQ3_XXS mmq_x=128: 128 arch + 128 AccVGPR at min_blocks=2 (412B scratch spill).
     // Disabling forces tile=64, doubling stream-k parallelism.
     // Benchmarked on MI210: n=128 drops from 12068 to 4815 us (-60%).
-    GGML_CUDA_MMQ_CONFIG_CASE(GGML_TYPE_IQ3_XXS, 128, 2, false);
+    GGML_CUDA_MMQ_LAUNCH_CASE(GGML_TYPE_IQ3_XXS, 128, 2, false);
 
     GGML_UNUSED(type);
     GGML_UNUSED(mmq_x);
-    return mmq_config{2, true};
+    return mmq_launch_config{2, true};
 }
 
 // CDNA1 (gfx908, MI100): wavefront64, (256 VGPRs + 256 AccGPRs)/SIMD.
 // Default min_blocks=2 targets <=256 VGPRs/wave (2 waves/SIMD).
 // No per-type overrides yet - needs benchmarking on actual hardware.
-static constexpr __host__ __device__ mmq_config mmq_get_config_cdna1(
+static constexpr __host__ __device__ mmq_launch_config mmq_get_config_cdna1(
         const ggml_type type, const int mmq_x) {
     GGML_UNUSED(type);
     GGML_UNUSED(mmq_x);
-    return mmq_config{2, true};
+    return mmq_launch_config{2, true};
 }
 
 // NVIDIA Volta+ (sm_70+): min_blocks=1 targets higher register usage per thread.
-static constexpr __host__ __device__ mmq_config mmq_get_config_nvidia_volta_up(
+static constexpr __host__ __device__ mmq_launch_config mmq_get_config_nvidia_volta_up(
         const ggml_type type, const int mmq_x) {
     GGML_UNUSED(type);
     GGML_UNUSED(mmq_x);
-    return mmq_config{1, true};
+    return mmq_launch_config{1, true};
 }
 
 // RDNA1 (gfx1010/gfx1012): wavefront32, dp4a only.
 // min_blocks=1 preserves the pre-existing behavior (no __launch_bounds__ second arg).
-static constexpr __host__ __device__ mmq_config mmq_get_config_rdna1(
+static constexpr __host__ __device__ mmq_launch_config mmq_get_config_rdna1(
         const ggml_type type, const int mmq_x) {
     GGML_UNUSED(type);
     GGML_UNUSED(mmq_x);
-    return mmq_config{1, true};
+    return mmq_launch_config{1, true};
 }
 
 // Default for all other architectures (pre-Volta NVIDIA, RDNA2-4, GCN, dp4a).
-static constexpr __host__ __device__ mmq_config mmq_get_config_default(
+static constexpr __host__ __device__ mmq_launch_config mmq_get_config_default(
         const ggml_type type, const int mmq_x) {
     GGML_UNUSED(type);
     GGML_UNUSED(mmq_x);
-    return mmq_config{2, true};
+    return mmq_launch_config{2, true};
 }
 
 // Host dispatch: uses runtime compute capability to select the right config table.
-static constexpr mmq_config mmq_get_config_host(const ggml_type type, const int mmq_x, const int cc) {
+static constexpr mmq_launch_config mmq_get_config_host(const ggml_type type, const int mmq_x, const int cc) {
     if (GGML_CUDA_CC_IS_CDNA4(cc)) {
         return mmq_get_config_cdna4(type, mmq_x);
     } else if (GGML_CUDA_CC_IS_CDNA3(cc)) {
@@ -452,7 +452,7 @@ static constexpr mmq_config mmq_get_config_host(const ggml_type type, const int 
 
 // Device dispatch: uses compile-time #ifdef to select the right config table.
 // Plain constexpr function (not a template) so it can be used in __launch_bounds__.
-static constexpr __device__ mmq_config mmq_get_config_device(const ggml_type type, const int mmq_x) {
+static constexpr __device__ mmq_launch_config mmq_get_config_device(const ggml_type type, const int mmq_x) {
 #if defined(CDNA4)
     return mmq_get_config_cdna4(type, mmq_x);
 #elif defined(CDNA3)
