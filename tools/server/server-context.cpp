@@ -2962,7 +2962,7 @@ private:
                             SLT_ERR(slot, "failed to process image, res = %d\n", res);
                             send_error(slot, "failed to process image", ERROR_TYPE_SERVER);
                             slot.release();
-                            continue;
+                            break;
                         }
 
                         if (ctx_dft) {
@@ -2984,6 +2984,10 @@ private:
                         }
 
                         has_mtmd = true;
+                    }
+
+                    if (!slot.is_processing()) {
+                        continue;
                     }
 
                     const int32_t checkpoint_before_last_user_token = slot.task->params.checkpoint_before_last_user_token;
