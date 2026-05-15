@@ -10,8 +10,8 @@
 // #ifdef GGML_METAL_ISTFT_KERNEL so it does not activate in production builds
 // until hardware verification passes.
 //
-// Algorithm: one threadgroup per output sample, iterating over all frames
-// that overlap that sample.  For each contributing frame the 1-D iDFT is
+// Algorithm: one threadgroup per output smpl, iterating over all frames
+// that overlap that smpl.  For each contributing frame the 1-D iDFT is
 // evaluated using the Hermitian symmetry of the real-output STFT.
 //
 // Input layout (same as Vulkan/CUDA):
@@ -45,7 +45,7 @@ kernel void kernel_istft_f32(
     const uint i = gid;
     const uint F = p.n_fft / 2u + 1u;
 
-    // Frame range overlapping output sample i.
+    // Frame range overlapping output smpl i.
     const uint t_max = min(i / p.hop_length, p.T - 1u);
     uint t_min = 0u;
     if (i + 1u > p.win_length) {
@@ -66,13 +66,13 @@ kernel void kernel_istft_f32(
         norm += win_k * win_k;
 
         // IDFT output at time-index k_mod for frame t.
-        float sample = 0.0f;
+        float smpl = 0.0f;
 
         // DC
         {
             const float mag_v   = mag_phase[0u * p.T + t];
             const float phase_v = mag_phase[F  * p.T + 0u * p.T + t];
-            sample += mag_v * cos(phase_v);
+            smpl += mag_v * cos(phase_v);
         }
 
         // Nyquist (n_fft even only)
@@ -82,7 +82,7 @@ kernel void kernel_istft_f32(
             const float phase_v = mag_phase[F   * p.T + nyq * p.T + t];
             const float re      = mag_v * cos(phase_v);
             const float sign    = ((k_mod & 1u) == 0u) ? 1.0f : -1.0f;
-            sample += sign * re;
+            smpl += sign * re;
         }
 
         // Interior bins [1, F-1)
@@ -93,11 +93,11 @@ kernel void kernel_istft_f32(
             const float re      = mag_v * cos(phase_v);
             const float im      = mag_v * sin(phase_v);
             const float angle   = two_pi * float(f) * float(k_mod) * inv_n;
-            sample += 2.0f * (re * cos(angle) - im * sin(angle));
+            smpl += 2.0f * (re * cos(angle) - im * sin(angle));
         }
 
-        sample *= inv_n;
-        acc += sample * win_k;
+        smpl *= inv_n;
+        acc += smpl * win_k;
     }
 
     dst_data[i] = (norm > 1e-8f) ? (acc / norm) : 0.0f;

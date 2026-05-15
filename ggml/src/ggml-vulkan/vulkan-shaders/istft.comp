@@ -1,7 +1,7 @@
 #version 450
 
 // ---------------------------------------------------------------------------
-// istft.comp — Inverse STFT (single-pass, one thread per output sample).
+// istft.comp — Inverse STFT (single-pass, one thread per output smpl).
 //
 // The Hann window is computed on-the-fly from win_length in push constants;
 // no window-tensor binding is required (binding 1 is unused / empty).
@@ -36,7 +36,7 @@ void main() {
 
     const uint F = p.n_fft / 2u + 1u;
 
-    // Frame range overlapping output sample i.
+    // Frame range overlapping output smpl i.
     const uint t_max = min(i / p.hop_length, p.T - 1u);
     uint t_min = 0u;
     if (i + 1u > p.win_length) {
@@ -60,13 +60,13 @@ void main() {
         const uint k_mod = k % p.n_fft;
 
         // Compute IDFT output at time-index k_mod for frame t.
-        float sample = 0.0;
+        float smpl = 0.0;
 
         // DC
         {
             const float mag_v   = mag_phase_data[0u * p.T + t];
             const float phase_v = mag_phase_data[F  * p.T + 0u * p.T + t];
-            sample += mag_v * cos(phase_v);
+            smpl += mag_v * cos(phase_v);
         }
 
         // Nyquist (n_fft even only)
@@ -76,7 +76,7 @@ void main() {
             const float phase_v = mag_phase_data[F   * p.T + nyq * p.T + t];
             float re = mag_v * cos(phase_v);
             float sign = ((k_mod & 1u) == 0u) ? 1.0 : -1.0;
-            sample += sign * re;
+            smpl += sign * re;
         }
 
         // Interior bins [1, F-1) with Hermitian symmetry (factor 2).
@@ -87,11 +87,11 @@ void main() {
             const float re = mag_v * cos(phase_v);
             const float im = mag_v * sin(phase_v);
             const float angle = PI2 * float(f) * float(k_mod) * inv_nfft;
-            sample += 2.0 * (re * cos(angle) - im * sin(angle));
+            smpl += 2.0 * (re * cos(angle) - im * sin(angle));
         }
 
-        sample *= inv_nfft;
-        acc += sample * win_k;
+        smpl *= inv_nfft;
+        acc += smpl * win_k;
     }
 
     dst_data[i] = (norm > 1e-8) ? (acc / norm) : 0.0;
