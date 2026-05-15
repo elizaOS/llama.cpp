@@ -645,8 +645,11 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
 
     uint16_t n_draft;
 
-    bool save_dynamic;
-    bool save_static;
+    // Upstream PR #22055: paths kept so the destructor can write the merged
+    // context cache back to disk for persistence across runs. Replaces the
+    // older save_dynamic/save_static bool toggles which were never wired up.
+    const std::string lookup_cache_static;
+    const std::string lookup_cache_dynamic;
 
     struct seq_info {
         size_t cache_size = 0; // number of tokens in n-gram cache
@@ -663,14 +666,12 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
             uint32_t n_seq,
             uint16_t n_draft,
             const std::string & path_static,
-            const std::string & path_dynamic,
-            bool save_dynamic,
-            bool save_static)
+            const std::string & path_dynamic)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE, n_seq)
         , params(params.ngram_cache)
         , n_draft(n_draft)
-        , save_dynamic(save_dynamic)
-        , save_static(save_static)
+        , lookup_cache_static(path_static)
+        , lookup_cache_dynamic(path_dynamic)
     {
         sinfos.resize(n_seq);
 
@@ -698,6 +699,33 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
                 LOG_ERR("failed to open dynamic lookup cache: %s", path_dynamic.c_str());
                 GGML_ABORT("Couldn't read dynamic lookup cache");
             }
+        }
+    }
+
+    // Upstream PR #22055: on destruction, merge per-seq context caches back
+    // into the on-disk static/dynamic caches so n-gram knowledge persists.
+    ~common_speculative_impl_ngram_cache() override {
+        if (lookup_cache_static.empty() && lookup_cache_dynamic.empty()) {
+            return;
+        }
+
+        // merge all per-seq context caches into a single aggregate cache
+        common_ngram_cache aggregate_context;
+        for (auto & sinfo : sinfos) {
+            common_ngram_cache_merge(aggregate_context, sinfo.ngram_cache_context);
+        }
+
+        if (!lookup_cache_static.empty()) {
+            // sinfos[0] holds the same loaded static cache as every other sinfo
+            // (loaded once, copied per-seq in the ctor), so use it as base
+            auto & base = sinfos.empty() ? aggregate_context : sinfos[0].ngram_cache_static;
+            common_ngram_cache_merge(base, aggregate_context);
+            common_ngram_cache_save(base, lookup_cache_static);
+        }
+        if (!lookup_cache_dynamic.empty()) {
+            auto & base = sinfos.empty() ? aggregate_context : sinfos[0].ngram_cache_dynamic;
+            common_ngram_cache_merge(base, aggregate_context);
+            common_ngram_cache_save(base, lookup_cache_dynamic);
         }
     }
 
@@ -794,20 +822,19 @@ static common_ngram_map get_common_ngram_map(
     return common_ngram_map(size_key, size_value, key_only, min_hits);
 }
 
-static common_speculative_impl_ngram_cache create_state_ngram_cache(
+static std::unique_ptr<common_speculative_impl_ngram_cache> create_state_ngram_cache(
         const common_speculative_config & config,
         uint32_t n_seq,
         const std::string & path_static,
         const std::string & path_dynamic) {
-    uint16_t n_draft = 8; // TODO get from config?
+    // Upstream PR #22055: n_draft now comes from params; save_static/save_dynamic
+    // bool toggles are replaced by "path non-empty means persist on destruction".
+    // Returns unique_ptr so the writing destructor only fires when the impl is
+    // truly torn down (not when a temporary copy goes out of scope).
+    const uint16_t n_draft = config.params.ngram_cache.n_draft;
 
-    // TODO bool param in common/common.h to set save_static/save_dynamic?
-    bool save_static = false;
-    bool save_dynamic = false;
-
-    common_speculative_impl_ngram_cache state(config.params, n_seq, n_draft, path_static, path_dynamic, save_static, save_dynamic);
-
-    return state;
+    return std::make_unique<common_speculative_impl_ngram_cache>(
+            config.params, n_seq, n_draft, path_static, path_dynamic);
 }
 
 std::string common_speculative_type_name_str(const std::vector<common_speculative_type> & types) {
@@ -1005,7 +1032,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                         config, n_seq,
                         params.ngram_cache.lookup_cache_static,
                         params.ngram_cache.lookup_cache_dynamic);
-                impls.push_back(std::make_unique<common_speculative_impl_ngram_cache>(state));
+                impls.push_back(std::move(state));
                 break;
             }
             default:
