@@ -1883,3 +1883,15 @@ struct llama_model_step35 : public llama_model_base {
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
+
+// Kokoro-82M TTS language-model arch (StyleTTS-2 + iSTFTNet backbone).
+// R8 §3.1: wiring the arch tag allows llama-quantize to run the K-quant
+// ladder (Q4_K_M / Q5_K_M / Q6_K) over Kokoro GGUF weights. Full graph
+// implementation is deferred until a Kokoro GGUF is published; the arch
+// registration here is sufficient to gate the K-quant publish pipeline.
+struct llama_model_kokoro : public llama_model_base {
+    llama_model_kokoro(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};

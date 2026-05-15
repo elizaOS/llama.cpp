@@ -737,6 +737,39 @@ struct vk_device_struct {
     vk_pipeline pipeline_mul_mat_vec_p021_f16_f32[p021_max_gqa_ratio];
     vk_pipeline pipeline_mul_mat_vec_nc_f16_f32;
     vk_pipeline pipeline_get_rows[GGML_TYPE_COUNT];
+    // ELIZA-VK-DISPATCH-PATCH-V1 BEGIN — eliza turbo / qjl / polar pipelines
+    // Pre-allocated pipeline slots for the 9 eliza standalone shaders. These
+    // fields keep the pipelines reachable from the device struct so the
+    // shader symbols are referenced at link time. Op-level dispatch wiring is
+    // deferred (see kernel-patches/vulkan-dispatch-patches/02-ggml-vulkan-pipelines.patch
+    // header comment for scope).
+    vk_pipeline pipeline_eliza_turbo3;
+    vk_pipeline pipeline_eliza_turbo4;
+    vk_pipeline pipeline_eliza_turbo3_tcq;
+    vk_pipeline pipeline_eliza_qjl;
+    vk_pipeline pipeline_eliza_qjl_get_rows;
+    vk_pipeline pipeline_eliza_qjl_mul_mv;
+    vk_pipeline pipeline_eliza_polar;
+    vk_pipeline pipeline_eliza_polar_preht;
+    vk_pipeline pipeline_eliza_polar_get_rows;
+    // Multi-block-per-workgroup score variants (constant_id=0 spec constant
+    // BLOCKS_PER_WG / TOKENS_PER_WG set at create time) — long-context /
+    // non-voice scoring amortises launch tax across several KV indices.
+    vk_pipeline pipeline_eliza_turbo3_multi;
+    vk_pipeline pipeline_eliza_turbo4_multi;
+    vk_pipeline pipeline_eliza_turbo3_tcq_multi;
+    vk_pipeline pipeline_eliza_qjl_multi;
+    // Device-policy fold factors actually baked into the _multi pipelines above
+    // (see ggml_vk_load_shaders). The runtime dispatch must divide the grid by
+    // exactly these — discrete-GPU classes (NVIDIA, big AMD) want a much larger
+    // fold than the conservative iGPU value. Defaults are the conservative 4.
+    uint32_t eliza_vk_tbq_multiblock_factor = 4;
+    uint32_t eliza_vk_qjl_multiblock_factor = 4;
+    // Fused attention (QJL-K score + V-mix, online softmax, score never
+    // materialised) — GGML_OP_FUSED_ATTN_QJL_TBQ + Polar V-mix variant.
+    vk_pipeline pipeline_eliza_fused_attn_qjl_tbq;
+    vk_pipeline pipeline_eliza_fused_attn_qjl_polar;
+    // ELIZA-VK-DISPATCH-PATCH-V1 END
     vk_pipeline pipeline_get_rows_f32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_acc_f32;
     vk_pipeline pipeline_set_f32;
@@ -1977,6 +2010,11 @@ struct ggml_backend_vk_context {
     int fused_ops_write_mask {};
     topk_moe_mode fused_topk_moe_mode {};
     bool fused_topk_moe_scale {};
+
+    // ELIZA-VK-RUNTIME-DISPATCH-V1
+    // Persistent device-side TCQ codebook used by GGML_OP_ATTN_SCORE_TBQ when
+    // packed_k is GGML_TYPE_TBQ3_TCQ. Created lazily on first dispatch.
+    vk_buffer eliza_turbo3_tcq_codebook;
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
@@ -5141,6 +5179,51 @@ static void ggml_vk_load_shaders(vk_device& device) {
         }
     }
 
+    // ELIZA-VK-DISPATCH-PATCH-V1 BEGIN — create eliza turbo / qjl / polar pipelines
+    // Push-constant sizes / bind counts are taken from the matching .comp files.
+    //   turbo3 / turbo4    : 3 storage buffers (q, k_blocks, scores)            + 5*u32 push
+    //   turbo3_tcq         : 4 storage buffers (q, k_blocks, scores, codebook)  + 5*u32 push
+    //   qjl (score)        : 3 storage buffers (q_sketch, packed_k, scores)     + 4*u32 push
+    //   qjl_get_rows       : 3 storage buffers (k_packed, prj, out)             + 2*u32 push
+    //   qjl_mul_mv         : 3 storage buffers (k_blocks, q_sketch, y)          + 2*u32 push
+    //   polar              : 3 storage buffers (k_blocks, q, y)                 + 6*u32 push
+    //   polar_preht        : 3 storage buffers (k_blocks, H*q, y)               + 6*u32 push
+    //   polar_get_rows     : 2 storage buffers (k_block, out)                   + 2*u32 push
+    ggml_vk_create_pipeline(device, device->pipeline_eliza_turbo3,         "eliza_turbo3",         eliza_turbo3_len,         eliza_turbo3_data,         "main", 3, 5 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_eliza_turbo4,         "eliza_turbo4",         eliza_turbo4_len,         eliza_turbo4_data,         "main", 3, 5 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_eliza_turbo3_tcq,     "eliza_turbo3_tcq",     eliza_turbo3_tcq_len,     eliza_turbo3_tcq_data,     "main", 4, 5 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_eliza_qjl,            "eliza_qjl",            eliza_qjl_len,            eliza_qjl_data,            "main", 3, 4 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_eliza_qjl_get_rows,   "eliza_qjl_get_rows",   eliza_qjl_get_rows_len,   eliza_qjl_get_rows_data,   "main", 3, 2 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_eliza_qjl_mul_mv,     "eliza_qjl_mul_mv",     eliza_qjl_mul_mv_len,     eliza_qjl_mul_mv_data,     "main", 3, 2 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_eliza_polar,          "eliza_polar",          eliza_polar_len,          eliza_polar_data,          "main", 3, 6 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_eliza_polar_preht,    "eliza_polar_preht",    eliza_polar_preht_len,    eliza_polar_preht_data,    "main", 3, 6 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_eliza_polar_get_rows, "eliza_polar_get_rows", eliza_polar_get_rows_len, eliza_polar_get_rows_data, "main", 2, 2 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
+    // Multi-block variants. constant_id=0 = BLOCKS_PER_WG (turbo* score) /
+    // TOKENS_PER_WG (qjl). Device-policy table from vulkan_bench
+    // (VK_QUERY_TYPE_TIMESTAMP per-dispatch sweep over {1,2,4,8,16}):
+    //   * NVIDIA discrete (RTX 5080 Laptop, ANV→nvidia ICD): factor 16 for the
+    //     turbo* score kernels (386us→48us at 4k, ~3.2x at 32k) and factor 8
+    //     for QJL (4742us→374us at 4k, ~8.6x at 32k; 16 is a wash vs 8 there,
+    //     8 keeps more WGs in flight under contention) — measured 2026-05-11.
+    //   * Intel Arc/Xe iGPU (Mesa ANV 25.2.8): factor 4 — bandwidth-bound at
+    //     n_kv>=512, the fold is a wash below 32k; only the engage threshold
+    //     moves (see runtime dispatch). Keep 4 (also the conservative
+    //     cross-device default for unprofiled Adreno/Mali/AMD).
+    {
+        const bool eliza_vk_discrete = device->vendor_id == VK_VENDOR_ID_NVIDIA;
+        device->eliza_vk_tbq_multiblock_factor = eliza_vk_discrete ? 16u : 4u;
+        device->eliza_vk_qjl_multiblock_factor = eliza_vk_discrete ? 8u  : 4u;
+    }
+    ggml_vk_create_pipeline(device, device->pipeline_eliza_turbo3_multi,     "eliza_turbo3_multi",     eliza_turbo3_multi_len,     eliza_turbo3_multi_data,     "main", 3, 5 * sizeof(uint32_t), {1, 1, 1}, {device->eliza_vk_tbq_multiblock_factor}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_eliza_turbo4_multi,     "eliza_turbo4_multi",     eliza_turbo4_multi_len,     eliza_turbo4_multi_data,     "main", 3, 5 * sizeof(uint32_t), {1, 1, 1}, {device->eliza_vk_tbq_multiblock_factor}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_eliza_turbo3_tcq_multi, "eliza_turbo3_tcq_multi", eliza_turbo3_tcq_multi_len, eliza_turbo3_tcq_multi_data, "main", 4, 5 * sizeof(uint32_t), {1, 1, 1}, {device->eliza_vk_tbq_multiblock_factor}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_eliza_qjl_multi,        "eliza_qjl_multi",        eliza_qjl_multi_len,        eliza_qjl_multi_data,        "main", 3, 4 * sizeof(uint32_t), {1, 1, 1}, {device->eliza_vk_qjl_multiblock_factor}, 1);
+    // Fused attention: 4 storage buffers (q_sketch, packed_k, packed_v, out).
+    //   fused_attn_qjl_tbq  : 6*u32 push (n_heads, n_kv_heads, n_tokens, q_pos, sm_scale_bits, kv_tile)
+    //   fused_attn_qjl_polar: 7*u32 push (… + v_use_qjl before kv_tile)
+    ggml_vk_create_pipeline(device, device->pipeline_eliza_fused_attn_qjl_tbq,   "eliza_fused_attn_qjl_tbq",   eliza_fused_attn_qjl_tbq_len,   eliza_fused_attn_qjl_tbq_data,   "main", 4, 8 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_eliza_fused_attn_qjl_polar, "eliza_fused_attn_qjl_polar", eliza_fused_attn_qjl_polar_len, eliza_fused_attn_qjl_polar_data, "main", 4, 9 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
+    // ELIZA-VK-DISPATCH-PATCH-V1 END
     for (auto &c : compiles) {
         c.wait();
     }
@@ -13446,6 +13529,364 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
     }
 }
 
+// ELIZA-VK-RUNTIME-DISPATCH-V1
+struct eliza_vk_qjl_score_push {
+    uint32_t n_heads;
+    uint32_t n_kv_heads;
+    uint32_t n_tokens;
+    uint32_t proj_dim;
+};
+
+struct eliza_vk_tbq_score_push {
+    uint32_t head_dim;
+    uint32_t n_kv;
+    uint32_t kv_stride_blocks;
+    uint32_t q_head;
+    uint32_t head_offset_bytes;
+};
+
+struct eliza_vk_polar_score_push {
+    uint32_t n_rows;
+    uint32_t head_dim;
+    uint32_t use_qjl;
+    uint32_t k_offset_bytes;
+    uint32_t q_offset;
+    uint32_t y_offset;
+};
+
+struct eliza_vk_fused_attn_push {
+    uint32_t n_heads;
+    uint32_t n_kv_heads;
+    uint32_t n_tokens;
+    uint32_t q_pos;
+    uint32_t sm_scale_bits;
+    uint32_t kv_tile;
+    uint32_t causal;
+    uint32_t q_pos_base;
+};
+
+// Long-context / non-voice scoring amortises the per-dispatch launch tax by
+// folding several KV indices (resp. tokens) into one workgroup via the
+// constant_id=0 spec constant (BLOCKS_PER_WG / TOKENS_PER_WG) baked into the
+// _multi pipeline at create time. Voice / small-n_kv stays single-block.
+//
+// The *fold factor* is device-policy: it is chosen by vendor in
+// ggml_vk_load_shaders (02-ggml-vulkan-pipelines.patch hunk 2) and stored on
+// device->eliza_vk_{tbq,qjl}_multiblock_factor. The dispatch here reads that
+// field so the grid divisor always matches whatever the pipeline was created
+// with. From vulkan_bench (VK_QUERY_TYPE_TIMESTAMP per-dispatch sweep over
+// {1,2,4,8,16}; vulkan_kopt_2026-05-11.json):
+//   * NVIDIA discrete (RTX 5080 Laptop): TBQ factor 16 (turbo3 386us→48us at
+//     4k, ~3.2x at 32k), QJL factor 8 (4742us→374us at 4k, ~8.6x at 32k).
+//   * Intel Arc/Xe iGPU (Mesa ANV 25.2.8): bandwidth-bound at n_kv>=512, both
+//     factors stay 4 — only the engage threshold matters. QJL engages from
+//     1024 tokens (the fold hoists the 256-wide q_sketch + sign vector out of
+//     the per-token loop, ~1.3x at 512 / ~1.8x at 4k); TBQ engages only at
+//     n_kv>=8192 (it's a wash at 512 and a slight regression at 4k on ANV).
+//   * Default / unprofiled (Adreno, Mali, AMD): conservative factor 4 and the
+//     same thresholds — safe everywhere. AMD wave64 wants its own sweep.
+// (The thresholds below are the same on every device; only the fold factor
+// diverges. The discrete-GPU thresholds being identical to the iGPU ones is
+// deliberate — on NVIDIA the _multi path is a win at *every* measured length
+// (e.g. turbo3 512: 83us single → 30us folded), so engaging from 1024/8192
+// only loses a little of the available speedup at the very small end.)
+static const int64_t  ELIZA_VK_QJL_MULTIBLOCK_THRESHOLD = 1024;
+static const int64_t  ELIZA_VK_TBQ_MULTIBLOCK_THRESHOLD = 8192;
+
+static const float k_eliza_tbq3_tcq_codebook[512] = {
+-0.14559399f, -0.09062801f, -0.054925077f, -0.03699251f, -0.006363985f, +0.026264573f, +0.067378916f, +0.121981815f,
+    -0.18648055f, -0.106522456f, -0.052047577f, -0.011695214f, +0.021953275f, +0.059698727f, +0.09831437f, +0.16083933f,
+    -0.16390342f, -0.12639847f, -0.09513180f, -0.05938352f, -0.028396897f, +0.005973862f, +0.049104784f, +0.11334257f,
+    -0.25952467f, -0.079778515f, -0.036024813f, +0.0003641268f, +0.031858794f, +0.073280424f, +0.11835553f, +0.19738495f,
+    -0.14218009f, -0.10224814f, -0.062498566f, -0.027066832f, +0.00393002f, +0.04069300f, +0.08257346f, +0.14548601f,
+    -0.18673635f, -0.13438253f, -0.088401966f, -0.05205436f, -0.02032501f, +0.012399545f, +0.05127183f, +0.10316186f,
+    -0.10807011f, -0.065903045f, -0.032206114f, -0.0062006037f, +0.020679146f, +0.04422085f, +0.08313074f, +0.16821936f,
+    -0.22979105f, -0.14431947f, -0.07689272f, -0.02755307f, +0.009225173f, +0.046684854f, +0.08834142f, +0.13766693f,
+    -0.22114082f, -0.12612148f, -0.06890522f, -0.016128855f, +0.03691900f, +0.08474852f, +0.14940020f, +0.23229980f,
+    -0.14933491f, -0.099693604f, -0.06738499f, -0.037100967f, -0.009332986f, +0.023535024f, +0.060272533f, +0.109464675f,
+    -0.20200425f, -0.07398328f, -0.038700905f, -0.01714807f, +0.011161969f, +0.04528101f, +0.08902637f, +0.19573534f,
+    -0.16645233f, -0.124482535f, -0.089342155f, -0.04427387f, -0.007353691f, +0.028033108f, +0.066108435f, +0.15552913f,
+    -0.22295763f, -0.059887577f, -0.018804537f, +0.020141022f, +0.059682943f, +0.097920544f, +0.14080113f, +0.25698325f,
+    -0.14248224f, -0.089685425f, -0.050101686f, -0.017257255f, +0.011412255f, +0.040830314f, +0.07400172f, +0.11997315f,
+    -0.18649384f, -0.113997504f, -0.067775466f, -0.033394672f, +0.006586988f, +0.05312057f, +0.10433043f, +0.22344802f,
+    -0.16138338f, -0.108194515f, -0.07600300f, -0.05135381f, -0.023365447f, +0.0087320795f, +0.045431953f, +0.09113002f,
+    -0.12630440f, -0.07225349f, -0.032280035f, +0.0029231994f, +0.019239848f, +0.05081419f, +0.077840395f, +0.121695265f,
+    -0.08928155f, -0.044983763f, -0.009889568f, +0.020831043f, +0.05684458f, +0.09409702f, +0.13867535f, +0.19084482f,
+    -0.14182915f, -0.11380146f, -0.06904074f, -0.002002765f, +0.034864165f, +0.070399575f, +0.11403063f, +0.15394832f,
+    -0.10876417f, -0.056122433f, -0.02267638f, +0.011113975f, +0.039639056f, +0.074084364f, +0.10155376f, +0.12540291f,
+    -0.17693359f, -0.13940524f, -0.10049578f, -0.06796275f, -0.036915872f, +0.00062823476f, +0.042142134f, +0.17906062f,
+    -0.09253492f, -0.04290128f, -0.006311852f, +0.023908244f, +0.049849935f, +0.078770354f, +0.10818172f, +0.15166481f,
+    -0.12429565f, -0.07392063f, -0.029114135f, +0.0059440783f, +0.042675965f, +0.08425635f, +0.13836108f, +0.18634140f,
+    -0.11795639f, -0.07033707f, -0.034163877f, -0.0008773357f, +0.03334606f, +0.07188203f, +0.12216825f, +0.17097956f,
+    -0.18718453f, -0.14090346f, -0.097799584f, -0.059522875f, -0.019208657f, +0.03079176f, +0.09334672f, +0.15811224f,
+    -0.27198875f, -0.16546582f, -0.11433405f, -0.06933013f, -0.04026183f, -0.0061146915f, +0.029263576f, +0.07322499f,
+    -0.18471734f, -0.102074504f, -0.06492570f, -0.034418534f, -0.009636157f, +0.023043344f, +0.05751496f, +0.09905984f,
+    -0.22826399f, -0.15946552f, -0.09913176f, -0.06585259f, -0.03252090f, +0.001313243f, +0.03556729f, +0.21612854f,
+    -0.13243781f, -0.087299444f, -0.049820945f, -0.016216082f, +0.01799807f, +0.057916876f, +0.09001349f, +0.13221787f,
+    -0.19516511f, -0.120894566f, -0.076130204f, -0.051442243f, -0.029535033f, -0.0020043184f, +0.029452588f, +0.075566076f,
+    -0.27272871f, -0.15841717f, -0.105432935f, -0.06792948f, -0.024532158f, +0.014960791f, +0.054415092f, +0.101517834f,
+    -0.21153601f, -0.15015371f, -0.08676790f, -0.04414934f, -0.0042129597f, +0.033762872f, +0.07589151f, +0.12768789f,
+    -0.090428725f, -0.037582967f, +0.0013173596f, +0.03900247f, +0.06840049f, +0.116906695f, +0.16584939f, +0.25382105f,
+    -0.13446195f, -0.07865091f, -0.039625354f, -0.0028398742f, +0.03019514f, +0.06799379f, +0.11850997f, +0.17521496f,
+    -0.11350345f, -0.058599845f, -0.017512511f, +0.019431496f, +0.055897832f, +0.093173414f, +0.14820710f, +0.22092152f,
+    -0.15165758f, -0.08869354f, -0.04974287f, -0.01705474f, +0.013134752f, +0.04367713f, +0.07733791f, +0.12430801f,
+    -0.09329869f, -0.04673005f, -0.00045857552f, +0.042781368f, +0.07802363f, +0.11887439f, +0.16250038f, +0.28612965f,
+    -0.12571070f, -0.07786012f, -0.03843933f, -0.0075433915f, +0.025822964f, +0.066053316f, +0.12021536f, +0.18341768f,
+    -0.16079275f, -0.04921760f, -0.006114644f, +0.026215268f, +0.05699377f, +0.09813471f, +0.16080129f, +0.23786584f,
+    -0.09980837f, -0.048535258f, -0.0096120685f, +0.025387142f, +0.05979822f, +0.09875251f, +0.14474337f, +0.20324114f,
+    -0.15846540f, -0.09938028f, -0.061492465f, -0.03523542f, -0.0061364113f, +0.024916094f, +0.06037314f, +0.106796466f,
+    -0.20557843f, -0.123237535f, -0.07734871f, -0.044549115f, -0.017114898f, +0.01616654f, +0.049574375f, +0.092319444f,
+    -0.19221115f, -0.14642999f, -0.091701314f, -0.055265956f, -0.021026207f, +0.017720066f, +0.05786183f, +0.110154524f,
+    -0.09956386f, -0.03870283f, +0.003052007f, +0.034851722f, +0.06256365f, +0.09628840f, +0.13979156f, +0.16582295f,
+    -0.18026546f, -0.12448310f, -0.07424377f, -0.03954519f, -0.01221123f, +0.028641058f, +0.100819774f, +0.18240699f,
+    -0.21520759f, -0.15573645f, -0.09820838f, -0.051450998f, -0.012993679f, +0.021135861f, +0.058727216f, +0.105848536f,
+    -0.11207385f, -0.08335689f, -0.048542723f, -0.023198519f, +0.0039304253f, +0.037778318f, +0.07813917f, +0.13106476f,
+    -0.17849164f, -0.120988995f, -0.078016765f, -0.043093704f, -0.016565649f, +0.015182641f, +0.050754096f, +0.09595712f,
+    -0.22132620f, -0.13407415f, -0.065785654f, -0.013291034f, +0.032098345f, +0.07478225f, +0.12431934f, +0.19174045f,
+    -0.095454164f, -0.051898945f, -0.015116375f, -0.012596778f, +0.018636847f, +0.05006925f, +0.087654814f, +0.13754296f,
+    -0.15254061f, -0.09576059f, -0.052086458f, -0.01596074f, +0.017607626f, +0.04778498f, +0.08950204f, +0.14901252f,
+    -0.26057002f, -0.12472382f, -0.074396215f, -0.03764066f, +0.0011168446f, +0.061569117f, +0.10793752f, +0.19771695f,
+    -0.08661132f, -0.045195263f, -0.016098704f, +0.012780116f, +0.040476497f, +0.074102715f, +0.074102715f, +0.12635531f,
+    -0.14047913f, -0.059587404f, -0.016261123f, +0.019801628f, +0.053541403f, +0.096650146f, +0.15005490f, +0.21051759f,
+    -0.22986396f, -0.11964334f, -0.07266585f, -0.026522418f, +0.018169926f, +0.058630653f, +0.100647695f, +0.15919648f,
+    -0.13251697f, -0.077567816f, -0.042766172f, -0.011389967f, +0.01831755f, +0.05304656f, +0.09620367f, +0.15567583f,
+    -0.119819686f, -0.06772876f, -0.028123451f, +0.00876240f, +0.014405836f, +0.048829112f, +0.08422175f, +0.13823749f,
+    -0.16379014f, -0.08956941f, -0.041652776f, +0.008921398f, +0.05473602f, +0.10037984f, +0.16022855f, +0.23457925f,
+    -0.115844205f, -0.05939626f, -0.020390417f, +0.01374377f, +0.044976473f, +0.07873563f, +0.12207942f, +0.18412720f,
+    -0.19048831f, -0.07587487f, -0.03220580f, -0.00011795067f, +0.02721784f, +0.04380719f, +0.07886723f, +0.13193911f,
+    -0.13935551f, -0.092902906f, -0.052706074f, -0.017797327f, +0.015312965f, +0.056098964f, +0.11203423f, +0.24448302f,
+    -0.17986591f, -0.10738580f, -0.06376371f, -0.026595421f, +0.00842492f, +0.04272362f, +0.08608052f, +0.15240218f,
+    -0.10953678f, -0.057022586f, -0.012483291f, +0.024463262f, +0.06076792f, +0.09776234f, +0.12983681f, +0.18648379f,
+    -0.16471463f, -0.089491285f, -0.037574016f, +0.004444791f, +0.039293647f, +0.07845859f, +0.12893885f, +0.23508036f,
+};
+
+static vk_pipeline eliza_vk_pipeline_for_tbq(ggml_backend_vk_context * ctx, ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TBQ3_0:   return ctx->device->pipeline_eliza_turbo3;
+        case GGML_TYPE_TBQ4_0:   return ctx->device->pipeline_eliza_turbo4;
+        case GGML_TYPE_TBQ3_TCQ: return ctx->device->pipeline_eliza_turbo3_tcq;
+        default: GGML_ABORT("eliza_vk_pipeline_for_tbq: unsupported type");
+    }
+}
+
+static vk_pipeline eliza_vk_pipeline_for_tbq_multi(ggml_backend_vk_context * ctx, ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TBQ3_0:   return ctx->device->pipeline_eliza_turbo3_multi;
+        case GGML_TYPE_TBQ4_0:   return ctx->device->pipeline_eliza_turbo4_multi;
+        case GGML_TYPE_TBQ3_TCQ: return ctx->device->pipeline_eliza_turbo3_tcq_multi;
+        default: GGML_ABORT("eliza_vk_pipeline_for_tbq_multi: unsupported type");
+    }
+}
+
+static vk_buffer eliza_vk_turbo3_tcq_codebook(ggml_backend_vk_context * ctx) {
+    if (ctx->eliza_turbo3_tcq_codebook == nullptr) {
+        ctx->eliza_turbo3_tcq_codebook = ggml_vk_create_buffer_device(ctx->device, sizeof(k_eliza_tbq3_tcq_codebook));
+        ggml_vk_buffer_write(ctx->eliza_turbo3_tcq_codebook, 0, k_eliza_tbq3_tcq_codebook, sizeof(k_eliza_tbq3_tcq_codebook));
+    }
+    return ctx->eliza_turbo3_tcq_codebook;
+}
+
+static void ggml_vk_eliza_attn_score_qjl(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * q  = dst->src[0];
+    const ggml_tensor * pk = dst->src[1];
+    GGML_ASSERT(q != nullptr && pk != nullptr);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(pk->type == GGML_TYPE_QJL1_256);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->ne[0] == 256 && pk->ne[0] == 128);
+    GGML_ASSERT(q->ne[2] == 1 && q->ne[3] == 1 && pk->ne[3] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(pk));
+    GGML_ASSERT(ggml_is_contiguous_rows(dst));
+
+    const uint32_t n_heads    = (uint32_t) q->ne[1];
+    const uint32_t n_kv_heads = (uint32_t) ((const int32_t *) dst->op_params)[0];
+    const uint32_t n_tokens   = (uint32_t) pk->ne[1];
+    GGML_ASSERT(n_kv_heads > 0 && (n_heads % n_kv_heads) == 0);
+    GGML_ASSERT(pk->ne[2] == (int64_t) n_kv_heads);
+    GGML_ASSERT(dst->ne[0] == (int64_t) n_tokens && dst->ne[1] == (int64_t) n_heads);
+    GGML_ASSERT(pk->nb[1] == ggml_row_size(GGML_TYPE_QJL1_256, 128));
+    GGML_ASSERT(pk->nb[2] == (size_t) n_tokens * pk->nb[1]);
+
+    const bool multi = (int64_t) n_tokens >= ELIZA_VK_QJL_MULTIBLOCK_THRESHOLD;
+    const uint32_t qjl_fold = ctx->device->eliza_vk_qjl_multiblock_factor;
+    vk_pipeline pipeline = multi ? ctx->device->pipeline_eliza_qjl_multi
+                                 : ctx->device->pipeline_eliza_qjl;
+    const uint32_t grid_y = multi ? (n_tokens + qjl_fold - 1u) / qjl_fold : n_tokens;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const eliza_vk_qjl_score_push pc = { n_heads, n_kv_heads, n_tokens, 256u };
+    ggml_vk_dispatch_pipeline(
+        ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, q), ggml_vk_tensor_subbuffer(ctx, pk), ggml_vk_tensor_subbuffer(ctx, dst) },
+        pc, { n_heads, grid_y, 1 });
+}
+
+static void ggml_vk_eliza_attn_score_tbq(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * q  = dst->src[0];
+    const ggml_tensor * pk = dst->src[1];
+    GGML_ASSERT(q != nullptr && pk != nullptr);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(pk->type == GGML_TYPE_TBQ3_0 || pk->type == GGML_TYPE_TBQ4_0 || pk->type == GGML_TYPE_TBQ3_TCQ);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->ne[0] == 128 && pk->ne[0] == 128);
+    GGML_ASSERT(q->ne[2] == 1 && q->ne[3] == 1 && pk->ne[3] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(pk));
+    GGML_ASSERT(ggml_is_contiguous_rows(dst));
+
+    const uint32_t n_heads    = (uint32_t) q->ne[1];
+    const uint32_t n_kv_heads = (uint32_t) ((const int32_t *) dst->op_params)[0];
+    const uint32_t n_tokens   = (uint32_t) pk->ne[1];
+    const uint32_t gqa        = n_heads / n_kv_heads;
+    const uint32_t blocks_per_kv = (uint32_t) (pk->ne[0] / ggml_blck_size(pk->type));
+    GGML_ASSERT(n_kv_heads > 0 && (n_heads % n_kv_heads) == 0);
+    GGML_ASSERT(pk->ne[2] == (int64_t) n_kv_heads);
+    GGML_ASSERT(dst->ne[0] == (int64_t) n_tokens && dst->ne[1] == (int64_t) n_heads);
+    GGML_ASSERT(pk->nb[1] == ggml_row_size(pk->type, 128));
+    GGML_ASSERT(pk->nb[2] == (size_t) n_tokens * pk->nb[1]);
+
+    const bool multi = (int64_t) n_tokens >= ELIZA_VK_TBQ_MULTIBLOCK_THRESHOLD;
+    const uint32_t tbq_fold = ctx->device->eliza_vk_tbq_multiblock_factor;
+    vk_pipeline pipeline = multi ? eliza_vk_pipeline_for_tbq_multi(ctx, pk->type)
+                                 : eliza_vk_pipeline_for_tbq(ctx, pk->type);
+    const uint32_t grid_x = multi ? (n_tokens + tbq_fold - 1u) / tbq_fold : n_tokens;
+    const vk_subbuffer q_buf   = ggml_vk_tensor_subbuffer(ctx, q);
+    const vk_subbuffer pk_buf  = ggml_vk_tensor_subbuffer(ctx, pk);
+    const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+    const bool is_tcq = pk->type == GGML_TYPE_TBQ3_TCQ;
+    const vk_subbuffer codebook_buf = is_tcq ? ggml_vk_subbuffer(ctx, eliza_vk_turbo3_tcq_codebook(ctx)) : vk_subbuffer{};
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, n_heads);
+    for (uint32_t h = 0; h < n_heads; ++h) {
+        const uint32_t h_k = h / gqa;
+        const uint64_t head_offset = (uint64_t) h_k * (uint64_t) pk->nb[2];
+        GGML_ASSERT(head_offset <= UINT32_MAX);
+        const eliza_vk_tbq_score_push pc = {
+            128u,
+            n_tokens,
+            blocks_per_kv,
+            h,
+            (uint32_t) head_offset,
+        };
+        if (is_tcq) {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, pk_buf, dst_buf, codebook_buf }, pc, { grid_x, 1, 1 });
+        } else {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, pk_buf, dst_buf }, pc, { grid_x, 1, 1 });
+        }
+    }
+}
+
+static void ggml_vk_eliza_attn_score_polar(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * q  = dst->src[0];
+    const ggml_tensor * pk = dst->src[1];
+    GGML_ASSERT(q != nullptr && pk != nullptr);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(pk->type == GGML_TYPE_Q4_POLAR);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->ne[0] == 128 && pk->ne[0] == 128);
+    GGML_ASSERT(q->ne[2] == 1 && q->ne[3] == 1 && pk->ne[3] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(pk));
+    GGML_ASSERT(ggml_is_contiguous_rows(dst));
+
+    const int32_t * params = (const int32_t *) dst->op_params;
+    const uint32_t n_heads    = (uint32_t) q->ne[1];
+    const uint32_t n_kv_heads = (uint32_t) params[0];
+    const uint32_t n_tokens   = (uint32_t) pk->ne[1];
+    const uint32_t use_qjl    = (uint32_t) (params[1] != 0);
+    const uint32_t gqa        = n_heads / n_kv_heads;
+    GGML_ASSERT(n_kv_heads > 0 && (n_heads % n_kv_heads) == 0);
+    GGML_ASSERT(pk->ne[2] == (int64_t) n_kv_heads);
+    GGML_ASSERT(dst->ne[0] == (int64_t) n_tokens && dst->ne[1] == (int64_t) n_heads);
+    GGML_ASSERT(pk->nb[1] == ggml_row_size(GGML_TYPE_Q4_POLAR, 128));
+    GGML_ASSERT(pk->nb[2] == (size_t) n_tokens * pk->nb[1]);
+
+    vk_pipeline pipeline = ctx->device->pipeline_eliza_polar;
+    const vk_subbuffer pk_buf  = ggml_vk_tensor_subbuffer(ctx, pk);
+    const vk_subbuffer q_buf   = ggml_vk_tensor_subbuffer(ctx, q);
+    const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, n_heads);
+    for (uint32_t h = 0; h < n_heads; ++h) {
+        const uint32_t h_k = h / gqa;
+        const uint64_t k_offset = (uint64_t) h_k * (uint64_t) pk->nb[2];
+        const uint64_t q_offset = ((uint64_t) h * (uint64_t) q->nb[1]) / sizeof(float);
+        const uint64_t y_offset = ((uint64_t) h * (uint64_t) dst->nb[1]) / sizeof(float);
+        GGML_ASSERT(k_offset <= UINT32_MAX && q_offset <= UINT32_MAX && y_offset <= UINT32_MAX);
+        const eliza_vk_polar_score_push pc = {
+            n_tokens,
+            128u,
+            use_qjl,
+            (uint32_t) k_offset,
+            (uint32_t) q_offset,
+            (uint32_t) y_offset,
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { pk_buf, q_buf, dst_buf }, pc, { n_tokens, 1, 1 });
+    }
+}
+
+// GGML_OP_FUSED_ATTN_QJL_TBQ — fused QJL-K score + TBQ3-V mix, online softmax,
+// the per-token score vector never materialised. Mirrors the C reference
+// eliza_fused_attn_qjl_tbq3() / fused_attn_qjl_tbq_ref() and the op contract
+// reports/porting/2026-05-11/fused-attn-op-contract.md §3/§6:
+//   src[0] = q          F32      [proj_dim=256, n_heads, n_q_pos, ne3]  (pre-projected QJL sketch)
+//   src[1] = packed_k   QJL1_256 [head_dim=128, n_kv, n_kv_heads, ne3]  (nb[1] == 34)
+//   src[2] = packed_v   TBQ3_0   [head_dim=128, n_kv, n_kv_heads, ne3]  (nb[1] == 56, 4 chunks/token)
+//   dst    = out        F32      [head_dim=128, n_heads, n_q_pos, ne3]
+//   op_params[0] = n_kv_heads, [1] = sm_scale (float bits), [2] = v_use_qjl (TBQ ignores it),
+//   [3] = kv_tile, [4] = causal, [5] = q_pos_base
+// One workgroup per (q_head); q_pos is a push constant, so n_q_pos > 1 is a
+// loop of dispatches (decode = 1). Conservative shape (ne3 == 1) matching the
+// other eliza graph routes; the unfused score → softmax → V-mix path covers
+// the wider shapes (AGENTS.md §3 — no silent degradation).
+static void ggml_vk_eliza_fused_attn_qjl_tbq(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * q  = dst->src[0];
+    const ggml_tensor * pk = dst->src[1];
+    const ggml_tensor * pv = dst->src[2];
+    GGML_ASSERT(q != nullptr && pk != nullptr && pv != nullptr);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(pk->type == GGML_TYPE_QJL1_256);
+    GGML_ASSERT(pv->type == GGML_TYPE_TBQ3_0);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->ne[0] == 256 && pk->ne[0] == 128 && pv->ne[0] == 128 && dst->ne[0] == 128);
+    GGML_ASSERT(q->ne[3] == 1 && pk->ne[3] == 1 && pv->ne[3] == 1 && dst->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(q));
+    GGML_ASSERT(ggml_is_contiguous(pk));
+    GGML_ASSERT(ggml_is_contiguous(pv));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int32_t * params = (const int32_t *) dst->op_params;
+    const uint32_t n_heads    = (uint32_t) q->ne[1];
+    const uint32_t n_kv_heads = (uint32_t) params[0];
+    const uint32_t sm_bits    = (uint32_t) params[1];
+    const uint32_t kv_tile    = (uint32_t) params[3];
+    const uint32_t causal     = (uint32_t) (params[4] != 0);
+    const uint32_t q_pos_base = (uint32_t) params[5];
+    const uint32_t n_tokens   = (uint32_t) pk->ne[1];
+    const int64_t  n_q_pos    = q->ne[2];
+    GGML_ASSERT(n_kv_heads > 0 && (n_heads % n_kv_heads) == 0);
+    GGML_ASSERT(pk->ne[2] == (int64_t) n_kv_heads && pv->ne[2] == (int64_t) n_kv_heads);
+    GGML_ASSERT(dst->ne[1] == (int64_t) n_heads && dst->ne[2] == n_q_pos);
+    GGML_ASSERT(pk->nb[1] == ggml_row_size(GGML_TYPE_QJL1_256, 128));
+    GGML_ASSERT(pv->nb[1] == ggml_row_size(GGML_TYPE_TBQ3_0, 128));
+    GGML_ASSERT(pk->nb[2] == (size_t) n_tokens * pk->nb[1]);
+    GGML_ASSERT(pv->nb[2] == (size_t) n_tokens * pv->nb[1]);
+
+    vk_pipeline pipeline = ctx->device->pipeline_eliza_fused_attn_qjl_tbq;
+    const vk_subbuffer q_buf   = ggml_vk_tensor_subbuffer(ctx, q);
+    const vk_subbuffer pk_buf  = ggml_vk_tensor_subbuffer(ctx, pk);
+    const vk_subbuffer pv_buf  = ggml_vk_tensor_subbuffer(ctx, pv);
+    const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, (uint32_t) n_q_pos);
+    for (int64_t p = 0; p < n_q_pos; ++p) {
+        const eliza_vk_fused_attn_push pc = {
+            n_heads, n_kv_heads, n_tokens, (uint32_t) p, sm_bits, kv_tile, causal, q_pos_base,
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, pk_buf, pv_buf, dst_buf }, pc, { n_heads, 1, 1 });
+    }
+}
+
 static void ggml_vk_compute_forward(ggml_backend_vk_context* ctx, ggml_cgraph * cgraph, ggml_tensor* tensor, int tensor_idx, bool almost_ready);
 
 // Returns true if node has enqueued work into the queue, false otherwise
@@ -13886,6 +14327,23 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
     case GGML_OP_MUL_MAT_ID:
         ggml_vk_mul_mat_id(ctx, compute_ctx, cgraph, node_idx);
+
+        break;
+
+    case GGML_OP_ATTN_SCORE_QJL:
+        ggml_vk_eliza_attn_score_qjl(ctx, compute_ctx, node);
+
+        break;
+    case GGML_OP_ATTN_SCORE_TBQ:
+        ggml_vk_eliza_attn_score_tbq(ctx, compute_ctx, node);
+
+        break;
+    case GGML_OP_ATTN_SCORE_POLAR:
+        ggml_vk_eliza_attn_score_polar(ctx, compute_ctx, node);
+
+        break;
+    case GGML_OP_FUSED_ATTN_QJL_TBQ:
+        ggml_vk_eliza_fused_attn_qjl_tbq(ctx, compute_ctx, node);
 
         break;
 
@@ -16311,6 +16769,77 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
 
                 return true;
             }
+        case GGML_OP_ATTN_SCORE_QJL:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0] != nullptr &&
+                   op->src[1] != nullptr &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_QJL1_256 &&
+                   op->src[0]->ne[0] == 256 &&
+                   op->src[1]->ne[0] == 128 &&
+                   op->src[0]->ne[2] == 1 &&
+                   op->src[0]->ne[3] == 1 &&
+                   op->src[1]->ne[3] == 1 &&
+                   op->ne[2] == 1 &&
+                   op->ne[3] == 1 &&
+                   ggml_is_contiguous_rows(op) &&
+                   ggml_is_contiguous_rows(op->src[0]) &&
+                   ggml_is_contiguous_rows(op->src[1]);
+        case GGML_OP_ATTN_SCORE_TBQ:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0] != nullptr &&
+                   op->src[1] != nullptr &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   (op->src[1]->type == GGML_TYPE_TBQ3_0 ||
+                    op->src[1]->type == GGML_TYPE_TBQ4_0 ||
+                    op->src[1]->type == GGML_TYPE_TBQ3_TCQ) &&
+                   op->src[0]->ne[0] == 128 &&
+                   op->src[1]->ne[0] == 128 &&
+                   op->src[0]->ne[2] == 1 &&
+                   op->src[0]->ne[3] == 1 &&
+                   op->src[1]->ne[3] == 1 &&
+                   op->ne[2] == 1 &&
+                   op->ne[3] == 1 &&
+                   ggml_is_contiguous_rows(op) &&
+                   ggml_is_contiguous_rows(op->src[0]) &&
+                   ggml_is_contiguous_rows(op->src[1]);
+        case GGML_OP_ATTN_SCORE_POLAR:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0] != nullptr &&
+                   op->src[1] != nullptr &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_Q4_POLAR &&
+                   op->src[0]->ne[0] == 128 &&
+                   op->src[1]->ne[0] == 128 &&
+                   op->src[0]->ne[2] == 1 &&
+                   op->src[0]->ne[3] == 1 &&
+                   op->src[1]->ne[3] == 1 &&
+                   op->ne[2] == 1 &&
+                   op->ne[3] == 1 &&
+                   ggml_is_contiguous_rows(op) &&
+                   ggml_is_contiguous_rows(op->src[0]) &&
+                   ggml_is_contiguous_rows(op->src[1]);
+        case GGML_OP_FUSED_ATTN_QJL_TBQ:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0] != nullptr &&
+                   op->src[1] != nullptr &&
+                   op->src[2] != nullptr &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_QJL1_256 &&
+                   op->src[2]->type == GGML_TYPE_TBQ3_0 &&
+                   op->src[0]->ne[0] == 256 &&
+                   op->src[1]->ne[0] == 128 &&
+                   op->src[2]->ne[0] == 128 &&
+                   op->ne[0] == 128 &&
+                   op->src[0]->ne[3] == 1 &&
+                   op->src[1]->ne[3] == 1 &&
+                   op->src[2]->ne[3] == 1 &&
+                   op->ne[3] == 1 &&
+                   ggml_is_contiguous(op) &&
+                   ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op->src[2]);
+
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 bool coopmat2 = device->coopmat2;

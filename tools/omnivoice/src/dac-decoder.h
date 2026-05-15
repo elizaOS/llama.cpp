@@ -49,6 +49,9 @@ struct DACBlock {
     DACSnake             s1;
     // ConvTranspose1d weight in eliza ggml's native [K, OC, IC] layout.
     // Source-side layout is (IC, OC, K), represented by ggml as ne=(K, OC, IC).
+    // dac_load_ctw() (below) handles the source→ggml axis reordering at GGUF
+    // load time; the runtime tensor declared on the next line keeps the
+    // canonical 3-D shape and is consumed by mul_mat + col2im_1d downstream.
     struct ggml_tensor * ctw;  // [K, OC, IC] bf16
     struct ggml_tensor * ctb;  // [OC] f32
     DACResUnit           ru[DAC_RES_UNITS];

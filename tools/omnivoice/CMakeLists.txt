@@ -33,24 +33,51 @@ add_custom_target(omnivoice-version ALL
 )
 
 # Audio tokenizer tensor names can exceed the default GGML_MAX_NAME of 64.
-# Mirrors the original omnivoice.cpp CMakeLists.txt. Apply it to the linked
-# ggml/llama targets too; ggml parses tensor names during GGUF load, so keeping
-# this only on omnivoice translation units leaves tokenizer GGUFs unreadable.
-set(OMNIVOICE_COMPILE_DEFINITIONS GGML_MAX_NAME=128)
+# Mirrors the original omnivoice.cpp CMakeLists.txt. Apply GGML_MAX_NAME to the
+# linked ggml/llama targets too; ggml parses tensor names during GGUF load, so
+# keeping this only on omnivoice translation units leaves tokenizer GGUFs
+# unreadable.
+set(OMNIVOICE_GGML_COMPILE_DEFINITIONS GGML_MAX_NAME=128)
 foreach(_omnivoice_ggml_name_target
         ggml ggml-base ggml-cpu ggml-blas ggml-metal ggml-vulkan ggml-cuda
         llama common)
     if(TARGET ${_omnivoice_ggml_name_target})
         target_compile_definitions(${_omnivoice_ggml_name_target}
-            PUBLIC ${OMNIVOICE_COMPILE_DEFINITIONS})
+            PUBLIC ${OMNIVOICE_GGML_COMPILE_DEFINITIONS})
     endif()
 endforeach()
+# LLAMA_BUILD_OMNIVOICE and ELIZA_FUSE_OMNIVOICE stay scoped to omnivoice
+# targets and llama-server. The legacy ELIZA_FUSE_OMNIVOICE source guard remains
+# as a deprecation runway while the canonical merged path is LLAMA_BUILD_OMNIVOICE.
+#
+# W3-3 — OmniVoice → llama.cpp literal merge (canonical path):
+#   * Both LLAMA_BUILD_OMNIVOICE and ELIZA_FUSE_OMNIVOICE are defined on
+#     every target so source-level `#ifdef ELIZA_FUSE_OMNIVOICE` blocks
+#     (e.g. `tools/server/server.cpp`'s /v1/audio/speech route handler)
+#     continue to compile under the canonical merged path. The legacy
+#     out-of-tree graft (`omnivoice/` at fork root) is being removed in
+#     this wave; ELIZA_FUSE_OMNIVOICE stays as a source-level alias for
+#     one release as a deprecation runway.
+set(OMNIVOICE_COMPILE_DEFINITIONS
+    GGML_MAX_NAME=128
+    LLAMA_BUILD_OMNIVOICE
+    ELIZA_FUSE_OMNIVOICE)
+set(OMNIVOICE_LLAMA_PRIVATE_INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
 
 # Sources shared by both the static core and the shared ABI-export library.
 set(OMNIVOICE_CORE_SOURCES
     src/omnivoice.cpp
     src/pipeline-codec.cpp
     src/pipeline-tts.cpp
+)
+
+# Eliza FFI bridge sources — produce the `eliza_inference_*` symbol table
+# consumed by JS/Bun (`plugin-local-inference/services/voice/ffi-bindings.ts`),
+# Capacitor (mobile), Electrobun (desktop). The bridge wraps omnivoice +
+# llama + mtmd into a single ABI-stable C surface.
+set(OMNIVOICE_FFI_SOURCES
+    src/eliza-inference-ffi.cpp
 )
 
 # omnivoice_lib (STATIC) — the core. Tools link against this to pull
@@ -65,8 +92,8 @@ target_compile_definitions(omnivoice_lib
 target_include_directories(omnivoice_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_BINARY_DIR})
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${OMNIVOICE_LLAMA_PRIVATE_INCLUDE_DIRS})
 # llama transitively pulls ggml + the backend pair chosen at parent
 # configure time. The omnivoice tree never touches backend selection
 # directly ; patch 0003 will rewrite backend.h to consume the
@@ -95,8 +122,8 @@ if(OMNIVOICE_SHARED)
     target_include_directories(omnivoice PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_BINARY_DIR})
+        ${CMAKE_CURRENT_BINARY_DIR}
+        ${OMNIVOICE_LLAMA_PRIVATE_INCLUDE_DIRS})
     target_link_libraries(omnivoice PUBLIC llama)
     set_target_properties(omnivoice PROPERTIES
         C_VISIBILITY_PRESET       hidden
@@ -104,6 +131,75 @@ if(OMNIVOICE_SHARED)
         VISIBILITY_INLINES_HIDDEN ON
         POSITION_INDEPENDENT_CODE ON)
     add_dependencies(omnivoice omnivoice-version)
+endif()
+
+# elizainference (SHARED) — the canonical fused FFI library consumed by
+# the Eliza runtime (JS / Bun via bun:ffi, Capacitor on mobile, Electrobun
+# on desktop). Exports BOTH `eliza_inference_*` (the FFI ABI declared in
+# include/eliza-inference-ffi.h) AND `omnivoice` / `llama` symbol families
+# so the same `dlopen()`-ed handle serves text inference + speech
+# synthesis + ASR + VAD.
+#
+# Built when LLAMA_BUILD_OMNIVOICE=ON (always, when the merged tree is
+# enabled). The pre-W3-3 build script (`build-llama-cpp-dflash.mjs`) used
+# to graft + generate this via `omnivoice-fuse/prepare.mjs`; the merged
+# path produces it directly from in-fork source.
+#
+# Library file name: `libelizainference.{so,dylib,dll}` (no version
+# suffix on Linux to keep dlopen() happy on the runtime side). Default
+# visibility is `default` (not hidden) because every `eliza_inference_*`
+# entry the JS loader needs is reachable through dlsym.
+add_library(elizainference SHARED
+    ${OMNIVOICE_CORE_SOURCES}
+    ${OMNIVOICE_FFI_SOURCES})
+target_compile_features(elizainference PUBLIC cxx_std_17)
+target_compile_definitions(elizainference
+    PRIVATE OMNIVOICE_BUILD ${OMNIVOICE_COMPILE_DEFINITIONS})
+target_include_directories(elizainference PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${OMNIVOICE_LLAMA_PRIVATE_INCLUDE_DIRS})
+target_include_directories(elizainference PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../mtmd
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+# Link llama + mtmd. The transitive link pulls ggml + the parent
+# build's backend selection in; we never call ggml_backend_*_init()
+# from here directly (patch 0003 — backend_init_auto() consumes the
+# shared pair or constructs its own as needed).
+target_link_libraries(elizainference PUBLIC llama)
+if(TARGET mtmd)
+    target_link_libraries(elizainference PUBLIC mtmd)
+endif()
+set_target_properties(elizainference PROPERTIES
+    OUTPUT_NAME              elizainference
+    POSITION_INDEPENDENT_CODE ON)
+# Apple re-exports llama symbols so the fused .dylib carries everything
+# JS will dlopen() without a second handle. Mirrors the legacy fork-root
+# graft block.
+if(APPLE)
+    target_link_options(elizainference PRIVATE
+        "LINKER:-reexport_library,$<TARGET_FILE:llama>")
+endif()
+add_dependencies(elizainference omnivoice-version)
+
+# llama-server wiring — mount the OmniVoice POST /v1/audio/speech route
+# onto the same process that serves /v1/chat/completions + the DFlash
+# speculative loop. Source-level guard is `#ifdef ELIZA_FUSE_OMNIVOICE` in
+# `tools/server/server.cpp` (kept for the deprecation runway — both
+# defines are set above).
+#
+# This call is the merged equivalent of the pre-W3-3 root CMakeLists.txt
+# block (`ELIZA-OMNIVOICE-FUSION-GRAFT-V1`) that ran at the build-script
+# graft layer. The target llama-server is declared by the regular
+# add_subdirectory(tools) — by the time we get here it already exists.
+if(TARGET llama-server)
+    target_link_libraries(llama-server PRIVATE omnivoice_lib)
+    target_include_directories(llama-server PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${OMNIVOICE_LLAMA_PRIVATE_INCLUDE_DIRS})
+    target_compile_definitions(llama-server PRIVATE ${OMNIVOICE_COMPILE_DEFINITIONS})
 endif()
 
 # omnivoice-tts : full TTS pipeline CLI.
