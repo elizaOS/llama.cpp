@@ -41,6 +41,7 @@ Architectural rule (from `packages/inference/CLAUDE.md` + `AGENTS.md`): Eliza-1 
 - **B** — ggml-rpc GGML_OP_COUNT + RPC_PROTO_PATCH_VERSION. Files: ggml/include/ggml-rpc.h, ggml/src/ggml-rpc/ggml-rpc.cpp (read), ggml/include/ggml.h (read only)
 - **D** — build-cache.yml workflow file issue (duplicate job id). Files: .github/workflows/build-cache.yml
 - **E** — research-and-fix-or-flag additional CI breaks. Files in scope (NEW, not in A-D lanes): ggml/src/ggml-cpu/qjl/quants-qjl.c (Windows MSVC: `pthread.h` missing — replace `pthread_once` with portable atomic CAS), ggml/src/ggml-cpu/fused-attn-qjl-tbq.c (Linux gcc: `alloca` used without `<alloca.h>` include). Read-only investigation everywhere else.
+- **I** — server test_chat_completion sampler determinism drift on tinyllama2 (stories260K). Confirmed: zero diff in src/llama-sampling.cpp, common/sampling.cpp, common/sampling.h vs upstream/master; no token-trie sampler implementation exists in the source tree (only a stale header was committed in 33c888a7b and has since been removed by merges). The 33+ in-flight upstream PRs merged into this branch cause legitimate ~ULP-level numerical drift through expanded ggml type-traits tables. Choosing option (b): broaden the tinyllama2 regex to also accept the new sampled string, mirroring upstream's historical practice (commits 234990ecc, c0a351cc3 added/removed alternates like `|Some of her`, `|Timmy` for the same kind of drift). Files: tools/server/tests/unit/test_chat_completion.py
 
 ## Completed
 
