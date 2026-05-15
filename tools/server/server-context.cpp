@@ -2986,6 +2986,8 @@ private:
                         has_mtmd = true;
                     }
 
+                    const int32_t checkpoint_before_last_user_token = slot.task->params.checkpoint_before_last_user_token;
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.n_tokens < n_batch) {
                         // get next token to process
@@ -3011,6 +3013,15 @@ private:
                         slot.prompt.tokens.push_back(cur_tok);
 
                         slot.n_prompt_tokens_processed++;
+
+                        // stop the prompt batch exactly before the latest user input, so a checkpoint
+                        // can be created at the conversation boundary
+                        if (checkpoint_before_last_user_token > 0 &&
+                            slot.prompt.n_tokens() == checkpoint_before_last_user_token) {
+                            SLT_INF(slot, "checkpoint before user input reached: ending prompt batch at prompt_n_tokens = %d\n",
+                                    slot.prompt.n_tokens());
+                            break;
+                        }
 
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
                         // create checkpoints that many tokens before the end of the prompt:
@@ -3078,6 +3089,16 @@ private:
 
                     const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                     const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+
+                    // only create a checkpoint at the boundary before the latest user input
+                    if (do_checkpoint && checkpoint_before_last_user_token > 0) {
+                        const int32_t checkpoint_token = slot.prompt.n_tokens() - n_tokens_cur;
+                        if (checkpoint_token != checkpoint_before_last_user_token) {
+                            SLT_INF(slot, "skip checkpoint at %d, expected boundary before user input = %d\n",
+                                    checkpoint_token, checkpoint_before_last_user_token);
+                            do_checkpoint = false;
+                        }
+                    }
 
                     // no need for empty or small checkpoints
                     do_checkpoint = do_checkpoint && (pos_min >= 0 && slot.prompt.n_tokens() >= 64);
@@ -3662,6 +3683,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     meta->logit_bias_eog,
                     data);
             task.id_slot = json_value(data, "id_slot", -1);
+
+            // Disable checkpoint_before_last_user_token when the prompts contains media tokens
+            if (task.tokens.get_text_tokens().size() != task.tokens.size()) {
+                task.params.checkpoint_before_last_user_token = -1;
+            }
 
             // OAI-compat
             task.params.res_type          = res_type;
