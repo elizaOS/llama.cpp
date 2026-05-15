@@ -236,6 +236,10 @@ struct gguf_source {
     virtual uint64_t remain() const = 0;
     // Read `size` raw bytes into `dst`, advancing the cursor. Returns bytes read.
     virtual size_t   read_raw(void * dst, size_t size) = 0;
+    // Returns the current absolute byte offset from start of source, or -1 on error.
+    virtual int64_t  tell() const = 0;
+    // Advances the cursor to absolute byte offset `off`. Returns 0 on success.
+    virtual int      seek(int64_t off) = 0;
 };
 
 struct gguf_file_source : gguf_source {
@@ -263,6 +267,14 @@ struct gguf_file_source : gguf_source {
     size_t read_raw(void * dst, size_t size) override {
         return fread(dst, 1, size, file);
     }
+
+    int64_t tell() const override {
+        return gguf_ftell(file);
+    }
+
+    int seek(int64_t off) override {
+        return gguf_fseek(file, off, SEEK_SET);
+    }
 };
 
 struct gguf_buffer_source : gguf_source {
@@ -284,6 +296,18 @@ struct gguf_buffer_source : gguf_source {
             pos += to_read;
         }
         return to_read;
+    }
+
+    int64_t tell() const override {
+        return static_cast<int64_t>(pos);
+    }
+
+    int seek(int64_t off) override {
+        if (off < 0 || static_cast<size_t>(off) > size) {
+            return -1;
+        }
+        pos = static_cast<size_t>(off);
+        return 0;
     }
 };
 
@@ -757,14 +781,14 @@ static struct gguf_context * gguf_init_from_source(struct gguf_source & src, str
     GGML_ASSERT(int64_t(ctx->info.size()) == n_tensors);
 
     // we require the data section to be aligned, so take into account any padding
-    if (gguf_fseek(file, GGML_PAD(gguf_ftell(file), ctx->alignment), SEEK_SET) != 0) {
+    if (src.seek(GGML_PAD(src.tell(), ctx->alignment)) != 0) {
         GGML_LOG_ERROR("%s: failed to seek to beginning of data section\n", __func__);
         gguf_free(ctx);
         return nullptr;
     }
 
     // store the current file offset - this is where the data section starts
-    ctx->offset = gguf_ftell(file);
+    ctx->offset = src.tell();
 
     // compute the total size of the data section, taking into account the alignment
     {
