@@ -52,18 +52,12 @@
 #include "simd-mappings.h"
 #include "ggml-quants.h"
 #include "quants.h"
+#include "fused-attn-qjl-tbq.h"
 
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
-
-/* MSVC uses __declspec(thread) for TLS; GCC/clang use __thread. */
-#if defined(_MSC_VER)
-#  define ELIZA_THREAD_LOCAL __declspec(thread)
-#else
-#  define ELIZA_THREAD_LOCAL __thread
-#endif
 
 /* alloca() is declared in different headers across platforms. Mirror
  * the include pattern used in ggml.c / ggml-cpu.c. */
@@ -158,19 +152,7 @@ static inline float qjl_score_one_ref(const float * qs, const uint8_t * signs) {
     return acc;
 }
 
-/* SIMD inner-loop entry points. Each per-ISA TU defines these and
- * carries its own ifdef guard. */
-#if defined(__AVX2__)
-float qjl_score_one_avx2(const float * q_sketch, const uint8_t * signs);
-void  fused_attn_v_mix_avx2(int n_tokens, const float * w, const uint8_t * v_codes,
-                            const uint16_t * v_scales, float * out);
-#endif
-
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-float qjl_score_one_neon(const float * q_sketch, const uint8_t * signs);
-void  fused_attn_v_mix_neon(int n_tokens, const float * w, const uint8_t * v_codes,
-                            const uint16_t * v_scales, float * out);
-#endif
+/* SIMD inner-loop entry points are declared in fused-attn-qjl-tbq.h. */
 
 /* Reference V-mix path. Walks one tbq3_0 block per token and accumulates
  * w[t] * dequant_V[t] into out (head_dim long). v_codes is laid out as
@@ -379,8 +361,8 @@ void ggml_compute_forward_fused_attn_qjl_tbq(
         /* K side: contiguous signs/norms staging, per-thread. */
         const char * pk_plane = (const char *) pk->data
             + i3 * pk->nb[3] + hk * pk->nb[2];
-                static ELIZA_THREAD_LOCAL uint8_t  k_signs_buf[256 * 1024];   /* bytes */
-        static ELIZA_THREAD_LOCAL uint16_t k_norms_buf[8 * 1024];     /* tokens */
+        static GGML_THREAD_LOCAL uint8_t  k_signs_buf[256 * 1024];   /* bytes */
+        static GGML_THREAD_LOCAL uint16_t k_norms_buf[8 * 1024];     /* tokens */
         GGML_ASSERT((size_t) n_kv_tokens * 32 <= sizeof(k_signs_buf));
         GGML_ASSERT((size_t) n_kv_tokens     <= sizeof(k_norms_buf) / sizeof(uint16_t));
         for (int t = 0; t < n_kv_tokens; t++) {
@@ -393,8 +375,8 @@ void ggml_compute_forward_fused_attn_qjl_tbq(
         /* V side: tbq3_0, FUSED_TBQ_PER_TOKEN blocks/token, per-thread. */
         const char * pv_plane = (const char *) pv->data
             + i3 * pv->nb[3] + hk * pv->nb[2];
-        static ELIZA_THREAD_LOCAL uint8_t  v_codes_buf[8 * 1024 * 4 * 12];
-        static ELIZA_THREAD_LOCAL uint16_t v_scales_buf[8 * 1024 * 4];
+        static GGML_THREAD_LOCAL uint8_t  v_codes_buf[8 * 1024 * 4 * 12];
+        static GGML_THREAD_LOCAL uint16_t v_scales_buf[8 * 1024 * 4];
         const size_t n_v_blocks = (size_t) n_kv_tokens * FUSED_TBQ_PER_TOKEN;
         GGML_ASSERT(n_v_blocks * 12 <= sizeof(v_codes_buf));
         GGML_ASSERT(n_v_blocks      <= sizeof(v_scales_buf) / sizeof(uint16_t));

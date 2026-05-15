@@ -341,6 +341,8 @@ struct common_params_speculative_ngram_map {
 };
 
 struct common_params_speculative_ngram_cache {
+    uint16_t n_draft = 8;             // upstream PR #22055: number of tokens to draft per pass
+
     std::string lookup_cache_static;  // path of static ngram cache file for lookup decoding
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
 };
@@ -609,6 +611,7 @@ struct common_params {
     bool use_jinja = true;                                                                                  // NOLINT
     bool enable_chat_template = true;
     bool force_pure_content_parser = false;
+    bool parallel_tool_calls = false;
     common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
     int enable_reasoning = -1; // -1 = auto, 0 = disable, 1 = enable
     bool prefill_assistant = true; // if true, any trailing assistant message will be prefilled into the response

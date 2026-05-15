@@ -110,9 +110,18 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     # TU was actually compiled — POLARQUANT_HAVE_* records which.
     target_include_directories(${GGML_CPU_NAME} PRIVATE ggml-cpu/polarquant)
     if (GGML_SYSTEM_ARCH STREQUAL "x86")
-        target_compile_definitions(${GGML_CPU_NAME} PRIVATE POLARQUANT_HAVE_AVX2=1)
-        if (GGML_AVX_VNNI)
-            target_compile_definitions(${GGML_CPU_NAME} PRIVATE POLARQUANT_HAVE_AVXVNNI=1)
+        # POLARQUANT_HAVE_AVX2 must match the actual `__AVX2__` predicate the
+        # per-TU bodies (polar_dot_preht_avx2.c) self-guard on. Variants like
+        # `ggml-cpu-x64` (the Android NDK x86_64 baseline) are compiled
+        # WITHOUT `-mavx2`, so their AVX2 TU compiles to an empty stub. If we
+        # still defined POLARQUANT_HAVE_AVX2 here the dispatcher would emit
+        # an unresolved call to `ggml_vec_dot_q4_polar_preht_f32_avx2` and
+        # the shared library would fail to link.
+        if (GGML_AVX2)
+            target_compile_definitions(${GGML_CPU_NAME} PRIVATE POLARQUANT_HAVE_AVX2=1)
+            if (GGML_AVX_VNNI)
+                target_compile_definitions(${GGML_CPU_NAME} PRIVATE POLARQUANT_HAVE_AVXVNNI=1)
+            endif()
         endif()
     elseif (GGML_SYSTEM_ARCH STREQUAL "ARM")
         target_compile_definitions(${GGML_CPU_NAME} PRIVATE POLARQUANT_HAVE_NEON=1)
@@ -127,12 +136,20 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     # / __ARM_FEATURE_DOTPROD so a host without the ISA gets a dead body,
     # never an undefined symbol.
     if (GGML_SYSTEM_ARCH STREQUAL "x86")
-        target_compile_definitions(${GGML_CPU_NAME} PRIVATE QJL_HAVE_AVX2=1)
-        if (GGML_AVX_VNNI)
-            # build-llama-cpp-dflash.mjs sets -DGGML_AVX_VNNI=ON only for
-            # native x86_64 hosts that report avx_vnni, which is exactly
-            # when the global ARCH_FLAGS make __AVXVNNI__ available.
-            target_compile_definitions(${GGML_CPU_NAME} PRIVATE QJL_HAVE_AVXVNNI=1)
+        # QJL_HAVE_AVX2 must match the actual `__AVX2__` predicate the per-TU
+        # bodies (qjl_quantize_avx2.c, qjl_score_avx2.c) self-guard on. The
+        # `ggml-cpu-x64` baseline variant (used by Android NDK x86_64) is
+        # compiled WITHOUT `-mavx2`, so its AVX2 TUs compile to empty stubs.
+        # Defining QJL_HAVE_AVX2 in that case would route the dispatcher to
+        # unresolved symbols at link time.
+        if (GGML_AVX2)
+            target_compile_definitions(${GGML_CPU_NAME} PRIVATE QJL_HAVE_AVX2=1)
+            if (GGML_AVX_VNNI)
+                # build-llama-cpp-dflash.mjs sets -DGGML_AVX_VNNI=ON only for
+                # native x86_64 hosts that report avx_vnni, which is exactly
+                # when the global ARCH_FLAGS make __AVXVNNI__ available.
+                target_compile_definitions(${GGML_CPU_NAME} PRIVATE QJL_HAVE_AVXVNNI=1)
+            endif()
         endif()
     elseif (GGML_SYSTEM_ARCH STREQUAL "ARM")
         target_compile_definitions(${GGML_CPU_NAME} PRIVATE QJL_HAVE_NEON=1)

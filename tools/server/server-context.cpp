@@ -860,6 +860,16 @@ private:
                 return false;
             }
 
+            // Upstream PR #22660: for SWA draft models, force swa_full on the
+            // draft context so prefix reuse (seq_rm + seq_add) works beyond
+            // the SWA window during speculation. Without this, the draft has
+            // to re-decode from the window edge on every long-context request
+            // and acceptance length degrades sharply.
+            if (llama_model_n_swa(model_dft.get()) > 0 && !params_dft.swa_full) {
+                SRV_INF("%s", "draft model uses SWA - enabling swa_full for the draft context\n");
+                params_dft.swa_full = true;
+            }
+
             auto cparams = common_context_params_to_llama(params_dft);
             ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
 
@@ -1152,6 +1162,7 @@ private:
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
                 /* media_path            */ params_base.media_path,
+                /* parallel_tool_calls   */ params_base.parallel_tool_calls,
                 /* force_pure_content    */ params_base.force_pure_content_parser
             };
         }
@@ -2016,13 +2027,39 @@ private:
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            // Upstream PR #22826: when the limit is reached, prefer evicting an
+            // interior checkpoint whose neighbours are closest together (i.e.
+            // the most redundant by coverage) over always dropping the oldest.
+            // This preserves early-context coverage so the slot can resume from
+            // near the start of a long prompt without full re-processing.
+            auto & checkpoints = slot.prompt.checkpoints;
 
-            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+            auto erase_it = checkpoints.begin();
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            if (checkpoints.size() >= 3) {
+                auto prev = checkpoints.begin();
+                auto it   = prev; ++it;
+                auto next = it;   ++next;
+
+                erase_it = it;
+                llama_pos best_gap = next->n_tokens - prev->n_tokens;
+
+                for (; next != checkpoints.end(); ++prev, ++it, ++next) {
+                    const llama_pos gap = next->n_tokens - prev->n_tokens;
+
+                    if (gap < best_gap) {
+                        best_gap = gap;
+                        erase_it = it;
+                    }
+                }
+            }
+
+            const auto & old = *erase_it;
+
+            SLT_WRN(slot, "erasing redundant context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                    old.pos_min, old.pos_max, old.n_tokens, (float) old.size() / 1024 / 1024);
+
+            checkpoints.erase(erase_it);
         }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();

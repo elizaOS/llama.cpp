@@ -90,6 +90,12 @@ void ggml_vec_dot_q4_polar_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const
 // for the algorithm. Tested by tests/test-fused-kernels.cpp.
 void ggml_vec_dot_q4_polar_q8_0_fused(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 
+// Fused-Hadamard Q4_POLAR x Q8_0 dot — collapses the WHT butterfly across
+// two consecutive Q4_POLAR blocks (length 256 WHT instead of 2 x length 128).
+// Same ABI as ggml_vec_dot_q4_polar_q8_0. See
+// ggml/src/ggml-cpu/fused-hadamard-polar-dot.c for the algorithm.
+void ggml_vec_dot_q4_polar_q8_0_fused_hadamard(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+
 void ggml_vec_dot_iq2_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_iq2_xs_q8_K (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_iq2_s_q8_K  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);

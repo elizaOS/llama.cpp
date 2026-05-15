@@ -61,7 +61,6 @@
 
 #if defined(GGML_CUDA_FUSED_ATTN_QJL)
 
-#include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
 #include <cmath>

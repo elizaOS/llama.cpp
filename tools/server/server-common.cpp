@@ -1038,7 +1038,7 @@ json oaicompat_chat_params_parse(
     inputs.json_schema           = json_schema.is_null() ? "" : json_schema.dump();
     inputs.grammar               = grammar;
     inputs.use_jinja             = opt.use_jinja;
-    inputs.parallel_tool_calls   = json_value(body, "parallel_tool_calls", caps["supports_parallel_tool_calls"]);
+    inputs.parallel_tool_calls   = json_value(body, "parallel_tool_calls", opt.parallel_tool_calls || caps["supports_parallel_tool_calls"]);
     inputs.add_generation_prompt = json_value(body, "add_generation_prompt", true);
     const bool continue_final_message = json_value(body, "continue_final_message", false);
     if (continue_final_message && inputs.add_generation_prompt) {

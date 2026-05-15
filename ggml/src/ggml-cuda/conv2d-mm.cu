@@ -1,7 +1,5 @@
 #include "conv2d-mm.cuh"
 
-#include <cuda_runtime.h>
-
 // If defined, indices are computed once and re-used by each thread
 #if __CUDA_ARCH__ < 700
 #    define USE_COLLECTIVES
@@ -20,7 +18,7 @@ uint32_t ceil_div(uint32_t M, uint32_t N) {
     return (M + N - 1) / N;
 }
 
-__align__(16) struct Params {
+struct __align__(16) Params {
     uint32_t Cout;
     uint32_t Cin;
     uint32_t N;
@@ -305,10 +303,10 @@ constexpr int conv_shapes[][NUM_VARIANTS] = {
 
 int get_sm_count() {
     int device;
-    cudaGetDevice(&device);
+    CUDA_CHECK(cudaGetDevice(&device));
 
     int sm_count;
-    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
+    CUDA_CHECK(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
     return sm_count;
 }
 
@@ -340,7 +338,7 @@ void ggml_cuda_op_conv_2d_variant(ggml_backend_cuda_context & ctx,
     uint32_t NB_K   = CEIL_DIV(p.Cout, BS_K);
     uint32_t NB_NPQ = CEIL_DIV(NPQ, BS_NPQ);
 
-    cudaMemcpyToSymbol(dp, &p, sizeof(Params));
+    CUDA_CHECK(cudaMemcpyToSymbol(dp, &p, sizeof(Params)));
 
     // Kernel arguments
     float * src0_data = (float *) src0->data;

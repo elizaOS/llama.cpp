@@ -709,9 +709,18 @@ llama_model_loader::llama_model_loader(
     }
 
     n_kv      = gguf_get_n_kv(metadata);
+    // When loading from an in-memory gguf with no backing files:
+    //   - no_alloc=true (buffer load, e.g. llama_model_init_from_user with a complete gguf
+    //     such as test-model-load-buffer): the gguf metadata enumerates every tensor the arch
+    //     will create, so use gguf_get_n_tensors(metadata) as the expected count.
+    //   - no_alloc=false (sparse-fixture synth path, e.g. test-llama-archs which constructs
+    //     a gguf with a handful of placeholder tensors and lets the loader synthesize the
+    //     remainder): weights_map is empty and the metadata count is unrelated to what the
+    //     arch will actually create — match upstream's legacy behavior of 0 here so the
+    //     done_getting_tensors check is consistent with the no-count synth path below.
     n_tensors = files.empty()
-        ? gguf_get_n_tensors(metadata)
-        : weights_map.size();
+        ? (no_alloc ? (int) gguf_get_n_tensors(metadata) : (int) weights_map.size())
+        : (int) weights_map.size();
 
     fver = (enum llama_fver) gguf_get_version(metadata);
 
@@ -1270,7 +1279,18 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             if (t) {
                 return t;
             }
-        } else {
+        } else if (tid != -1) {
+            // Pair this increment with the n_tensors selection above:
+            //   - no_alloc=true (buffer load): every create_tensor() reaching the synth
+            //     branch must find tid != -1 (otherwise the no_alloc throw above fires),
+            //     so this increment runs for every created tensor and matches
+            //     n_tensors = gguf_get_n_tensors(metadata).
+            //   - no_alloc=false (sparse-fixture path used by test-llama-archs): tid == -1
+            //     for every arch tensor synthesized from the sparse gguf, so this branch
+            //     is skipped and n_created stays at 0 — matching the n_tensors = 0
+            //     legacy value above. Without this gate, the synthesized placeholders
+            //     inflate n_created past gguf_get_n_tensors() and done_getting_tensors
+            //     throws "wrong number of tensors".
             n_created++;
         }
 

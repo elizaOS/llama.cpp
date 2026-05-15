@@ -17,10 +17,10 @@
 #include "simd-mappings.h"
 #include "ggml-quants.h"
 #include "quants.h"
+#include "fused-attn-qjl-tbq.h"
 
 #include <immintrin.h>
 #include <math.h>
-#include <stdalign.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -39,14 +39,6 @@ static inline __m256 expand_signs_byte(uint8_t b) {
     __m256 negones = _mm256_set1_ps(-1.0f);
     return _mm256_blendv_ps(negones, ones, _mm256_castsi256_ps(mask));
 }
-
-/* Public AVX2 entry points. Forward-declared in fused-attn-qjl-tbq.c
- * (the dispatcher); local prototypes here so gcc -Wmissing-prototypes
- * accepts the definitions. */
-float qjl_score_one_avx2(const float * q_sketch, const uint8_t * signs);
-void  fused_attn_v_mix_avx2(int n_tokens, const float * w,
-                            const uint8_t * v_codes, const uint16_t * v_scales,
-                            float * out);
 
 float qjl_score_one_avx2(const float * q_sketch, const uint8_t * signs) {
     __m256 acc = _mm256_setzero_ps();
@@ -160,7 +152,7 @@ void fused_attn_v_mix_avx2(int n_tokens, const float * w,
             const int blk = t * (FUSED_QJL_HEAD_DIM / FUSED_TBQ_BLOCK) + c;
             const uint8_t * codes = v_codes + (size_t) blk * (FUSED_TBQ_BLOCK * 3 / 8);
             const float d = GGML_CPU_FP16_TO_FP32(v_scales[blk]);
-            alignas(32) float decoded[FUSED_TBQ_BLOCK];
+            GGML_ALIGN(32) float decoded[FUSED_TBQ_BLOCK];
             tbq3_decode_block_avx2(codes, d, decoded);
             float * out_chunk = out + c * FUSED_TBQ_BLOCK;
             for (int i = 0; i < FUSED_TBQ_BLOCK; i += 8) {
