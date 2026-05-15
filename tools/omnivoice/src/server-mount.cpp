@@ -382,7 +382,7 @@ static float json_float_positive(const json & in, const char * name, float fallb
 }
 
 // handler_t for POST /v1/audio/speech.
-static server_http_context::handler_t audio_speech_handler() {
+server_http_context::handler_t audio_speech_handler() {
     return [](const server_http_req & req) -> server_http_res_ptr {
         json in;
         try {
