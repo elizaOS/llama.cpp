@@ -255,6 +255,7 @@ Tracked but NOT fixed in this pass — all blocked behind agents A-D landing the
 
 - **II** — SYCL Windows `test-model-load-buffer.exe` LNK2019 on `llama_model::memory_breakdown()`. Root cause: test uses internal C++ method not exported with `LLAMA_API` on Windows shared-lib builds — same class as existing tests at tests/CMakeLists.txt:151-152 already-gated behind `if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)`. Fix: same gate around test-model-load-buffer. Files: tests/CMakeLists.txt.
 - **LL** — broad triage Apple/RISC-V/self-hosted/Server
+- **KK** — Vulkan gate gemma2/gemma3n in test-llama-archs (NMSE-vs-CPU drift on llvmpipe). Files: tests/test-llama-archs.cpp
 
 ## Completed (II)
 
