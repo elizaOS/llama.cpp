@@ -109,6 +109,7 @@ The full failure log set (71 raw failures across 9 workflows) collapses to 7 dis
 - **GG** — broad wave-11 CI triage (excl. Apple ios-xcode dup-symbols [EE] / Vulkan test-llama-archs decode [FF])
 - **FF** — Vulkan test-llama-archs decode crash. Files: tests/test-llama-archs.cpp, possibly src/llama-model-loader.cpp
 - **HH** — dflash-draft test-llama-archs missing tensor. Files: tests/test-llama-archs.cpp
+- **OO** — wave-14 catchall triage. Files: investigative only (lane-respect MM EAGLE3 and NN RISC-V); no overlapping edit with MM's unstaged llama-model.cpp/test-llama-archs.cpp work-in-tree.
 
 ## Completed
 
