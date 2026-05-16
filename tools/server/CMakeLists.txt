@@ -172,4 +172,15 @@ target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PRIVATE server-context PUBLIC llama-common cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
 
+# Kokoro TTS — when LLAMA_BUILD_KOKORO is on, the server links the
+# kokoro_lib static library (which carries the audio_speech_handler) and
+# adds the kokoro headers to its include path so server.cpp's
+# `#include "kokoro-server-mount.h"` resolves. The LLAMA_BUILD_KOKORO
+# define is also propagated so server.cpp's `#ifdef`-guarded blocks compile.
+if (LLAMA_BUILD_KOKORO)
+    target_include_directories(${TARGET} PRIVATE ../kokoro/include)
+    target_link_libraries(${TARGET} PRIVATE kokoro_lib)
+    target_compile_definitions(${TARGET} PRIVATE LLAMA_BUILD_KOKORO)
+endif()
+
 target_compile_features(${TARGET} PRIVATE cxx_std_17)

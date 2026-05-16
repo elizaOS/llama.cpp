@@ -1173,9 +1173,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "ISTFT",
 };
 
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1287,9 +1289,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "istft(x)",
 };
 
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5082,6 +5086,40 @@ struct ggml_tensor * ggml_pool_2d_back(
     result->op     = GGML_OP_POOL_2D_BACK;
     result->src[0] = a;
     result->src[1] = af;
+
+    return result;
+}
+
+// ggml_istft
+
+struct ggml_tensor * ggml_istft(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mag_phase,
+        struct ggml_tensor  * window,
+        int                   n_fft,
+        int                   hop_length,
+        int                   win_length) {
+    GGML_ASSERT(mag_phase != NULL);
+    GGML_ASSERT(n_fft > 0 && hop_length > 0 && win_length > 0);
+
+    // mag_phase layout: ne[0]=2 (mag/phase), ne[1]=F (n_fft/2+1), ne[2]=T (frames)
+    const int64_t F = n_fft / 2 + 1;
+    const int64_t T = mag_phase->ne[2] > 0 ? mag_phase->ne[2] : mag_phase->ne[1];
+    (void) F; // validated at runtime by the kernel
+
+    // Output length: (T-1)*hop + win_length
+    // Use ne[2] as T when the tensor is 3-D [2, F, T]; ne[1] as T when 2-D.
+    const int64_t n_out = (T - 1) * hop_length + win_length;
+
+    const int64_t ne[4] = { n_out, 1, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    int32_t params[] = { n_fft, hop_length, win_length };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_ISTFT;
+    result->src[0] = mag_phase;
+    result->src[1] = window;  // may be NULL
 
     return result;
 }

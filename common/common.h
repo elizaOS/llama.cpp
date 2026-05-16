@@ -354,7 +354,14 @@ struct common_params_speculative {
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
 
-    // Optional target-token-string -> draft-token-string compatibility map used by --spec-replace.
+    // Cross-vocab token replacement pairs for spec-decode: when the
+    // target and draft models have different tokenizers, replace
+    // occurrences of `first` (target-tokenizer string) with `second`
+    // (draft-tokenizer string) in the prompt fed to the draft model.
+    // Wired by the `--spec-replace TARGET DRAFT` CLI flag and consumed
+    // by `common_speculative_apply_replacements()`. Required by the
+    // upstream/master speculative-decode rewrite that landed in
+    // 79079c25e but not added to this struct as part of that merge.
     std::vector<std::pair<std::string, std::string>> replacements;
 
     common_params_speculative_ngram_mod ngram_mod;

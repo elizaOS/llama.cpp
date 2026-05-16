@@ -37,9 +37,11 @@
 #define cublasOperation_t mublasOperation_t
 #define cublasGetStatusString mublasGetStatusString
 #define cudaDataType_t musaDataType_t
+#define cudaDevAttrMultiProcessorCount musaDevAttrMultiProcessorCount
 #define cudaDeviceCanAccessPeer musaDeviceCanAccessPeer
 #define cudaDeviceDisablePeerAccess musaDeviceDisablePeerAccess
 #define cudaDeviceEnablePeerAccess musaDeviceEnablePeerAccess
+#define cudaDeviceGetAttribute musaDeviceGetAttribute
 #define cudaDeviceGetPCIBusId musaDeviceGetPCIBusId
 #define cudaDeviceProp musaDeviceProp
 #define cudaDeviceSynchronize musaDeviceSynchronize
@@ -77,6 +79,7 @@
 #define cudaMemcpyDeviceToHost musaMemcpyDeviceToHost
 #define cudaMemcpyHostToDevice musaMemcpyHostToDevice
 #define cudaMemcpyKind musaMemcpyKind
+#define cudaMemcpyToSymbol musaMemcpyToSymbol
 #define cudaMemset musaMemset
 #define cudaMemsetAsync musaMemsetAsync
 #define cudaMemGetInfo musaMemGetInfo

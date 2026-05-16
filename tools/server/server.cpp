@@ -11,268 +11,23 @@
 #include "llama.h"
 #include "log.h"
 
-// ELIZA-OMNIVOICE-AUDIO-SPEECH-ROUTE-V1
+// ELIZA-OMNIVOICE-AUDIO-SPEECH-ROUTE-V1 — the route handler used to live
+// here as a large inline `#ifdef ELIZA_FUSE_OMNIVOICE` block. H2.c moved
+// it into `tools/omnivoice/src/server-mount.cpp` so a fresh checkout of
+// the fork carries the production route without any build-time patcher.
 #ifdef ELIZA_FUSE_OMNIVOICE
-#include "omnivoice.h"
-#include <algorithm>
-#include <cstdlib>
-#include <cstdint>
-#include <cstring>
-#include <mutex>
-#include <string>
-#include <vector>
-
-namespace eliza_omnivoice {
-
-// Resolve a config value: prefer the CLI override captured in main(), then
-// the env var, then empty.
-static std::string g_model_path;
-static std::string g_codec_path;
-
-static std::string cli_or_env(const std::string & cli, const char * name) {
-    if (!cli.empty()) return cli;
-    const char * v = std::getenv(name);
-    if (v && v[0] != '\0') return std::string(v);
-    return std::string();
-}
-
-static std::string resolved_model_path() {
-    return cli_or_env(g_model_path, "ELIZA_OMNIVOICE_MODEL");
-}
-static std::string resolved_codec_path() {
-    return cli_or_env(g_codec_path, "ELIZA_OMNIVOICE_CODEC");
-}
-
-static std::mutex      g_mu;
-static ov_context *    g_ctx = nullptr;   // lazily initialised under g_mu
-static std::string     g_init_error;       // sticky: a failed init stays failed until paths change
-static std::string     g_init_signature;   // model|codec the live ctx was built from
-
-// Returns the OmniVoice context, initialising it on first use. Returns
-// nullptr and sets *err on failure. Caller must hold g_mu.
-static ov_context * acquire_locked(std::string & err) {
-    const std::string model = resolved_model_path();
-    const std::string codec = resolved_codec_path();
-    const std::string sig = model + "|" + codec;
-    if (g_ctx && g_init_signature == sig) return g_ctx;
-    if (g_ctx && g_init_signature != sig) {
-        ov_free(g_ctx);
-        g_ctx = nullptr;
-        g_init_error.clear();
-    }
-    if (model.empty() || codec.empty()) {
-        err = "omnivoice TTS not configured: pass --omnivoice-model and "
-              "--omnivoice-codec (or set ELIZA_OMNIVOICE_MODEL / "
-              "ELIZA_OMNIVOICE_CODEC) when launching the fused server";
-        return nullptr;
-    }
-    if (!g_init_error.empty() && g_init_signature == sig) {
-        err = g_init_error;
-        return nullptr;
-    }
-    ov_init_params ip;
-    ov_init_default_params(&ip);
-    ip.model_path = model.c_str();
-    ip.codec_path = codec.c_str();
-    ov_context * ctx = ov_init(&ip);
-    if (!ctx) {
-        const char * le = ov_last_error();
-        g_init_error = std::string("omnivoice ov_init failed: ") + (le ? le : "(no detail)");
-        g_init_signature = sig;
-        err = g_init_error;
-        return nullptr;
-    }
-    g_ctx = ctx;
-    g_init_signature = sig;
-    g_init_error.clear();
-    return g_ctx;
-}
-
-// Build a 16-bit PCM WAV container around f32 mono samples at sample_rate.
-static std::string wav16_from_f32(const float * pcm, int n, int sample_rate) {
-    auto put_u32 = [](std::string & s, uint32_t v) {
-        s.push_back((char)(v & 0xff));
-        s.push_back((char)((v >> 8) & 0xff));
-        s.push_back((char)((v >> 16) & 0xff));
-        s.push_back((char)((v >> 24) & 0xff));
-    };
-    auto put_u16 = [](std::string & s, uint16_t v) {
-        s.push_back((char)(v & 0xff));
-        s.push_back((char)((v >> 8) & 0xff));
-    };
-    const uint16_t channels = 1;
-    const uint16_t bits = 16;
-    const uint32_t byte_rate = (uint32_t)sample_rate * channels * (bits / 8);
-    const uint16_t block_align = channels * (bits / 8);
-    const uint32_t data_bytes = (uint32_t)n * (bits / 8);
-    std::string out;
-    out.reserve(44 + data_bytes);
-    out += "RIFF";
-    put_u32(out, 36 + data_bytes);
-    out += "WAVE";
-    out += "fmt ";
-    put_u32(out, 16);          // PCM fmt chunk size
-    put_u16(out, 1);           // PCM
-    put_u16(out, channels);
-    put_u32(out, (uint32_t)sample_rate);
-    put_u32(out, byte_rate);
-    put_u16(out, block_align);
-    put_u16(out, bits);
-    out += "data";
-    put_u32(out, data_bytes);
-    for (int i = 0; i < n; ++i) {
-        float v = pcm[i];
-        if (v > 1.0f) v = 1.0f;
-        if (v < -1.0f) v = -1.0f;
-        int32_t s = (int32_t)(v * 32767.0f);
-        put_u16(out, (uint16_t)(int16_t)s);
-    }
-    return out;
-}
-
-// Raw little-endian f32 PCM (the runtime's preferred wire form — the JS
-// ring buffer is f32 @ 24 kHz, no decode step).
-static std::string pcm_f32_le(const float * pcm, int n) {
-    std::string out;
-    out.resize((size_t)n * sizeof(float));
-    std::memcpy(out.data(), pcm, out.size());
-    return out;
-}
-
-static server_http_res_ptr error_res(int status, const std::string & message) {
-    auto res = std::make_unique<server_http_res>();
-    res->status = status;
-    res->content_type = "application/json; charset=utf-8";
-    json body = { { "error", { { "message", message }, { "type", "omnivoice_error" } } } };
-    res->data = body.dump();
-    return res;
-}
-
-static int env_int_clamped(const char * name, int fallback, int lo, int hi) {
-    const char * v = std::getenv(name);
-    if (!v || v[0] == '\0') return fallback;
-    char * end = nullptr;
-    long parsed = std::strtol(v, &end, 10);
-    if (end == v) return fallback;
-    return (int) std::max((long) lo, std::min((long) hi, parsed));
-}
-
-static int json_int_clamped(const json & in, const char * name, int fallback, int lo, int hi) {
-    if (!in.contains(name)) return fallback;
-    try {
-        if (in[name].is_number_integer()) {
-            const int v = in[name].get<int>();
-            return std::max(lo, std::min(hi, v));
-        }
-        if (in[name].is_string()) {
-            const std::string s = in[name].get<std::string>();
-            char * end = nullptr;
-            long parsed = std::strtol(s.c_str(), &end, 10);
-            if (end != s.c_str()) return (int) std::max((long) lo, std::min((long) hi, parsed));
-        }
-    } catch (...) {
-    }
-    return fallback;
-}
-
-static float json_float_positive(const json & in, const char * name, float fallback) {
-    if (!in.contains(name)) return fallback;
-    try {
-        if (in[name].is_number()) {
-            const float v = in[name].get<float>();
-            return v > 0.0f ? v : fallback;
-        }
-        if (in[name].is_string()) {
-            const std::string s = in[name].get<std::string>();
-            char * end = nullptr;
-            float parsed = std::strtof(s.c_str(), &end);
-            if (end != s.c_str() && parsed > 0.0f) return parsed;
-        }
-    } catch (...) {
-    }
-    return fallback;
-}
-
-// handler_t for POST /v1/audio/speech.
-static server_http_context::handler_t audio_speech_handler() {
-    return [](const server_http_req & req) -> server_http_res_ptr {
-        json in;
-        try {
-            in = req.body.empty() ? json::object() : json::parse(req.body);
-        } catch (const std::exception & e) {
-            return error_res(400, std::string("invalid JSON body: ") + e.what());
-        }
-        std::string text;
-        if (in.contains("input") && in["input"].is_string()) {
-            text = in["input"].get<std::string>();
-        } else if (in.contains("text") && in["text"].is_string()) {
-            text = in["text"].get<std::string>();
-        }
-        if (text.empty()) {
-            return error_res(400, "missing or empty 'input' field");
-        }
-        std::string fmt = "wav";
-        if (in.contains("response_format") && in["response_format"].is_string()) {
-            fmt = in["response_format"].get<std::string>();
-        }
-        // 'voice' is accepted for OpenAI shape compatibility; the Eliza-1
-        // bundle ships one default voice preset, so it is informational only
-        // until per-voice presets are wired into omnivoice-core.
-
-        std::string err;
-        ov_context * ctx = nullptr;
-        {
-            std::lock_guard<std::mutex> lk(g_mu);
-            ctx = acquire_locked(err);
-        }
-        if (!ctx) return error_res(503, err);
-
-        ov_tts_params tp;
-        ov_tts_default_params(&tp);
-        tp.text = text.c_str();
-        int mg_steps = env_int_clamped("ELIZA_OMNIVOICE_MG_NUM_STEP", tp.mg_num_step, 4, 64);
-        mg_steps = json_int_clamped(in, "num_step", mg_steps, 4, 64);
-        mg_steps = json_int_clamped(in, "num_steps", mg_steps, 4, 64);
-        mg_steps = json_int_clamped(in, "steps", mg_steps, 4, 64);
-        tp.mg_num_step = mg_steps;
-        const float duration_sec = json_float_positive(in, "duration", 0.0f);
-        if (duration_sec > 0.0f) {
-            const int frames = ov_duration_sec_to_tokens(ctx, duration_sec);
-            if (frames > 0) tp.T_override = frames;
-        }
-        ov_audio audio = {};
-        ov_status st;
-        {
-            // ov_synthesize is not reentrant on one context; serialise.
-            std::lock_guard<std::mutex> lk(g_mu);
-            st = ov_synthesize(ctx, &tp, &audio);
-        }
-        if (st != OV_STATUS_OK) {
-            const char * le = ov_last_error();
-            ov_audio_free(&audio);
-            return error_res(500, std::string("ov_synthesize failed (status ") +
-                std::to_string((int)st) + "): " + (le ? le : "(no detail)"));
-        }
-        const int sample_rate = 24000; // omnivoice codec output rate
-        auto res = std::make_unique<server_http_res>();
-        res->status = 200;
-        if (fmt == "pcm" || fmt == "f32" || fmt == "raw") {
-            res->content_type = "application/octet-stream";
-            res->headers["X-Sample-Rate"] = std::to_string(sample_rate);
-            res->headers["X-Sample-Format"] = "f32le";
-            res->data = pcm_f32_le(audio.samples, audio.n_samples);
-        } else {
-            res->content_type = "audio/wav";
-            res->data = wav16_from_f32(audio.samples, audio.n_samples, sample_rate);
-        }
-        ov_audio_free(&audio);
-        return res;
-    };
-}
-
-} // namespace eliza_omnivoice
+#include "server-mount.h"
 #endif // ELIZA_FUSE_OMNIVOICE
 // end // ELIZA-OMNIVOICE-AUDIO-SPEECH-ROUTE-V1
+
+// ELIZA-KOKORO-AUDIO-SPEECH-ROUTE-V1 — J2 (2026-05-15). When
+// LLAMA_BUILD_KOKORO=ON, the Kokoro fork-side TTS pipeline owns
+// `/v1/audio/speech` whenever --kokoro-model is set. Falls back to the
+// OmniVoice handler otherwise. The dispatcher lives in main() below.
+#ifdef LLAMA_BUILD_KOKORO
+#include "kokoro-server-mount.h"
+#endif // LLAMA_BUILD_KOKORO
+// end // ELIZA-KOKORO-AUDIO-SPEECH-ROUTE-V1
 
 #include <atomic>
 #include <clocale>
@@ -342,20 +97,30 @@ int main(int argc, char ** argv) {
 
     common_init();
 
-#ifdef ELIZA_FUSE_OMNIVOICE
-    // Strip omnivoice-fused-only flags before common_params_parse so the
-    // upstream parser doesn't reject them. Values feed the lazily-created
-    // OmniVoice context (see the eliza_omnivoice namespace above).
+#if defined(ELIZA_FUSE_OMNIVOICE) || defined(LLAMA_BUILD_KOKORO)
+    // Strip fused-TTS-only flags before common_params_parse so the upstream
+    // parser doesn't reject them. Values feed the lazily-created OmniVoice
+    // and Kokoro contexts (see the eliza_omnivoice / eliza_kokoro
+    // namespaces).
     {
         std::vector<char *> filtered;
         filtered.reserve((size_t)argc);
         for (int i = 0; i < argc; ++i) {
             const std::string a = argv[i];
+#ifdef ELIZA_FUSE_OMNIVOICE
             if ((a == "--omnivoice-model" || a == "--omnivoice-codec") && i + 1 < argc) {
                 if (a == "--omnivoice-model") eliza_omnivoice::g_model_path = argv[++i];
                 else                          eliza_omnivoice::g_codec_path = argv[++i];
                 continue;
             }
+#endif
+#ifdef LLAMA_BUILD_KOKORO
+            if ((a == "--kokoro-model" || a == "--kokoro-voices-dir") && i + 1 < argc) {
+                if (a == "--kokoro-model")       eliza_kokoro::g_model_path = argv[++i];
+                else                             eliza_kokoro::g_voices_dir = argv[++i];
+                continue;
+            }
+#endif
             filtered.push_back(argv[i]);
         }
         static std::vector<char *> s_filtered = filtered;
@@ -469,11 +234,24 @@ int main(int argc, char ** argv) {
     ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
     ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));
     ctx_http.post("/audio/transcriptions",     ex_wrapper(routes.post_transcriptions_oai));
-#ifdef ELIZA_FUSE_OMNIVOICE
-    // Fused omnivoice TTS — same process as the text/DFlash routes above.
-    ctx_http.post("/v1/audio/speech",          ex_wrapper(eliza_omnivoice::audio_speech_handler()));
-    ctx_http.post("/audio/speech",             ex_wrapper(eliza_omnivoice::audio_speech_handler()));
+    // Fused TTS — /v1/audio/speech dispatcher. When --kokoro-model is set
+    // and LLAMA_BUILD_KOKORO=ON, the Kokoro path owns the route; otherwise
+    // (and when LLAMA_BUILD_KOKORO=OFF), the OmniVoice path takes it.
+    // Picking the handler at registration time (vs per-request) keeps the
+    // route's hot path branch-free and lets each handler own its own
+    // server-mount mutex / context.
+#ifdef LLAMA_BUILD_KOKORO
+    if (eliza_kokoro::is_enabled()) {
+        ctx_http.post("/v1/audio/speech",      ex_wrapper(eliza_kokoro::audio_speech_handler()));
+        ctx_http.post("/audio/speech",         ex_wrapper(eliza_kokoro::audio_speech_handler()));
+    } else
 #endif
+    {
+#ifdef ELIZA_FUSE_OMNIVOICE
+        ctx_http.post("/v1/audio/speech",      ex_wrapper(eliza_omnivoice::audio_speech_handler()));
+        ctx_http.post("/audio/speech",         ex_wrapper(eliza_omnivoice::audio_speech_handler()));
+#endif
+    }
     ctx_http.post("/v1/messages",              ex_wrapper(routes.post_anthropic_messages)); // anthropic messages API
     ctx_http.post("/v1/messages/count_tokens", ex_wrapper(routes.post_anthropic_count_tokens)); // anthropic token counting
     ctx_http.post("/infill",                   ex_wrapper(routes.post_infill));

@@ -276,10 +276,20 @@ if (NOT GGML_BACKEND_DL)
     # GGML_OP_FUSED_ATTN_QJL_TBQ op, so they require static-linked
     # backends just like the standard quant tests above.
     llama_build_and_test(test-qjl-cache.cpp)
-    llama_build_and_test(test-fused-kernels.cpp)
-    # Standalone bench: not part of `ctest` (no LABEL "main") since it
-    # records perf numbers rather than asserting correctness.
-    llama_build(bench-fused-kernels.cpp)
+    if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+        # test-fused-kernels and bench-fused-kernels call directly into the
+        # internal fused-kernel entry points (ggml_vec_dot_q4_polar_q8_0,
+        # ggml_vec_dot_q4_polar_q8_0_fused,
+        # ggml_vec_dot_q4_polar_q8_0_fused_hadamard) which live in
+        # ggml-cpu but are not exported with GGML_BACKEND_API. On Windows
+        # shared-lib builds (e.g. CI sycl), those symbols are not visible
+        # to consumers of ggml-cpu.dll → LNK2019. Match the gate used by
+        # test-model-load-buffer above and the other internal-symbol tests.
+        llama_build_and_test(test-fused-kernels.cpp)
+        # Standalone bench: not part of `ctest` (no LABEL "main") since it
+        # records perf numbers rather than asserting correctness.
+        llama_build(bench-fused-kernels.cpp)
+    endif()
     # W4-B compile-only validation that the new CUDA host wrappers for
     # QJL / PolarQuant Q4 / TBQ3_TCQ are linkable. Skipped entirely when
     # the CUDA backend is not built; otherwise the matching feature

@@ -2063,7 +2063,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 // here, the graph builder put a Metal-only op on the CPU backend by
                 // mistake. Abort explicitly so the failure is visible.
                 GGML_ABORT("attn_score_tbq / attn_score_polar: no CPU implementation; route via Metal backend or use attn_score_qjl / flash_attn_ext on CPU graphs");
-            } break;
+            }
         case GGML_OP_FUSED_ATTN_QJL_TBQ:
             {
                 ggml_compute_forward_fused_attn_qjl_tbq(params, tensor);
@@ -2098,6 +2098,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_GLU:
             {
                 ggml_compute_forward_glu(params, tensor);
+            } break;
+        case GGML_OP_ISTFT:
+            {
+                ggml_compute_forward_istft(params, tensor);
             } break;
         case GGML_OP_GET_REL_POS:
             {
@@ -2524,6 +2528,12 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
             {
+                n_tasks = n_threads;
+            } break;
+        case GGML_OP_ISTFT:
+            {
+                // iSTFT is parallelized per frame; n_tasks = n_threads capped
+                // by the number of output frames at runtime — set max here.
                 n_tasks = n_threads;
             } break;
         case GGML_OP_NONE:

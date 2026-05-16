@@ -2350,7 +2350,6 @@ void ggml_vec_dot_q5_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #if defined __AVX2__
 
     const __m256i m4 = _mm256_set1_epi8(0xF);
-    const __m128i mzero = _mm_setzero_si128();
     const __m256i mone  = _mm256_set1_epi8(1);
 
     __m256 acc = _mm256_setzero_ps();

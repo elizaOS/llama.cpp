@@ -443,6 +443,17 @@ static bool arch_supported(const llm_arch arch) {
         return false;
     }
 
+    // LLM_ARCH_KOKORO has no native graph inference path — the arch tag
+    // exists purely so the K-quant publish pipeline (R8 §3.1) can route a
+    // Kokoro-82M GGUF through the standard llama-quantize tool. Inference
+    // happens in the standalone `tools/kokoro/` runtime (kokoro.cpp), which
+    // does not go through `llama_init_from_model`. The test-llama-archs
+    // fixture path would abort with "native graph inference not yet
+    // implemented", so skip it here just like DFLASH_DRAFT above.
+    if (arch == LLM_ARCH_KOKORO) {
+        return false;
+    }
+
     return true;
 }
 

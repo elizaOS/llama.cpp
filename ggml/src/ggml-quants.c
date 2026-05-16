@@ -408,6 +408,12 @@ void quantize_row_q1_0_ref(const float * GGML_RESTRICT x, block_q1_0 * GGML_REST
     }
 }
 
+// Sister to quantize_row_q1_0_ref / _g128_ref. Identical body, only the
+// block type and QK constant differ. The 79079c25e upstream/master merge
+// dropped this definition while leaving the declaration in
+// `ggml-quants.h:18` and three call sites (`ggml.c:683`, `ggml-quants.c:2265`
+// + `2271`, `ggml-cpu/quants.c:30`); link fails with
+// `undefined reference to 'quantize_row_q1_0_g32_ref'`.
 void quantize_row_q1_0_g32_ref(const float * GGML_RESTRICT x, block_q1_0_g32 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK1_0_g32;
 

@@ -1373,7 +1373,46 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 };
             }
         case GGML_OP_GET_ROWS:
-            return true;
+            // Metal has get_rows kernels for the standard quants + a few
+            // float types. Eliza custom quants (Q1_0_g32 / Q1_0_g128 / TBQ*
+            // / QJL1_256 / Q4_POLAR / TBQ3_TCQ) only have CPU vec_dot paths
+            // for now — without a Metal kernel,
+            // `ggml_metal_library_compile_pipeline(kernel_get_rows_<type>)`
+            // returns a nil pipeline and the dispatcher segfaults on
+            // `ggml_metal_pipeline_max_theads_per_threadgroup(nil)`. Gate
+            // the supported set explicitly here so test-backend-ops and the
+            // graph scheduler offload these types to CPU.
+            switch (op->src[0]->type) {
+                case GGML_TYPE_F32:
+                case GGML_TYPE_F16:
+                case GGML_TYPE_BF16:
+                case GGML_TYPE_I32:
+                case GGML_TYPE_Q1_0:
+                case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q4_1:
+                case GGML_TYPE_Q5_0:
+                case GGML_TYPE_Q5_1:
+                case GGML_TYPE_Q8_0:
+                case GGML_TYPE_MXFP4:
+                case GGML_TYPE_NVFP4:
+                case GGML_TYPE_Q2_K:
+                case GGML_TYPE_Q3_K:
+                case GGML_TYPE_Q4_K:
+                case GGML_TYPE_Q5_K:
+                case GGML_TYPE_Q6_K:
+                case GGML_TYPE_IQ2_XXS:
+                case GGML_TYPE_IQ2_XS:
+                case GGML_TYPE_IQ2_S:
+                case GGML_TYPE_IQ3_XXS:
+                case GGML_TYPE_IQ3_S:
+                case GGML_TYPE_IQ1_S:
+                case GGML_TYPE_IQ1_M:
+                case GGML_TYPE_IQ4_NL:
+                case GGML_TYPE_IQ4_XS:
+                    return true;
+                default:
+                    return false;
+            }
         case GGML_OP_SET_ROWS:
             {
                 if (op->src[0]->type != GGML_TYPE_F32) {
@@ -1877,7 +1916,7 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
             [encoder endEncoding];
         }
 
-        [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> __unused cb) {
             dispatch_semaphore_signal(completion_semaphore);
         }];
 
@@ -1893,11 +1932,20 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
 void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     if (buf->is_shared) {
 #if GGML_METAL_HAS_MANAGED_BUFFERS
-        // For Managed buffers, sync GPU→CPU then direct memcpy
+        // For Managed buffers (discrete GPU), sync GPU→CPU via blit encoder
+        // before reading. synchronizeResource: lives on MTLBlitCommandEncoder,
+        // not on MTLBuffer directly.
         if (buf->dev->props.use_managed_buffers) {
             struct ggml_metal_buffer_id bid = ggml_metal_buffer_get_id(buf, tensor);
             @autoreleasepool {
-                [(id<MTLBuffer>)bid.metal synchronizeResource];
+                id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
+                {
+                    id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+                    [encoder synchronizeResource:bid.metal];
+                    [encoder endEncoding];
+                }
+                [cmd_buf commit];
+                [cmd_buf waitUntilCompleted];
             }
         }
 #endif

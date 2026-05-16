@@ -36,6 +36,13 @@ else()
         # the one that fires for the normal standalone build.
         add_subdirectory(omnivoice)
     endif()
+    if (LLAMA_BUILD_KOKORO)
+        # Kokoro-82M (StyleTTS-2 + iSTFTNet) standalone TTS — J2 fork-side
+        # replacement for the ONNX runtime path. Produces kokoro_lib +
+        # the kokoro-tts CLI; when LLAMA_BUILD_SERVER is also on, the
+        # `/v1/audio/speech` handler is mounted via server.cpp.
+        add_subdirectory(kokoro)
+    endif()
     if (GGML_RPC)
         add_subdirectory(rpc)
     endif()

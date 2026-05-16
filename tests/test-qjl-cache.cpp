@@ -37,7 +37,6 @@ constexpr int kBlockBytes  = 34;           // sizeof(block_qjl1_256)
 constexpr int kNHeads      = 8;            // q-heads (Qwen3-0.6B-shaped)
 constexpr int kNKvHeads    = 2;            // GQA share = 4
 constexpr int kNTokens     = 100;          // KV-cache decode length
-constexpr int kProjSeed    = 42;           // matches the default Π in the shim
 
 // Mersenne-style helpers stolen from the shim — we don't import the kernel
 // header here (this test runs against the shipped libggml.so / libggml-cpu.so

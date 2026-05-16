@@ -58,7 +58,8 @@ static void print_usage(const char * argv0) {
 
 static void run_benchmark(ggml_backend_t backend, const BenchmarkParams & params, ggml_type type_a, const std::string & phase_name, int64_t n) {
     if (params.verbose) {
-        printf("Benchmarking %s %s: m=%ld n=%ld k=%ld\n", phase_name.c_str(), ggml_type_name(type_a), params.m, n, params.k);
+        printf("Benchmarking %s %s: m=%lld n=%lld k=%lld\n", phase_name.c_str(), ggml_type_name(type_a),
+               (long long) params.m, (long long) n, (long long) params.k);
     }
 
     // Init context
@@ -242,7 +243,7 @@ int main(int argc, char ** argv) {
         GGML_TYPE_MXFP4
     };
 
-    printf("\n=== Prompt Processing (Prefill) Phase (Batch Size = %ld) ===\n", params.n_prefill);
+    printf("\n=== Prompt Processing (Prefill) Phase (Batch Size = %lld) ===\n", (long long) params.n_prefill);
     printf("| %-10s | %-10s | %-10s |\n", "Quant", "Time (us)", "TOPS");
     printf("|-%-10s-|-%-10s-|-%-10s-|\n", "----------", "----------", "----------");
     
@@ -250,7 +251,7 @@ int main(int argc, char ** argv) {
         run_benchmark(backend_ptr.get(), params, type, "Prefill", params.n_prefill);
     }
 
-    printf("\n=== Token Generation (Decoding) Phase (Batch Size = %ld) ===\n", params.n_decode);
+    printf("\n=== Token Generation (Decoding) Phase (Batch Size = %lld) ===\n", (long long) params.n_decode);
     printf("| %-10s | %-10s | %-10s | %-10s |\n", "Quant", "Time (us)", "TOPS", "Eff. BW (GB/s)");
     printf("|-%-10s-|-%-10s-|-%-10s-|-%-14s-|\n", "----------", "----------", "----------", "--------------");
 

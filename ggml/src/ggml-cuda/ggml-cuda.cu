@@ -37,6 +37,7 @@
 #include "ggml-cuda/out-prod.cuh"
 #include "ggml-cuda/pad.cuh"
 #include "ggml-cuda/pool2d.cuh"
+#include "ggml-cuda/istft.cuh"
 #include "ggml-cuda/quantize.cuh"
 #include "ggml-cuda/rope.cuh"
 #include "ggml-cuda/roll.cuh"
@@ -339,15 +340,10 @@ static ggml_cuda_device_info ggml_cuda_init() {
         }
     }
 
-#ifdef GGML_USE_NCCL
-    if (info.device_count > 1) {
-        int dev_ids[GGML_CUDA_MAX_DEVICES];
-        for (int id = 0; id < info.device_count; ++id) {
-            dev_ids[id] = id;
-        }
-        NCCL_CHECK(ncclCommInitAll(info.comms, info.device_count, dev_ids));
-    }
-#endif // GGML_USE_NCCL
+    // NCCL communicator initialization moved to ggml_backend_cuda_comm_init_nccl
+    // (operates on ggml_backend_cuda_comm_context::comms). ggml_cuda_device_info
+    // no longer carries `comms`; the device info is per-process, NCCL state is
+    // per-backend.
 
     return info;
 }
@@ -3145,6 +3141,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_POOL_2D:
             ggml_cuda_op_pool2d(ctx, dst);
             break;
+        case GGML_OP_ISTFT:
+            ggml_cuda_op_istft(ctx, dst);
+            break;
         case GGML_OP_SUM:
             ggml_cuda_op_sum(ctx, dst);
             break;
@@ -5351,6 +5350,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return true;
                 }
                 return false;
+            } break;
+        case GGML_OP_ISTFT:
+            {
+                // Only F32 mag_phase is supported; n_fft must fit shared memory.
+                if (op->src[0]->type != GGML_TYPE_F32) return false;
+                const int32_t * pp = (const int32_t *) op->op_params;
+                const int n_fft = pp[0];
+                return (n_fft > 0 && n_fft <= 2048);
             } break;
         case GGML_OP_SILU_BACK:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;

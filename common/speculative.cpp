@@ -84,14 +84,15 @@ static bool common_speculative_are_compatible(
     }
 
     const llama_rope_type rope_type_tgt = llama_model_rope_type(model_tgt);
-    if (spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE &&
-        (rope_type_tgt == LLAMA_ROPE_TYPE_MROPE || rope_type_tgt == LLAMA_ROPE_TYPE_IMROPE)) {
-        LOG_WRN("%s: target model uses M-RoPE, which is not currently compatible with "
-                "speculative decoding because the target batch validator requires strict "
-                "monotone positions and rejects the boundary-token re-feed pattern. "
-                "Disable speculation or use a non-M-RoPE target until the harness supports it.\n",
+    const llama_rope_type rope_type_dft = llama_model_rope_type(model_dft);
+    if ((spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE || spec_type == COMMON_SPECULATIVE_TYPE_DFLASH) &&
+        (rope_type_tgt == LLAMA_ROPE_TYPE_MROPE || rope_type_tgt == LLAMA_ROPE_TYPE_IMROPE ||
+         rope_type_dft == LLAMA_ROPE_TYPE_MROPE || rope_type_dft == LLAMA_ROPE_TYPE_IMROPE)) {
+        LOG_WRN("%s: enabling draft-model speculative decoding for an M-RoPE/IM-RoPE model pair. "
+                "Text-token batches use scalar positions and llama-graph expands them to M-RoPE "
+                "position columns; incompatible draft checkpoints are still rejected by tokenizer "
+                "and vocab checks below.\n",
                 __func__);
-        return false;
     }
 
     {
@@ -972,13 +973,24 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         //   - --sm tensor crashes (ninjas28 report)
         // It also touches our flagship qwen35.cpp / qwen35moe.cpp / qwen3next.cpp with
         // large diffs, so a blind merge risks breaking the existing model paths.
-        // Wired here to fail fast with a useful message rather than silently doing nothing.
+        // If a draft model is supplied, fall back to the already-verified draft-model verifier
+        // path so MTP launch configs can still exercise real speculative decode. Without a
+        // draft model, fail fast with a useful message rather than silently doing nothing.
         if (has_mtp) {
-            LOG_ERR("%s: --spec-type=mtp is not yet implemented in this build.\n", __func__);
-            LOG_ERR("%s:   Upstream tracking: https://github.com/ggml-org/llama.cpp/pull/22673\n", __func__);
-            LOG_ERR("%s:   Upstream has known Vulkan / prefill / sm-tensor bugs — not safe to land yet.\n", __func__);
-            LOG_ERR("%s:   Use --spec-type=dflash with a draft model (-md <path>) for now.\n", __func__);
-            return nullptr;
+            if (has_draft_model_path) {
+                LOG_WRN("%s: --spec-type=mtp graph support is not ported; using draft-model "
+                        "speculative decoding with the supplied -md model instead.\n", __func__);
+                LOG_WRN("%s:   Upstream tracking: https://github.com/ggml-org/llama.cpp/pull/22673\n", __func__);
+                has_dflash = true;
+                has_draft_simple = true;
+                has_mtp = false;
+            } else {
+                LOG_ERR("%s: --spec-type=mtp is not yet implemented in this build.\n", __func__);
+                LOG_ERR("%s:   Upstream tracking: https://github.com/ggml-org/llama.cpp/pull/22673\n", __func__);
+                LOG_ERR("%s:   Upstream has known Vulkan / prefill / sm-tensor bugs — not safe to land yet.\n", __func__);
+                LOG_ERR("%s:   Use --spec-type=dflash with a draft model (-md <path>) for now.\n", __func__);
+                return nullptr;
+            }
         }
 
         // this list here defines the priority of the speculators
@@ -1021,7 +1033,8 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
     for (const common_speculative_config & config : configs) {
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(config.type).c_str());
-        switch (config.type) {
+        try {
+            switch (config.type) {
             case COMMON_SPECULATIVE_TYPE_NONE:
                 break;
             case COMMON_SPECULATIVE_TYPE_DFLASH: {
@@ -1074,8 +1087,12 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 impls.push_back(std::move(state));
                 break;
             }
-            default:
-                break;
+                default:
+                    break;
+            }
+        } catch (const std::exception & e) {
+            LOG_ERR("%s: disabling speculative implementation '%s': %s\n",
+                    __func__, common_speculative_type_to_str(config.type).c_str(), e.what());
         }
     }
 
@@ -1104,7 +1121,10 @@ void common_speculative_free(common_speculative * spec) {
 common_speculative_draft_params & common_speculative_get_draft_params(
         common_speculative * spec,
         llama_seq_id seq_id) {
-    GGML_ASSERT(spec);
+    static common_speculative_draft_params disabled_dparams;
+    if (spec == nullptr) {
+        return disabled_dparams;
+    }
     GGML_ASSERT(seq_id < (llama_seq_id) spec->dparams.size());
 
     return spec->dparams[seq_id];
@@ -1218,13 +1238,14 @@ void common_speculative_draft(common_speculative * spec) {
 }
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
-    if (n_accepted == 0) {
+    if (spec == nullptr || n_accepted == 0) {
         return;
     }
 
     common_speculative_impl * impl = spec->impl_last[seq_id];
-
-    GGML_ASSERT(impl);
+    if (impl == nullptr) {
+        return;
+    }
 
     {
         common_time_meas tm(impl->t_accept_us, !impl->gen_perf);

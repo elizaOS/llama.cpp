@@ -118,10 +118,32 @@ option(LLAMA_TESTS_INSTALL          "llama: install tests"                      
 # llama.cpp, producing the libomnivoice shared library (when
 # OMNIVOICE_SHARED is also set) and the omnivoice-tts / omnivoice-codec
 # CLI tools. Default OFF so stock llama.cpp consumers see no change.
-# NOTE: until patch 0002 vendors tools/omnivoice/, enabling this flag
-# is a hard error - see the guard near the bottom of this file.
 option(LLAMA_BUILD_OMNIVOICE "Build the merged omnivoice TTS subtree" OFF)
 option(OMNIVOICE_SHARED      "Build libomnivoice for ABI consumers" OFF)
+
+# Kokoro-82M (StyleTTS-2 + iSTFTNet) standalone TTS subtree. Built only
+# when LLAMA_BUILD_KOKORO=ON. Produces kokoro_lib (static) + kokoro-tts
+# (standalone CLI harness) + the `/v1/audio/speech` server-mount handler.
+# The arch tag LLM_ARCH_KOKORO already lives in src/models/kokoro.cpp for
+# the K-quant publish pipeline (R8 §3.1); this option enables the actual
+# inference path. Default OFF so stock llama.cpp consumers see no change.
+option(LLAMA_BUILD_KOKORO    "Build the Kokoro-82M TTS subtree (tools/kokoro/)" OFF)
+
+# W3-3 deprecation: ELIZA_FUSE_OMNIVOICE=ON is the pre-W3-3 flag for the
+# fork-root `omnivoice/` graft. The graft is gone (see the deprecation
+# block below); turn the flag into a redirect now so the option ON state
+# is visible to add_subdirectory(tools) — which runs the merged tree's
+# CMakeLists at `tools/omnivoice/CMakeLists.txt`.
+if(ELIZA_FUSE_OMNIVOICE AND NOT LLAMA_BUILD_OMNIVOICE)
+    message(WARNING
+        "ELIZA_FUSE_OMNIVOICE=ON is deprecated as of W3-3 (OmniVoice → "
+        "llama.cpp literal merge). It now redirects to "
+        "LLAMA_BUILD_OMNIVOICE=ON which builds the merged tools/omnivoice/ "
+        "tree. Update your build flags to LLAMA_BUILD_OMNIVOICE=ON before "
+        "the next release.")
+    set(LLAMA_BUILD_OMNIVOICE ON CACHE BOOL
+        "Build the merged omnivoice TTS subtree" FORCE)
+endif()
 
 # 3rd party libs
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
@@ -230,8 +252,8 @@ if (LLAMA_BUILD_OMNIVOICE)
     if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/omnivoice/CMakeLists.txt")
         message(FATAL_ERROR
             "LLAMA_BUILD_OMNIVOICE=ON but tools/omnivoice/CMakeLists.txt is missing. "
-            "Re-vendor the omnivoice subtree (see ../llama.cpp-omnivoice-merge/PLAN.md "
-            "patch 0002), then re-run cmake.")
+            "The merged tree should be present in any v1.0.1-eliza+ checkout. "
+            "Verify the fork is at the v1.0.1-eliza tag or later.")
     endif()
     # When LLAMA_BUILD_TOOLS=ON the tools/ subdirectory above already
     # adds omnivoice. Only add it directly from here for the
@@ -327,142 +349,9 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 
 
-# ELIZA-OMNIVOICE-FUSION-GRAFT-V1
-# ----------------------------------------------------------------------
-# Source-level fusion of github.com/ServeurpersoCom/omnivoice.cpp into
-# this build tree. See packages/app-core/scripts/omnivoice-fuse/README.md
-# for the strategy. The omnivoice sources were copied into omnivoice/
-# by prepare.mjs and intentionally do NOT bring their own ggml — they
-# share llama.cpp's vendored ggml.
-# ----------------------------------------------------------------------
-
-if(ELIZA_FUSE_OMNIVOICE)
-    find_package(Threads REQUIRED)
-
-    # Audio tokenizer tensor names exceed default GGML_MAX_NAME of 64.
-    # Mirrored from omnivoice's own CMakeLists.txt.
-    add_compile_definitions(GGML_MAX_NAME=128)
-    foreach(_eliza_ggml_max_name_target
-            ggml ggml-base ggml-cpu ggml-blas ggml-metal ggml-vulkan ggml-cuda
-            llama common mtmd server-context)
-        if(TARGET ${_eliza_ggml_max_name_target})
-            target_compile_definitions(${_eliza_ggml_max_name_target}
-                PUBLIC GGML_MAX_NAME=128)
-        endif()
-    endforeach()
-
-    file(GLOB ELIZA_OMNIVOICE_SOURCES
-        CONFIGURE_DEPENDS
-        ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice/src/*.cpp)
-    file(GLOB ELIZA_OMNIVOICE_HEADERS
-        CONFIGURE_DEPENDS
-        ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice/src/*.h)
-
-    if(NOT ELIZA_OMNIVOICE_SOURCES)
-        message(FATAL_ERROR "ELIZA_FUSE_OMNIVOICE=ON but no sources under omnivoice/src/")
-    endif()
-
-    add_library(omnivoice-core STATIC ${ELIZA_OMNIVOICE_SOURCES})
-    target_compile_definitions(omnivoice-core PUBLIC OMNIVOICE_STATIC)
-    target_compile_features(omnivoice-core PUBLIC cxx_std_17)
-    target_include_directories(omnivoice-core PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice
-        ${CMAKE_CURRENT_SOURCE_DIR}/tools/mtmd
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_BINARY_DIR})
-    # Share llama.cpp's ggml. NEVER add a second add_subdirectory(ggml)
-    # from the omnivoice tree — see the README's reconciliation
-    # strategy for why.
-    target_include_directories(omnivoice-core SYSTEM PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include)
-    target_link_libraries(omnivoice-core PUBLIC llama mtmd ggml Threads::Threads)
-    if(TARGET ggml-base)
-        target_link_libraries(omnivoice-core PUBLIC ggml-base)
-    endif()
-    foreach(_eliza_backend cpu blas cuda metal vulkan)
-        if(TARGET ggml-${_eliza_backend})
-            get_target_property(_eliza_btype ggml-${_eliza_backend} TYPE)
-            if(NOT _eliza_btype STREQUAL "MODULE_LIBRARY")
-                target_link_libraries(omnivoice-core PUBLIC ggml-${_eliza_backend})
-            endif()
-        endif()
-    endforeach()
-
-    # Fused shared library exporting both `llama_*` and `omnivoice_*`.
-    # Used by Electrobun + Capacitor bridges that dlopen one artifact.
-    add_library(elizainference SHARED
-        ${ELIZA_OMNIVOICE_SOURCES})
-    target_compile_definitions(elizainference PRIVATE OMNIVOICE_BUILD)
-    target_compile_features(elizainference PUBLIC cxx_std_17)
-    target_include_directories(elizainference PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice
-        ${CMAKE_CURRENT_SOURCE_DIR}/tools/mtmd
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_BINARY_DIR})
-    target_include_directories(elizainference SYSTEM PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include)
-    target_link_libraries(elizainference PUBLIC llama mtmd)
-    if(APPLE)
-        target_link_options(elizainference PRIVATE
-            "LINKER:-reexport_library,$<TARGET_FILE:llama>")
-    endif()
-    target_link_libraries(elizainference PUBLIC ggml Threads::Threads)
-    if(TARGET ggml-base)
-        target_link_libraries(elizainference PUBLIC ggml-base)
-    endif()
-    foreach(_eliza_backend cpu blas cuda metal vulkan)
-        if(TARGET ggml-${_eliza_backend})
-            get_target_property(_eliza_btype ggml-${_eliza_backend} TYPE)
-            if(NOT _eliza_btype STREQUAL "MODULE_LIBRARY")
-                target_link_libraries(elizainference PUBLIC ggml-${_eliza_backend})
-            endif()
-        endif()
-    endforeach()
-    set_target_properties(elizainference PROPERTIES
-        OUTPUT_NAME elizainference
-        POSITION_INDEPENDENT_CODE ON)
-
-    # The fused HTTP server IS `llama-server`. The kernel-patch
-    # `server-omnivoice-route.mjs` adds a `POST /v1/audio/speech` route to
-    # tools/server/server.cpp, guarded by `#ifdef ELIZA_FUSE_OMNIVOICE`,
-    # backed by omnivoice-core's `ov_synthesize`. So the same process that
-    # serves `/completion` + `/v1/chat/completions` + the DFlash spec loop
-    # also serves TTS — one process, one llama.cpp build, one GGML pin
-    # (packages/inference/AGENTS.md §4). We link omnivoice-core into the
-    # `llama-server` target and put the route define + omnivoice headers on
-    # it. The non-fused build is untouched (this whole block is inside
-    # `if(ELIZA_FUSE_OMNIVOICE)`).
-    if(TARGET llama-server)
-        target_link_libraries(llama-server PRIVATE omnivoice-core)
-        target_include_directories(llama-server PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice/src
-            ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice)
-        # Match the rest of the fused build's ggml_tensor layout (the
-        # foreach above bumps GGML_MAX_NAME on every other target);
-        # omnivoice-core was compiled the same way, so the static link is
-        # ABI-consistent.
-        target_compile_definitions(llama-server PRIVATE
-            ELIZA_FUSE_OMNIVOICE GGML_MAX_NAME=128)
-    endif()
-
-    # Legacy `llama-omnivoice-server` placeholder kept ONLY so the symbol
-    # verifier can still confirm both symbol families are co-resident in an
-    # executable, and so an operator who scripted the old binary name still
-    # gets a working OmniVoice CLI. The real merged HTTP route lives in
-    # `llama-server` above; spawn that, not this.
-    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice/tools/omnivoice-tts.cpp)
-        add_executable(llama-omnivoice-server
-            ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice/tools/omnivoice-tts.cpp)
-        target_include_directories(llama-omnivoice-server PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice/src
-            ${CMAKE_CURRENT_SOURCE_DIR}/omnivoice
-            ${CMAKE_CURRENT_BINARY_DIR})
-        target_compile_features(llama-omnivoice-server PRIVATE cxx_std_17)
-        target_link_libraries(llama-omnivoice-server PRIVATE
-            omnivoice-core llama)
-    endif()
-endif()
-# ----------------------------------------------------------------------
-# end # ELIZA-OMNIVOICE-FUSION-GRAFT-V1
+# ELIZA-OMNIVOICE-FUSION-GRAFT-V1 (REMOVED — W3-3 merged path is canonical)
+# The pre-W3-3 legacy graft block lived here. The merged build is now
+# self-contained inside `tools/omnivoice/CMakeLists.txt`. The
+# `ELIZA_FUSE_OMNIVOICE` deprecation redirect lives near the top of
+# this file (next to the LLAMA_BUILD_OMNIVOICE option declaration) so
+# the option ON state is visible when add_subdirectory(tools) runs.
