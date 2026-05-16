@@ -6620,6 +6620,117 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// Eliza custom-quant attention parity tests. These exercise the two
+// custom attention ops that have a CPU reference implementation:
+//   - GGML_OP_ATTN_SCORE_QJL      (QJL1_256 packed K)
+//   - GGML_OP_FUSED_ATTN_QJL_TBQ  (QJL1_256 K + TBQ3_0 V)
+//
+// GGML_OP_ATTN_SCORE_TBQ and GGML_OP_ATTN_SCORE_POLAR are intentionally
+// not tested here because the CPU backend has no implementation for
+// them (they GGML_ABORT — they are Metal-only and canonical CPU graphs
+// lower them via attn_score_qjl / flash_attn_ext). A test_case for
+// either would crash the harness when computing the CPU reference, not
+// produce a "FAIL" line.
+//
+// Metal implements all four ops (see ggml_metal_device_supports_op
+// cases ATTN_SCORE_QJL / TBQ / POLAR / FUSED_ATTN_QJL_TBQ in
+// ggml-metal-device.m). For the two ops below the CPU reference comes
+// from ggml-cpu/qjl. Vulkan + CUDA have no kernels for these ops; the
+// harness prints "not supported" for those backends, matching the
+// GET_ROWS/CPY/MUL_MAT pattern above.
+//
+// Shapes are pinned to the only values Metal accepts in supports_op:
+//   q.ne[0] = 256 (QJL projection dim)
+//   K.ne[0] = 128, V.ne[0] = 128 (head_dim)
+// All shapes are contiguous in rows (required by supports_op).
+
+// GGML_OP_ATTN_SCORE_QJL
+struct test_attn_score_qjl : public test_case {
+    const int64_t n_heads;
+    const int64_t n_kv_heads;
+    const int64_t n_kv_tokens;
+    const int64_t n_batch;
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_heads, n_kv_heads, n_kv_tokens, n_batch);
+    }
+
+    double max_nmse_err() override {
+        return 1e-3;
+    }
+
+    test_attn_score_qjl(int64_t n_heads = 8, int64_t n_kv_heads = 2,
+                        int64_t n_kv_tokens = 64, int64_t n_batch = 4)
+        : n_heads(n_heads), n_kv_heads(n_kv_heads),
+          n_kv_tokens(n_kv_tokens), n_batch(n_batch) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // q is F32 [proj_dim=256, n_heads, n_batch, 1]
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, n_heads, n_batch, 1);
+        ggml_set_name(q, "q");
+
+        // packed_k is QJL1_256 [head_dim=128, n_kv_tokens, n_kv_heads, 1]
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_QJL1_256, 128, n_kv_tokens, n_kv_heads, 1);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * out = ggml_attn_score_qjl(ctx, q, k, (int) n_kv_heads);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t);
+        }
+    }
+};
+
+// GGML_OP_FUSED_ATTN_QJL_TBQ
+struct test_fused_attn_qjl_tbq : public test_case {
+    const int64_t n_heads;
+    const int64_t n_kv_heads;
+    const int64_t n_kv_tokens;
+    const int64_t n_batch;
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_heads, n_kv_heads, n_kv_tokens, n_batch);
+    }
+
+    double max_nmse_err() override {
+        // Two-pass max + softmax + mix produces slightly more numerical
+        // drift than the score-only ops, especially since dequantized V
+        // values multiply softmax weights.
+        return 5e-3;
+    }
+
+    test_fused_attn_qjl_tbq(int64_t n_heads = 8, int64_t n_kv_heads = 2,
+                            int64_t n_kv_tokens = 64, int64_t n_batch = 4)
+        : n_heads(n_heads), n_kv_heads(n_kv_heads),
+          n_kv_tokens(n_kv_tokens), n_batch(n_batch) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, n_heads, n_batch, 1);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_QJL1_256, 128, n_kv_tokens, n_kv_heads, 1);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_TBQ3_0, 128, n_kv_tokens, n_kv_heads, 1);
+        ggml_set_name(v, "v");
+
+        const float sm_scale = 1.0f / sqrtf(128.0f);
+        ggml_tensor * out = ggml_fused_attn_qjl_tbq(ctx, q, k, v, (int) n_kv_heads, sm_scale);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t);
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -8471,6 +8582,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 1, 256, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 4, 256, {1, 1}, {1, 1}));
     }
+
+    // Eliza custom-quant attention parity. Only ATTN_SCORE_QJL and
+    // FUSED_ATTN_QJL_TBQ are exercised here, because the test harness
+    // compares each backend's output against a CPU reference — and the
+    // CPU backend deliberately has no implementation for
+    // GGML_OP_ATTN_SCORE_TBQ / GGML_OP_ATTN_SCORE_POLAR (they
+    // GGML_ABORT in ggml_compute_forward; the canonical CPU lowering
+    // is via attn_score_qjl / flash_attn_ext). Adding test cases for
+    // them would crash the harness on CPU, not produce a "FAIL" line,
+    // so they are intentionally omitted.
+    //
+    // Metal implements ATTN_SCORE_QJL and FUSED_ATTN_QJL_TBQ (see
+    // ggml_metal_device_supports_op). Other backends (Vulkan/CUDA)
+    // print "not supported" — that is the intended baseline.
+    //
+    // Shape constraints come from ggml_metal_device_supports_op:
+    //   - ATTN_SCORE_QJL:      q.ne[0]=256, K.ne[0]=128
+    //   - FUSED_ATTN_QJL_TBQ:  q.ne[0]=256, K.ne[0]=128, V.ne[0]=128, out.ne[0]=128
+    // and (q.ne[1] % n_kv_heads) == 0, i.e. n_heads is a multiple of n_kv_heads.
+    test_cases.emplace_back(new test_attn_score_qjl    (/*n_heads*/ 8, /*n_kv_heads*/ 2, /*n_kv_tokens*/ 64, /*n_batch*/ 4));
+    test_cases.emplace_back(new test_attn_score_qjl    (/*n_heads*/ 4, /*n_kv_heads*/ 1, /*n_kv_tokens*/ 32, /*n_batch*/ 2));
+
+    test_cases.emplace_back(new test_fused_attn_qjl_tbq(/*n_heads*/ 8, /*n_kv_heads*/ 2, /*n_kv_tokens*/ 64, /*n_batch*/ 4));
 
 #if 0
     {
