@@ -472,6 +472,18 @@ static bool arch_supported(const llm_arch arch) {
         return false;
     }
 
+    // LLM_ARCH_EAGLE3 is a fail-fast scaffolding stub from upstream PR #18039
+    // (wired in commit 8b5574cd3 "spec: wire EAGLE3/MTP enum stubs"). The arch
+    // exists in the enum and tensor-name tables but has no `llama_model_*`
+    // constructor and no graph builder, so `llama_model::create` falls through
+    // its switch and throws `unsupported model architecture: 'eagle3'` during
+    // the test fixture's model-load step. Same skip pattern as DFLASH_DRAFT
+    // above (commit 5311271ca) — fail-fast stub archs that aren't loadable
+    // models. Drop this gate once EAGLE3 has a real model class + graph.
+    if (arch == LLM_ARCH_EAGLE3) {
+        return false;
+    }
+
     return true;
 }
 

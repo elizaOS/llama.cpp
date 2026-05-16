@@ -83,6 +83,11 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/fused-attn-qjl-tbq-avx2.c
         ggml-cpu/fused-attn-qjl-tbq-neon.c
         ggml-cpu/fused-hadamard-polar-dot.c
+        # ELIZA-TBQ-POLAR-ATTN-CPU-REF — scalar correctness oracle for the
+        # Metal GGML_OP_ATTN_SCORE_TBQ / GGML_OP_ATTN_SCORE_POLAR kernels.
+        # Wired into ggml_compute_forward so test-backend-ops can compare
+        # backend output against a CPU result. Header sits in quants.h.
+        ggml-cpu/attn-score-tbq-polar.c
         # ELIZA-CPU-POLAR-PREHT-V1 — PolarQuant pre-Hadamard-transposed dot TUs
         # (mirrored from packages/native-plugins/polarquant-cpu + two
         # generated fork-shim files). Each per-ISA body self-guards on
