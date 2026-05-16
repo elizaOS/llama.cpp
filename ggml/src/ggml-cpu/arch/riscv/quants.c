@@ -3956,6 +3956,70 @@ static NOINLINE void ggml_vec_dot_iq2_xs_q8_K_vl256(int n, float * GGML_RESTRICT
     }
     *s = 0.125f * sumf;
 }
+
+static NOINLINE void ggml_vec_dot_iq2_xs_q8_K_vl512(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_K == 0);
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+
+    const block_iq2_xs * GGML_RESTRICT x = vx;
+    const block_q8_K   * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_K;
+    const uint64_t * signs64 = (const uint64_t *)keven_signs_q2xs;
+    const uint64_t * grid64  = (const uint64_t *)iq2xs_grid;
+
+    float sumf = 0.0f;
+     for (int i = 0; i < nb; ++i) {
+        const float combined_scale = GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d;
+
+        const uint16_t * GGML_RESTRICT qs = x[i].qs;
+        const uint8_t  * GGML_RESTRICT scales = x[i].scales;
+        const int8_t   * GGML_RESTRICT q8 = y[i].qs;
+
+        vint8m4_t q8_all = __riscv_vle8_v_i8m4(q8, 256);
+
+        // Load indices ---
+        vuint16m1_t v_qs = __riscv_vle16_v_u16m1(qs, 32);
+
+        // Extract low 9 bits and multiply by 8 (shift left 3) for byte offset into uint64 table
+        vuint16m1_t vidx_grid = __riscv_vsll_vx_u16m1(__riscv_vand_vx_u16m1(v_qs, 511, 32), 3, 32);
+
+        // Extract high 7 bits (shift right 9) and multiply by 8 (shift left 3) for byte offset
+        vuint16m1_t vidx_sign = __riscv_vsll_vx_u16m1(__riscv_vsrl_vx_u16m1(v_qs, 9, 32), 3, 32);
+
+        vuint64m4_t vq2_64 = __riscv_vluxei16_v_u64m4(grid64, vidx_grid, 32);
+        vuint64m4_t vs2_64 = __riscv_vluxei16_v_u64m4(signs64, vidx_sign, 32);
+
+        vint8m4_t q2_all = __riscv_vreinterpret_v_u8m4_i8m4(__riscv_vreinterpret_v_u64m4_u8m4(vq2_64));
+        vint8m4_t s2_all = __riscv_vreinterpret_v_u8m4_i8m4(__riscv_vreinterpret_v_u64m4_u8m4(vs2_64));
+
+        vint8m4_t q2_signed = __riscv_vmul_vv_i8m4(q2_all, s2_all, 256);
+        vint16m8_t dot_all = __riscv_vwmul_vv_i16m8(q2_signed, q8_all, 256);
+        float sum = 0.0f;
+        vint32m1_t zero_vec = __riscv_vmv_v_x_i32m1(0, 1);
+
+#pragma GCC unroll 1
+        for (int j = 0; j < 8; ++j) {
+            uint8_t sc = scales[j];
+            int16_t sc_lo = 2 * (sc & 0x0F) + 1;
+            int16_t sc_hi = 2 * (sc >> 4)   + 1;
+
+            vint32m1_t sum_v0 = __riscv_vwredsum_vs_i16m8_i32m1(
+                __riscv_vslidedown_vx_i16m8(dot_all, j * 32, 16), zero_vec, 16);
+            int32_t isum0 = __riscv_vmv_x_s_i32m1_i32(sum_v0);
+
+            vint32m1_t sum_v1 = __riscv_vwredsum_vs_i16m8_i32m1(
+                __riscv_vslidedown_vx_i16m8(dot_all, j * 32 + 16, 16), zero_vec, 16);
+            int32_t isum1 = __riscv_vmv_x_s_i32m1_i32(sum_v1);
+
+            sum += (float)isum0 * sc_lo + (float)isum1 * sc_hi;
+        }
+
+        sumf += sum * combined_scale;
+    }
+    *s = 0.125f * sumf;
+}
 #endif
 
 void ggml_vec_dot_iq2_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
@@ -3967,6 +4031,9 @@ void ggml_vec_dot_iq2_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 #if GGML_RISCV_RVV_1_0
           case 256:
               ggml_vec_dot_iq2_xs_q8_K_vl256(n, s, bs, vx, bx, vy, by, nrc);
+              break;
+          case 512:
+              ggml_vec_dot_iq2_xs_q8_K_vl512(n, s, bs, vx, bx, vy, by, nrc);
               break;
 #endif
           default:
