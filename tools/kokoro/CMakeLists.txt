@@ -16,12 +16,15 @@ set(KOKORO_PUBLIC_HEADERS
     include/kokoro.h
     include/kokoro-istft.h
     include/kokoro-phonemes.h
-    include/kokoro-server-mount.h)
+    include/kokoro-server-mount.h
+    include/kokoro-layers.h
+    include/kokoro-predictor.h)
 
 set(KOKORO_CORE_SOURCES
     src/kokoro.cpp
     src/kokoro-istft.cpp
-    src/kokoro-phonemes.cpp)
+    src/kokoro-phonemes.cpp
+    src/kokoro-predictor.cpp)
 
 add_library(kokoro_lib STATIC
     ${KOKORO_CORE_SOURCES}

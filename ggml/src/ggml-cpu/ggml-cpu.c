@@ -2099,6 +2099,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_glu(params, tensor);
             } break;
+        case GGML_OP_ISTFT:
+            {
+                ggml_compute_forward_istft(params, tensor);
+            } break;
         case GGML_OP_GET_REL_POS:
             {
                 ggml_compute_forward_get_rel_pos(params, tensor);
@@ -2524,6 +2528,12 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
             {
+                n_tasks = n_threads;
+            } break;
+        case GGML_OP_ISTFT:
+            {
+                // iSTFT is parallelized per frame; n_tasks = n_threads capped
+                // by the number of output frames at runtime — set max here.
                 n_tasks = n_threads;
             } break;
         case GGML_OP_NONE:
