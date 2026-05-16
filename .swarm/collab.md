@@ -260,6 +260,7 @@ Tracked but NOT fixed in this pass — all blocked behind agents A-D landing the
 - **KK** — Vulkan gate gemma2/gemma3n in test-llama-archs (NMSE-vs-CPU drift on llvmpipe). Files: tests/test-llama-archs.cpp
 - **JJ** — SYCL Windows `test-fused-kernels`/`bench-fused-kernels` LNK2019 on `ggml_vec_dot_q4_polar_q8_0` / `_fused` / `_fused_hadamard`. Files: tests/CMakeLists.txt (verify-only; already gated). NO-OP claim: the fix already landed at commit `64cfd9906` (option b: gate `NOT WIN32 OR NOT BUILD_SHARED_LIBS` around both `test-fused-kernels` and `bench-fused-kernels`), but the cited failing run `25917370465` was at pre-fix SHA `5fbb7991b`. The 3 polar-dot symbols are internal to ggml-cpu (declared in `ggml/src/ggml-cpu/quants.h`, an internal header — not in `ggml/include/`) and explicitly intended to be internal per the test-block CMakeLists comment that V wrote (lines 281-287). Option (a) "add GGML_BACKEND_API to the declarations" would re-expose internal kernels as public ABI which contradicts wave-6 V's architectural decision. Option (c) "static link test against ggml-cpu" would conflict with `BUILD_SHARED_LIBS=ON` builds where the library only exists as a DLL. Option (b) is correct and already in place.
 - **MM** — EAGLE3/MTP switch + test gate. Files: src/llama-model.cpp, tests/test-llama-archs.cpp
+- **PP** — wave-15 fresh-CI watcher
 
 ## Completed (II)
 
