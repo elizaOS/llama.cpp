@@ -21,7 +21,7 @@
  *         dot( dequant_kT_row(pk[:, t, h_q/gqa, i3]) , q[:, h_q, i_batch, i3] )
  *
  * This file is the CORRECTNESS ORACLE. Performance is irrelevant — the
- * production paths are the Metal kernels (ggml/src/ggml-metal/eliza-shipped/*).
+ * production paths are the Metal kernels under ggml/src/ggml-metal/eliza-shipped/.
  * The reference exists so test-backend-ops.cpp can compare a backend's
  * output against the CPU result for the same input, the same way every
  * other op is validated.
