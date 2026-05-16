@@ -4816,6 +4816,177 @@ static NOINLINE void ggml_vec_dot_iq3_xxs_q8_K_vl256(int n, float * GGML_RESTRIC
     }
     *s = 0.25f * sumf;
 }
+
+static NOINLINE void ggml_vec_dot_iq3_xxs_q8_K_vl512(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_K == 0);
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+    const block_iq3_xxs * GGML_RESTRICT x = vx;
+    const block_q8_K    * GGML_RESTRICT y = vy;
+    const int nb = n / QK_K;
+
+    const uint64_t * signs64 = (const uint64_t *)keven_signs_q2xs;
+    const uint32_t * grid32  = (const uint32_t *)iq3xxs_grid;
+
+    // generate constants for unpacking metadata words into sign indices
+    vuint32m1_t v_shifts;
+    {
+        vuint32m1_t v_base = __riscv_vid_v_u32m1(16);
+        vuint32m1_t v_mod4 = __riscv_vand_vx_u32m1(v_base, 3, 16);
+        v_shifts = __riscv_vmul_vx_u32m1(v_mod4, 7, 16);
+    }
+
+    vuint16mf2_t v_gather_idx;
+    {
+        vuint16mf2_t v_idx = __riscv_vid_v_u16mf2(16);
+        v_gather_idx = __riscv_vsrl_vx_u16mf2(v_idx, 2, 16);
+    }
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; ++i) {
+        const float d = GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d;
+
+        const uint8_t * GGML_RESTRICT q3_indices = x[i].qs;
+        const uint8_t * GGML_RESTRICT metadata   = x[i].qs + QK_K/4;
+        const int8_t  * GGML_RESTRICT q8         = y[i].qs;
+
+        float block_sum = 0.0f;
+        for (int ib128 = 0; ib128 < 2; ++ib128) {
+
+            vint8m2_t v_q8 = __riscv_vle8_v_i8m2(q8, 128);
+            q8 += 128;
+            vuint8mf2_t v_q3_idx_u8 = __riscv_vle8_v_u8mf2(q3_indices, 32);
+            q3_indices += 32;
+
+            vuint16m1_t v_q3_idx_u16 = __riscv_vwmulu_vx_u16m1(v_q3_idx_u8, 4, 32);
+            vuint32m2_t v_q3_mag_u32 = __riscv_vluxei16_v_u32m2(grid32, v_q3_idx_u16, 32);
+            vint8m2_t v_q3_magnitudes = __riscv_vreinterpret_v_u8m2_i8m2(
+            __riscv_vreinterpret_v_u32m2_u8m2(v_q3_mag_u32));
+            vuint32m1_t v_aux = __riscv_vreinterpret_v_u8m1_u32m1(__riscv_vle8_v_u8m1(metadata, 16));
+            metadata += 4 * sizeof(uint32_t);
+
+            vuint32m1_t v_aux_expanded = __riscv_vrgatherei16_vv_u32m1(v_aux, v_gather_idx, 16);
+
+            vuint32m1_t v_s_raw = __riscv_vand_vx_u32m1(
+                __riscv_vsrl_vv_u32m1(v_aux_expanded, v_shifts, 16), 127, 16);
+            vuint16mf2_t sign_byte_offset = __riscv_vsll_vx_u16mf2(
+                __riscv_vncvt_x_x_w_u16mf2(v_s_raw, 16), 3, 16);
+            vuint64m2_t v_s_u64 = __riscv_vluxei16_v_u64m2(signs64, sign_byte_offset, 16);
+            vint8m2_t v_signs = __riscv_vreinterpret_v_u8m2_i8m2(
+                __riscv_vreinterpret_v_u64m2_u8m2(v_s_u64));
+            vint8m2_t v_q3_signed = __riscv_vmul_vv_i8m2(v_q3_magnitudes, v_signs, 128);
+            vint16m4_t prod = __riscv_vwmul_vv_i16m4(v_q3_signed, v_q8, 128);
+
+            vint32m1_t zero_vec = __riscv_vmv_v_x_i32m1(0, 1);
+            int32_t group0_sum = __riscv_vmv_x_s_i32m1_i32(__riscv_vwredsum_vs_i16m1_i32m1(
+                         __riscv_vget_v_i16m4_i16m1(prod, 0), zero_vec, 32));
+            int32_t group1_sum = __riscv_vmv_x_s_i32m1_i32(__riscv_vwredsum_vs_i16m1_i32m1(
+                         __riscv_vget_v_i16m4_i16m1(prod, 1), zero_vec, 32));
+            int32_t group2_sum = __riscv_vmv_x_s_i32m1_i32(__riscv_vwredsum_vs_i16m1_i32m1(
+                         __riscv_vget_v_i16m4_i16m1(prod, 2), zero_vec, 32));
+            int32_t group3_sum = __riscv_vmv_x_s_i32m1_i32(__riscv_vwredsum_vs_i16m1_i32m1(
+                         __riscv_vget_v_i16m4_i16m1(prod, 3), zero_vec, 32));
+
+            vuint32m1_t v_scales_raw = __riscv_vsrl_vx_u32m1(v_aux, 28, 4);
+            vuint32m1_t v_scales = __riscv_vadd_vx_u32m1(
+                                        __riscv_vsll_vx_u32m1(v_scales_raw, 1, 4),
+                                        1, 4);
+            int32_t scale0 = (int32_t)__riscv_vmv_x_s_u32m1_u32(v_scales);
+            int32_t scale1 = (int32_t)__riscv_vmv_x_s_u32m1_u32(__riscv_vslidedown_vx_u32m1(v_scales, 1, 4));
+            int32_t scale2 = (int32_t)__riscv_vmv_x_s_u32m1_u32(__riscv_vslidedown_vx_u32m1(v_scales, 2, 4));
+            int32_t scale3 = (int32_t)__riscv_vmv_x_s_u32m1_u32(__riscv_vslidedown_vx_u32m1(v_scales, 3, 4));
+
+            block_sum += (float)(group0_sum * scale0 + group1_sum * scale1 +
+                                 group2_sum * scale2 + group3_sum * scale3);
+        }
+
+        sumf += d * block_sum;
+    }
+    *s = 0.25f * sumf;
+}
+
+static NOINLINE void ggml_vec_dot_iq3_xxs_q8_K_vl1024(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_K == 0);
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+
+    const block_iq3_xxs * GGML_RESTRICT x = vx;
+    const block_q8_K    * GGML_RESTRICT y = vy;
+    const int nb = n / QK_K;
+
+    const uint64_t * signs64 = (const uint64_t *)keven_signs_q2xs;
+    const uint32_t * grid32  = (const uint32_t *)iq3xxs_grid;
+
+    vuint32m1_t v_shifts;
+    {
+        vuint32m1_t v_id   = __riscv_vid_v_u32m1(32);
+        vuint32m1_t v_mod4 = __riscv_vand_vx_u32m1(v_id, 3, 32);
+        v_shifts           = __riscv_vmul_vx_u32m1(v_mod4, 7, 32);
+    }
+    vuint16mf2_t v_gather_idx;
+    {
+        vuint16mf2_t v_id_16 = __riscv_vid_v_u16mf2(32);
+        v_gather_idx         = __riscv_vsrl_vx_u16mf2(v_id_16, 2, 32);
+    }
+
+    float sumf = 0.0f;
+    uint32_t aux32[8]; // Buffer for block metadata
+
+    for (int i = 0; i < nb; ++i) {
+        const float d = GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d;
+
+        const uint8_t * GGML_RESTRICT q3_indices = x[i].qs;
+        const uint8_t * GGML_RESTRICT metadata   = x[i].qs + QK_K/4;
+        const int8_t  * GGML_RESTRICT q8         = y[i].qs;
+
+        vint8m2_t v_q8 = __riscv_vle8_v_i8m2(q8, 256);
+        vuint8mf2_t v_q3_idx_raw = __riscv_vle8_v_u8mf2(q3_indices, 64);
+        vuint16m1_t v_q3_idx_u16 = __riscv_vwmulu_vx_u16m1(v_q3_idx_raw, 4, 64);
+
+        vuint32m2_t v_q3_grid_vals = __riscv_vluxei16_v_u32m2(grid32, v_q3_idx_u16, 64);
+
+        vint8m2_t v_q3_mags = __riscv_vreinterpret_v_u8m2_i8m2(
+                              __riscv_vreinterpret_v_u32m2_u8m2(v_q3_grid_vals));
+
+        memcpy(aux32, metadata, 8 * sizeof(uint32_t));
+        vuint32m1_t v_aux_8 = __riscv_vle32_v_u32m1(aux32, 8);
+
+        vuint32m1_t v_aux_32 = __riscv_vrgatherei16_vv_u32m1(v_aux_8, v_gather_idx, 32);
+
+        vuint32m1_t v_sign_idx_raw = __riscv_vand_vx_u32m1(
+                                     __riscv_vsrl_vv_u32m1(v_aux_32, v_shifts, 32), 127, 32);
+
+        vuint16mf2_t v_sign_offsets = __riscv_vsll_vx_u16mf2(
+                                      __riscv_vncvt_x_x_w_u16mf2(v_sign_idx_raw, 32), 3, 32);
+
+        vuint64m2_t v_signs_u64 = __riscv_vluxei16_v_u64m2(signs64, v_sign_offsets, 32);
+
+        vint8m2_t v_signs = __riscv_vreinterpret_v_u8m2_i8m2(
+                            __riscv_vreinterpret_v_u64m2_u8m2(v_signs_u64));
+
+        vint8m2_t v_q3_final = __riscv_vmul_vv_i8m2(v_q3_mags, v_signs, 256);
+
+        vint16m4_t v_dot = __riscv_vwmul_vv_i16m4(v_q8, v_q3_final, 256);
+        float block_sum = 0.0f;
+        vint32m1_t v_zero = __riscv_vmv_v_x_i32m1(0, 1);
+        vint16m4_t v_accum = v_dot;
+
+        for (int j = 0; j < 8; ++j) {
+            float scale = (float)(2 * (aux32[j] >> 28) + 1);
+
+            vint32m1_t v_partial_sum = __riscv_vwredsum_vs_i16m4_i32m1(v_accum, v_zero, 32);
+
+            int32_t partial_sum_i = __riscv_vmv_x_s_i32m1_i32(v_partial_sum);
+            block_sum += partial_sum_i * scale;
+            v_accum = __riscv_vslidedown_vx_i16m4(v_accum, 32, 32);
+
+        }
+
+        sumf += d * block_sum;
+    }
+    *s = 0.25f * sumf;
+}
 #endif
 
 void ggml_vec_dot_iq3_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
@@ -4827,6 +4998,12 @@ void ggml_vec_dot_iq3_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
 #if GGML_RISCV_RVV_1_0
         case 256:
             ggml_vec_dot_iq3_xxs_q8_K_vl256(n, s, bs, vx, bx, vy, by, nrc);
+            break;
+        case 512:
+            ggml_vec_dot_iq3_xxs_q8_K_vl512(n, s, bs, vx, bx, vy, by, nrc);
+            break;
+        case 1024:
+            ggml_vec_dot_iq3_xxs_q8_K_vl1024(n, s, bs, vx, bx, vy, by, nrc);
             break;
 #endif
         default:
