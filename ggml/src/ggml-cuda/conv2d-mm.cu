@@ -1,5 +1,12 @@
 #include "conv2d-mm.cuh"
 
+// Windows / MSVC does not define `uint` (POSIX/GLSL convention). Some Linux
+// toolchains imply it via system headers; on MSVC we need an explicit typedef
+// before the GLSL-style kernel signatures below.
+#ifdef _MSC_VER
+typedef unsigned int uint;
+#endif
+
 // If defined, indices are computed once and re-used by each thread
 #if __CUDA_ARCH__ < 700
 #    define USE_COLLECTIVES
