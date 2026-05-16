@@ -2438,6 +2438,7 @@ void ggml_vec_dot_q5_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
     const __m128i m4 = _mm_set1_epi8(0xF);
     const __m128i mzero = _mm_setzero_si128();
+    (void) mzero; // referenced only inside the per-block loop below
     const __m128i mone  = _mm_set1_epi8(1);
     const __m128i m2 = _mm_set1_epi8(2);
 
