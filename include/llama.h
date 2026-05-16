@@ -1586,6 +1586,31 @@ extern "C" {
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
 
+    //
+    // EAGLE3 speculative-decoding scaffolding (upstream PR #18039)
+    //
+    // These are stub declarations only. The full EAGLE3 port (graph
+    // builder, hparams, model loader wiring, drafter integration) is
+    // deferred — see /tmp/wave6-eagle3-real-journal.md.
+    //
+    // Both functions currently return failure / NULL with an
+    // explanatory log line, so callers wired up against the future
+    // API surface fail loudly instead of silently.
+    //
+
+    // Returns a pointer to the cached EAGLE3 "target features" tensor
+    // captured during the target model's last decode, or NULL if
+    // EAGLE3 is not active on this context.
+    LLAMA_API struct ggml_tensor * llama_get_eagle3_target_features(struct llama_context * ctx);
+
+    // Pushes target-model hidden-state embeddings into the EAGLE3
+    // drafter context. Returns 0 on success, -1 on failure.
+    LLAMA_API int32_t llama_set_eagle3_g_embeddings(
+            struct llama_context * ctx,
+            const float          * embd,
+            size_t                 n_embd,
+            size_t                 n_tokens);
+
 #ifdef __cplusplus
 }
 #endif
