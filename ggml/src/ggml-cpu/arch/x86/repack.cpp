@@ -658,6 +658,7 @@ static void gemm_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t 
     const __m128i loadMask = _mm_blend_epi32(_mm_setzero_si128(), _mm_set1_epi32(0xFFFFFFFF), 3);
     // Permute mask used for easier vector processing at later stages
     __m256i requiredOrder = _mm256_set_epi32(3, 2, 1, 0, 7, 6, 5, 4);
+    (void) requiredOrder; // used only inside AVX-512 path
     int64_t xstart = 0;
     int anr = nr - nr%16; // Used to align nr with boundary of 16
 #if defined(__AVX512BW__) && defined(__AVX512DQ__)
@@ -3598,6 +3599,7 @@ void ggml_gemm_q5_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     const __m128i loadMask = _mm_blend_epi32(_mm_setzero_si128(), _mm_set1_epi32(0xFFFFFFFF), 3);
     // Permute mask used for easier vector processing at later stages
     __m256i requiredOrder  = _mm256_set_epi32(3, 2, 1, 0, 7, 6, 5, 4);
+    (void) requiredOrder; // used only inside AVX-512 path
     int64_t xstart = 0;
     int anr = nr - nr%16;// Used to align nr with boundary of 16
 
@@ -4444,6 +4446,7 @@ void ggml_gemm_q2_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
     // Permute mask used for easier vector processing at later stages
     __m256i requiredOrder = _mm256_set_epi32(3, 2, 1, 0, 7, 6, 5, 4);
+    (void) requiredOrder; // used only inside AVX-512 path
     int64_t xstart = 0;
     int anr = nr - nr % 16; // Used to align nr with boundary of 16
 
