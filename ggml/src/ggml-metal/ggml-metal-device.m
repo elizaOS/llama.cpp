@@ -1877,7 +1877,7 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
             [encoder endEncoding];
         }
 
-        [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> __unused cb) {
             dispatch_semaphore_signal(completion_semaphore);
         }];
 
@@ -1893,11 +1893,20 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
 void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     if (buf->is_shared) {
 #if GGML_METAL_HAS_MANAGED_BUFFERS
-        // For Managed buffers, sync GPU→CPU then direct memcpy
+        // For Managed buffers (discrete GPU), sync GPU→CPU via blit encoder
+        // before reading. synchronizeResource: lives on MTLBlitCommandEncoder,
+        // not on MTLBuffer directly.
         if (buf->dev->props.use_managed_buffers) {
             struct ggml_metal_buffer_id bid = ggml_metal_buffer_get_id(buf, tensor);
             @autoreleasepool {
-                [(id<MTLBuffer>)bid.metal synchronizeResource];
+                id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
+                {
+                    id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+                    [encoder synchronizeResource:bid.metal];
+                    [encoder endEncoding];
+                }
+                [cmd_buf commit];
+                [cmd_buf waitUntilCompleted];
             }
         }
 #endif
