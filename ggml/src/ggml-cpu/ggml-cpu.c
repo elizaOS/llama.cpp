@@ -2063,7 +2063,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 // here, the graph builder put a Metal-only op on the CPU backend by
                 // mistake. Abort explicitly so the failure is visible.
                 GGML_ABORT("attn_score_tbq / attn_score_polar: no CPU implementation; route via Metal backend or use attn_score_qjl / flash_attn_ext on CPU graphs");
-            } break;
+            }
         case GGML_OP_FUSED_ATTN_QJL_TBQ:
             {
                 ggml_compute_forward_fused_attn_qjl_tbq(params, tensor);
