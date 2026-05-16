@@ -340,15 +340,10 @@ static ggml_cuda_device_info ggml_cuda_init() {
         }
     }
 
-#ifdef GGML_USE_NCCL
-    if (info.device_count > 1) {
-        int dev_ids[GGML_CUDA_MAX_DEVICES];
-        for (int id = 0; id < info.device_count; ++id) {
-            dev_ids[id] = id;
-        }
-        NCCL_CHECK(ncclCommInitAll(info.comms, info.device_count, dev_ids));
-    }
-#endif // GGML_USE_NCCL
+    // NCCL communicator initialization moved to ggml_backend_cuda_comm_init_nccl
+    // (operates on ggml_backend_cuda_comm_context::comms). ggml_cuda_device_info
+    // no longer carries `comms`; the device info is per-process, NCCL state is
+    // per-backend.
 
     return info;
 }
