@@ -4230,6 +4230,78 @@ static NOINLINE void ggml_vec_dot_iq2_xxs_q8_K_vl256(int n, float * GGML_RESTRIC
     }
     *s = 0.125f * sumf;
 }
+
+static NOINLINE void ggml_vec_dot_iq2_xxs_q8_K_vl512(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_K == 0);
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+
+    const block_iq2_xxs * GGML_RESTRICT x = vx;
+    const block_q8_K    * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_K;
+    const uint64_t * signs64 = (const uint64_t *)keven_signs_q2xs;
+    const uint64_t * grid64  = (const uint64_t *)iq2xxs_grid;
+    // Shift pattern {0,7,14,21} repeated 8 times for all 8 sub-blocks
+    uint8_t shift_arr[32] = {
+        0, 7, 14, 21, 0, 7, 14, 21, 0, 7, 14, 21, 0, 7, 14, 21,
+        0, 7, 14, 21, 0, 7, 14, 21, 0, 7, 14, 21, 0, 7, 14, 21
+    };
+    vuint8mf2_t v_shifts = __riscv_vle8_v_u8mf2(shift_arr, 32);
+
+    // Gather pattern to broadcast the 8 sub-block scales across the 32 lookup slots
+    uint8_t gather_arr[32] = {
+        0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3,
+        4,4,4,4, 5,5,5,5, 6,6,6,6, 7,7,7,7
+    };
+    vuint8mf2_t v_sign_gather_idx = __riscv_vle8_v_u8mf2(gather_arr, 32);
+
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+        const float combined_scale = GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d;
+
+        const uint8_t  * GGML_RESTRICT q2_ptr = (const uint8_t *) x[i].qs;
+        const int8_t   * GGML_RESTRICT q8 = y[i].qs;
+        vint8m4_t q8_all = __riscv_vle8_v_i8m4(q8, 256);
+
+        // De-interleave all 8 Index/Scale pairs for the 8x32-element sub-blocks
+        vuint32mf2x2_t tuple = __riscv_vlseg2e32_v_u32mf2x2((const uint32_t*)q2_ptr, 8);
+        vuint32mf2_t v_ind32 = __riscv_vget_v_u32mf2x2_u32mf2(tuple, 0);
+        vuint32mf2_t v_sc32  = __riscv_vget_v_u32mf2x2_u32mf2(tuple, 1);
+
+        vuint8mf2_t v_raw_q2 = __riscv_vreinterpret_v_u32mf2_u8mf2(v_ind32);
+        vuint16m1_t vidx_q2 = __riscv_vwcvtu_x_x_v_u16m1(v_raw_q2, 32);
+        vidx_q2 = __riscv_vsll_vx_u16m1(vidx_q2, 3, 32);
+
+        vuint32m2_t v_s = __riscv_vrgatherei16_vv_u32m2(__riscv_vlmul_ext_v_u32mf2_u32m2(v_sc32), __riscv_vwcvtu_x_x_v_u16m1(v_sign_gather_idx,32), 32);
+        v_s = __riscv_vsrl_vv_u32m2(v_s, __riscv_vwcvtu_x_x_v_u32m2(__riscv_vwcvtu_x_x_v_u16m1(v_shifts,32),32), 32);
+        v_s = __riscv_vand_vx_u32m2(v_s, 127, 32);
+        vuint16m1_t vidx_s2 = __riscv_vsll_vx_u16m1(__riscv_vncvt_x_x_w_u16m1(v_s, 32), 3, 32);
+
+        vuint64m4_t vq2_64 = __riscv_vluxei16_v_u64m4(grid64, vidx_q2, 32);
+        vuint64m4_t vs2_64 = __riscv_vluxei16_v_u64m4(signs64, vidx_s2, 32);
+        vint8m4_t q2_all = __riscv_vreinterpret_v_u8m4_i8m4(__riscv_vreinterpret_v_u64m4_u8m4(vq2_64));
+        vint8m4_t s2_all = __riscv_vreinterpret_v_u8m4_i8m4(__riscv_vreinterpret_v_u64m4_u8m4(vs2_64));
+
+        vint8m4_t q8s_all = __riscv_vmul_vv_i8m4(q8_all, s2_all, 256);
+        vint16m8_t dot_all = __riscv_vwmul_vv_i16m8(q8s_all, q2_all, 256);
+
+        float sum = 0.0f;
+        vint32m1_t zero_vec = __riscv_vmv_v_x_i32m1(0, 1);
+
+        for (int j = 0; j < 8; ++j) {
+            uint32_t s_p = __riscv_vmv_x_s_u32mf2_u32(__riscv_vslidedown_vx_u32mf2(v_sc32, j, 8));
+            int16_t sc = 2 * ((s_p >> 28) & 0xF) + 1;
+            dot_all=__riscv_vslidedown_vx_i16m8(dot_all,j*32,32);
+            vint32m1_t sum_v = __riscv_vwredsum_vs_i16m8_i32m1(dot_all, zero_vec, 32);
+            int32_t isum = __riscv_vmv_x_s_i32m1_i32(sum_v);
+            sum += (float)isum * sc;
+        }
+
+        sumf += sum * combined_scale;
+    }
+    *s = 0.125f * sumf;
+}
 #endif
 
 void ggml_vec_dot_iq2_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
@@ -4238,7 +4310,13 @@ void ggml_vec_dot_iq2_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
         case 128:
             ggml_vec_dot_iq2_xxs_q8_K_vl128(n, s, bs, vx, bx, vy, by, nrc);
             break;
-        default: // 256 and above
+        case 256:
+            ggml_vec_dot_iq2_xxs_q8_K_vl256(n, s, bs, vx, bx, vy, by, nrc);
+            break;
+        case 512:
+            ggml_vec_dot_iq2_xxs_q8_K_vl512(n, s, bs, vx, bx, vy, by, nrc);
+            break;
+        default: // 1024 and above
             ggml_vec_dot_iq2_xxs_q8_K_vl256(n, s, bs, vx, bx, vy, by, nrc);
             break;
     }
