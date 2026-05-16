@@ -56,11 +56,18 @@ jobs:
 
       - name: Configure (cross, RVV 1.0)
         run: |
+          # NOTE: `-static` is required so the binary can be run under
+          # qemu-user without dynamic loader plumbing. That forces
+          # BUILD_SHARED_LIBS=OFF too — otherwise libggml-base.so is
+          # link-time built with `-static` and pulls in the static-PIE
+          # crt (crtbeginT.o) into a `-shared` link, which fails with
+          # `R_RISCV_HI20 against local symbol ... recompile with -fPIC`.
           cmake -B build-riscv64 -G Ninja \
             -DCMAKE_C_COMPILER=riscv64-linux-gnu-gcc \
             -DCMAKE_CXX_COMPILER=riscv64-linux-gnu-g++ \
             -DCMAKE_SYSTEM_NAME=Linux \
             -DCMAKE_SYSTEM_PROCESSOR=riscv64 \
+            -DBUILD_SHARED_LIBS=OFF \
             -DGGML_NATIVE=OFF \
             -DGGML_RVV=ON \
             -DCMAKE_C_FLAGS="-march=rv64gcv -mabi=lp64d -static" \
