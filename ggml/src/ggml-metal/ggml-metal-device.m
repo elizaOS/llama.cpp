@@ -1373,7 +1373,46 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 };
             }
         case GGML_OP_GET_ROWS:
-            return true;
+            // Metal has get_rows kernels for the standard quants + a few
+            // float types. Eliza custom quants (Q1_0_g32 / Q1_0_g128 / TBQ*
+            // / QJL1_256 / Q4_POLAR / TBQ3_TCQ) only have CPU vec_dot paths
+            // for now — without a Metal kernel,
+            // `ggml_metal_library_compile_pipeline(kernel_get_rows_<type>)`
+            // returns a nil pipeline and the dispatcher segfaults on
+            // `ggml_metal_pipeline_max_theads_per_threadgroup(nil)`. Gate
+            // the supported set explicitly here so test-backend-ops and the
+            // graph scheduler offload these types to CPU.
+            switch (op->src[0]->type) {
+                case GGML_TYPE_F32:
+                case GGML_TYPE_F16:
+                case GGML_TYPE_BF16:
+                case GGML_TYPE_I32:
+                case GGML_TYPE_Q1_0:
+                case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q4_1:
+                case GGML_TYPE_Q5_0:
+                case GGML_TYPE_Q5_1:
+                case GGML_TYPE_Q8_0:
+                case GGML_TYPE_MXFP4:
+                case GGML_TYPE_NVFP4:
+                case GGML_TYPE_Q2_K:
+                case GGML_TYPE_Q3_K:
+                case GGML_TYPE_Q4_K:
+                case GGML_TYPE_Q5_K:
+                case GGML_TYPE_Q6_K:
+                case GGML_TYPE_IQ2_XXS:
+                case GGML_TYPE_IQ2_XS:
+                case GGML_TYPE_IQ2_S:
+                case GGML_TYPE_IQ3_XXS:
+                case GGML_TYPE_IQ3_S:
+                case GGML_TYPE_IQ1_S:
+                case GGML_TYPE_IQ1_M:
+                case GGML_TYPE_IQ4_NL:
+                case GGML_TYPE_IQ4_XS:
+                    return true;
+                default:
+                    return false;
+            }
         case GGML_OP_SET_ROWS:
             {
                 if (op->src[0]->type != GGML_TYPE_F32) {
