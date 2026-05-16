@@ -566,6 +566,9 @@ enum llm_tensor {
     LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
     LLM_TENSOR_DFLASH_FC,
     LLM_TENSOR_DFLASH_HIDDEN_NORM,
+    // EAGLE3 draft-model tensors (upstream PR #18039)
+    LLM_TENSOR_EAGLE3_TARGET_FEATURES,
+    LLM_TENSOR_EAGLE3_TARGET_TOK_EMBD,
 };
 
 enum llm_tensor_layer {

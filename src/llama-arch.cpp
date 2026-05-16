@@ -561,6 +561,9 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     // milady DFlash tensors
     { LLM_TENSOR_DFLASH_FC,                              "dflash_fc" },
     { LLM_TENSOR_DFLASH_HIDDEN_NORM,                     "dflash_hidden_norm" },
+    // EAGLE3 draft-model tensors (upstream PR #18039)
+    { LLM_TENSOR_EAGLE3_TARGET_FEATURES,                 "target_features" },
+    { LLM_TENSOR_EAGLE3_TARGET_TOK_EMBD,                 "target_tok_embd" },
 };
 
 // declare information about the model weight tensors:
@@ -784,6 +787,9 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     // milady DFlash draft tensors
     {LLM_TENSOR_DFLASH_FC,                  {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}},
     {LLM_TENSOR_DFLASH_HIDDEN_NORM,         {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL}},
+    // EAGLE3 draft-model tensors (upstream PR #18039)
+    {LLM_TENSOR_EAGLE3_TARGET_FEATURES,     {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_EAGLE3_TARGET_TOK_EMBD,     {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
 };
 
 LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}
