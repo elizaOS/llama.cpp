@@ -220,3 +220,22 @@
 | `--spec-default` | enable default speculative decoding config |
 
 <!-- HELP_END -->
+
+## Speculative decoding: Multi-Token Prediction (MTP)
+
+Models with an MTP head baked into the GGUF (e.g. Qwen3.5/3.6 with NextN
+layers) can use `--spec-type draft-mtp` for self-speculative decoding —
+no separate draft model required. The deprecated `mtp` alias maps to
+`draft-mtp` for backwards compatibility.
+
+```sh
+./llama-cli \
+    -m model-with-mtp.gguf \
+    -p "The capital of France is" \
+    --spec-type draft-mtp \
+    --spec-draft-n-max 2
+```
+
+Upstream reports ~2.4× generation speedup at ~83% acceptance on Qwen3.6
+27B. Our measurements on Qwen3.5-2B Q4_K_M (Apple M-series, Metal):
+~1.86× generation speedup vs the non-spec baseline.
