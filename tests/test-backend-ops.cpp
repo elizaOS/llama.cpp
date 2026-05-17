@@ -6825,6 +6825,69 @@ struct test_attn_score_polar : public test_case {
     }
 };
 
+// GGML_OP_ISTFT
+//
+// Inverse short-time Fourier transform with a Hann analysis window and
+// overlap-add synthesis. Used by the Kokoro iSTFTNet decoder.
+//
+// src0 (mag_phase): F32 [2, F, T] — column-major storage so ggml ne is
+//   ne[0] = T (frames, fastest), ne[1] = F (n_fft/2+1), ne[2] = 2 (mag/phase)
+// src1 (window):    F32 [win_length], or NULL for internal periodic Hann
+//
+// dst: F32 [N] where N = (T-1)*hop_length + win_length
+//
+// op_params: { n_fft, hop_length, win_length }.
+struct test_istft : public test_case {
+    const int n_fft;
+    const int hop_length;
+    const int win_length;
+    const int n_frames;
+    const bool with_window;
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_fft, hop_length, win_length, n_frames, with_window);
+    }
+
+    double max_nmse_err() override {
+        // The CPU reference uses a naive O(n_fft^2) IDFT in double precision,
+        // GPU backends typically use Cooley-Tukey or shared-memory variants;
+        // 1e-3 leaves enough slop for the fp32 OLA accumulation order.
+        return 1e-3;
+    }
+
+    test_istft(int n_fft = 20, int hop_length = 5, int win_length = 20,
+               int n_frames = 16, bool with_window = false)
+        : n_fft(n_fft), hop_length(hop_length), win_length(win_length),
+          n_frames(n_frames), with_window(with_window) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t F = n_fft / 2 + 1;
+        ggml_tensor * mag_phase = ggml_new_tensor_3d(
+            ctx, GGML_TYPE_F32, (int64_t) n_frames, F, 2);
+        ggml_set_name(mag_phase, "mag_phase");
+
+        ggml_tensor * window = nullptr;
+        if (with_window) {
+            window = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) win_length);
+            ggml_set_name(window, "window");
+        }
+
+        ggml_tensor * out = ggml_istft(ctx, mag_phase, window,
+                                       n_fft, hop_length, win_length);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            // Bound magnitudes/phases to [-1,1] which is what the uniform
+            // initializer already produces. The naive IDFT then stays well
+            // within fp32 range for the parity check.
+            init_tensor_uniform(t);
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -8714,6 +8777,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_attn_score_polar(/*use_qjl*/ false, /*n_heads*/ 4, /*n_kv_heads*/ 1, /*n_kv_tokens*/ 16, /*n_batch*/ 1));
     test_cases.emplace_back(new test_attn_score_polar(/*use_qjl*/ true,  /*n_heads*/ 4, /*n_kv_heads*/ 1, /*n_kv_tokens*/ 16, /*n_batch*/ 1));
     test_cases.emplace_back(new test_attn_score_polar(/*use_qjl*/ false, /*n_heads*/ 8, /*n_kv_heads*/ 2, /*n_kv_tokens*/ 256, /*n_batch*/ 4));
+
+    // ISTFT parity: tiny shape mirrors the Kokoro iSTFTNet decoder
+    // (n_fft=20, hop=5, win=20) and medium shape mirrors a librosa-style
+    // 512-FFT TTS vocoder. Internal Hann and user-supplied Hann window
+    // paths both exercised. Op signature in src/ggml.c and op semantics
+    // documented in ggml/include/ggml.h:2246.
+    test_cases.emplace_back(new test_istft(/*n_fft*/  20, /*hop*/  5, /*win*/  20, /*frames*/  16, /*window*/ false));
+    test_cases.emplace_back(new test_istft(/*n_fft*/  20, /*hop*/  5, /*win*/  20, /*frames*/  16, /*window*/ true));
+    test_cases.emplace_back(new test_istft(/*n_fft*/ 256, /*hop*/ 64, /*win*/ 256, /*frames*/   8, /*window*/ false));
+    test_cases.emplace_back(new test_istft(/*n_fft*/ 512, /*hop*/128, /*win*/ 512, /*frames*/   8, /*window*/ true));
 
 #if 0
     {
