@@ -160,18 +160,21 @@ jobs:
               exit 1
             fi
           done
-          # ATTN_SCORE_TBQ / ATTN_SCORE_POLAR are tracked but not gated
-          # until the Metal kernel is reconciled with the new CPU oracle.
-          # Surface counts so regressions in the OTHER direction (PASS
-          # going to FAIL) are obvious in the log.
-          echo "=== Eliza custom-attention (tracking, not gated) ==="
+          # ATTN_SCORE_TBQ and ATTN_SCORE_POLAR: Metal kernels reconciled
+          # with the CPU oracle (attn-score-tbq-polar.c). Both are now
+          # hard-gated. A FAIL here means a real correctness regression in
+          # the Metal kernel — eliza-shipped/turbo3.metal,
+          # eliza-shipped/turbo4.metal, eliza-shipped/turbo3_tcq.metal,
+          # eliza-shipped/polar.metal, or eliza-shipped/polar_preht.metal.
+          echo "=== Eliza custom-attention (gated) ==="
           for op_name in ATTN_SCORE_TBQ ATTN_SCORE_POLAR; do
             n_fail=$(grep -c "$op_name.*FAIL"          /tmp/eliza-custom-quants.log || true)
             n_skip=$(grep -c "$op_name.*not supported" /tmp/eliza-custom-quants.log || true)
             n_pass=$(grep -c "$op_name.*OK"            /tmp/eliza-custom-quants.log || true)
             echo "  $op_name: skip=$n_skip pass=$n_pass fail=$n_fail"
             if [ "$n_fail" -gt 0 ]; then
-              echo "::warning::Metal kernel diverges from CPU oracle for $op_name (tracked, not gated; see attn-score-tbq-polar.c)"
+              echo "::error::Metal kernel diverges from CPU oracle for $op_name (see attn-score-tbq-polar.c)"
+              exit 1
             fi
           done
 
