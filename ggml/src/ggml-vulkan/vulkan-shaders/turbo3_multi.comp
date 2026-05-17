@@ -2,20 +2,14 @@
 // build-llama-cpp-dflash.mjs. Frozen — do not edit in fork.
 // Multi-block-per-workgroup variant of turbo3.comp. Identical decode math;
 // one workgroup processes BLOCKS_PER_WG consecutive KV indices serially in a
-// 32-thread loop, trading dispatch grid breadth for amortised launch tax.
+// 32-thread loop.
 //
-// BLOCKS_PER_WG is a SPIR-V specialization constant (constant_id = 0) so a
-// single SPV family tunes per device — the harness / runtime sets it via
-// VkSpecializationInfo when creating the compute pipeline. Default 1 makes
-// this byte-for-byte equivalent to turbo3.comp.
+// BLOCKS_PER_WG is a SPIR-V specialization constant (constant_id = 0); default
+// 1 makes this byte-for-byte equivalent to turbo3.comp.
 //
-// Dispatch shape:
+// Dispatch:
 //     grid_x = ceil(n_kv / BLOCKS_PER_WG)
 //     tg_x   = 32
-//
-// Push-constant layout and decode are unchanged from turbo3.comp; this file
-// only adds the outer block loop. Keep local_size 32 (portable: no subgroup
-// assumptions, shared-memory tree reduction).
 
 #version 450
 #extension GL_EXT_shader_16bit_storage  : require
@@ -24,7 +18,6 @@
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
-// blocks_per_workgroup — one SPV, device-specialized at pipeline-create time.
 layout(constant_id = 0) const uint BLOCKS_PER_WG = 1u;
 
 layout(std430, binding = 0) readonly buffer QBuf {
@@ -45,9 +38,18 @@ layout(push_constant) uniform Push {
     uint head_offset_bytes;
 } push;
 
-const float TURBO_CENTROIDS_3BIT[8] = float[8](
-    -0.190685, -0.117832, -0.065717, -0.021460,
-     0.021460,  0.065717,  0.117832,  0.190685
+const uint TURBO3_BLOCK_BYTES = 14u;
+
+const float TBQ3_CODEBOOK[8] = float[8](
+    -2.1519457, -1.3439093, -0.7560053, -0.2450942,
+     0.2450942,  0.7560053,  1.3439093,  2.1519457
+);
+
+const float TBQ_SIGNS_32[32] = float[32](
+     1.0, -1.0,  1.0,  1.0, -1.0,  1.0, -1.0, -1.0,
+     1.0,  1.0, -1.0,  1.0, -1.0, -1.0,  1.0, -1.0,
+    -1.0,  1.0,  1.0, -1.0,  1.0, -1.0, -1.0,  1.0,
+     1.0, -1.0,  1.0, -1.0, -1.0,  1.0, -1.0,  1.0
 );
 
 float fp16_to_fp32(uint h16) {
@@ -79,6 +81,17 @@ uint read_u16(uint b) {
     return read_byte(b) | (read_byte(b + 1u) << 8u);
 }
 
+uint tbq3_get_code(uint qs_byte_base, uint i) {
+    uint bit   = i * 3u;
+    uint byte  = bit >> 3u;
+    uint shift = bit & 7u;
+    uint bits  = read_byte(qs_byte_base + byte) >> shift;
+    if (shift > 5u && byte + 1u < 12u) {
+        bits |= read_byte(qs_byte_base + byte + 1u) << (8u - shift);
+    }
+    return bits & 0x7u;
+}
+
 shared float partials[32];
 
 float reduce_sum_32(float v, uint tid) {
@@ -93,12 +106,42 @@ float reduce_sum_32(float v, uint tid) {
     return partials[0];
 }
 
+shared float q_t[128];
+
+void precompute_qt(uint tid) {
+    if (tid < 4u) {
+        float buf[32];
+        uint base = tid * 32u;
+        uint q_off = push.q_head * push.head_dim + base;
+        for (uint i = 0u; i < 32u; ++i) {
+            buf[i] = q[q_off + i] * TBQ_SIGNS_32[i];
+        }
+        for (uint len = 1u; len < 32u; len <<= 1) {
+            for (uint i = 0u; i < 32u; i += 2u * len) {
+                for (uint j = 0u; j < len; ++j) {
+                    float a = buf[i + j];
+                    float b = buf[i + j + len];
+                    buf[i + j]       = a + b;
+                    buf[i + j + len] = a - b;
+                }
+            }
+        }
+        const float norm = 0.1767766952966369;
+        for (uint i = 0u; i < 32u; ++i) {
+            q_t[base + i] = buf[i] * norm;
+        }
+    }
+    barrier();
+    memoryBarrierShared();
+}
+
 void main() {
     uint tid = gl_LocalInvocationID.x;
-    uint base_elem = tid * 4u;
-    uint block = base_elem >> 5;              // 0..3
-    uint within0 = base_elem & 31u;           // 0,4,8,...,28
-    uint q_base = push.q_head * push.head_dim + base_elem;
+    precompute_qt(tid);
+
+    uint elem0 = tid * 4u;
+    uint block = elem0 >> 5;              // 0..3
+    uint within0 = elem0 & 31u;           // 0,4,8,...,28
 
     uint kv_base = gl_WorkGroupID.x * BLOCKS_PER_WG;
     for (uint b = 0u; b < BLOCKS_PER_WG; ++b) {
@@ -109,20 +152,18 @@ void main() {
             return;
         }
 
-        uint group_byte_off = push.head_offset_bytes + kv_idx * (push.kv_stride_blocks * 14u);
-        uint blk_off = group_byte_off + block * 14u;
+        uint group_byte_off = push.head_offset_bytes +
+                              kv_idx * push.kv_stride_blocks * TURBO3_BLOCK_BYTES;
+        uint blk_off = group_byte_off + block * TURBO3_BLOCK_BYTES;
         float norm = fp16_to_fp32(read_u16(blk_off));
-        uint qs_byte = read_byte(blk_off + 2u + (within0 >> 2));
-        uint sb = read_byte(blk_off + 2u + 8u + (within0 >> 3));
+        uint qs_base = blk_off + 2u;
 
         float acc = 0.0;
         for (uint local = 0u; local < 4u; local += 1u) {
             uint within = within0 + local;
-            uint low2 = (qs_byte >> ((within & 3u) * 2u)) & 0x3u;
-            uint hi1 = (sb >> (within & 7u)) & 0x1u;
-            uint idx = low2 | (hi1 << 2);
-            float k_val = TURBO_CENTROIDS_3BIT[idx] * norm;
-            acc = fma(q[q_base + local], k_val, acc);
+            uint code = tbq3_get_code(qs_base, within);
+            float k_val = TBQ3_CODEBOOK[code] * norm;
+            acc = fma(q_t[elem0 + local], k_val, acc);
         }
 
         float sum = reduce_sum_32(acc, tid);
