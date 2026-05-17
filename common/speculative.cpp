@@ -967,31 +967,8 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             return nullptr;
         }
 
-        // MTP is upstream PR #22673 (1932 LOC, 48 files). Has known bugs as of 2026-05:
-        //   - Vulkan backend produces garbage output (mbednarek360 report)
-        //   - Prefill path bug (am17an acknowledged, fix pending)
-        //   - --sm tensor crashes (ninjas28 report)
-        // It also touches our flagship qwen35.cpp / qwen35moe.cpp / qwen3next.cpp with
-        // large diffs, so a blind merge risks breaking the existing model paths.
-        // If a draft model is supplied, fall back to the already-verified draft-model verifier
-        // path so MTP launch configs can still exercise real speculative decode. Without a
-        // draft model, fail fast with a useful message rather than silently doing nothing.
-        if (has_mtp) {
-            if (has_draft_model_path) {
-                LOG_WRN("%s: --spec-type=mtp graph support is not ported; using draft-model "
-                        "speculative decoding with the supplied -md model instead.\n", __func__);
-                LOG_WRN("%s:   Upstream tracking: https://github.com/ggml-org/llama.cpp/pull/22673\n", __func__);
-                has_dflash = true;
-                has_draft_simple = true;
-                has_mtp = false;
-            } else {
-                LOG_ERR("%s: --spec-type=mtp is not yet implemented in this build.\n", __func__);
-                LOG_ERR("%s:   Upstream tracking: https://github.com/ggml-org/llama.cpp/pull/22673\n", __func__);
-                LOG_ERR("%s:   Upstream has known Vulkan / prefill / sm-tensor bugs — not safe to land yet.\n", __func__);
-                LOG_ERR("%s:   Use --spec-type=dflash with a draft model (-md <path>) for now.\n", __func__);
-                return nullptr;
-            }
-        }
+        // MTP (upstream PR #22673) Option-C fail-fast stub removed — port in progress.
+        // The real MTP impl is wired below alongside the other speculator configs.
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
