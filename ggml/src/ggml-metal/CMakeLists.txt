@@ -64,7 +64,14 @@ if (GGML_METAL_EMBED_LIBRARY)
         COMMAND echo "Embedding Metal library (compiled metallib + eliza-shipped kernels)"
         COMMAND sed -e "/__embed_ggml-common.h__/r ${METALLIB_COMMON}"       -e "/__embed_ggml-common.h__/d"         < "${METALLIB_SOURCE}"           > "${METALLIB_SOURCE_EMBED_TMP}"
         COMMAND sed -e "/\#include \"ggml-metal-impl.h\"/r ${METALLIB_IMPL}" -e "/\#include \"ggml-metal-impl.h\"/d" < "${METALLIB_SOURCE_EMBED_TMP}" > "${METALLIB_SOURCE_EMBED}"
-        COMMAND xcrun -sdk ${METAL_SDK} metal ${XC_FLAGS} -DGGML_METAL_EMBED_LIBRARY=1 -c "${METALLIB_SOURCE_EMBED}" -o "${METALLIB_EMBED_AIR}"
+        # # ELIZA-METAL-BF16-FIX
+        # Define GGML_METAL_HAS_BF16 when compiling the embedded metallib so that
+        # bfloat-typed kernels (e.g. kernel_get_rows_bf16, kernel_mul_mv_bf16_*,
+        # kernel_flash_attn_ext_bf16_*) are emitted into default.metallib. The
+        # runtime gates kernel lookup on the device's actual has_bfloat property
+        # via supports_op, and ggml-metal.metal auto-undefs the macro when
+        # __METAL_VERSION__ < 310, so this is safe for older Metal targets too.
+        COMMAND xcrun -sdk ${METAL_SDK} metal ${XC_FLAGS} -DGGML_METAL_EMBED_LIBRARY=1 -DGGML_METAL_HAS_BF16=1 -c "${METALLIB_SOURCE_EMBED}" -o "${METALLIB_EMBED_AIR}"
         COMMAND xcrun -sdk ${METAL_SDK} metal ${XC_FLAGS} -c ${CMAKE_CURRENT_SOURCE_DIR}/eliza-shipped/turbo3.metal -o ${CMAKE_CURRENT_BINARY_DIR}/turbo3.air
         COMMAND xcrun -sdk ${METAL_SDK} metal ${XC_FLAGS} -c ${CMAKE_CURRENT_SOURCE_DIR}/eliza-shipped/turbo4.metal -o ${CMAKE_CURRENT_BINARY_DIR}/turbo4.air
         COMMAND xcrun -sdk ${METAL_SDK} metal ${XC_FLAGS} -c ${CMAKE_CURRENT_SOURCE_DIR}/eliza-shipped/turbo3_tcq.metal -o ${CMAKE_CURRENT_BINARY_DIR}/turbo3_tcq.air
@@ -129,7 +136,7 @@ else()
     # collide with anything ggml-metal.metal pulls in via ggml-common.h.
     add_custom_command(
         OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib
-        COMMAND xcrun -sdk macosx metal ${XC_FLAGS} -c ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/ggml-metal.metal -o ${CMAKE_CURRENT_BINARY_DIR}/ggml-metal.air
+        COMMAND xcrun -sdk macosx metal ${XC_FLAGS} -DGGML_METAL_HAS_BF16=1 -c ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/ggml-metal.metal -o ${CMAKE_CURRENT_BINARY_DIR}/ggml-metal.air
         COMMAND xcrun -sdk macosx metal ${XC_FLAGS} -c ${CMAKE_CURRENT_SOURCE_DIR}/eliza-shipped/turbo3.metal -o ${CMAKE_CURRENT_BINARY_DIR}/turbo3.air
         COMMAND xcrun -sdk macosx metal ${XC_FLAGS} -c ${CMAKE_CURRENT_SOURCE_DIR}/eliza-shipped/turbo4.metal -o ${CMAKE_CURRENT_BINARY_DIR}/turbo4.air
         COMMAND xcrun -sdk macosx metal ${XC_FLAGS} -c ${CMAKE_CURRENT_SOURCE_DIR}/eliza-shipped/turbo3_tcq.metal -o ${CMAKE_CURRENT_BINARY_DIR}/turbo3_tcq.air
