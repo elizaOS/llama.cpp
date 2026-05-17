@@ -6731,6 +6731,99 @@ struct test_fused_attn_qjl_tbq : public test_case {
     }
 };
 
+// GGML_OP_ATTN_SCORE_TBQ
+//
+// CPU reference landed at 4ab3e26f6 (ggml-cpu/attn-score-tbq-polar.c).
+// q is F32 [head_dim=128, n_heads, n_batch, 1]; K is one of TBQ3_0 /
+// TBQ4_0 / TBQ3_TCQ at [128, n_kv_tokens, n_kv_heads, 1]; output is
+// F32 [n_kv_tokens, n_heads, n_batch, 1]. n_heads must be a multiple
+// of n_kv_heads (GQA).
+struct test_attn_score_tbq : public test_case {
+    const ggml_type k_type;
+    const int64_t n_heads;
+    const int64_t n_kv_heads;
+    const int64_t n_kv_tokens;
+    const int64_t n_batch;
+
+    std::string vars() override {
+        return VARS_TO_STR5(k_type, n_heads, n_kv_heads, n_kv_tokens, n_batch);
+    }
+
+    double max_nmse_err() override {
+        return 1e-3;
+    }
+
+    test_attn_score_tbq(ggml_type k_type = GGML_TYPE_TBQ3_0,
+                        int64_t n_heads = 8, int64_t n_kv_heads = 2,
+                        int64_t n_kv_tokens = 64, int64_t n_batch = 4)
+        : k_type(k_type), n_heads(n_heads), n_kv_heads(n_kv_heads),
+          n_kv_tokens(n_kv_tokens), n_batch(n_batch) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, n_heads, n_batch, 1);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, k_type, 128, n_kv_tokens, n_kv_heads, 1);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * out = ggml_attn_score_tbq(ctx, q, k, (int) n_kv_heads);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t);
+        }
+    }
+};
+
+// GGML_OP_ATTN_SCORE_POLAR
+//
+// CPU reference landed at 4ab3e26f6. q is F32 [128, n_heads, n_batch, 1];
+// K is Q4_POLAR [128, n_kv_tokens, n_kv_heads, 1]; output is F32
+// [n_kv_tokens, n_heads, n_batch, 1]. The use_qjl flag mirrors the
+// PolarQuant GGUF residual flag and lives in op_params[1].
+struct test_attn_score_polar : public test_case {
+    const bool use_qjl;
+    const int64_t n_heads;
+    const int64_t n_kv_heads;
+    const int64_t n_kv_tokens;
+    const int64_t n_batch;
+
+    std::string vars() override {
+        return VARS_TO_STR5(use_qjl, n_heads, n_kv_heads, n_kv_tokens, n_batch);
+    }
+
+    double max_nmse_err() override {
+        return 1e-3;
+    }
+
+    test_attn_score_polar(bool use_qjl = false,
+                          int64_t n_heads = 8, int64_t n_kv_heads = 2,
+                          int64_t n_kv_tokens = 64, int64_t n_batch = 4)
+        : use_qjl(use_qjl), n_heads(n_heads), n_kv_heads(n_kv_heads),
+          n_kv_tokens(n_kv_tokens), n_batch(n_batch) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, n_heads, n_batch, 1);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_Q4_POLAR, 128, n_kv_tokens, n_kv_heads, 1);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * out = ggml_attn_score_polar(ctx, q, k, (int) n_kv_heads, use_qjl);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t);
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -8583,28 +8676,43 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 4, 256, {1, 1}, {1, 1}));
     }
 
-    // Eliza custom-quant attention parity. Only ATTN_SCORE_QJL and
-    // FUSED_ATTN_QJL_TBQ are exercised here, because the test harness
-    // compares each backend's output against a CPU reference — and the
-    // CPU backend deliberately has no implementation for
-    // GGML_OP_ATTN_SCORE_TBQ / GGML_OP_ATTN_SCORE_POLAR (they
-    // GGML_ABORT in ggml_compute_forward; the canonical CPU lowering
-    // is via attn_score_qjl / flash_attn_ext). Adding test cases for
-    // them would crash the harness on CPU, not produce a "FAIL" line,
-    // so they are intentionally omitted.
+    // Eliza custom-quant attention parity. The test harness compares
+    // each backend's output against a CPU reference, so every op listed
+    // here MUST have a CPU implementation:
+    //   - ATTN_SCORE_QJL        : ggml-cpu/qjl (existing)
+    //   - FUSED_ATTN_QJL_TBQ    : ggml-cpu/qjl (existing)
+    //   - ATTN_SCORE_TBQ        : ggml-cpu/attn-score-tbq-polar.c (4ab3e26f6)
+    //   - ATTN_SCORE_POLAR      : ggml-cpu/attn-score-tbq-polar.c (4ab3e26f6)
     //
-    // Metal implements ATTN_SCORE_QJL and FUSED_ATTN_QJL_TBQ (see
-    // ggml_metal_device_supports_op). Other backends (Vulkan/CUDA)
-    // print "not supported" — that is the intended baseline.
+    // Metal implements all four (see ggml_metal_device_supports_op).
+    // Vulkan/CUDA print "not supported" — that is the intended baseline
+    // until a kernel lands, at which point the harness automatically
+    // starts comparing the new backend's output against CPU.
     //
     // Shape constraints come from ggml_metal_device_supports_op:
     //   - ATTN_SCORE_QJL:      q.ne[0]=256, K.ne[0]=128
     //   - FUSED_ATTN_QJL_TBQ:  q.ne[0]=256, K.ne[0]=128, V.ne[0]=128, out.ne[0]=128
+    //   - ATTN_SCORE_TBQ:      q.ne[0]=128, K.ne[0]=128, K type ∈ {TBQ3_0, TBQ4_0, TBQ3_TCQ}
+    //   - ATTN_SCORE_POLAR:    q.ne[0]=128, K.ne[0]=128, K type = Q4_POLAR
     // and (q.ne[1] % n_kv_heads) == 0, i.e. n_heads is a multiple of n_kv_heads.
     test_cases.emplace_back(new test_attn_score_qjl    (/*n_heads*/ 8, /*n_kv_heads*/ 2, /*n_kv_tokens*/ 64, /*n_batch*/ 4));
     test_cases.emplace_back(new test_attn_score_qjl    (/*n_heads*/ 4, /*n_kv_heads*/ 1, /*n_kv_tokens*/ 32, /*n_batch*/ 2));
 
     test_cases.emplace_back(new test_fused_attn_qjl_tbq(/*n_heads*/ 8, /*n_kv_heads*/ 2, /*n_kv_tokens*/ 64, /*n_batch*/ 4));
+
+    // ATTN_SCORE_TBQ parity: cover all three accepted K types at a tiny
+    // shape (fast inner loop) and the TBQ3_0 medium shape (eliza-1
+    // representative: head_dim=128, n_kv_tokens=256, GQA 8:2).
+    test_cases.emplace_back(new test_attn_score_tbq(GGML_TYPE_TBQ3_0,   /*n_heads*/ 4, /*n_kv_heads*/ 1, /*n_kv_tokens*/ 16, /*n_batch*/ 1));
+    test_cases.emplace_back(new test_attn_score_tbq(GGML_TYPE_TBQ4_0,   /*n_heads*/ 4, /*n_kv_heads*/ 1, /*n_kv_tokens*/ 16, /*n_batch*/ 1));
+    test_cases.emplace_back(new test_attn_score_tbq(GGML_TYPE_TBQ3_TCQ, /*n_heads*/ 4, /*n_kv_heads*/ 1, /*n_kv_tokens*/ 16, /*n_batch*/ 1));
+    test_cases.emplace_back(new test_attn_score_tbq(GGML_TYPE_TBQ3_0,   /*n_heads*/ 8, /*n_kv_heads*/ 2, /*n_kv_tokens*/ 256, /*n_batch*/ 4));
+
+    // ATTN_SCORE_POLAR parity: both use_qjl values at the tiny shape,
+    // plus the eliza-1 medium shape.
+    test_cases.emplace_back(new test_attn_score_polar(/*use_qjl*/ false, /*n_heads*/ 4, /*n_kv_heads*/ 1, /*n_kv_tokens*/ 16, /*n_batch*/ 1));
+    test_cases.emplace_back(new test_attn_score_polar(/*use_qjl*/ true,  /*n_heads*/ 4, /*n_kv_heads*/ 1, /*n_kv_tokens*/ 16, /*n_batch*/ 1));
+    test_cases.emplace_back(new test_attn_score_polar(/*use_qjl*/ false, /*n_heads*/ 8, /*n_kv_heads*/ 2, /*n_kv_tokens*/ 256, /*n_batch*/ 4));
 
 #if 0
     {
