@@ -1449,19 +1449,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         llama_buf_map buf_map;
         buf_map.reserve(n_max_backend_buffer);
 
-        // check if it is possible to use buffer_from_host_ptr with this buffer type
-        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-        if (!dev) {
-            // FIXME: workaround for CPU backend buft having a NULL device
-            dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        ggml_backend_dev_t dev = nullptr;
+        bool buffer_from_host_ptr_supported = false;
+        bool is_default_buft = false;
+        if (ml.use_mmap && use_mmap_buffer) {
+            // check if it is possible to use buffer_from_host_ptr with this buffer type
+            dev = ggml_backend_buft_get_device(buft);
             if (!dev) {
-                throw std::runtime_error(format("%s: no CPU backend found", __func__));
+                // FIXME: workaround for CPU backend buft having a NULL device
+                dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                if (!dev) {
+                    throw std::runtime_error(format("%s: no CPU backend found", __func__));
+                }
             }
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev, &props);
+            buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
+            is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
         }
-        ggml_backend_dev_props props;
-        ggml_backend_dev_get_props(dev, &props);
-        bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
-        bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
         if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
