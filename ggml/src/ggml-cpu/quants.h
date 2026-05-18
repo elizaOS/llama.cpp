@@ -56,6 +56,18 @@ void ggml_compute_forward_fused_attn_qjl_tbq(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst);
 
+// TBQ / POLAR packed-K attention-score CPU references. Defined in
+// ggml/src/ggml-cpu/attn-score-tbq-polar.c. These are the correctness
+// oracles for the Metal kernels of the same names; production paths
+// run on Metal (no SIMD path exists on CPU). See the file header for
+// the layout contract.
+void ggml_compute_forward_attn_score_tbq(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst);
+void ggml_compute_forward_attn_score_polar(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst);
+
 void quantize_row_iq4_nl (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 void quantize_row_iq4_xs (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 

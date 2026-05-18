@@ -140,6 +140,7 @@ enum llm_arch {
     LLM_ARCH_MAINCODER,
     LLM_ARCH_KIMI_LINEAR,
     LLM_ARCH_TALKIE,
+    LLM_ARCH_EAGLE3,
     LLM_ARCH_UNKNOWN,
 };
 
@@ -565,6 +566,9 @@ enum llm_tensor {
     LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
     LLM_TENSOR_DFLASH_FC,
     LLM_TENSOR_DFLASH_HIDDEN_NORM,
+    // EAGLE3 draft-model tensors (upstream PR #18039)
+    LLM_TENSOR_EAGLE3_TARGET_FEATURES,
+    LLM_TENSOR_EAGLE3_TARGET_TOK_EMBD,
 };
 
 enum llm_tensor_layer {
@@ -647,3 +651,4 @@ bool llm_arch_is_recurrent      (const llm_arch & arch);
 bool llm_arch_is_hybrid         (const llm_arch & arch);
 bool llm_arch_is_diffusion      (const llm_arch & arch);
 bool llm_arch_supports_sm_tensor(const llm_arch & arch);
+bool llm_arch_supports_rs_rollback(const llm_arch & arch);

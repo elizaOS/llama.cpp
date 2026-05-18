@@ -1,0 +1,190 @@
+name: Eliza Metal Validation
+
+# Eliza-specific Metal backend parity job. Sibling to
+# eliza-vulkan-validation.yml. Builds with -DGGML_METAL=ON on
+# macos-latest (arm64) and runs the Eliza custom-quant parity tests
+# from tests/test-backend-ops.cpp against the Metal backend.
+#
+# What gets exercised on Metal vs CPU:
+#   - GET_ROWS / CPY / MUL_MAT for Q1_0_g32, Q1_0_g128, TBQ3_0, TBQ4_0,
+#     TBQ3_K, TBQ4_K, QJL1_256, Q4_POLAR, TBQ3_TCQ. Most of these have
+#     no Metal kernel today and emit "not supported"; Q1_0_g128 MUL_MAT
+#     runs for real (it has a registered get_pipeline path).
+#   - ATTN_SCORE_QJL / ATTN_SCORE_TBQ / ATTN_SCORE_POLAR /
+#     FUSED_ATTN_QJL_TBQ — all four are implemented on Metal and run
+#     against the CPU reference for real parity.
+#
+# Any "FAIL" line for ATTN_SCORE_QJL / FUSED_ATTN_QJL_TBQ or for the
+# GET_ROWS/CPY/MUL_MAT custom-quant cases fails the job. ATTN_SCORE_TBQ
+# and ATTN_SCORE_POLAR are tracked but not (yet) gated — their CPU
+# oracle is new (4ab3e26f6) and the first matrix surfaced Metal
+# divergence that we want visible without breaking the pipeline.
+# "not supported" is the expected baseline for the un-kerneled
+# GET_ROWS/CPY/MUL_MAT custom-quant kernels.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/eliza-metal-validation.yml'
+      - 'ggml/src/ggml-metal/**'
+      - 'ggml/include/**'
+      - 'src/**'
+      - 'tests/test-backend-ops.cpp'
+      - 'tests/test-quantize-fns.cpp'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  GGML_NLOOP: 3
+  GGML_N_THREADS: 1
+  LLAMA_LOG_COLORS: 0
+  LLAMA_LOG_PREFIX: 1
+  LLAMA_LOG_TIMESTAMPS: 1
+
+jobs:
+  macos-metal-validation:
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: eliza-metal-validation-macos
+          evict-old-files: 1d
+          save: ${{ github.event_name == 'push' }}
+
+      - name: Configure
+        run: |
+          cmake -B build-metal \
+            -DGGML_METAL=ON \
+            -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=ON \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: |
+          cmake --build build-metal -j $(sysctl -n hw.ncpu) \
+            --target llama-cli llama-completion \
+                     test-backend-ops test-quantize-fns
+
+      - name: test-quantize-fns (CPU; smoke for Eliza custom quants)
+        run: |
+          ./build-metal/bin/test-quantize-fns | tee /tmp/quantize-fns.log
+          # Must mention the Eliza-divergent quant types.
+          for t in qjl1_256 q4_polar tbq3_0 tbq4_0 tbq3_tcq; do
+            grep -q "Testing $t" /tmp/quantize-fns.log \
+              || (echo "MISSING quant: $t" && exit 1)
+          done
+
+      - name: test-backend-ops on Metal (filtered subset)
+        run: |
+          # Filter to ops that matter most for inference correctness.
+          for op in MUL_MAT MUL_MAT_ID ADD MUL SOFT_MAX RMS_NORM CPY ROPE FLASH_ATTN_EXT; do
+            echo "=== $op ==="
+            timeout 600 ./build-metal/bin/test-backend-ops \
+              -b Metal -o "$op" \
+              2>&1 | tee -a /tmp/backend-ops.log || true
+          done
+          echo "=== FAIL SUMMARY ==="
+          grep -E "Backend Metal:.*FAIL|tests passed|Failing tests:" \
+            /tmp/backend-ops.log || true
+
+      - name: test-backend-ops Eliza custom-quant parity (Metal)
+        run: |
+          # Eliza custom quants + custom attention ops on Metal.
+          #
+          # GET_ROWS / CPY / MUL_MAT: most custom-quant kernels are not
+          # registered on Metal today and emit "not supported" — that
+          # is the expected baseline. Q1_0_g128 MUL_MAT does run for
+          # real and PASS lines are expected for it.
+          #
+          # ATTN_SCORE_QJL / FUSED_ATTN_QJL_TBQ: Metal has kernels and
+          # CPU has reference implementations. Real parity runs; PASS
+          # is required.
+          #
+          # ATTN_SCORE_TBQ / ATTN_SCORE_POLAR: CPU reference landed at
+          # 4ab3e26f6 (ggml-cpu/attn-score-tbq-polar.c). Real parity
+          # runs against Metal kernels. ATTN_SCORE_POLAR passes; the
+          # initial ATTN_SCORE_TBQ matrix surfaced TBQ3_0/TBQ4_0
+          # divergence vs. the CPU oracle on the wave-15 hardware run,
+          # so the matrix is tracked but not (yet) gated until the
+          # Metal kernel is reconciled.
+          #
+          # We do NOT fail the job on "not supported" lines (expected
+          # for the un-kerneled GET_ROWS/CPY/MUL_MAT custom-quant cases).
+          # We DO fail on any FAIL line — Metal divergence from CPU.
+          for op in GET_ROWS CPY MUL_MAT \
+                    ATTN_SCORE_QJL FUSED_ATTN_QJL_TBQ \
+                    ATTN_SCORE_TBQ ATTN_SCORE_POLAR; do
+            echo "=== $op (Eliza custom quants) ==="
+            timeout 300 ./build-metal/bin/test-backend-ops \
+              -b Metal -o "$op" \
+              2>&1 | tee -a /tmp/eliza-custom-quants.log || true
+          done
+          echo "=== Eliza custom-quant summary ==="
+          for t in q1_0_g32 q1_0_g128 tbq3_0 tbq4_0 tbq3_k tbq4_k qjl1_256 q4_polar tbq3_tcq; do
+            n_skip=$(grep -c "type=$t.*not supported" /tmp/eliza-custom-quants.log || true)
+            n_fail=$(grep -c "type=$t.*FAIL"          /tmp/eliza-custom-quants.log || true)
+            n_pass=$(grep -c "type=$t.*OK"            /tmp/eliza-custom-quants.log || true)
+            echo "  $t: skip=$n_skip pass=$n_pass fail=$n_fail"
+            if [ "$n_fail" -gt 0 ]; then
+              echo "::error::Metal kernel divergence for type=$t (see /tmp/eliza-custom-quants.log)"
+              exit 1
+            fi
+          done
+          # ATTN_SCORE_QJL and FUSED_ATTN_QJL_TBQ should run real parity
+          # and PASS. Any FAIL is a Metal divergence; any "not supported"
+          # means supports_op regressed and the parity test silently
+          # stopped running.
+          echo "=== Eliza custom-attention summary ==="
+          for op_name in ATTN_SCORE_QJL FUSED_ATTN_QJL_TBQ; do
+            n_fail=$(grep -c "$op_name.*FAIL"          /tmp/eliza-custom-quants.log || true)
+            n_skip=$(grep -c "$op_name.*not supported" /tmp/eliza-custom-quants.log || true)
+            n_pass=$(grep -c "$op_name.*OK"            /tmp/eliza-custom-quants.log || true)
+            echo "  $op_name: skip=$n_skip pass=$n_pass fail=$n_fail"
+            if [ "$n_fail" -gt 0 ]; then
+              echo "::error::Metal kernel divergence for op=$op_name"
+              exit 1
+            fi
+            if [ "$n_skip" -gt 0 ]; then
+              echo "::error::Metal unexpectedly reports $op_name as not supported (regression in supports_op)"
+              exit 1
+            fi
+          done
+          # ATTN_SCORE_TBQ and ATTN_SCORE_POLAR: Metal kernels reconciled
+          # with the CPU oracle (attn-score-tbq-polar.c). Both are now
+          # hard-gated. A FAIL here means a real correctness regression in
+          # the Metal kernel — eliza-shipped/turbo3.metal,
+          # eliza-shipped/turbo4.metal, eliza-shipped/turbo3_tcq.metal,
+          # eliza-shipped/polar.metal, or eliza-shipped/polar_preht.metal.
+          echo "=== Eliza custom-attention (gated) ==="
+          for op_name in ATTN_SCORE_TBQ ATTN_SCORE_POLAR; do
+            n_fail=$(grep -c "$op_name.*FAIL"          /tmp/eliza-custom-quants.log || true)
+            n_skip=$(grep -c "$op_name.*not supported" /tmp/eliza-custom-quants.log || true)
+            n_pass=$(grep -c "$op_name.*OK"            /tmp/eliza-custom-quants.log || true)
+            echo "  $op_name: skip=$n_skip pass=$n_pass fail=$n_fail"
+            if [ "$n_fail" -gt 0 ]; then
+              echo "::error::Metal kernel diverges from CPU oracle for $op_name (see attn-score-tbq-polar.c)"
+              exit 1
+            fi
+          done
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eliza-metal-validation-logs
+          path: |
+            /tmp/quantize-fns.log
+            /tmp/backend-ops.log
+            /tmp/eliza-custom-quants.log
+          retention-days: 14

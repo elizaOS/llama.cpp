@@ -439,6 +439,67 @@ static int eliza_asr_thread_count(bool encoder) {
     return (int) std::max(1u, std::min(hw, cap));
 }
 
+static int eliza_int_env_or_default(const char * name, int fallback) {
+    if (const char * env = std::getenv(name)) {
+        int n = std::atoi(env);
+        if (n > 0) return n;
+    }
+    return fallback;
+}
+
+static bool eliza_bool_env_or_default(const char * name, bool fallback) {
+    if (const char * env = std::getenv(name)) {
+        std::string value = env;
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+            return (char) std::tolower(c);
+        });
+        if (value == "1" || value == "true" || value == "yes" || value == "on") return true;
+        if (value == "0" || value == "false" || value == "no" || value == "off") return false;
+    }
+    return fallback;
+}
+
+static void eliza_asr_debug_log(const char * message) {
+    if (!eliza_bool_env_or_default("ELIZA_ASR_DEBUG", false)) return;
+    std::fprintf(stderr, "[libelizainference][asr] %s\n", message);
+    std::fflush(stderr);
+}
+
+static bool eliza_running_on_android() {
+#if defined(__ANDROID__)
+    return true;
+#else
+    return std::getenv("ANDROID_ROOT") || std::getenv("ANDROID_DATA") || std::getenv("ANDROID_BOOTLOGO");
+#endif
+}
+
+static bool eliza_asr_android_cpu_profile() {
+    if (eliza_running_on_android()) {
+        return eliza_bool_env_or_default("ELIZA_ASR_ANDROID_CPU_PROFILE", true);
+    }
+    return false;
+}
+
+static bool eliza_asr_use_gpu() {
+    return eliza_bool_env_or_default("ELIZA_ASR_USE_GPU", !eliza_asr_android_cpu_profile());
+}
+
+static bool eliza_asr_use_mmap() {
+    return eliza_bool_env_or_default("ELIZA_ASR_USE_MMAP", !eliza_asr_android_cpu_profile());
+}
+
+static bool eliza_asr_use_extra_bufts() {
+    return eliza_bool_env_or_default("ELIZA_ASR_USE_EXTRA_BUFTS", !eliza_asr_android_cpu_profile());
+}
+
+static int eliza_asr_context_size() {
+    return eliza_int_env_or_default("ELIZA_ASR_N_CTX", eliza_asr_android_cpu_profile() ? 4096 : 8192);
+}
+
+static int eliza_asr_batch_size() {
+    return eliza_int_env_or_default("ELIZA_ASR_N_BATCH", eliza_asr_android_cpu_profile() ? 64 : 512);
+}
+
 static std::vector<float> eliza_resample_linear(
     const float * pcm,
     size_t n_samples,
@@ -671,41 +732,51 @@ static int eliza_load_asr(EliInferenceContext * ctx, char ** out_error) {
     });
 
     llama_model_params mparams = llama_model_default_params();
-    mparams.n_gpu_layers = 99;
-    mparams.use_mmap = true;
+    mparams.n_gpu_layers = eliza_asr_use_gpu() ? 99 : 0;
+    mparams.use_mmap = eliza_asr_use_mmap();
+    mparams.use_extra_bufts = eliza_asr_use_extra_bufts();
+    eliza_asr_debug_log("loading ASR text model");
     ctx->asr_model = llama_model_load_from_file(ctx->asr_model_path.c_str(), mparams);
     if (!ctx->asr_model) {
         eliza_free_asr(ctx);
         eliza_set_error(out_error, std::string("[libelizainference] failed to load ASR model: ") + ctx->asr_model_path);
         return ELIZA_ERR_BUNDLE_INVALID;
     }
+    eliza_asr_debug_log("loaded ASR text model; initializing llama context");
 
     llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx = 8192;
+    ctx->asr_n_batch = eliza_asr_batch_size();
+    cparams.n_ctx = eliza_asr_context_size();
     cparams.n_batch = (uint32_t) ctx->asr_n_batch;
     cparams.n_ubatch = (uint32_t) ctx->asr_n_batch;
     cparams.n_threads = eliza_asr_thread_count(false);
     cparams.n_threads_batch = eliza_asr_thread_count(true);
-    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+    cparams.flash_attn_type = eliza_asr_android_cpu_profile()
+        ? LLAMA_FLASH_ATTN_TYPE_DISABLED
+        : LLAMA_FLASH_ATTN_TYPE_AUTO;
     ctx->asr_lctx = llama_init_from_model(ctx->asr_model, cparams);
     if (!ctx->asr_lctx) {
         eliza_free_asr(ctx);
         eliza_set_error(out_error, "[libelizainference] failed to initialize ASR llama context");
         return ELIZA_ERR_FFI_FAULT;
     }
+    eliza_asr_debug_log("initialized ASR llama context; loading audio mmproj");
 
     mtmd_context_params aparams = mtmd_context_params_default();
-    aparams.use_gpu = true;
+    aparams.use_gpu = eliza_asr_use_gpu();
     aparams.print_timings = false;
     aparams.n_threads = eliza_asr_thread_count(true);
-    aparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
-    aparams.warmup = true;
+    aparams.flash_attn_type = eliza_asr_android_cpu_profile()
+        ? LLAMA_FLASH_ATTN_TYPE_DISABLED
+        : LLAMA_FLASH_ATTN_TYPE_AUTO;
+    aparams.warmup = !eliza_asr_android_cpu_profile();
     ctx->asr_mtmd = mtmd_init_from_file(ctx->asr_mmproj_path.c_str(), ctx->asr_model, aparams);
     if (!ctx->asr_mtmd) {
         eliza_free_asr(ctx);
         eliza_set_error(out_error, std::string("[libelizainference] failed to load ASR mmproj: ") + ctx->asr_mmproj_path);
         return ELIZA_ERR_BUNDLE_INVALID;
     }
+    eliza_asr_debug_log("loaded ASR audio mmproj; initializing sampler");
     if (!mtmd_support_audio(ctx->asr_mtmd)) {
         eliza_free_asr(ctx);
         eliza_set_error(out_error, "[libelizainference] ASR mmproj does not report audio support");
@@ -726,6 +797,7 @@ static int eliza_load_asr(EliInferenceContext * ctx, char ** out_error) {
         return ELIZA_ERR_FFI_FAULT;
     }
     llama_sampler_chain_add(ctx->asr_sampler, llama_sampler_init_greedy());
+    eliza_asr_debug_log("ASR region ready");
     return ELIZA_OK;
 }
 

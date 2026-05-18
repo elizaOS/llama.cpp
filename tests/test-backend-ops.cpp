@@ -3917,16 +3917,17 @@ struct test_gated_delta_net : public test_case {
     const int     v_repeat;
     const bool    permuted;
     const bool    kda;
+    const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
 
     std::string vars() override {
-        return VARS_TO_STR8(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda);
+        return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
     }
 
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
-            int v_repeat = 1, bool permuted = false, bool kda = false)
+            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
-          v_repeat(v_repeat), permuted(permuted), kda(kda) {}
+          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q;
@@ -3948,7 +3949,7 @@ struct test_gated_delta_net : public test_case {
         const int64_t g_ne0 = kda ? head_size : 1;
         ggml_tensor * g     = ggml_new_tensor_4d(ctx, type, g_ne0, head_count * v_repeat, n_seq_tokens, n_seqs);
         ggml_tensor * beta  = ggml_new_tensor_4d(ctx, type, 1, head_count * v_repeat, n_seq_tokens, n_seqs);
-        ggml_tensor * state = ggml_new_tensor_2d(ctx, type, head_size * v_repeat * head_size * head_count, n_seqs);
+        ggml_tensor * state = ggml_new_tensor_3d(ctx, type, head_size * v_repeat * head_size * head_count, K, n_seqs);
         ggml_set_name(g,     "g");
         ggml_set_name(beta,  "beta");
         ggml_set_name(state, "state");
@@ -6620,6 +6621,273 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// Eliza custom-quant attention parity tests. These exercise the two
+// custom attention ops that have a CPU reference implementation:
+//   - GGML_OP_ATTN_SCORE_QJL      (QJL1_256 packed K)
+//   - GGML_OP_FUSED_ATTN_QJL_TBQ  (QJL1_256 K + TBQ3_0 V)
+//
+// GGML_OP_ATTN_SCORE_TBQ and GGML_OP_ATTN_SCORE_POLAR are intentionally
+// not tested here because the CPU backend has no implementation for
+// them (they GGML_ABORT — they are Metal-only and canonical CPU graphs
+// lower them via attn_score_qjl / flash_attn_ext). A test_case for
+// either would crash the harness when computing the CPU reference, not
+// produce a "FAIL" line.
+//
+// Metal implements all four ops (see ggml_metal_device_supports_op
+// cases ATTN_SCORE_QJL / TBQ / POLAR / FUSED_ATTN_QJL_TBQ in
+// ggml-metal-device.m). For the two ops below the CPU reference comes
+// from ggml-cpu/qjl. Vulkan + CUDA have no kernels for these ops; the
+// harness prints "not supported" for those backends, matching the
+// GET_ROWS/CPY/MUL_MAT pattern above.
+//
+// Shapes are pinned to the only values Metal accepts in supports_op:
+//   q.ne[0] = 256 (QJL projection dim)
+//   K.ne[0] = 128, V.ne[0] = 128 (head_dim)
+// All shapes are contiguous in rows (required by supports_op).
+
+// GGML_OP_ATTN_SCORE_QJL
+struct test_attn_score_qjl : public test_case {
+    const int64_t n_heads;
+    const int64_t n_kv_heads;
+    const int64_t n_kv_tokens;
+    const int64_t n_batch;
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_heads, n_kv_heads, n_kv_tokens, n_batch);
+    }
+
+    double max_nmse_err() override {
+        return 1e-3;
+    }
+
+    test_attn_score_qjl(int64_t n_heads = 8, int64_t n_kv_heads = 2,
+                        int64_t n_kv_tokens = 64, int64_t n_batch = 4)
+        : n_heads(n_heads), n_kv_heads(n_kv_heads),
+          n_kv_tokens(n_kv_tokens), n_batch(n_batch) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // q is F32 [proj_dim=256, n_heads, n_batch, 1]
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, n_heads, n_batch, 1);
+        ggml_set_name(q, "q");
+
+        // packed_k is QJL1_256 [head_dim=128, n_kv_tokens, n_kv_heads, 1]
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_QJL1_256, 128, n_kv_tokens, n_kv_heads, 1);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * out = ggml_attn_score_qjl(ctx, q, k, (int) n_kv_heads);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t);
+        }
+    }
+};
+
+// GGML_OP_FUSED_ATTN_QJL_TBQ
+struct test_fused_attn_qjl_tbq : public test_case {
+    const int64_t n_heads;
+    const int64_t n_kv_heads;
+    const int64_t n_kv_tokens;
+    const int64_t n_batch;
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_heads, n_kv_heads, n_kv_tokens, n_batch);
+    }
+
+    double max_nmse_err() override {
+        // Two-pass max + softmax + mix produces slightly more numerical
+        // drift than the score-only ops, especially since dequantized V
+        // values multiply softmax weights.
+        return 5e-3;
+    }
+
+    test_fused_attn_qjl_tbq(int64_t n_heads = 8, int64_t n_kv_heads = 2,
+                            int64_t n_kv_tokens = 64, int64_t n_batch = 4)
+        : n_heads(n_heads), n_kv_heads(n_kv_heads),
+          n_kv_tokens(n_kv_tokens), n_batch(n_batch) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, n_heads, n_batch, 1);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_QJL1_256, 128, n_kv_tokens, n_kv_heads, 1);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_TBQ3_0, 128, n_kv_tokens, n_kv_heads, 1);
+        ggml_set_name(v, "v");
+
+        const float sm_scale = 1.0f / sqrtf(128.0f);
+        ggml_tensor * out = ggml_fused_attn_qjl_tbq(ctx, q, k, v, (int) n_kv_heads, sm_scale);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t);
+        }
+    }
+};
+
+// GGML_OP_ATTN_SCORE_TBQ
+//
+// CPU reference landed at 4ab3e26f6 (ggml-cpu/attn-score-tbq-polar.c).
+// q is F32 [head_dim=128, n_heads, n_batch, 1]; K is one of TBQ3_0 /
+// TBQ4_0 / TBQ3_TCQ at [128, n_kv_tokens, n_kv_heads, 1]; output is
+// F32 [n_kv_tokens, n_heads, n_batch, 1]. n_heads must be a multiple
+// of n_kv_heads (GQA).
+struct test_attn_score_tbq : public test_case {
+    const ggml_type k_type;
+    const int64_t n_heads;
+    const int64_t n_kv_heads;
+    const int64_t n_kv_tokens;
+    const int64_t n_batch;
+
+    std::string vars() override {
+        return VARS_TO_STR5(k_type, n_heads, n_kv_heads, n_kv_tokens, n_batch);
+    }
+
+    double max_nmse_err() override {
+        return 1e-3;
+    }
+
+    test_attn_score_tbq(ggml_type k_type = GGML_TYPE_TBQ3_0,
+                        int64_t n_heads = 8, int64_t n_kv_heads = 2,
+                        int64_t n_kv_tokens = 64, int64_t n_batch = 4)
+        : k_type(k_type), n_heads(n_heads), n_kv_heads(n_kv_heads),
+          n_kv_tokens(n_kv_tokens), n_batch(n_batch) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, n_heads, n_batch, 1);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, k_type, 128, n_kv_tokens, n_kv_heads, 1);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * out = ggml_attn_score_tbq(ctx, q, k, (int) n_kv_heads);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t);
+        }
+    }
+};
+
+// GGML_OP_ATTN_SCORE_POLAR
+//
+// CPU reference landed at 4ab3e26f6. q is F32 [128, n_heads, n_batch, 1];
+// K is Q4_POLAR [128, n_kv_tokens, n_kv_heads, 1]; output is F32
+// [n_kv_tokens, n_heads, n_batch, 1]. The use_qjl flag mirrors the
+// PolarQuant GGUF residual flag and lives in op_params[1].
+struct test_attn_score_polar : public test_case {
+    const bool use_qjl;
+    const int64_t n_heads;
+    const int64_t n_kv_heads;
+    const int64_t n_kv_tokens;
+    const int64_t n_batch;
+
+    std::string vars() override {
+        return VARS_TO_STR5(use_qjl, n_heads, n_kv_heads, n_kv_tokens, n_batch);
+    }
+
+    double max_nmse_err() override {
+        return 1e-3;
+    }
+
+    test_attn_score_polar(bool use_qjl = false,
+                          int64_t n_heads = 8, int64_t n_kv_heads = 2,
+                          int64_t n_kv_tokens = 64, int64_t n_batch = 4)
+        : use_qjl(use_qjl), n_heads(n_heads), n_kv_heads(n_kv_heads),
+          n_kv_tokens(n_kv_tokens), n_batch(n_batch) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, n_heads, n_batch, 1);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_Q4_POLAR, 128, n_kv_tokens, n_kv_heads, 1);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * out = ggml_attn_score_polar(ctx, q, k, (int) n_kv_heads, use_qjl);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t);
+        }
+    }
+};
+
+// GGML_OP_ISTFT
+//
+// Inverse short-time Fourier transform with a Hann analysis window and
+// overlap-add synthesis. Used by the Kokoro iSTFTNet decoder.
+//
+// src0 (mag_phase): F32 [2, F, T] — column-major storage so ggml ne is
+//   ne[0] = T (frames, fastest), ne[1] = F (n_fft/2+1), ne[2] = 2 (mag/phase)
+// src1 (window):    F32 [win_length], or NULL for internal periodic Hann
+//
+// dst: F32 [N] where N = (T-1)*hop_length + win_length
+//
+// op_params: { n_fft, hop_length, win_length }.
+struct test_istft : public test_case {
+    const int n_fft;
+    const int hop_length;
+    const int win_length;
+    const int n_frames;
+    const bool with_window;
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_fft, hop_length, win_length, n_frames, with_window);
+    }
+
+    double max_nmse_err() override {
+        // The CPU reference uses a naive O(n_fft^2) IDFT in double precision,
+        // GPU backends typically use Cooley-Tukey or shared-memory variants;
+        // 1e-3 leaves enough slop for the fp32 OLA accumulation order.
+        return 1e-3;
+    }
+
+    test_istft(int n_fft = 20, int hop_length = 5, int win_length = 20,
+               int n_frames = 16, bool with_window = false)
+        : n_fft(n_fft), hop_length(hop_length), win_length(win_length),
+          n_frames(n_frames), with_window(with_window) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t F = n_fft / 2 + 1;
+        ggml_tensor * mag_phase = ggml_new_tensor_3d(
+            ctx, GGML_TYPE_F32, (int64_t) n_frames, F, 2);
+        ggml_set_name(mag_phase, "mag_phase");
+
+        ggml_tensor * window = nullptr;
+        if (with_window) {
+            window = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) win_length);
+            ggml_set_name(window, "window");
+        }
+
+        ggml_tensor * out = ggml_istft(ctx, mag_phase, window,
+                                       n_fft, hop_length, win_length);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            // Bound magnitudes/phases to [-1,1] which is what the uniform
+            // initializer already produces. The naive IDFT then stays well
+            // within fp32 range for the parity check.
+            init_tensor_uniform(t);
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -8472,6 +8740,54 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 4, 256, {1, 1}, {1, 1}));
     }
 
+    // Eliza custom-quant attention parity. The test harness compares
+    // each backend's output against a CPU reference, so every op listed
+    // here MUST have a CPU implementation:
+    //   - ATTN_SCORE_QJL        : ggml-cpu/qjl (existing)
+    //   - FUSED_ATTN_QJL_TBQ    : ggml-cpu/qjl (existing)
+    //   - ATTN_SCORE_TBQ        : ggml-cpu/attn-score-tbq-polar.c (4ab3e26f6)
+    //   - ATTN_SCORE_POLAR      : ggml-cpu/attn-score-tbq-polar.c (4ab3e26f6)
+    //
+    // Metal implements all four (see ggml_metal_device_supports_op).
+    // Vulkan/CUDA print "not supported" — that is the intended baseline
+    // until a kernel lands, at which point the harness automatically
+    // starts comparing the new backend's output against CPU.
+    //
+    // Shape constraints come from ggml_metal_device_supports_op:
+    //   - ATTN_SCORE_QJL:      q.ne[0]=256, K.ne[0]=128
+    //   - FUSED_ATTN_QJL_TBQ:  q.ne[0]=256, K.ne[0]=128, V.ne[0]=128, out.ne[0]=128
+    //   - ATTN_SCORE_TBQ:      q.ne[0]=128, K.ne[0]=128, K type ∈ {TBQ3_0, TBQ4_0, TBQ3_TCQ}
+    //   - ATTN_SCORE_POLAR:    q.ne[0]=128, K.ne[0]=128, K type = Q4_POLAR
+    // and (q.ne[1] % n_kv_heads) == 0, i.e. n_heads is a multiple of n_kv_heads.
+    test_cases.emplace_back(new test_attn_score_qjl    (/*n_heads*/ 8, /*n_kv_heads*/ 2, /*n_kv_tokens*/ 64, /*n_batch*/ 4));
+    test_cases.emplace_back(new test_attn_score_qjl    (/*n_heads*/ 4, /*n_kv_heads*/ 1, /*n_kv_tokens*/ 32, /*n_batch*/ 2));
+
+    test_cases.emplace_back(new test_fused_attn_qjl_tbq(/*n_heads*/ 8, /*n_kv_heads*/ 2, /*n_kv_tokens*/ 64, /*n_batch*/ 4));
+
+    // ATTN_SCORE_TBQ parity: cover all three accepted K types at a tiny
+    // shape (fast inner loop) and the TBQ3_0 medium shape (eliza-1
+    // representative: head_dim=128, n_kv_tokens=256, GQA 8:2).
+    test_cases.emplace_back(new test_attn_score_tbq(GGML_TYPE_TBQ3_0,   /*n_heads*/ 4, /*n_kv_heads*/ 1, /*n_kv_tokens*/ 16, /*n_batch*/ 1));
+    test_cases.emplace_back(new test_attn_score_tbq(GGML_TYPE_TBQ4_0,   /*n_heads*/ 4, /*n_kv_heads*/ 1, /*n_kv_tokens*/ 16, /*n_batch*/ 1));
+    test_cases.emplace_back(new test_attn_score_tbq(GGML_TYPE_TBQ3_TCQ, /*n_heads*/ 4, /*n_kv_heads*/ 1, /*n_kv_tokens*/ 16, /*n_batch*/ 1));
+    test_cases.emplace_back(new test_attn_score_tbq(GGML_TYPE_TBQ3_0,   /*n_heads*/ 8, /*n_kv_heads*/ 2, /*n_kv_tokens*/ 256, /*n_batch*/ 4));
+
+    // ATTN_SCORE_POLAR parity: both use_qjl values at the tiny shape,
+    // plus the eliza-1 medium shape.
+    test_cases.emplace_back(new test_attn_score_polar(/*use_qjl*/ false, /*n_heads*/ 4, /*n_kv_heads*/ 1, /*n_kv_tokens*/ 16, /*n_batch*/ 1));
+    test_cases.emplace_back(new test_attn_score_polar(/*use_qjl*/ true,  /*n_heads*/ 4, /*n_kv_heads*/ 1, /*n_kv_tokens*/ 16, /*n_batch*/ 1));
+    test_cases.emplace_back(new test_attn_score_polar(/*use_qjl*/ false, /*n_heads*/ 8, /*n_kv_heads*/ 2, /*n_kv_tokens*/ 256, /*n_batch*/ 4));
+
+    // ISTFT parity: tiny shape mirrors the Kokoro iSTFTNet decoder
+    // (n_fft=20, hop=5, win=20) and medium shape mirrors a librosa-style
+    // 512-FFT TTS vocoder. Internal Hann and user-supplied Hann window
+    // paths both exercised. Op signature in src/ggml.c and op semantics
+    // documented in ggml/include/ggml.h:2246.
+    test_cases.emplace_back(new test_istft(/*n_fft*/  20, /*hop*/  5, /*win*/  20, /*frames*/  16, /*window*/ false));
+    test_cases.emplace_back(new test_istft(/*n_fft*/  20, /*hop*/  5, /*win*/  20, /*frames*/  16, /*window*/ true));
+    test_cases.emplace_back(new test_istft(/*n_fft*/ 256, /*hop*/ 64, /*win*/ 256, /*frames*/   8, /*window*/ false));
+    test_cases.emplace_back(new test_istft(/*n_fft*/ 512, /*hop*/128, /*win*/ 512, /*frames*/   8, /*window*/ true));
+
 #if 0
     {
         // Test paths in OpenCL
@@ -9228,6 +9544,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  33, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1, 1, false, true));
+
+    // K > 1: output keeps the last min(n_tokens, K) per-token snapshots in the trailing K-token region.
+    // exact-match cases (K == n_seq_tokens):
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 16,   2, 1, 1, false, false, /*K=*/2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   4, 1, 1, false, false, /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,   4, 2, 1, false, false, /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128,  4, 1, 1, false, false, /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,   4, 2, 1, false, true,  /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32,   4, 2, 2, false, true,  /*K=*/4));
+    // overflow: n_tokens > K — only the last K snapshots kept.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

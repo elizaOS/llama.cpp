@@ -56,13 +56,27 @@ jobs:
 
       - name: Configure (cross, RVV 1.0)
         run: |
+          # NOTE: `-static` is required so the binary can be run under
+          # qemu-user without dynamic loader plumbing. That forces
+          # BUILD_SHARED_LIBS=OFF too — otherwise libggml-base.so is
+          # link-time built with `-static` and pulls in the static-PIE
+          # crt (crtbeginT.o) into a `-shared` link, which fails with
+          # `R_RISCV_HI20 against local symbol ... recompile with -fPIC`.
+          # NOTE: GGML_OPENMP=OFF is required because the riscv64
+          # cross toolchain ships libgomp as a dynamic library only
+          # (`/usr/lib/gcc-cross/riscv64-linux-gnu/14/libgomp.so`),
+          # and `-static` cannot resolve it (`attempted static link
+          # of dynamic object`). test-quantize-fns runs single-threaded
+          # under qemu-user, so OpenMP is unnecessary.
           cmake -B build-riscv64 -G Ninja \
             -DCMAKE_C_COMPILER=riscv64-linux-gnu-gcc \
             -DCMAKE_CXX_COMPILER=riscv64-linux-gnu-g++ \
             -DCMAKE_SYSTEM_NAME=Linux \
             -DCMAKE_SYSTEM_PROCESSOR=riscv64 \
+            -DBUILD_SHARED_LIBS=OFF \
             -DGGML_NATIVE=OFF \
             -DGGML_RVV=ON \
+            -DGGML_OPENMP=OFF \
             -DCMAKE_C_FLAGS="-march=rv64gcv -mabi=lp64d -static" \
             -DCMAKE_CXX_FLAGS="-march=rv64gcv -mabi=lp64d -static" \
             -DCMAKE_EXE_LINKER_FLAGS="-static" \

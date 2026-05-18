@@ -2053,17 +2053,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_attn_score_qjl(params, tensor);
             } break;
         case GGML_OP_ATTN_SCORE_TBQ:
+            {
+                // ELIZA-TBQ-POLAR-ATTN-DISPATCH-V1 (CPU reference)
+                // Scalar correctness oracle for the Metal kernel of the
+                // same name. Not perf-tuned; the production path is
+                // Metal. Lets test-backend-ops compare backend output
+                // against a CPU result. See attn-score-tbq-polar.c.
+                ggml_compute_forward_attn_score_tbq(params, tensor);
+            } break;
         case GGML_OP_ATTN_SCORE_POLAR:
             {
-                // ELIZA-TBQ-POLAR-ATTN-DISPATCH-V1
-                // TBQ and POLAR attention score forward are GPU-only ops (Metal kernels
-                // live under ggml/src/ggml-metal/). The CPU backend never produces these
-                // ops directly — they are routed via the Metal backend or lowered to
-                // GGML_OP_ATTN_SCORE_QJL / FLASH_ATTN_EXT on CPU graphs. If we reach
-                // here, the graph builder put a Metal-only op on the CPU backend by
-                // mistake. Abort explicitly so the failure is visible.
-                GGML_ABORT("attn_score_tbq / attn_score_polar: no CPU implementation; route via Metal backend or use attn_score_qjl / flash_attn_ext on CPU graphs");
-            }
+                ggml_compute_forward_attn_score_polar(params, tensor);
+            } break;
         case GGML_OP_FUSED_ATTN_QJL_TBQ:
             {
                 ggml_compute_forward_fused_attn_qjl_tbq(params, tensor);
@@ -2466,15 +2467,16 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_FUSED_ATTN_QJL_TBQ:
             {
                 // ELIZA-CPU-THREAD-PARALLELISM-V1
-                // QJL score forward and the fused QJL-K + TBQ-V kernel
-                // both split the flattened (ne3, n_batch, h_q) output
+                // QJL score forward, the fused QJL-K + TBQ-V kernel, and
+                // the TBQ / POLAR packed-K attention-score CPU references
+                // all split the flattened (ne3, n_batch, h_q) output
                 // space over ith/nth — each task owns disjoint score rows
                 // / head outputs, no shared scratch race (the fused op
                 // takes a per-task wdata slice; see the work-size case).
-                // TBQ / POLAR variants are Metal-only and abort in the
-                // compute_forward dispatcher; they are listed here so the
-                // n_tasks default-branch abort doesn't fire first and so
-                // the n_tasks contract stays uniform across the family.
+                // TBQ / POLAR are correctness oracles for the Metal
+                // kernels (production path is Metal); they are listed
+                // here so they get full thread fan-out instead of falling
+                // through to the n_tasks default branch.
                 n_tasks = n_threads;
             } break;
         case GGML_OP_WIN_PART:
@@ -3069,7 +3071,9 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_GATED_DELTA_NET:
                     {
                         const int64_t S_v = node->src[2]->ne[0];
-                        cur = S_v * sizeof(float) * n_tasks;
+                        const int64_t K   = node->src[5]->ne[1];  // state is (D, K, n_seqs)
+                        const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
+                        cur = per_thread * sizeof(float) * n_tasks;
                     } break;
                 case GGML_OP_COUNT:
                     {

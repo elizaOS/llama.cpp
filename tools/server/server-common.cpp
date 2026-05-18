@@ -1157,21 +1157,29 @@ json oaicompat_chat_params_parse(
     // json_schema fallback: if the chat template did not produce a grammar, pass json_schema
     // through to server-task.cpp and skip template grammar artifacts to avoid conflicts.
     bool json_schema_passthrough = !json_schema.is_null() && chat_params.grammar.empty();
+    const bool custom_grammar_passthrough = !grammar.empty() && chat_params.grammar == grammar;
 
     if (json_schema_passthrough) {
         llama_params["json_schema"] = json_schema;
     } else {
         if (!chat_params.grammar.empty()) {
-            llama_params["grammar"]      = chat_params.grammar;
-            llama_params["grammar_type"] = std::string("tool_calls");
+            llama_params["grammar"] = chat_params.grammar;
+            if (!custom_grammar_passthrough) {
+                llama_params["grammar_type"] = std::string("tool_calls");
+            }
         }
-        llama_params["grammar_lazy"] = chat_params.grammar_lazy;
-        auto grammar_triggers        = json::array();
-        for (const auto & trigger : chat_params.grammar_triggers) {
-            server_grammar_trigger ct(trigger);
-            grammar_triggers.push_back(ct.to_json());
+        if (custom_grammar_passthrough) {
+            llama_params["grammar_lazy"] = json_value(body, "grammar_lazy", false);
+            llama_params["grammar_triggers"] = json_value(body, "grammar_triggers", json::array());
+        } else {
+            llama_params["grammar_lazy"] = chat_params.grammar_lazy;
+            auto grammar_triggers        = json::array();
+            for (const auto & trigger : chat_params.grammar_triggers) {
+                server_grammar_trigger ct(trigger);
+                grammar_triggers.push_back(ct.to_json());
+            }
+            llama_params["grammar_triggers"]  = grammar_triggers;
         }
-        llama_params["grammar_triggers"]  = grammar_triggers;
         llama_params["preserved_tokens"]  = chat_params.preserved_tokens;
     }
     llama_params["generation_prompt"] = json_schema_passthrough ? "" : chat_params.generation_prompt;

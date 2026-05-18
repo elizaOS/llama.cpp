@@ -250,7 +250,10 @@ Vulkan/SYCL/RISC-V/iOS platforms. GitHub search capped the merged-PR scan at
 - #22055, save dynamic/static ngram cache file.
 - #18039, EAGLE3 speculative decoding.
 - #17034, profile-guided speculative decoding.
-- #18886 and #22673, MTP API/support.
+- #22673, MTP support — **PORTED** (commit 276163573, see
+  tools/cli/README.md `--spec-type draft-mtp`); CUDA `gated_delta_net.cu`
+  K-snapshot path still backed out, requires separate port.
+- #18886, MTP API — superseded by merged #22673; do not consume.
 - #20981, Step3.5 MTP.
 - #15225, GLM-style MTP.
 - #19833, multiple outputs per sequence.

@@ -1,18 +1,25 @@
 // ELIZA-VK-DISPATCH-PATCH-V1 — staged from packages/inference/vulkan/turbo4.comp by
 // build-llama-cpp-dflash.mjs. Frozen — do not edit in fork.
-// Hardware-verified on Intel ARL (Mesa 25.2.8) + lavapipe (Mesa 25.2.8 LLVMpipe)
-// for the earlier single-block layout. This source now follows the current
-// fork block_tbq4_0 layout (four 32-element blocks per 128-row); re-run
-// `make -C packages/inference/verify vulkan-verify` on a Vulkan host after
-// regenerating fixtures.
 //
 // turbo4 KV cache dequant + Q·K dot product (Vulkan compute shader, GLSL 450).
 //
-// Ports the fork's block_tbq4_0 decode path.
-//
-// Block layout (matches block_tbq4_0 in ggml-common.h, 18 bytes):
+// Block layout (matches block_tbq4_0 in ggml-common.h, 18 bytes, alignment 2):
 //     half  norm        // [0..1]   fp16 RMS after TBQ preconditioning
 //     u8    qs[16]      // [2..17]  first 16 low nibbles, last 16 high nibbles
+//
+// Element decode (matches CPU reference dequantize_row_tbq4_0):
+//     elem 0..31 within a 32-element block:
+//         qb  = qs[elem & 15]
+//         idx = elem < 16 ? (qb & 0xF) : (qb >> 4)
+//         rotated = TURBO_CENTROIDS_4BIT[idx] * norm
+//     then: y = tbq_uncondition_block(rotated) = k_tbq_signs .* H32(rotated)
+//
+// By the orthogonality of H32 (FWHT normalized by 1/sqrt(32)) and the
+// distributivity of pointwise sign multiply,
+//     <q, sign .* H32(r)> = <H32(q .* sign), r>
+// so we precompute q_t = H32(q .* sign) once per (q_head, batch) launch in
+// shared memory and dot q_t against the raw codebook-decoded K. Bit-exactly
+// matches the CPU dequant + dot.
 //
 // Four 32-element blocks form one 128-element attention row.
 //
@@ -52,6 +59,14 @@ const float TURBO_CENTROIDS_4BIT[16] = float[16](
     -0.9419147, -0.6564307, -0.3878412, -0.1283243,
      0.1283243,  0.3878412,  0.6564307,  0.9419147,
      1.2557391,  1.6175243,  2.0685055,  2.7321365
+);
+
+// k_tbq_signs[QK_TBQ=32] from ggml/src/ggml-quants.c:59. Reused per block.
+const float TBQ_SIGNS_32[32] = float[32](
+     1.0, -1.0,  1.0,  1.0, -1.0,  1.0, -1.0, -1.0,
+     1.0,  1.0, -1.0,  1.0, -1.0, -1.0,  1.0, -1.0,
+    -1.0,  1.0,  1.0, -1.0,  1.0, -1.0, -1.0,  1.0,
+     1.0, -1.0,  1.0, -1.0, -1.0,  1.0, -1.0,  1.0
 );
 
 float fp16_to_fp32(uint h16) {
@@ -100,9 +115,42 @@ float reduce_sum_32(float v, uint tid) {
     return partials[0];
 }
 
+// q_t[128] = H32(q .* k_tbq_signs) per 32-element block. Computed once at
+// launch by threads 0..3 (one Hadamard-32 each), reused for every KV index.
+shared float q_t[128];
+
+void precompute_qt(uint tid) {
+    if (tid < 4u) {
+        float buf[32];
+        uint base = tid * 32u;
+        uint q_off = push.q_head * push.head_dim + base;
+        for (uint i = 0u; i < 32u; ++i) {
+            buf[i] = q[q_off + i] * TBQ_SIGNS_32[i];
+        }
+        // In-place FWHT-32 with 1/sqrt(32) normalization (tbq_hadamard32).
+        for (uint len = 1u; len < 32u; len <<= 1) {
+            for (uint i = 0u; i < 32u; i += 2u * len) {
+                for (uint j = 0u; j < len; ++j) {
+                    float a = buf[i + j];
+                    float b = buf[i + j + len];
+                    buf[i + j]       = a + b;
+                    buf[i + j + len] = a - b;
+                }
+            }
+        }
+        const float norm = 0.1767766952966369;
+        for (uint i = 0u; i < 32u; ++i) {
+            q_t[base + i] = buf[i] * norm;
+        }
+    }
+    barrier();
+    memoryBarrierShared();
+}
+
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint kv_idx = gl_WorkGroupID.x;
+    precompute_qt(tid);
     if (kv_idx >= push.n_kv) return;
 
     uint elem0 = tid * 4u;
@@ -116,12 +164,12 @@ void main() {
     float norm = fp16_to_fp32(norm16);
 
     float acc = 0.0;
-    uint q_base = push.q_head * push.head_dim + elem0;
     for (uint local = 0u; local < 4u; local += 1u) {
         uint within = within0 + local;
         uint qs_byte = read_byte(blk_off + 2u + (within & 15u));
         uint idx = within < 16u ? (qs_byte & 0xFu) : (qs_byte >> 4);
-        acc = fma(q[q_base + local], TURBO_CENTROIDS_4BIT[idx] * norm, acc);
+        float k_val = TURBO_CENTROIDS_4BIT[idx] * norm;
+        acc = fma(q_t[elem0 + local], k_val, acc);
     }
 
     float sum = reduce_sum_32(acc, tid);

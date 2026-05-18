@@ -41,6 +41,8 @@ add_library(llama
             ${LLAMA_MODELS_SOURCES}
             # milady: DFlash draft model
             models/dflash-draft.cpp
+            # EAGLE3 speculative-decoding scaffolding (upstream PR #18039)
+            llama-eagle3.cpp
             )
 
 set_target_properties(llama PROPERTIES

@@ -147,7 +147,8 @@ jobs:
           # We do NOT fail the job on "not supported" lines (expected).
           # We DO fail on any "FAIL" line for these types — that would
           # signal a Vulkan kernel that diverges from the CPU reference.
-          for op in GET_ROWS CPY MUL_MAT; do
+          for op in GET_ROWS CPY MUL_MAT \
+                    ATTN_SCORE_TBQ ATTN_SCORE_POLAR; do
             echo "=== $op (Eliza custom quants) ==="
             timeout 300 ./build-vulkan/bin/test-backend-ops \
               -b Vulkan0 -o "$op" \
@@ -164,6 +165,23 @@ jobs:
             echo "  $t: skip=$n_skip pass=$n_pass fail=$n_fail"
             if [ "$n_fail" -gt 0 ]; then
               echo "::error::Vulkan kernel divergence for type=$t (see /tmp/eliza-custom-quants.log)"
+              exit 1
+            fi
+          done
+          # ATTN_SCORE_TBQ / ATTN_SCORE_POLAR: CPU oracle landed at
+          # 4ab3e26f6. Vulkan kernels were corrected at 2e5094b2c
+          # (turbo4 uncondition) and 1cbc7e0f8 (turbo3 layout + codebook
+          # + uncondition); all 3 TBQ shapes now pass parity vs CPU.
+          # Promoted from warning to hard-fail so future shader changes
+          # cannot silently regress attention scores.
+          echo "=== Eliza custom-attention (Vulkan) ==="
+          for op_name in ATTN_SCORE_TBQ ATTN_SCORE_POLAR; do
+            n_fail=$(grep -c "$op_name.*FAIL"          /tmp/eliza-custom-quants.log || true)
+            n_skip=$(grep -c "$op_name.*not supported" /tmp/eliza-custom-quants.log || true)
+            n_pass=$(grep -c "$op_name.*OK"            /tmp/eliza-custom-quants.log || true)
+            echo "  $op_name: skip=$n_skip pass=$n_pass fail=$n_fail"
+            if [ "$n_fail" -gt 0 ]; then
+              echo "::error::Vulkan kernel diverges from CPU oracle for $op_name (see /tmp/eliza-custom-quants.log)"
               exit 1
             fi
           done
