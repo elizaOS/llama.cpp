@@ -113,21 +113,21 @@ option(LLAMA_USE_PREBUILT_WEBUI     "llama: use prebuilt WebUI from HF Bucket wh
 option(LLAMA_TOOLS_INSTALL          "llama: install tools"                                                                          ${LLAMA_TOOLS_INSTALL_DEFAULT})
 option(LLAMA_TESTS_INSTALL          "llama: install tests"                                                                          ON)
 
-# omnivoice.cpp merged subtree. Compiled against the same GGML + backend
-# selection as the rest of llama.cpp, producing the libomnivoice shared
-# library (when OMNIVOICE_SHARED is also set) and the omnivoice-tts /
-# omnivoice-codec CLI tools. Default ON: the TTS GGUFs are staged in the
-# eliza-1 bundles and the runtime needs a loader for them.
-option(LLAMA_BUILD_OMNIVOICE "Build the merged omnivoice TTS subtree" ON)
+# omnivoice.cpp merged subtree: opt-in. When enabled, tools/omnivoice/
+# is compiled against the same GGML + backend selection as the rest of
+# llama.cpp, producing the libomnivoice shared library (when
+# OMNIVOICE_SHARED is also set) and the omnivoice-tts / omnivoice-codec
+# CLI tools. Default OFF so stock llama.cpp consumers see no change.
+option(LLAMA_BUILD_OMNIVOICE "Build the merged omnivoice TTS subtree" OFF)
 option(OMNIVOICE_SHARED      "Build libomnivoice for ABI consumers" OFF)
 
-# Kokoro-82M (StyleTTS-2 + iSTFTNet) standalone TTS subtree. Produces
-# kokoro_lib (static) + kokoro-tts (standalone CLI harness) + the
-# `/v1/audio/speech` server-mount handler. The arch tag LLM_ARCH_KOKORO
-# already lives in src/models/kokoro.cpp for the K-quant publish pipeline
-# (R8 §3.1); this option enables the actual inference path. Default ON:
-# Kokoro is a first-class voice surface in the eliza-1 stack.
-option(LLAMA_BUILD_KOKORO    "Build the Kokoro-82M TTS subtree (tools/kokoro/)" ON)
+# Kokoro-82M (StyleTTS-2 + iSTFTNet) standalone TTS subtree. Built only
+# when LLAMA_BUILD_KOKORO=ON. Produces kokoro_lib (static) + kokoro-tts
+# (standalone CLI harness) + the `/v1/audio/speech` server-mount handler.
+# The arch tag LLM_ARCH_KOKORO already lives in src/models/kokoro.cpp for
+# the K-quant publish pipeline (R8 §3.1); this option enables the actual
+# inference path. Default OFF so stock llama.cpp consumers see no change.
+option(LLAMA_BUILD_KOKORO    "Build the Kokoro-82M TTS subtree (tools/kokoro/)" OFF)
 
 # W3-3 deprecation: ELIZA_FUSE_OMNIVOICE=ON is the pre-W3-3 flag for the
 # fork-root `omnivoice/` graft. The graft is gone (see the deprecation
