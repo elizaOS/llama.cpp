@@ -14,11 +14,17 @@ namespace eliza_kokoro {
 
 namespace {
 
+// MSVC does not define M_PI by default (it's a POSIX/GNU extension behind
+// _USE_MATH_DEFINES). Declare a local constant so the Windows-MSVC builds
+// compile without depending on the math.h extension. Mirrors the same
+// pattern used in ggml/src/ggml-cpu/ops.cpp for the ISTFT op.
+static constexpr double K_PI = 3.14159265358979323846;
+
 // Build a periodic Hann window of length N. Matches numpy.hanning's
 // "symmetric=False" convention used by librosa.istft.
 static std::vector<float> hann_window(int n) {
     std::vector<float> w((size_t) n);
-    const double scale = 2.0 * M_PI / (double) n;
+    const double scale = 2.0 * K_PI / (double) n;
     for (int i = 0; i < n; ++i) {
         w[(size_t) i] = (float) (0.5 - 0.5 * std::cos(scale * (double) i));
     }
@@ -48,7 +54,7 @@ static void irdft_frame(
             acc += sign * re[F - 1];
         }
         for (int f = 1; f < F - ((n_fft & 1) == 0 ? 1 : 0); ++f) {
-            const double angle = 2.0 * M_PI * (double) f * (double) t * inv_n;
+            const double angle = 2.0 * K_PI * (double) f * (double) t * inv_n;
             acc += 2.0 * (re[f] * std::cos(angle) - im[f] * std::sin(angle));
         }
         out[t] = (float) (acc * inv_n);
