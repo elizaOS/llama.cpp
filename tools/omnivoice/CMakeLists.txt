@@ -244,25 +244,24 @@ target_link_libraries(omnivoice-test-abi-c PRIVATE omnivoice_lib)
 # dac_conv_t1d's ggml_conv_transpose_1d migration (elizaOS/eliza#7660).
 # The default run uses deterministic synthetic DAC block shapes; pass
 # `--gguf <omnivoice-tokenizer.gguf>` to exercise real conv_t1 weights.
-add_executable(omnivoice-dac-parity tests/dac-parity.cpp)
-target_compile_features(omnivoice-dac-parity PRIVATE cxx_std_17)
-target_include_directories(omnivoice-dac-parity PRIVATE
-    ${CMAKE_SOURCE_DIR}/ggml/include
-    ${CMAKE_SOURCE_DIR}/ggml/src)
-# Link ggml-cpu / ggml-base only when those CMake targets actually exist.
-# On some cross-compile configurations (Android NDK in particular) the
-# ggml-cpu target may not be defined, and naming it unconditionally in
-# target_link_libraries makes CMake fall back to a literal `-lggml-cpu`
-# link flag against a phantom library. Guard the link the same way
-# tools/kokoro/CMakeLists.txt does for kokoro_lib.
-target_link_libraries(omnivoice-dac-parity PRIVATE ggml)
-if(TARGET ggml-base)
-    target_link_libraries(omnivoice-dac-parity PRIVATE ggml-base)
-endif()
+#
+# The parity harness calls ggml_backend_cpu_init / ggml_backend_cpu_set_n_threads
+# directly, so it can only be built when the ggml-cpu CMake target is present.
+# On some cross-compile configurations (Android NDK in particular) the ggml-cpu
+# target is not defined, and the executable would fail to link. Gate the whole
+# target on ggml-cpu availability so those builds skip it cleanly.
 if(TARGET ggml-cpu)
-    target_link_libraries(omnivoice-dac-parity PRIVATE ggml-cpu)
-endif()
+    add_executable(omnivoice-dac-parity tests/dac-parity.cpp)
+    target_compile_features(omnivoice-dac-parity PRIVATE cxx_std_17)
+    target_include_directories(omnivoice-dac-parity PRIVATE
+        ${CMAKE_SOURCE_DIR}/ggml/include
+        ${CMAKE_SOURCE_DIR}/ggml/src)
+    target_link_libraries(omnivoice-dac-parity PRIVATE ggml ggml-cpu)
+    if(TARGET ggml-base)
+        target_link_libraries(omnivoice-dac-parity PRIVATE ggml-base)
+    endif()
 
-if(BUILD_TESTING)
-    add_test(NAME omnivoice-dac-parity COMMAND omnivoice-dac-parity --no-real)
+    if(BUILD_TESTING)
+        add_test(NAME omnivoice-dac-parity COMMAND omnivoice-dac-parity --no-real)
+    endif()
 endif()
