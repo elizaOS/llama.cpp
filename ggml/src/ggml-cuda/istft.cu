@@ -38,8 +38,7 @@ static __global__ void build_hann_kernel(float * win, int win_length) {
 // dst_acc accumulates the windowed samples; dst_norm accumulates w^2.
 // ---------------------------------------------------------------------------
 static __global__ void istft_ola_kernel(
-        const float * __restrict__ mag_base,    // [F * T] channel 0
-        const float * __restrict__ phase_base,  // [F * T] channel 1
+        const float * __restrict__ mag_phase,   // [2, F, T] interleaved (ne[0]=2)
         const float * __restrict__ win,         // [win_length]
         float       * __restrict__ dst_acc,     // [n_out] output accumulator
         float       * __restrict__ dst_norm,    // [n_out] window^2 accumulator
@@ -64,9 +63,11 @@ static __global__ void istft_ola_kernel(
     const double inv_n = 1.0 / (double) n_fft;
 
     // --- Phase 1: load mag/phase and compute re/im for this frame ---
+    // Layout (column-major): element [ch=0|1, f, t] => mag_phase[t*(2*F) + f*2 + ch]
+    const float * frame_base = mag_phase + (int64_t) t * (2 * F);
     for (int f = tid; f < F; f += blockDim.x) {
-        const float mag_v   = mag_base  [(int64_t) f * T + t];
-        const float phase_v = phase_base[(int64_t) f * T + t];
+        const float mag_v   = frame_base[(int64_t) f * 2 + 0];
+        const float phase_v = frame_base[(int64_t) f * 2 + 1];
         sh_re[f] = mag_v * __cosf(phase_v);
         sh_im[f] = mag_v * __sinf(phase_v);
     }
@@ -134,10 +135,10 @@ void ggml_cuda_op_istft(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int win_length = op_params[2];
     const int F          = n_fft / 2 + 1;
 
-    // src0 layout: ne[0]=T (frames), ne[1]=F, ne[2]=2
-    const int T = (int) src0->ne[0];
+    // src0 layout: ne[0]=2 (mag/phase), ne[1]=F, ne[2]=T (matches ggml_istft).
+    GGML_ASSERT((int) src0->ne[0] == 2);
     GGML_ASSERT((int) src0->ne[1] == F);
-    GGML_ASSERT((int) src0->ne[2] == 2);
+    const int T = (int) src0->ne[2];
 
     const int n_out = (T - 1) * hop_length + win_length;
     GGML_ASSERT((int) dst->ne[0] == n_out);
@@ -147,9 +148,8 @@ void ggml_cuda_op_istft(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     cudaStream_t stream = ctx.stream();
 
-    const float * mag_base   = (const float *) src0->data;
-    const float * phase_base = mag_base + (int64_t) F * T;
-    float       * out_data   = (float *)       dst->data;
+    const float * mag_phase = (const float *) src0->data;
+    float       * out_data  = (float *)       dst->data;
 
     // Allocate temporary norm buffer and optional window.
     float * d_norm = nullptr;
@@ -176,7 +176,7 @@ void ggml_cuda_op_istft(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int block_sz = CUDA_ISTFT_BLOCK_SIZE;
 
     istft_ola_kernel<<<T, block_sz, shm_bytes, stream>>>(
-        mag_base, phase_base,
+        mag_phase,
         d_win,
         out_data, d_norm,
         T, F, n_fft, hop_length, win_length, n_out);

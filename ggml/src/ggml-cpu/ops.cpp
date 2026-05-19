@@ -11498,28 +11498,27 @@ static void ggml_compute_forward_istft_f32(
     // Temporary per-frame real + imag and IDFT output.
     std::vector<float> re((size_t) F), im((size_t) F), frame((size_t) n_fft);
 
-    // NOTE: ggml tensor dimensions are column-major: ne[0] is the fastest
-    // varying. Our mag_phase is declared [2, F, T], but ggml stores as
-    // ne[0]=T, ne[1]=F, ne[2]=2 (the last dimension listed is the slowest).
-    // So element at [chan, freq, frame] => data[chan * ne[1]*ne[0] + freq * ne[0] + frame].
-    const int T_ne  = (int) src0->ne[0];   // frames (fastest in storage)
-    const int F_ne  = (int) src0->ne[1];   // freq bins
-    const int CH_ne = (int) src0->ne[2];   // 2 (mag/phase)
+    // ggml tensor layout (column-major, ne[0] is fastest-varying):
+    //   ne[0] = 2 (mag/phase channel), ne[1] = F, ne[2] = T.
+    // See ggml_istft in ggml.c. Element at [ch, f, t] sits at index
+    //   t * (ne[0] * ne[1]) + f * ne[0] + ch
+    //   = t * (2 * F) + f * 2 + ch.
+    const int CH_ne = (int) src0->ne[0];
+    const int F_ne  = (int) src0->ne[1];
+    const int T_ne  = (int) src0->ne[2];
 
     GGML_ASSERT(CH_ne == 2);
     GGML_ASSERT(F_ne  == F);
     GGML_ASSERT(T_ne  == T);
 
-    const float * mag_base   = mag_data;                         // channel 0
-    const float * phase_base = mag_data + (int64_t) F * T;       // channel 1
-
     const double inv_n = 1.0 / (double) n_fft;
 
     for (int t = 0; t < T; ++t) {
+        const float * frame_base = mag_data + (int64_t) t * (2 * F);
         // Unpack polar → rectangular for this frame.
         for (int f = 0; f < F; ++f) {
-            const float mag_v   = mag_base  [(int64_t) f * T + t];
-            const float phase_v = phase_base[(int64_t) f * T + t];
+            const float mag_v   = frame_base[(int64_t) f * 2 + 0];
+            const float phase_v = frame_base[(int64_t) f * 2 + 1];
             re[(size_t) f] = mag_v * std::cos(phase_v);
             im[(size_t) f] = mag_v * std::sin(phase_v);
         }

@@ -103,6 +103,7 @@ set_and_check(GGML_LIB_DIR "@PACKAGE_GGML_LIB_INSTALL_DIR@")
 
 include("${CMAKE_CURRENT_LIST_DIR}/ggml-targets.cmake")
 
+set(_ggml_all_targets "")
 foreach(_ggml_backend ${GGML_AVAILABLE_BACKENDS})
     get_target_property(_ggml_backend_pfx ggml::${_ggml_backend} IMPORTED_LOCATION)
     if (_ggml_backend_pfx)
@@ -115,6 +116,19 @@ foreach(_ggml_backend ${GGML_AVAILABLE_BACKENDS})
             endif ()
         endforeach()
     endif()
+    if (TARGET ggml::${_ggml_backend})
+        list(APPEND _ggml_all_targets ggml::${_ggml_backend})
+    endif()
 endforeach()
+
+# Synthetic ggml::all aggregating every available backend — matches the
+# upstream contract used by examples/simple-cmake-pkg and any external
+# consumer that wants every registered backend in one target.
+if (NOT TARGET ggml::all)
+    add_library(ggml::all INTERFACE IMPORTED)
+    set_target_properties(ggml::all
+        PROPERTIES
+            INTERFACE_LINK_LIBRARIES "${_ggml_all_targets}")
+endif()
 
 check_required_components(ggml)
