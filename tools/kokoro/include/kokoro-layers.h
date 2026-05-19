@@ -147,6 +147,9 @@ inline void convtranspose1d_forward(
         const float * W, const float * b, int Cout, int K,
         int stride, int pad, int output_pad,
         float * y, int T_out) {
+    // output_pad affects T_out (computed by caller) but does not change
+    // the per-element formula here.
+    (void)output_pad;
     // Zero output, then add contributions.
     std::memset(y, 0, sizeof(float) * (size_t)Cout * (size_t)T_out);
     if (b) {
@@ -179,6 +182,9 @@ inline void convtranspose1d_depthwise_forward(
         const float * W, const float * b, int K,
         int stride, int pad, int output_pad,
         float * y, int T_out) {
+    // output_pad affects T_out (computed by caller) but does not change
+    // the per-element formula here.
+    (void)output_pad;
     std::memset(y, 0, sizeof(float) * (size_t)C * (size_t)T_out);
     for (int c = 0; c < C; ++c) {
         const float * xi = x + (size_t)c * T;

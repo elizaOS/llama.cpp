@@ -347,7 +347,13 @@ static FILE * get_handcrafted_file(const unsigned int seed, const enum handcraft
             name += "_" + std::to_string(i);
         }
         if (hft == HANDCRAFTED_TENSORS_BAD_NAME_SIZE) {
-            name += "_with_a_very_long_name_which_is_longer_than_what_is_allowed_for_ggml_tensors";
+            // Pad past GGML_MAX_NAME (default 64, can be raised at build time
+            // — omnivoice bumps it to 128). Keep growing until we're strictly
+            // over the limit so the "bad name size" branch actually exercises
+            // the oversize-name failure path under any GGML_MAX_NAME.
+            while (name.length() < (size_t) GGML_MAX_NAME) {
+                name += "_with_a_very_long_name_which_is_longer_than_what_is_allowed_for_ggml_tensors";
+            }
             GGML_ASSERT(name.length() >= GGML_MAX_NAME);
         }
         {
