@@ -1,49 +1,15 @@
 name: CI (self-hosted)
 
+# This workflow targets self-hosted runners with labels like
+# [self-hosted, Linux, NVIDIA], [self-hosted, macOS, ARM64], etc. The
+# elizaOS org currently has zero self-hosted runners registered
+# (`gh api repos/elizaOS/llama.cpp/actions/runners` → total_count: 0),
+# so every push and PR left these jobs queued indefinitely. Restrict
+# the trigger to workflow_dispatch only — manual triggers will surface
+# the missing-runner state immediately instead of silently hanging.
+# Re-enable push/pull_request once a self-hosted fleet exists.
 on:
   workflow_dispatch: # allows manual triggering
-  push:
-    branches:
-      - master
-      - main
-      - 'eliza/**'
-    paths: [
-      '.github/workflows/build.yml',
-      '**/CMakeLists.txt',
-      '**/.cmake',
-      '**/*.h',
-      '**/*.hpp',
-      '**/*.c',
-      '**/*.cpp',
-      '**/*.cu',
-      '**/*.cuh',
-      '**/*.swift',
-      '**/*.m',
-      '**/*.metal',
-      '**/*.comp',
-      '**/*.glsl',
-      '**/*.wgsl'
-    ]
-
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths: [
-      '.github/workflows/build-self-hosted.yml',
-      '**/CMakeLists.txt',
-      '**/.cmake',
-      '**/*.h',
-      '**/*.hpp',
-      '**/*.c',
-      '**/*.cpp',
-      '**/*.cu',
-      '**/*.cuh',
-      '**/*.swift',
-      '**/*.m',
-      '**/*.metal',
-      '**/*.comp',
-      '**/*.glsl',
-      '**/*.wgsl'
-    ]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
