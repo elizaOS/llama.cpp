@@ -105,8 +105,12 @@ if(MSVC)
     target_compile_options(omnivoice_lib PRIVATE
         /W4 /wd4100 /wd4505)
 else()
+    # -Wshadow intentionally omitted: omnivoice sources include llama's
+    # private headers + the public ggml-backend.h, neither of which are
+    # shadow-clean upstream. Under -DLLAMA_FATAL_WARNINGS=ON those
+    # warnings escalate to -Werror and break the 3rd-party CI lane.
     target_compile_options(omnivoice_lib PRIVATE
-        -Wall -Wextra -Wshadow -Wconversion
+        -Wall -Wextra -Wconversion
         -Wno-unused-parameter -Wno-unused-function -Wno-sign-conversion)
 endif()
 
