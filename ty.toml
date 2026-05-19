@@ -19,6 +19,12 @@ include = [
     # type-checker can't resolve it. It runs only against an installed
     # kokoro env, not under CI.
     "./tools/kokoro/tools/**",
+    # conversion/* defines mixins (e.g. _Qwen35MtpMixin) whose super()
+    # chains resolve to attributes provided by the composed Model
+    # subclasses in convert_hf_to_gguf.py. ty cannot see that
+    # composition at the mixin level, so the super() calls and
+    # base-class attributes (ftype, metadata) appear unresolved.
+    "./conversion/**",
 ]
 
 [overrides.rules]

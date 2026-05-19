@@ -148,7 +148,8 @@ jobs:
           # We DO fail on any "FAIL" line for these types — that would
           # signal a Vulkan kernel that diverges from the CPU reference.
           for op in GET_ROWS CPY MUL_MAT \
-                    ATTN_SCORE_TBQ ATTN_SCORE_POLAR; do
+                    ATTN_SCORE_TBQ ATTN_SCORE_POLAR \
+                    ISTFT; do
             echo "=== $op (Eliza custom quants) ==="
             timeout 300 ./build-vulkan/bin/test-backend-ops \
               -b Vulkan0 -o "$op" \
@@ -182,6 +183,25 @@ jobs:
             echo "  $op_name: skip=$n_skip pass=$n_pass fail=$n_fail"
             if [ "$n_fail" -gt 0 ]; then
               echo "::error::Vulkan kernel diverges from CPU oracle for $op_name (see /tmp/eliza-custom-quants.log)"
+              exit 1
+            fi
+          done
+          # ISTFT: Vulkan kernel at vulkan-shaders/istft.comp + ggml_vk_istft
+          # dispatch in ggml-vulkan.cpp.  All 4 parity cases against the CPU
+          # reference must PASS — any FAIL or "not supported" line indicates
+          # a regression in the Vulkan iSTFT dispatch path or shader.
+          echo "=== ISTFT (Vulkan, gated) ==="
+          for op_name in ISTFT; do
+            n_fail=$(grep -c "$op_name.*FAIL"          /tmp/eliza-custom-quants.log || true)
+            n_skip=$(grep -c "$op_name.*not supported" /tmp/eliza-custom-quants.log || true)
+            n_pass=$(grep -c "$op_name.*OK"            /tmp/eliza-custom-quants.log || true)
+            echo "  $op_name: skip=$n_skip pass=$n_pass fail=$n_fail"
+            if [ "$n_fail" -gt 0 ]; then
+              echo "::error::Vulkan iSTFT diverges from CPU reference (see ggml-cpu/ops.cpp:ggml_compute_forward_istft_f32)"
+              exit 1
+            fi
+            if [ "$n_skip" -gt 0 ]; then
+              echo "::error::Vulkan unexpectedly reports ISTFT as not supported (regression in supports_op)"
               exit 1
             fi
           done

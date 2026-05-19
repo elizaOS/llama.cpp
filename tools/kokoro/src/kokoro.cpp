@@ -534,7 +534,9 @@ kokoro_status kokoro_synthesize(
         const int n_out      = (n_frames - 1) * hop_length + win_length;
 
         // Build a tiny graph: mag_phase_tensor → ggml_istft → pcm_tensor.
-        // mag_phase_tensor shape: ne[0]=n_frames (T), ne[1]=F, ne[2]=2.
+        // mag_phase_tensor shape: ne[0]=2 (mag/phase), ne[1]=F, ne[2]=T.
+        // See ggml.h ggml_istft contract: src0 is [2, F, T] channel-first
+        // interleaved. Element [ch, f, t] sits at offset t*(2*F) + f*2 + ch.
         bool used_native_op = false;
         {
             ggml_init_params ip = {
@@ -544,8 +546,8 @@ kokoro_status kokoro_synthesize(
             };
             ggml_context * gctx = ggml_init(ip);
             if (gctx) {
-                const int64_t ne_mp[4] = { (int64_t) n_frames, (int64_t) F, 2, 1 };
-                ggml_tensor * mp = ggml_new_tensor(gctx, GGML_TYPE_F32, 4, ne_mp);
+                ggml_tensor * mp = ggml_new_tensor_3d(
+                    gctx, GGML_TYPE_F32, 2, (int64_t) F, (int64_t) n_frames);
                 ggml_tensor * pcm = ggml_istft(gctx, mp, /*window=*/nullptr,
                                                n_fft, hop_length, win_length);
                 ggml_cgraph * gf = ggml_new_graph_custom(gctx, 64, false);
@@ -555,15 +557,16 @@ kokoro_status kokoro_synthesize(
                     ggml_backend_get_default_buffer_type(model->backend));
 
                 if (alloc && ggml_gallocr_alloc_graph(alloc, gf)) {
-                    // Pack mag/phase into the [T, F, 2] tensor.
-                    // mag goes into channel 0 (base offset 0), phase into
-                    // channel 1 (base offset F*T floats).
-                    const size_t ch_stride = (size_t) F * (size_t) n_frames;
-                    std::vector<float> mp_data(2 * ch_stride);
-                    for (int f = 0; f < F; ++f) {
-                        for (int t = 0; t < n_frames; ++t) {
-                            mp_data[              f * n_frames + t] = mag  [(size_t)(f * n_frames + t)];
-                            mp_data[ch_stride + f * n_frames + t]  = phase[(size_t)(f * n_frames + t)];
+                    // Pack mag/phase into the [2, F, T] tensor.
+                    // mag is channel 0, phase is channel 1. Source arrays are
+                    // laid out as mag/phase[f * n_frames + t].
+                    std::vector<float> mp_data((size_t) 2 * (size_t) F * (size_t) n_frames);
+                    for (int t = 0; t < n_frames; ++t) {
+                        for (int f = 0; f < F; ++f) {
+                            const size_t src = (size_t)(f * n_frames + t);
+                            const size_t base = (size_t) t * (size_t)(2 * F) + (size_t) f * 2;
+                            mp_data[base + 0] = mag  [src];
+                            mp_data[base + 1] = phase[src];
                         }
                     }
                     ggml_backend_tensor_set(mp, mp_data.data(), 0,
@@ -604,6 +607,9 @@ const kokoro_hparams * kokoro_get_hparams(const kokoro_model * model) noexcept {
 // trained tensors by name from the loader-owned ggml_context. Keeping
 // this internal-by-convention (not in kokoro.h) preserves the public
 // surface while giving the sibling TUs a stable handle.
+// Forward-declare here so -Wmissing-declarations sees a prior declaration
+// at the definition site (the matching extern lives in the sibling TUs).
+ggml_context * kokoro_model_ggml_ctx(const kokoro_model * model);
 ggml_context * kokoro_model_ggml_ctx(const kokoro_model * model) {
     return model ? model->ctx : nullptr;
 }

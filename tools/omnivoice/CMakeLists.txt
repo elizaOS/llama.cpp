@@ -140,48 +140,48 @@ endif()
 # so the same `dlopen()`-ed handle serves text inference + speech
 # synthesis + ASR + VAD.
 #
-# Built when LLAMA_BUILD_OMNIVOICE=ON (always, when the merged tree is
-# enabled). The pre-W3-3 build script (`build-llama-cpp-dflash.mjs`) used
-# to graft + generate this via `omnivoice-fuse/prepare.mjs`; the merged
-# path produces it directly from in-fork source.
+# Built when LLAMA_BUILD_OMNIVOICE=ON AND the mtmd target exists. The FFI
+# wraps mtmd_* for the ASR (audio→text) pipeline, so it cannot be built
+# without it. iOS XCFramework configurations (LLAMA_BUILD_TOOLS=OFF,
+# LLAMA_BUILD_MTMD=OFF) skip this target — the Eliza iOS runtime loads
+# llama / omnivoice without ASR until a build with mtmd is enabled.
 #
 # Library file name: `libelizainference.{so,dylib,dll}` (no version
 # suffix on Linux to keep dlopen() happy on the runtime side). Default
 # visibility is `default` (not hidden) because every `eliza_inference_*`
 # entry the JS loader needs is reachable through dlsym.
-add_library(elizainference SHARED
-    ${OMNIVOICE_CORE_SOURCES}
-    ${OMNIVOICE_FFI_SOURCES})
-target_compile_features(elizainference PUBLIC cxx_std_17)
-target_compile_definitions(elizainference
-    PRIVATE OMNIVOICE_BUILD ${OMNIVOICE_COMPILE_DEFINITIONS})
-target_include_directories(elizainference PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_BINARY_DIR}
-    ${OMNIVOICE_LLAMA_PRIVATE_INCLUDE_DIRS})
-target_include_directories(elizainference PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../mtmd
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
-# Link llama + mtmd. The transitive link pulls ggml + the parent
-# build's backend selection in; we never call ggml_backend_*_init()
-# from here directly (patch 0003 — backend_init_auto() consumes the
-# shared pair or constructs its own as needed).
-target_link_libraries(elizainference PUBLIC llama)
 if(TARGET mtmd)
-    target_link_libraries(elizainference PUBLIC mtmd)
+    add_library(elizainference SHARED
+        ${OMNIVOICE_CORE_SOURCES}
+        ${OMNIVOICE_FFI_SOURCES})
+    target_compile_features(elizainference PUBLIC cxx_std_17)
+    target_compile_definitions(elizainference
+        PRIVATE OMNIVOICE_BUILD ${OMNIVOICE_COMPILE_DEFINITIONS})
+    target_include_directories(elizainference PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_BINARY_DIR}
+        ${OMNIVOICE_LLAMA_PRIVATE_INCLUDE_DIRS})
+    target_include_directories(elizainference PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../mtmd
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+    # Link llama + mtmd. The transitive link pulls ggml + the parent
+    # build's backend selection in; we never call ggml_backend_*_init()
+    # from here directly (patch 0003 — backend_init_auto() consumes the
+    # shared pair or constructs its own as needed).
+    target_link_libraries(elizainference PUBLIC llama mtmd)
+    set_target_properties(elizainference PROPERTIES
+        OUTPUT_NAME              elizainference
+        POSITION_INDEPENDENT_CODE ON)
+    # Apple re-exports llama symbols so the fused .dylib carries everything
+    # JS will dlopen() without a second handle. Mirrors the legacy fork-root
+    # graft block.
+    if(APPLE)
+        target_link_options(elizainference PRIVATE
+            "LINKER:-reexport_library,$<TARGET_FILE:llama>")
+    endif()
+    add_dependencies(elizainference omnivoice-version)
 endif()
-set_target_properties(elizainference PROPERTIES
-    OUTPUT_NAME              elizainference
-    POSITION_INDEPENDENT_CODE ON)
-# Apple re-exports llama symbols so the fused .dylib carries everything
-# JS will dlopen() without a second handle. Mirrors the legacy fork-root
-# graft block.
-if(APPLE)
-    target_link_options(elizainference PRIVATE
-        "LINKER:-reexport_library,$<TARGET_FILE:llama>")
-endif()
-add_dependencies(elizainference omnivoice-version)
 
 # llama-server wiring — mount the OmniVoice POST /v1/audio/speech route
 # onto the same process that serves /v1/chat/completions + the DFlash
@@ -249,7 +249,19 @@ target_compile_features(omnivoice-dac-parity PRIVATE cxx_std_17)
 target_include_directories(omnivoice-dac-parity PRIVATE
     ${CMAKE_SOURCE_DIR}/ggml/include
     ${CMAKE_SOURCE_DIR}/ggml/src)
-target_link_libraries(omnivoice-dac-parity PRIVATE ggml ggml-cpu ggml-base)
+# Link ggml-cpu / ggml-base only when those CMake targets actually exist.
+# On some cross-compile configurations (Android NDK in particular) the
+# ggml-cpu target may not be defined, and naming it unconditionally in
+# target_link_libraries makes CMake fall back to a literal `-lggml-cpu`
+# link flag against a phantom library. Guard the link the same way
+# tools/kokoro/CMakeLists.txt does for kokoro_lib.
+target_link_libraries(omnivoice-dac-parity PRIVATE ggml)
+if(TARGET ggml-base)
+    target_link_libraries(omnivoice-dac-parity PRIVATE ggml-base)
+endif()
+if(TARGET ggml-cpu)
+    target_link_libraries(omnivoice-dac-parity PRIVATE ggml-cpu)
+endif()
 
 if(BUILD_TESTING)
     add_test(NAME omnivoice-dac-parity COMMAND omnivoice-dac-parity --no-real)

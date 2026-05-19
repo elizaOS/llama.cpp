@@ -6862,8 +6862,11 @@ struct test_istft : public test_case {
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t F = n_fft / 2 + 1;
+        // ggml_istft expects mag_phase with ne[0]=2 (mag/phase), ne[1]=F,
+        // ne[2]=T (frames) — see ggml.c:5105. ggml_new_tensor_3d takes args
+        // in (ne0, ne1, ne2) order.
         ggml_tensor * mag_phase = ggml_new_tensor_3d(
-            ctx, GGML_TYPE_F32, (int64_t) n_frames, F, 2);
+            ctx, GGML_TYPE_F32, 2, F, (int64_t) n_frames);
         ggml_set_name(mag_phase, "mag_phase");
 
         ggml_tensor * window = nullptr;

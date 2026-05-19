@@ -1540,19 +1540,15 @@ struct vk_op_pool2d_push_constants {
     int32_t p0; int32_t p1;
 };
 
+// # ELIZA-ISTFT-DISPATCH-V1 — single-pass IDFT + OLA push constants.
+// Must mirror the Params block in vulkan-shaders/istft.comp.
 struct vk_op_istft_push_constants {
     uint32_t n_fft;
     uint32_t hop_length;
     uint32_t win_length;
-    uint32_t T;          // number of frames (IDFT pass)
-};
-
-struct vk_op_istft_ola_push_constants {
-    uint32_t n_fft;
-    uint32_t hop_length;
-    uint32_t win_length;
-    uint32_t T;
-    uint32_t n_out;      // total output samples (OLA pass)
+    uint32_t T;          // number of frames
+    uint32_t n_out;      // total output samples
+    uint32_t use_window; // 1 when src1 (window tensor) is bound, 0 otherwise
 };
 
 struct vk_op_rwkv_wkv6_push_constants {
@@ -4971,7 +4967,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
     // iSTFT: single-pass, one thread per output sample (2 bindings: mag_phase, dst)
     // Window is computed from push-constant win_length — no window tensor binding.
-    ggml_vk_create_pipeline(device, device->pipeline_istft_f32, "istft_f32", istft_f32_len, istft_f32_data, "main", 2, sizeof(vk_op_istft_ola_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_istft_f32, "istft_f32", istft_f32_len, istft_f32_data, "main", 3, sizeof(vk_op_istft_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_rwkv_wkv6_f32, "rwkv_wkv6_f32", rwkv_wkv6_f32_len, rwkv_wkv6_f32_data, "main", 7, sizeof(vk_op_rwkv_wkv6_push_constants), {1, 1, 1}, {device->subgroup_size}, 1);
 
@@ -12564,9 +12560,11 @@ static void ggml_vk_pool_2d(ggml_backend_vk_context * ctx, vk_context& subctx, c
 }
 
 static void ggml_vk_istft(ggml_backend_vk_context * ctx, vk_context& subctx,
-                          const ggml_tensor * src0, const ggml_tensor * /* src1 */, ggml_tensor * dst) {
-    // src0: mag_phase [T, F, 2]  (ne[0]=T, ne[1]=F, ne[2]=2)
-    // Window is computed on-the-fly inside the shader from win_length push constant.
+                          const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // # ELIZA-ISTFT-DISPATCH-V1
+    // src0: mag_phase F32 [2, F, T]  (ne[0]=2 mag/phase channel, ne[1]=F, ne[2]=T)
+    // src1: window    F32 [win_length] — optional; when NULL the shader
+    //                                    synthesises a periodic Hann window.
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
@@ -12574,18 +12572,24 @@ static void ggml_vk_istft(ggml_backend_vk_context * ctx, vk_context& subctx,
     const uint32_t n_fft      = (uint32_t) op_params[0];
     const uint32_t hop_length = (uint32_t) op_params[1];
     const uint32_t win_length = (uint32_t) op_params[2];
-    const uint32_t T          = (uint32_t) src0->ne[0];
+    const uint32_t T          = (uint32_t) src0->ne[2];
     const uint32_t n_out      = (uint32_t) dst->ne[0];
 
-    vk_op_istft_ola_push_constants pc{};
+    const bool has_window = (src1 != nullptr);
+
+    vk_op_istft_push_constants pc{};
     pc.n_fft      = n_fft;
     pc.hop_length = hop_length;
     pc.win_length = win_length;
     pc.T          = T;
     pc.n_out      = n_out;
+    pc.use_window = has_window ? 1u : 0u;
 
-    // 2-binding dispatch: src0=mag_phase, dst (no window tensor — built in shader)
-    ggml_vk_op_f32<vk_op_istft_ola_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_ISTFT, std::move(pc));
+    // 3-binding dispatch: src0=mag_phase, src1=window (or src0 again when NULL
+    // to keep the descriptor set populated; shader gates on use_window), dst.
+    // We pass src1 unconditionally so ggml_vk_op_f32 takes the use_src1 path.
+    const ggml_tensor * window_src = has_window ? src1 : src0;
+    ggml_vk_op_f32<vk_op_istft_push_constants>(ctx, subctx, src0, window_src, nullptr, nullptr, dst, GGML_OP_ISTFT, std::move(pc));
 }
 
 static void ggml_vk_conv_2d(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * src0,

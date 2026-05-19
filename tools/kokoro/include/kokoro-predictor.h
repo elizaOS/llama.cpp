@@ -23,6 +23,7 @@
 #include "kokoro-layers.h"
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace eliza_kokoro {

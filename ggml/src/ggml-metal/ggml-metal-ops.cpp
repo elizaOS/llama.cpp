@@ -935,6 +935,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_timestep_embedding(ctx, idx);
             } break;
+        case GGML_OP_ISTFT:
+            {
+                n_fuse = ggml_metal_op_istft(ctx, idx);
+            } break;
         case GGML_OP_ARGSORT:
             {
                 n_fuse = ggml_metal_op_argsort(ctx, idx);
@@ -4837,6 +4841,74 @@ int ggml_metal_op_timestep_embedding(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, ne00, 1, 1, nth, 1, 1);
+
+    return 1;
+}
+
+// # ELIZA-ISTFT-DISPATCH-V1 — Metal dispatch for GGML_OP_ISTFT.
+//
+// Tensor contract (mirrors CPU/CUDA reference at ops.cpp / istft.cu):
+//   src0 (mag_phase): F32 [2, F, T]  (ne[0]=2, ne[1]=F=n_fft/2+1, ne[2]=T)
+//   src1 (window):    F32 [win_length], OPTIONAL — NULL means synthesise Hann.
+//   dst:              F32 [n_out], n_out = (T-1)*hop_length + win_length.
+//
+// One thread per output sample; the shader iterates over the (typically tiny)
+// set of frames that overlap each sample and accumulates the windowed IDFT.
+int ggml_metal_op_istft(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT(op->type         == GGML_TYPE_F32);
+
+    const int32_t * op_params = (const int32_t *) op->op_params;
+    const uint32_t n_fft      = (uint32_t) op_params[0];
+    const uint32_t hop_length = (uint32_t) op_params[1];
+    const uint32_t win_length = (uint32_t) op_params[2];
+    const uint32_t T          = (uint32_t) op->src[0]->ne[2];
+    const uint32_t n_out      = (uint32_t) op->ne[0];
+
+    const bool has_window = (op->src[1] != nullptr);
+
+    ggml_metal_kargs_istft args = {
+        /*.n_fft      =*/ n_fft,
+        /*.hop_length =*/ hop_length,
+        /*.win_length =*/ win_length,
+        /*.T          =*/ T,
+        /*.n_out      =*/ n_out,
+        /*.use_window =*/ (uint32_t)(has_window ? 1u : 0u),
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_istft(lib, op);
+
+    // Bind the window buffer when present; otherwise fall back to src0's
+    // buffer at slot 1 (the shader will never read from it because
+    // use_window == 0).  Metal requires every declared buffer argument to
+    // be bound to *something* valid.
+    const auto src0_buf = ggml_metal_get_buffer_id(op->src[0]);
+    const auto win_buf  = has_window
+        ? ggml_metal_get_buffer_id(op->src[1])
+        : src0_buf;
+    const auto dst_buf  = ggml_metal_get_buffer_id(op);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_buffer  (enc, src0_buf, 0);
+    ggml_metal_encoder_set_buffer  (enc, win_buf,  1);
+    ggml_metal_encoder_set_buffer  (enc, dst_buf,  2);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 3);
+
+    // One thread per output sample.  Threadgroup width is capped by the
+    // pipeline's max threads per group; pick a multiple of 32 (SIMD width)
+    // that does not exceed n_out.
+    int nth = 32;
+    while ((uint32_t)(nth * 2) <= n_out && nth < 1024) {
+        nth *= 2;
+    }
+    const int n_groups = (int)((n_out + (uint32_t)nth - 1u) / (uint32_t)nth);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, n_groups, 1, 1, nth, 1, 1);
 
     return 1;
 }

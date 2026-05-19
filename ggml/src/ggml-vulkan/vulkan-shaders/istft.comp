@@ -1,16 +1,23 @@
 #version 450
 
 // ---------------------------------------------------------------------------
-// istft.comp — Inverse STFT (single-pass, one thread per output smpl).
+// istft.comp — Inverse STFT (single-pass, one thread per output sample).
 //
-// The Hann window is computed on-the-fly from win_length in push constants;
-// no window-tensor binding is required (binding 1 is unused / empty).
+// Tensor layout (matches ggml_istft contract — see ggml/src/ggml.c:ggml_istft
+// and the CPU reference at ggml/src/ggml-cpu/ops.cpp):
 //
-// Bindings:
-//   0 : mag_phase F32 [F*T | F*T]  mag first half, phase second half
-//   1 : dst       F32 [n_out]
+//   binding 0 : mag_phase F32 [2, F, T]   ne[0]=2 (mag/phase channel),
+//                                         ne[1]=F=n_fft/2+1, ne[2]=T (frames).
+//                                         Element [ch,f,t] is stored at
+//                                         data[t*(2*F) + f*2 + ch].
+//   binding 1 : window    F32 [win_length] — used only when use_window != 0;
+//                                            otherwise a periodic Hann window
+//                                            is synthesised inline (the
+//                                            buffer is still bound to keep
+//                                            the descriptor set happy).
+//   binding 2 : dst       F32 [n_out]
 //
-// Push constants: n_fft, hop_length, win_length, T (frames), n_out
+// Push constants: n_fft, hop_length, win_length, T, n_out, use_window.
 // ---------------------------------------------------------------------------
 
 #include "types.glsl"
@@ -18,7 +25,8 @@
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(binding = 0) readonly  buffer MagPhase { float mag_phase_data[]; };
-layout(binding = 1) writeonly buffer Dst       { float dst_data[]; };
+layout(binding = 1) readonly  buffer Window   { float win_data[]; };
+layout(binding = 2) writeonly buffer Dst      { float dst_data[]; };
 
 layout(push_constant) uniform Params {
     uint n_fft;
@@ -26,6 +34,7 @@ layout(push_constant) uniform Params {
     uint win_length;
     uint T;
     uint n_out;
+    uint use_window;
 } p;
 
 #define PI2 6.28318530717958647692
@@ -34,18 +43,18 @@ void main() {
     const uint i = gl_GlobalInvocationID.x;
     if (i >= p.n_out) return;
 
-    const uint F = p.n_fft / 2u + 1u;
+    const uint F      = p.n_fft / 2u + 1u;
+    const uint stride = 2u * F;  // floats per frame in mag_phase
 
-    // Frame range overlapping output smpl i.
+    // Frame range overlapping output sample i.
     const uint t_max = min(i / p.hop_length, p.T - 1u);
     uint t_min = 0u;
     if (i + 1u > p.win_length) {
         t_min = (i + 1u - p.win_length + p.hop_length - 1u) / p.hop_length;
     }
 
-    float acc  = 0.0;
-    float norm = 0.0;
-
+    float acc       = 0.0;
+    float norm      = 0.0;
     const float inv_nfft = 1.0 / float(p.n_fft);
     const float win_scale = PI2 / float(p.win_length);
 
@@ -53,27 +62,31 @@ void main() {
         const uint k = i - t * p.hop_length;
         if (k >= p.win_length) continue;
 
-        // Periodic Hann window: w[k] = 0.5 - 0.5*cos(2*pi*k / win_length)
-        const float win_k = 0.5 - 0.5 * cos(win_scale * float(k));
+        // Use the supplied window tensor when present; otherwise the
+        // periodic Hann that matches the CPU reference's internal fallback.
+        const float win_k = (p.use_window != 0u)
+            ? win_data[k]
+            : (0.5 - 0.5 * cos(win_scale * float(k)));
         norm += win_k * win_k;
 
         const uint k_mod = k % p.n_fft;
+        const uint base  = t * stride;
 
         // Compute IDFT output at time-index k_mod for frame t.
         float smpl = 0.0;
 
         // DC
         {
-            const float mag_v   = mag_phase_data[0u * p.T + t];
-            const float phase_v = mag_phase_data[F  * p.T + 0u * p.T + t];
+            const float mag_v   = mag_phase_data[base + 0u * 2u + 0u];
+            const float phase_v = mag_phase_data[base + 0u * 2u + 1u];
             smpl += mag_v * cos(phase_v);
         }
 
         // Nyquist (n_fft even only)
         if ((p.n_fft & 1u) == 0u) {
             const uint  nyq     = F - 1u;
-            const float mag_v   = mag_phase_data[nyq * p.T + t];
-            const float phase_v = mag_phase_data[F   * p.T + nyq * p.T + t];
+            const float mag_v   = mag_phase_data[base + nyq * 2u + 0u];
+            const float phase_v = mag_phase_data[base + nyq * 2u + 1u];
             float re = mag_v * cos(phase_v);
             float sign = ((k_mod & 1u) == 0u) ? 1.0 : -1.0;
             smpl += sign * re;
@@ -82,8 +95,8 @@ void main() {
         // Interior bins [1, F-1) with Hermitian symmetry (factor 2).
         const uint interior_end = F - ((p.n_fft & 1u) == 0u ? 1u : 0u);
         for (uint f = 1u; f < interior_end; ++f) {
-            const float mag_v   = mag_phase_data[f * p.T + t];
-            const float phase_v = mag_phase_data[F * p.T + f * p.T + t];
+            const float mag_v   = mag_phase_data[base + f * 2u + 0u];
+            const float phase_v = mag_phase_data[base + f * 2u + 1u];
             const float re = mag_v * cos(phase_v);
             const float im = mag_v * sin(phase_v);
             const float angle = PI2 * float(f) * float(k_mod) * inv_nfft;
