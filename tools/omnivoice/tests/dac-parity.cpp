@@ -155,7 +155,14 @@ static void new_dac_conv_t1d_ggml(
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, y);
-    ggml_graph_compute_with_ctx(ctx, gf, 4);
+    // ggml_graph_compute_with_ctx was removed upstream — use the ggml-backend
+    // CPU path. Tensors live in the user-managed ctx buffer, which the CPU
+    // backend can compute against directly.
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    GGML_ASSERT(backend);
+    ggml_backend_cpu_set_n_threads(backend, 4);
+    ggml_backend_graph_compute(backend, gf);
+    ggml_backend_free(backend);
 
     T_out_final = (int) y->ne[0];
     GGML_ASSERT((int) y->ne[1] == c.OC);

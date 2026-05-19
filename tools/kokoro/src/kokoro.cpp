@@ -607,6 +607,9 @@ const kokoro_hparams * kokoro_get_hparams(const kokoro_model * model) noexcept {
 // trained tensors by name from the loader-owned ggml_context. Keeping
 // this internal-by-convention (not in kokoro.h) preserves the public
 // surface while giving the sibling TUs a stable handle.
+// Forward-declare here so -Wmissing-declarations sees a prior declaration
+// at the definition site (the matching extern lives in the sibling TUs).
+ggml_context * kokoro_model_ggml_ctx(const kokoro_model * model);
 ggml_context * kokoro_model_ggml_ctx(const kokoro_model * model) {
     return model ? model->ctx : nullptr;
 }
