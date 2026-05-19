@@ -568,6 +568,7 @@ jobs:
       VULKAN_VERSION: 1.4.313.2
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - build: 'cpu-x64 (static)'
@@ -620,6 +621,23 @@ jobs:
           & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
           Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
           Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      - name: Install SPIRV-Headers
+        id: get_spirv_headers
+        if: ${{ matrix.build == 'vulkan-x64' }}
+        run: |
+          git clone --depth 1 --branch vulkan-sdk-${env:VULKAN_VERSION} https://github.com/KhronosGroup/SPIRV-Headers "$env:RUNNER_TEMP/SPIRV-Headers" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "SDK-tagged branch not available, falling back to main"
+            git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers "$env:RUNNER_TEMP/SPIRV-Headers"
+          }
+          cmake -S "$env:RUNNER_TEMP/SPIRV-Headers" -B "$env:RUNNER_TEMP/SPIRV-Headers/build" `
+            -DCMAKE_INSTALL_PREFIX="$env:RUNNER_TEMP/spirv-headers-install" `
+            -DSPIRV_HEADERS_SKIP_EXAMPLES=ON `
+            -DSPIRV_HEADERS_SKIP_INSTALL=OFF
+          cmake --build "$env:RUNNER_TEMP/SPIRV-Headers/build" --target install --config Release
+          Add-Content $env:GITHUB_ENV "SPIRV-Headers_DIR=$env:RUNNER_TEMP/spirv-headers-install/share/cmake/SPIRV-Headers"
+          Add-Content $env:GITHUB_ENV "CMAKE_PREFIX_PATH=$env:RUNNER_TEMP/spirv-headers-install"
 
       - name: Install Ninja
         id: install_ninja
