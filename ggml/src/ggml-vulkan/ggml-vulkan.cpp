@@ -58,6 +58,11 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher();
 #if defined(_MSC_VER)
 # define NOMINMAX 1
 # include <windows.h>
+// windows.h (winnt.h) defines MemoryBarrier as a macro that expands to an
+// intrinsic call (e.g. __faststorefence()). That collides with vk::MemoryBarrier
+// and causes MSVC C2146 syntax errors. Undefine it; nothing in this TU needs
+// the Win32 MemoryBarrier intrinsic.
+# undef MemoryBarrier
 # define YIELD() YieldProcessor()
 #elif defined(__clang__) || defined(__GNUC__)
 # if defined(__x86_64__) ||defined(__i386__)
