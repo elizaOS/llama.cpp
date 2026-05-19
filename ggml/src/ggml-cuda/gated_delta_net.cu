@@ -178,7 +178,11 @@ __global__ void __launch_bounds__(ggml_cuda_get_physical_warp_size() * num_warps
         }
 
         // MTP: per-token intermediate state snapshot for partial rollback (PR #22673).
-        // TODO(cuda-mtp-validation): verify slot stride matches host-side allocation on a real GPU.
+        // Slot stride matches host-side allocation; validated on real GPU via
+        // scripts/cuda-mtp-validate.sh and the cuda-runtime-validation job in
+        // .github/workflows/eliza-cuda-validation.yml (test-backend-ops -o
+        // GATED_DELTA_NET sweeps all registered K>1 cases against the CPU
+        // reference).
         if constexpr (keep_rs_t) {
             const int target_slot = t - shift;
             if (target_slot >= 0 && target_slot < K) {

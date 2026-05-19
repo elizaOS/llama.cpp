@@ -23,6 +23,7 @@ on:
     paths:
       - '.github/workflows/eliza-cuda-validation.yml'
       - 'scripts/cuda-docker-build.sh'
+      - 'scripts/cuda-mtp-validate.sh'
       - 'ggml/src/ggml-cuda/**'
       - 'ggml/include/**'
       - 'src/**'
@@ -217,6 +218,55 @@ jobs:
             fi
           done
 
+      - name: CUDA MTP gated_delta_net K-snapshot parity
+        # Closes TODO(cuda-mtp-validation) in
+        # ggml/src/ggml-cuda/gated_delta_net.cu (commit 142e7ac65 — port of
+        # upstream PR #22673 multi-token-prediction state snapshots).
+        # Runs the full GATED_DELTA_NET op-test sweep and confirms the K>1
+        # snapshot cases were scheduled (not silently skipped).
+        run: |
+          docker run --rm --gpus all \
+            -v "$PWD":/work -w /work \
+            -e GGML_NLOOP=3 -e GGML_N_THREADS=1 \
+            nvidia/cuda:12.4.1-devel-ubuntu22.04 bash -lc '
+              ./build-cuda-runtime/bin/test-backend-ops \
+                -b CUDA0 -o GATED_DELTA_NET 2>&1
+            ' | tee /tmp/cuda-mtp.log
+          if grep -qE "GATED_DELTA_NET.*FAIL" /tmp/cuda-mtp.log; then
+            echo "::error::CUDA GATED_DELTA_NET parity failed vs CPU reference"
+            exit 1
+          fi
+          n_k_gt_1=$(grep -cE "GATED_DELTA_NET.*K=[2-9][0-9]*" /tmp/cuda-mtp.log || true)
+          echo "K>1 cases observed: $n_k_gt_1"
+          if [ "$n_k_gt_1" -lt 4 ]; then
+            echo "::error::expected >=4 K>1 cases (MTP snapshot path), got $n_k_gt_1"
+            exit 1
+          fi
+
+      - name: CUDA MTP end-to-end smoke (skip-without-model)
+        # Optional smoke. The MTP-baked GGUF is not in the repo; this step
+        # is best-effort and explicitly skips when the model is absent so a
+        # missing artifact doesn't break the runtime job.
+        run: |
+          MTP_GGUF=/tmp/Qwen3.5-2B-MTP-Q4_K_M.gguf
+          if [ ! -f "$MTP_GGUF" ]; then
+            echo "skip-without-model: $MTP_GGUF missing"
+            echo "(stage Qwen3.5-2B-MTP-Q4_K_M.gguf on the runner to enable)"
+            exit 0
+          fi
+          docker run --rm --gpus all \
+            -v "$PWD":/work -v /tmp:/tmp -w /work \
+            nvidia/cuda:12.4.1-devel-ubuntu22.04 bash -lc "
+              timeout 120 ./build-cuda-runtime/bin/llama-cli \
+                -m $MTP_GGUF \
+                -p 'The capital of France is' \
+                -n 32 --temp 0 -c 512 -t 4 -ngl 99 \
+                --spec-type draft-mtp --spec-draft-n-max 2 2>&1
+            " | tee /tmp/cuda-mtp-smoke.log
+          grep -qE "Generation:|generated [0-9]+ tokens|^The capital of France" \
+            /tmp/cuda-mtp-smoke.log \
+            || (echo "::error::no recognisable llama-cli output" && exit 1)
+
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -225,4 +275,6 @@ jobs:
           path: |
             /tmp/backend-ops.log
             /tmp/eliza-custom-quants.log
+            /tmp/cuda-mtp.log
+            /tmp/cuda-mtp-smoke.log
           retention-days: 14
