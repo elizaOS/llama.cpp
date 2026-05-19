@@ -155,7 +155,7 @@ static int infer_mode(const char * path) {
     return 0;
 }
 
-int main_impl(int argc, char ** argv) {
+static int main_impl(int argc, char ** argv) {
     if (argc <= 1) {
         print_usage(argv[0]);
         return 0;
