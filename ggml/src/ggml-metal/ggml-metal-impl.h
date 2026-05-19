@@ -1095,6 +1095,17 @@ typedef struct {
     int      max_period;
 } ggml_metal_kargs_timestep_embedding;
 
+// # ELIZA-ISTFT-DISPATCH-V1 — kargs for GGML_OP_ISTFT (must mirror IstftParams
+// in eliza-shipped/istft.metal).
+typedef struct {
+    uint32_t n_fft;
+    uint32_t hop_length;
+    uint32_t win_length;
+    uint32_t T;
+    uint32_t n_out;
+    uint32_t use_window;
+} ggml_metal_kargs_istft;
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne01;

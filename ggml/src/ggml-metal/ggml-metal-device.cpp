@@ -2126,6 +2126,27 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_timestep_embeddi
     return res;
 }
 
+// # ELIZA-ISTFT-DISPATCH-V1 — pipeline lookup for GGML_OP_ISTFT.
+// Source kernel lives in eliza-shipped/istft.metal (compiled into default.metallib).
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_istft(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_ISTFT);
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT(op->type         == GGML_TYPE_F32);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_istft_f32");
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_opt_step_adamw(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_OPT_STEP_ADAMW);
 
