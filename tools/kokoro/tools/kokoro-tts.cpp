@@ -3,11 +3,11 @@
 // kokoro-tts.cpp — standalone CLI harness for the Kokoro fork inference path.
 //
 // Usage:
-//     kokoro-tts \
-//         --model    <path-to-kokoro-v1.0.gguf> \
-//         --voice    <path-to-voices/af_sam.bin> \
-//         --text     "Hello world." \
-//         --output   <out.wav> \
+//     kokoro-tts
+//         --model    <path-to-kokoro-v1.0.gguf>
+//         --voice    <path-to-voices/af_sam.bin>
+//         --text     "Hello world."
+//         --output   <out.wav>
 //         [--speed 1.0]
 //
 // Exits 0 on a non-blank WAV being written; non-zero on any failure. Used
