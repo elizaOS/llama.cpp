@@ -162,7 +162,11 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
         }
     }
 
-    char src1_str[256] = { 0 };
+    // Buffer must fit `src1->name` (up to GGML_MAX_NAME, which omnivoice
+    // bumps to 128) plus the bracketed shape string. Stay well above the
+    // worst case so -Werror=format-truncation on CI 3rd-party doesn't
+    // reject a write the compiler can't prove is bounded.
+    char src1_str[512] = { 0 };
     if (src1) {
         snprintf(src1_str, sizeof(src1_str), "%s{%s}", src1->name, common_ggml_ne_string(src1).c_str());
     }
