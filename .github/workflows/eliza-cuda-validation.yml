@@ -18,6 +18,11 @@ name: Eliza CUDA Validation
 
 on:
   workflow_dispatch:
+    inputs:
+      force_cuda_runtime:
+        description: 'Force runtime validation on a self-hosted-cuda runner. Leave unchecked on push/PR — the runtime job is skipped automatically because no GPU runner is registered yet.'
+        type: boolean
+        default: false
   pull_request:
     types: [opened, synchronize, reopened]
     paths:
@@ -135,12 +140,18 @@ jobs:
 
   cuda-runtime-validation:
     # Gated: requires a self-hosted runner with a real NVIDIA GPU and
-    # the `self-hosted-cuda` label. The job is skipped automatically
-    # by GitHub Actions if no such runner is online.
+    # the `self-hosted-cuda` label. No such runner is registered in the
+    # elizaOS org yet, so this job is gated behind the
+    # `force_cuda_runtime` workflow_dispatch input — running it on
+    # every push/PR would queue forever and never reach a runner.
+    #
+    # To run it: register a runner with label `self-hosted-cuda`, then
+    #   gh workflow run eliza-cuda-validation.yml -f force_cuda_runtime=true
+    # See docs/eliza-cuda-runtime-validation.md for runner setup.
     needs: ubuntu-cuda-build
     runs-on: [self-hosted, self-hosted-cuda]
     timeout-minutes: 120
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request'
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.force_cuda_runtime }}
 
     steps:
       - name: Clone
