@@ -2,12 +2,6 @@ name: CI (openvino)
 
 on:
   workflow_dispatch: # allows manual triggering
-    inputs:
-      force_self_hosted:
-        description: 'Also run the GPU matrix variant on the self-hosted Intel OpenVINO runner'
-        required: false
-        type: boolean
-        default: false
   push:
     branches:
       - master
@@ -45,25 +39,21 @@ jobs:
   ubuntu-24-openvino:
     name: ubuntu-24-openvino-${{ matrix.openvino_device }}
 
-    # The GPU variant targets [self-hosted, Linux, Intel, OpenVINO], which is
-    # not currently registered in the elizaOS org — every push/PR left it
-    # queued indefinitely. Skip it on automatic triggers; surface it only
-    # when explicitly opted in via `workflow_dispatch -f force_self_hosted=true`.
-    if: ${{ matrix.variant != 'gpu' || (github.event_name == 'workflow_dispatch' && inputs.force_self_hosted) }}
-
     concurrency:
       group: openvino-${{ matrix.variant }}-${{ github.head_ref || github.ref }}
       cancel-in-progress: false
 
+    # The legacy GPU variant targeted [self-hosted, Linux, Intel, OpenVINO],
+    # which is not registered in the elizaOS org — every push/PR left it
+    # queued indefinitely. Until that fleet exists, only run the CPU variant
+    # on ubuntu-24.04. Re-add a GPU variant (or a separate dedicated GPU job)
+    # once a self-hosted runner is available.
     strategy:
       matrix:
         include:
           - variant: cpu
             runner: '"ubuntu-24.04"'
             openvino_device: "CPU"
-          - variant: gpu
-            runner: '["self-hosted","Linux","Intel","OpenVINO"]'
-            openvino_device: "GPU"
 
     runs-on: ${{ fromJSON(matrix.runner) }}
 
