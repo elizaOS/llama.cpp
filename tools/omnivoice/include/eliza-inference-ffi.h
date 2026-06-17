@@ -71,6 +71,7 @@
 #define ELIZA_INFERENCE_FFI_H
 
 #include <stddef.h>
+#include <stdint.h> /* int32_t in eliza_llm_stream_config_t + streaming-LLM ABI */
 
 #ifdef __cplusplus
 extern "C" {
@@ -444,6 +445,113 @@ int eliza_inference_asr_stream_finish(
 
 /* Close + free a streaming ASR session. Idempotent on NULL. */
 void eliza_inference_asr_stream_close(EliAsrStream * stream);
+
+/* ---- Streaming LLM (ABI v4, additive) ----------------------------- *
+ *
+ * In-process text generation. Replaces the legacy "spawn llama-server as a
+ * child process and stream over loopback HTTP" path: the stock Android /
+ * iOS sandboxes forbid forking executables out of the app private dir, and
+ * the per-token HTTP round-trip dwarfs the latency speculative decoding is
+ * meant to save. The session loads its own text GGUF (resolved from the
+ * bundle's `text/` directory) into a private llama_context + sampler chain
+ * and decodes against it.
+ *
+ * The surface is PULL-based and token-id oriented to match the Bun loader
+ * in `plugin-local-inference/src/services/voice/ffi-bindings.ts`:
+ *   open → prefill → next* → close
+ * `_next` returns 0 (more output available), 1 (final step — EOS / cap), or
+ * a negative ELIZA_* code. The JS runner does NOT register a per-token
+ * callback; it polls `_next` and reads the committed-token batch out of the
+ * caller-provided buffers. `_cancel` flips an atomic the decode loop checks
+ * at each step boundary so an in-flight `_next` returns ELIZA_ERR_CANCELLED.
+ *
+ * Symbols are exported behind `eliza_inference_llm_stream_supported()`; a
+ * build that does not wire real forward passes returns 0 there and the
+ * loader picks the legacy HTTP path (desktop only — mobile requires this).
+ */
+
+/* 1 only when this build wires real streaming-LLM forward passes + the
+ * cooperative cancel path; 0 otherwise. */
+int eliza_inference_llm_stream_supported(void);
+
+/* Per-session config. Mirrored 1:1 by `LlmStreamConfig` marshalling in
+ * `ffi-bindings.ts` (8-byte aligned, sizeof = 64). `slot_id` may be -1 to
+ * disable slot pinning. `prompt_cache_key` / `mtp_drafter_path` /
+ * `gbnf_grammar` may be NULL. When `gbnf_grammar` is a non-empty GBNF
+ * source string the session installs a grammar sampler FIRST in the chain
+ * so every sampled token is grammar-constrained — this is how the
+ * structured-reply envelope is forced on the in-process FFI path.
+ * `disable_thinking` is a v1 no-op passthrough. */
+typedef struct {
+    int32_t      max_tokens;
+    float        temperature;
+    float        top_p;
+    int32_t      top_k;
+    float        repeat_penalty;
+    int32_t      slot_id;
+    const char * prompt_cache_key;   /* NULL ok */
+    int32_t      draft_min;
+    int32_t      draft_max;
+    const char * mtp_drafter_path;   /* NULL disables speculative (v1 ignores) */
+    const char * gbnf_grammar;       /* NULL/empty = no grammar constraint */
+    int32_t      disable_thinking;   /* 0/1 — v1 no-op */
+} eliza_llm_stream_config_t;
+
+/* Opaque streaming-LLM session. One per active generation. */
+typedef struct EliLlmStream EliLlmStream;
+
+/* Open a session anchored to `ctx`. Loads the bundle's text GGUF on first
+ * open and reuses it across sessions. Returns NULL on failure with
+ * `*out_error` populated. Close exactly once via `_close`. */
+EliLlmStream * eliza_inference_llm_stream_open(
+    EliInferenceContext * ctx,
+    const eliza_llm_stream_config_t * cfg,
+    char ** out_error);
+
+/* Feed pre-tokenized prompt tokens into the session KV before the first
+ * `_next`. `token_ids` is `num_tokens` int32s the library copies. Returns
+ * ELIZA_OK on success or a negative ELIZA_* code. */
+int eliza_inference_llm_stream_prefill(
+    EliLlmStream * stream,
+    const int32_t * token_ids,
+    size_t num_tokens,
+    char ** out_error);
+
+/* Pull the next step. Samples up to `tokens_cap` tokens (bounded internally
+ * by the per-step cap), writes the committed token ids into `tokens_out`
+ * (count into `*num_tokens_out`) and the detokenized UTF-8 into `text_out`
+ * (NUL-terminated, up to `text_cap`). `drafter_drafted_out` /
+ * `drafter_accepted_out` carry MTP stats (0 for the v1 non-speculative
+ * path). Returns 0 (more), 1 (final step), or a negative ELIZA_* code
+ * (ELIZA_ERR_CANCELLED on cancel). */
+int eliza_inference_llm_stream_next(
+    EliLlmStream * stream,
+    int32_t * tokens_out,
+    size_t tokens_cap,
+    size_t * num_tokens_out,
+    char * text_out,
+    size_t text_cap,
+    int32_t * drafter_drafted_out,
+    int32_t * drafter_accepted_out,
+    char ** out_error);
+
+/* Hard-cancel an in-flight `_next` (publishes an atomic flag; safe from
+ * another thread). Returns ELIZA_OK whether or not a pass was running. */
+int eliza_inference_llm_stream_cancel(EliLlmStream * stream);
+
+/* Slot KV persistence — optional. v1 returns ELIZA_ERR_INVALID_ARG. */
+int eliza_inference_llm_stream_save_slot(
+    EliLlmStream * stream,
+    const char * filename,
+    char ** out_error);
+
+int eliza_inference_llm_stream_restore_slot(
+    EliLlmStream * stream,
+    const char * filename,
+    char ** out_error);
+
+/* Close + free a streaming-LLM session. Idempotent on NULL. */
+void eliza_inference_llm_stream_close(EliLlmStream * stream);
 
 /* ---- Memory ownership helpers -------------------------------------- */
 
