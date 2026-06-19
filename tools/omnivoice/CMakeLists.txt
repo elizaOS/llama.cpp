@@ -80,6 +80,54 @@ set(OMNIVOICE_FFI_SOURCES
     src/eliza-inference-ffi.cpp
 )
 
+# Vendored standalone voice-classifier forward graphs (pure scalar C, no
+# ggml/llama dependency; they carry their own GGUF reader). These back
+# the fused wake-word (ABI v5), speaker-encoder, and diarizer (ABI v6)
+# surfaces so the whole voice pipeline runs through one
+# libelizainference handle instead of separate
+# libvoice_classifier / libwakeword .so libs. Vendored from
+# packages/native/plugins/{wakeword-cpp,voice-classifier-cpp} by the
+# Phase-1 fused-voice consolidation.
+set(OMNIVOICE_VOICE_CLASSIFIER_SOURCES
+    src/voice-classifiers/wakeword/wakeword_runtime.c
+    src/voice-classifiers/wakeword/wakeword_melspec.c
+    src/voice-classifiers/wakeword/wakeword_window.c
+    src/voice-classifiers/voice_classifier/voice_speaker.c
+    src/voice-classifiers/voice_classifier/voice_speaker_distance.c
+    src/voice-classifiers/voice_classifier/voice_diarizer.c
+    src/voice-classifiers/voice_classifier/voice_mel_features.c
+    src/voice-classifiers/voice_classifier/voice_gguf_loader.c
+    src/voice-classifiers/voice_classifier/voice_gguf_tensors.c
+)
+
+# Include roots so the vendored TUs resolve their own headers
+# (`voice_classifier/voice_classifier.h`, `voice_gguf_loader.h`,
+# `wakeword/wakeword.h`, `wakeword_internal.h`) and so the FFI bridge can
+# #include the two public ABI headers via their vendored relative paths.
+set(OMNIVOICE_VOICE_CLASSIFIER_INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/voice-classifiers/wakeword
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/voice-classifiers/wakeword/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/voice-classifiers/voice_classifier
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/voice-classifiers/voice_classifier/include
+)
+
+# Static archive of the vendored scalar-C forward graphs. Plain C11, no
+# llama/ggml link. PIC so it folds into the elizainference SHARED lib.
+add_library(eliza_voice_classifiers STATIC ${OMNIVOICE_VOICE_CLASSIFIER_SOURCES})
+set_target_properties(eliza_voice_classifiers PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED ON
+    POSITION_INDEPENDENT_CODE ON)
+target_include_directories(eliza_voice_classifiers PUBLIC
+    ${OMNIVOICE_VOICE_CLASSIFIER_INCLUDE_DIRS})
+if(MSVC)
+    target_compile_options(eliza_voice_classifiers PRIVATE /W3 /wd4100)
+else()
+    target_compile_options(eliza_voice_classifiers PRIVATE
+        -O3 -Wall -Wextra -Wno-unused-parameter)
+    target_link_libraries(eliza_voice_classifiers PUBLIC m)
+endif()
+
 # omnivoice_lib (STATIC) — the core. Tools link against this to pull
 # every pipeline_*/backend_* symbol without going through the public ABI.
 # Public include directories let consumers (omnivoice-tts, omnivoice-codec,
@@ -174,7 +222,16 @@ if(TARGET mtmd)
     # build's backend selection in; we never call ggml_backend_*_init()
     # from here directly (patch 0003 — backend_init_auto() consumes the
     # shared pair or constructs its own as needed).
+    #
+    # eliza_voice_classifiers folds the vendored scalar-C wake-word /
+    # speaker / diarizer forward graphs into the fused .so so the
+    # `eliza_inference_{wakeword,speaker,diariz}_*` ABIs resolve from
+    # the same dlopen()-ed handle. PRIVATE: the standalone C ABI
+    # (`wakeword_*` / `voice_speaker_*` / `voice_diarizer_*`) is an
+    # implementation detail behind the `eliza_inference_*` surface and
+    # must NOT be re-exported.
     target_link_libraries(elizainference PUBLIC llama mtmd)
+    target_link_libraries(elizainference PRIVATE eliza_voice_classifiers)
     set_target_properties(elizainference PROPERTIES
         OUTPUT_NAME              elizainference
         POSITION_INDEPENDENT_CODE ON)

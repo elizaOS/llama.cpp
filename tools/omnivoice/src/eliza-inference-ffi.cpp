@@ -19,6 +19,15 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+/* Vendored standalone scalar-C voice-classifier forward graphs (no ggml
+ * dependency; their own GGUF reader). These back the fused wake-word,
+ * speaker-encoder, and diarizer ABIs so the whole voice pipeline runs
+ * through one libelizainference handle instead of separate .so libs. */
+extern "C" {
+#include "voice-classifiers/wakeword/include/wakeword/wakeword.h"
+#include "voice-classifiers/voice_classifier/include/voice_classifier/voice_classifier.h"
+}
+
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -1547,6 +1556,353 @@ int eliza_inference_vad_reset(
 
 void eliza_inference_vad_close(EliVad * vad) {
     (void) vad;
+}
+
+/* ---- Native wake-word (ABI v5) ------------------------------------ *
+ *
+ * Thin wrapper that owns a context-anchored session and drives the
+ * vendored openWakeWord scalar-C runtime (wakeword_open/process/close).
+ * The fused build resolves the three head GGUFs from the context bundle
+ * + the head name. `reset` is implemented as close+reopen of the
+ * standalone session (the standalone runtime has no in-place reset; the
+ * streaming rings live on its private session struct) — that fully
+ * clears mel/embedding streaming state per the ABI contract.
+ */
+
+struct EliWakeWord {
+    wakeword_handle handle = nullptr;
+    /* Retained for reset (close+reopen). */
+    std::string melspec_path;
+    std::string embedding_path;
+    std::string classifier_path;
+};
+
+/* Resolve <bundle_dir>/wake/<head>.{melspec,embedding,classifier}.gguf.
+ * Returns false (with *out_error) when any of the three is missing. */
+static bool eliza_resolve_wakeword_ggufs(
+    const std::filesystem::path & bundle_dir,
+    const std::string & head,
+    std::string & melspec,
+    std::string & embedding,
+    std::string & classifier,
+    char ** out_error) {
+    const std::filesystem::path wake_dir = bundle_dir / "wake";
+    const std::filesystem::path mel = wake_dir / (head + ".melspec.gguf");
+    const std::filesystem::path emb = wake_dir / (head + ".embedding.gguf");
+    const std::filesystem::path cls = wake_dir / (head + ".classifier.gguf");
+    std::error_code ec;
+    if (!std::filesystem::exists(mel, ec) ||
+        !std::filesystem::exists(emb, ec) ||
+        !std::filesystem::exists(cls, ec)) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] wake-word GGUFs not found for head '") +
+            head + "' under " + wake_dir.string() +
+            " (expected " + head + ".{melspec,embedding,classifier}.gguf)");
+        return false;
+    }
+    melspec = mel.string();
+    embedding = emb.string();
+    classifier = cls.string();
+    return true;
+}
+
+int eliza_inference_wakeword_supported(void) {
+    return 1;
+}
+
+EliWakeWord * eliza_inference_wakeword_open(
+    EliInferenceContext * ctx,
+    int sample_rate_hz,
+    const char * head_name,
+    char ** out_error) {
+    if (!ctx) {
+        eliza_set_error(out_error,
+            "[libelizainference] wakeword_open: ctx is required");
+        return nullptr;
+    }
+    if (sample_rate_hz != WAKEWORD_SAMPLE_RATE) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] wakeword_open: sample_rate_hz must be ") +
+            std::to_string(WAKEWORD_SAMPLE_RATE));
+        return nullptr;
+    }
+    if (!head_name || head_name[0] == '\0') {
+        eliza_set_error(out_error,
+            "[libelizainference] wakeword_open: head_name is required");
+        return nullptr;
+    }
+
+    EliWakeWord * wake = new (std::nothrow) EliWakeWord();
+    if (!wake) {
+        eliza_set_error(out_error, "[libelizainference] wakeword_open: out of memory");
+        return nullptr;
+    }
+    if (!eliza_resolve_wakeword_ggufs(std::filesystem::path(ctx->bundle_dir),
+                                      head_name,
+                                      wake->melspec_path,
+                                      wake->embedding_path,
+                                      wake->classifier_path,
+                                      out_error)) {
+        delete wake;
+        return nullptr;
+    }
+
+    int rc = wakeword_open(wake->melspec_path.c_str(),
+                           wake->embedding_path.c_str(),
+                           wake->classifier_path.c_str(),
+                           &wake->handle);
+    if (rc != 0 || !wake->handle) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] wakeword_open: standalone runtime "
+                        "failed to load head '") + head_name +
+            "' (errno-style rc=" + std::to_string(rc) + ")");
+        delete wake;
+        return nullptr;
+    }
+    return wake;
+}
+
+int eliza_inference_wakeword_score(
+    EliWakeWord * wake,
+    const float * pcm,
+    size_t n_samples,
+    float * out_probability,
+    char ** out_error) {
+    if (!wake || !wake->handle || !pcm || !out_probability) {
+        eliza_set_error(out_error,
+            "[libelizainference] wakeword_score: invalid arguments");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    float score = 0.0f;
+    int rc = wakeword_process(wake->handle, pcm, n_samples, &score);
+    if (rc != 0) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] wakeword_score: forward failed "
+                        "(errno-style rc=") + std::to_string(rc) + ")");
+        return ELIZA_ERR_FFI_FAULT;
+    }
+    *out_probability = score;
+    return ELIZA_OK;
+}
+
+int eliza_inference_wakeword_reset(
+    EliWakeWord * wake,
+    char ** out_error) {
+    if (!wake) {
+        eliza_set_error(out_error,
+            "[libelizainference] wakeword_reset: invalid session");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    /* The standalone runtime has no in-place reset; close+reopen clears
+     * every streaming ring (mel state, mel ring, embedding ring, last
+     * score) deterministically. */
+    if (wake->handle) {
+        wakeword_close(wake->handle);
+        wake->handle = nullptr;
+    }
+    int rc = wakeword_open(wake->melspec_path.c_str(),
+                           wake->embedding_path.c_str(),
+                           wake->classifier_path.c_str(),
+                           &wake->handle);
+    if (rc != 0 || !wake->handle) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] wakeword_reset: reopen failed "
+                        "(errno-style rc=") + std::to_string(rc) + ")");
+        return ELIZA_ERR_FFI_FAULT;
+    }
+    return ELIZA_OK;
+}
+
+void eliza_inference_wakeword_close(EliWakeWord * wake) {
+    if (!wake) return;
+    if (wake->handle) wakeword_close(wake->handle);
+    delete wake;
+}
+
+/* ---- Native speaker encoder (ABI v6) ------------------------------ *
+ *
+ * Thin wrapper over the vendored WeSpeaker ResNet34-LM scalar-C forward
+ * graph (voice_speaker_open/embed/close). Resolves the encoder GGUF
+ * from the bundle's speaker dir or an explicit path.
+ */
+
+struct EliSpeaker {
+    voice_speaker_handle handle = nullptr;
+};
+
+/* Pick the single GGUF under <bundle_dir>/<subdir>. Returns "" when none
+ * found. */
+static std::string eliza_pick_one_gguf(
+    const std::filesystem::path & bundle_dir,
+    const char * subdir) {
+    std::vector<std::string> ggufs = eliza_find_ggufs(bundle_dir / subdir);
+    if (ggufs.empty()) return std::string();
+    return ggufs[0];
+}
+
+int eliza_inference_speaker_supported(void) {
+    return 1;
+}
+
+EliSpeaker * eliza_inference_speaker_open(
+    EliInferenceContext * ctx,
+    const char * gguf_path,
+    char ** out_error) {
+    if (!ctx) {
+        eliza_set_error(out_error,
+            "[libelizainference] speaker_open: ctx is required");
+        return nullptr;
+    }
+    std::string path;
+    if (gguf_path && gguf_path[0] != '\0') {
+        path = gguf_path;
+    } else {
+        path = eliza_pick_one_gguf(std::filesystem::path(ctx->bundle_dir), "speaker");
+        if (path.empty()) {
+            eliza_set_error(out_error,
+                std::string("[libelizainference] speaker_open: no GGUF found under ") +
+                (std::filesystem::path(ctx->bundle_dir) / "speaker").string() +
+                " and no explicit gguf_path given");
+            return nullptr;
+        }
+    }
+
+    EliSpeaker * speaker = new (std::nothrow) EliSpeaker();
+    if (!speaker) {
+        eliza_set_error(out_error, "[libelizainference] speaker_open: out of memory");
+        return nullptr;
+    }
+    int rc = voice_speaker_open(path.c_str(), &speaker->handle);
+    if (rc != 0 || !speaker->handle) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] speaker_open: standalone encoder "
+                        "failed to load ") + path +
+            " (errno-style rc=" + std::to_string(rc) + ")");
+        delete speaker;
+        return nullptr;
+    }
+    return speaker;
+}
+
+int eliza_inference_speaker_embed(
+    EliSpeaker * speaker,
+    const float * pcm,
+    size_t n_samples,
+    float * out_embedding,
+    char ** out_error) {
+    if (!speaker || !speaker->handle || !pcm || !out_embedding) {
+        eliza_set_error(out_error,
+            "[libelizainference] speaker_embed: invalid arguments");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    int rc = voice_speaker_embed(speaker->handle, pcm, n_samples, out_embedding);
+    if (rc != 0) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] speaker_embed: forward failed "
+                        "(errno-style rc=") + std::to_string(rc) + ")");
+        return rc == -EINVAL ? ELIZA_ERR_INVALID_ARG : ELIZA_ERR_FFI_FAULT;
+    }
+    return ELIZA_OK;
+}
+
+void eliza_inference_speaker_free(float * embedding) {
+    (void) embedding; /* caller-owned in _embed; provided for ABI symmetry */
+}
+
+void eliza_inference_speaker_close(EliSpeaker * speaker) {
+    if (!speaker) return;
+    if (speaker->handle) voice_speaker_close(speaker->handle);
+    delete speaker;
+}
+
+/* ---- Native diarizer (ABI v6) ------------------------------------- *
+ *
+ * Thin wrapper over the vendored pyannote-segmentation-3.0 scalar-C
+ * forward graph (voice_diarizer_open/segment/close). Resolves the
+ * diarizer GGUF from the bundle's diariz dir or an explicit path.
+ */
+
+struct EliDiariz {
+    voice_diarizer_handle handle = nullptr;
+};
+
+int eliza_inference_diariz_supported(void) {
+    return 1;
+}
+
+EliDiariz * eliza_inference_diariz_open(
+    EliInferenceContext * ctx,
+    const char * gguf_path,
+    char ** out_error) {
+    if (!ctx) {
+        eliza_set_error(out_error,
+            "[libelizainference] diariz_open: ctx is required");
+        return nullptr;
+    }
+    std::string path;
+    if (gguf_path && gguf_path[0] != '\0') {
+        path = gguf_path;
+    } else {
+        path = eliza_pick_one_gguf(std::filesystem::path(ctx->bundle_dir), "diariz");
+        if (path.empty()) {
+            eliza_set_error(out_error,
+                std::string("[libelizainference] diariz_open: no GGUF found under ") +
+                (std::filesystem::path(ctx->bundle_dir) / "diariz").string() +
+                " and no explicit gguf_path given");
+            return nullptr;
+        }
+    }
+
+    EliDiariz * diariz = new (std::nothrow) EliDiariz();
+    if (!diariz) {
+        eliza_set_error(out_error, "[libelizainference] diariz_open: out of memory");
+        return nullptr;
+    }
+    int rc = voice_diarizer_open(path.c_str(), &diariz->handle);
+    if (rc != 0 || !diariz->handle) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] diariz_open: standalone diarizer "
+                        "failed to load ") + path +
+            " (errno-style rc=" + std::to_string(rc) + ")");
+        delete diariz;
+        return nullptr;
+    }
+    return diariz;
+}
+
+int eliza_inference_diariz_segment(
+    EliDiariz * diariz,
+    const float * pcm,
+    size_t n_samples,
+    int8_t * out_labels,
+    size_t * io_n_labels,
+    char ** out_error) {
+    if (!diariz || !diariz->handle || !pcm || !out_labels || !io_n_labels) {
+        eliza_set_error(out_error,
+            "[libelizainference] diariz_segment: invalid arguments");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    int rc = voice_diarizer_segment(diariz->handle, pcm, n_samples,
+                                    out_labels, io_n_labels);
+    if (rc == -ENOSPC) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] diariz_segment: labels buffer too "
+                        "small; need ") + std::to_string(*io_n_labels) + " frames");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    if (rc != 0) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] diariz_segment: forward failed "
+                        "(errno-style rc=") + std::to_string(rc) + ")");
+        return rc == -EINVAL ? ELIZA_ERR_INVALID_ARG : ELIZA_ERR_FFI_FAULT;
+    }
+    return ELIZA_OK;
+}
+
+void eliza_inference_diariz_close(EliDiariz * diariz) {
+    if (!diariz) return;
+    if (diariz->handle) voice_diarizer_close(diariz->handle);
+    delete diariz;
 }
 
 /* ---- Streaming LLM (text generation, ABI v4) --------------------- *

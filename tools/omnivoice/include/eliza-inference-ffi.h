@@ -1,5 +1,5 @@
 /*
- * libelizainference FFI ABI v4.
+ * libelizainference FFI ABI v6.
  *
  * Single source of truth for the C-callable surface that the fused
  * omnivoice + llama.cpp build (`libelizainference.{dylib,so,dll}`)
@@ -56,6 +56,37 @@
  *     them in the preset file. Symbol is additive — v3 callers that
  *     don't use it are unaffected.
  *
+ * ABI v5 adds the native wake-word surface (already consumed by the
+ * Bun loader in `ffi-bindings.ts`):
+ *   - `eliza_inference_wakeword_supported/open/score/reset/close`,
+ *     mirroring the openWakeWord three-stage streaming pipeline
+ *     (melspec → embedding → classifier head): 16 kHz mono fp32,
+ *     1280-sample (80 ms) frames, one P(wake) in [0, 1] per call,
+ *     streaming state reset at utterance boundaries. The fused build
+ *     resolves the three head GGUFs
+ *     (`<bundle_dir>/wake/<head>.{melspec,embedding,classifier}.gguf`)
+ *     from the context bundle + the head name passed at open.
+ *
+ * ABI v6 fuses the remaining standalone voice classifiers into the
+ * single libelizainference handle so the whole voice pipeline runs
+ * through one native lib (replaces the separate
+ * `libvoice_classifier.{so,dylib}` standalone). Both additions own a
+ * context-anchored session and call the vendored scalar-C forward
+ * graphs under `tools/omnivoice/src/voice-classifiers/`:
+ *   - `eliza_inference_speaker_supported/open/embed/free/close` — the
+ *     WeSpeaker ResNet34-LM 256-d speaker-embedding encoder. 16 kHz
+ *     mono fp32 in, one L2-normalized 256-float embedding out, for
+ *     cosine-distance speaker matching.
+ *   - `eliza_inference_diariz_supported/open/segment/close` — the
+ *     pyannote-segmentation-3.0 diarizer. A fixed 80000-sample (5 s)
+ *     16 kHz mono fp32 window in, a per-frame powerset-label sequence
+ *     (293 int8 labels, one per frame) out.
+ * All v5/v6 additions are additive symbols — a v4 caller is
+ * unaffected — but the version bumps so loaders can require the new
+ * surfaces. Older fused builds that report a lower version are still
+ * usable at degraded capability via the per-symbol `*_supported()`
+ * probes.
+ *
  * Errors are propagated via heap-allocated `char *` strings written to
  * `out_error` arguments; callers MUST free them with
  * `eliza_inference_free_string`. A NULL `out_error` parameter is a
@@ -82,9 +113,9 @@ extern "C" {
 /* Bump on any breaking shape change. The Node loader checks the value
  * returned by `eliza_inference_abi_version()` against this constant on
  * load and refuses to bind if they disagree. */
-#define ELIZA_INFERENCE_ABI_VERSION 4
+#define ELIZA_INFERENCE_ABI_VERSION 6
 
-/* Returns a static, NUL-terminated string of the form "4" matching
+/* Returns a static, NUL-terminated string of the form "6" matching
  * ELIZA_INFERENCE_ABI_VERSION at the time the library was built. The
  * pointer is owned by the library — do NOT free. */
 const char * eliza_inference_abi_version(void);
@@ -355,6 +386,147 @@ int eliza_inference_vad_reset(
 
 /* Close + free a native VAD session. Idempotent on NULL. */
 void eliza_inference_vad_close(EliVad * vad);
+
+/* ---- Native wake-word (ABI v5) ------------------------------------ *
+ *
+ * Native openWakeWord backend. The shape mirrors
+ * `voice/wake-word.ts::GgmlWakeWordModel`: 16 kHz mono fp32 PCM,
+ * 1280-sample (80 ms) frames, one P(wake) in [0, 1] per call, streaming
+ * state reset at utterance boundaries. The fused build resolves the
+ * three head GGUFs
+ * (`<bundle_dir>/wake/<head>.{melspec,embedding,classifier}.gguf`)
+ * from the context bundle + the head name passed at open, then runs the
+ * vendored scalar-C three-stage pipeline (melspec → embedding →
+ * classifier). The JS binding routes wake-word detection exclusively
+ * through this surface when `eliza_inference_wakeword_supported() == 1`;
+ * otherwise the wake-word path throws (no ONNX fallback). */
+
+/* Capability probe: 1 when this build implements native wake-word, 0
+ * when it does not (stub / wake-word-disabled build). */
+int eliza_inference_wakeword_supported(void);
+
+/* Opaque native wake-word session. One per detector. */
+typedef struct EliWakeWord EliWakeWord;
+
+/* Open a wake-word session anchored to `ctx`. `sample_rate_hz` must be
+ * 16000. `head_name` selects the wake phrase (e.g. "hey-eliza") and is
+ * used to resolve `<bundle_dir>/wake/<head_name>.{melspec,embedding,
+ * classifier}.gguf`. Returns NULL on failure with `*out_error`
+ * populated. */
+EliWakeWord * eliza_inference_wakeword_open(
+    EliInferenceContext * ctx,
+    int sample_rate_hz,
+    const char * head_name,
+    char ** out_error);
+
+/* Score one 1280-sample (80 ms @ 16 kHz) fp32 mono frame and write the
+ * latest P(wake) in [0, 1] into `*out_probability`. Early calls before
+ * enough context accumulates write 0. Returns ELIZA_OK on success or a
+ * negative ELIZA_* code on failure. */
+int eliza_inference_wakeword_score(
+    EliWakeWord * wake,
+    const float * pcm,
+    size_t n_samples,
+    float * out_probability,
+    char ** out_error);
+
+/* Clear all streaming state (audio tail, mel ring, embedding ring) at
+ * utterance boundaries. Returns ELIZA_OK on success. */
+int eliza_inference_wakeword_reset(
+    EliWakeWord * wake,
+    char ** out_error);
+
+/* Close + free a native wake-word session. Idempotent on NULL. */
+void eliza_inference_wakeword_close(EliWakeWord * wake);
+
+/* ---- Native speaker encoder (ABI v6) ------------------------------ *
+ *
+ * Native WeSpeaker ResNet34-LM speaker-embedding encoder. The shape
+ * mirrors `voice/speaker/encoder.ts`: 16 kHz mono fp32 PCM in, one
+ * L2-normalized 256-d speaker embedding out, for cosine-distance
+ * matching. The fused build resolves the encoder GGUF from
+ * the `<bundle_dir>/speaker/` dir (or accepts an explicit path) and runs
+ * the vendored scalar-C forward graph. */
+
+/* Capability probe: 1 when this build implements the native speaker
+ * encoder, 0 otherwise. */
+int eliza_inference_speaker_supported(void);
+
+/* Opaque native speaker-encoder session. One per encoder. */
+typedef struct EliSpeaker EliSpeaker;
+
+/* Open a speaker-encoder session anchored to `ctx`. `gguf_path` may be
+ * NULL to resolve the `<bundle_dir>/speaker/` dir, or a non-empty
+ * absolute path to a WeSpeaker GGUF. Returns NULL on failure with
+ * `*out_error` populated. */
+EliSpeaker * eliza_inference_speaker_open(
+    EliInferenceContext * ctx,
+    const char * gguf_path,
+    char ** out_error);
+
+/* Embed `n_samples` of 16 kHz mono fp32 PCM into a 256-d L2-normalized
+ * speaker embedding written to `out_embedding` (caller-owned, must hold
+ * at least 256 floats). Returns ELIZA_OK on success or a negative
+ * ELIZA_* code on failure. */
+int eliza_inference_speaker_embed(
+    EliSpeaker * speaker,
+    const float * pcm,
+    size_t n_samples,
+    float * out_embedding,
+    char ** out_error);
+
+/* Reserved free hook to mirror the encode/free pair in the JS binding.
+ * The embedding buffer is caller-owned in `_embed`, so this is a no-op
+ * provided for ABI symmetry. Safe on NULL. */
+void eliza_inference_speaker_free(float * embedding);
+
+/* Close + free a native speaker-encoder session. Idempotent on NULL. */
+void eliza_inference_speaker_close(EliSpeaker * speaker);
+
+/* ---- Native diarizer (ABI v6) ------------------------------------- *
+ *
+ * Native pyannote-segmentation-3.0 diarizer. The shape mirrors
+ * `voice/speaker/diarizer.ts`: a fixed 80000-sample (5 s) 16 kHz mono
+ * fp32 window in, a per-frame powerset-label sequence out (293 int8
+ * labels, one per frame, each in [0, 7) over the pyannote powerset
+ * classes). The fused build resolves the diarizer GGUF from
+ * the `<bundle_dir>/diariz/` dir (or accepts an explicit path) and runs
+ * the vendored scalar-C forward graph; agglomerative clustering across
+ * windows stays JS-side. */
+
+/* Capability probe: 1 when this build implements the native diarizer, 0
+ * otherwise. */
+int eliza_inference_diariz_supported(void);
+
+/* Opaque native diarizer session. One per diarizer. */
+typedef struct EliDiariz EliDiariz;
+
+/* Open a diarizer session anchored to `ctx`. `gguf_path` may be NULL to
+ * resolve the `<bundle_dir>/diariz/` dir, or a non-empty absolute path to
+ * a pyannote GGUF. Returns NULL on failure with `*out_error`
+ * populated. */
+EliDiariz * eliza_inference_diariz_open(
+    EliInferenceContext * ctx,
+    const char * gguf_path,
+    char ** out_error);
+
+/* Segment `n_samples` of 16 kHz mono fp32 PCM (must be the 80000-sample
+ * window) into a per-frame powerset-label sequence. The caller passes
+ * the capacity of `out_labels` in `*io_n_labels`; on success the
+ * function writes `frames_per_window` (293) int8 labels and sets
+ * `*io_n_labels` to that count. On `ELIZA_ERR_INVALID_ARG` for a too-
+ * small buffer it sets `*io_n_labels` to the required count without
+ * writing. Returns ELIZA_OK on success or a negative ELIZA_* code. */
+int eliza_inference_diariz_segment(
+    EliDiariz * diariz,
+    const float * pcm,
+    size_t n_samples,
+    int8_t * out_labels,
+    size_t * io_n_labels,
+    char ** out_error);
+
+/* Close + free a native diarizer session. Idempotent on NULL. */
+void eliza_inference_diariz_close(EliDiariz * diariz);
 
 /* ---- ASR transcription (synchronous) ------------------------------- */
 
