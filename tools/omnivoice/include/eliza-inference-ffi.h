@@ -128,10 +128,26 @@ extern "C" {
 
 /* Bump on any breaking shape change. The Node loader checks the value
  * returned by `eliza_inference_abi_version()` against this constant on
- * load and refuses to bind if they disagree. */
-#define ELIZA_INFERENCE_ABI_VERSION 7
+ * load and refuses to bind if they disagree.
+ *
+ * Changelog:
+ *   v8: streaming-LLM text path reaches feature parity with the
+ *       libllama+eliza-llama-shim path. `eliza_llm_stream_config_t` grows
+ *       `cache_type_k` / `cache_type_v` (KV-cache quant pass-through; names
+ *       mapped to ggml_type) and `n_gpu_layers` (per-load GPU offload,
+ *       replacing the ELIZA_LLM_USE_GPU env hardcode). The `_open` path now
+ *       builds a same-file MTP speculative driver when `mtp_drafter_path`
+ *       is set (reusing common/speculative.cpp's DRAFT_MTP engine) and
+ *       `_next` drives draft+verify, populating drafter_drafted/accepted.
+ *       New capability probes `eliza_inference_llm_mtp_supported()` and
+ *       `eliza_inference_llm_kv_quant_supported()` let the loader refuse a
+ *       library that lacks these optimizations. sizeof config = 80.
+ *   v7: real Silero VAD (same symbol surface as v6).
+ *   v6: fused wake-word, speaker, diarizer.
+ */
+#define ELIZA_INFERENCE_ABI_VERSION 8
 
-/* Returns a static, NUL-terminated string of the form "7" matching
+/* Returns a static, NUL-terminated string of the form "8" matching
  * ELIZA_INFERENCE_ABI_VERSION at the time the library was built. The
  * pointer is owned by the library — do NOT free. */
 const char * eliza_inference_abi_version(void);
@@ -669,14 +685,42 @@ void eliza_inference_asr_stream_close(EliAsrStream * stream);
  * cooperative cancel path; 0 otherwise. */
 int eliza_inference_llm_stream_supported(void);
 
+/* ---- Streaming-LLM capability probes (ABI v8) --------------------- *
+ *
+ * These let the TS loader REFUSE the fused text path on a library that
+ * does not actually wire the make-or-break text optimizations, instead of
+ * silently regressing to a plain fixed-KV non-speculative loop. A build
+ * that wires same-file MTP speculative decoding returns 1 from
+ * `_mtp_supported`; a build that maps + applies KV-cache quant types
+ * returns 1 from `_kv_quant_supported`. Older v7 libraries do not export
+ * these symbols at all, so absence == unsupported. */
+int eliza_inference_llm_mtp_supported(void);
+int eliza_inference_llm_kv_quant_supported(void);
+
 /* Per-session config. Mirrored 1:1 by `LlmStreamConfig` marshalling in
- * `ffi-bindings.ts` (8-byte aligned, sizeof = 64). `slot_id` may be -1 to
+ * `ffi-bindings.ts` (8-byte aligned, sizeof = 80). `slot_id` may be -1 to
  * disable slot pinning. `prompt_cache_key` / `mtp_drafter_path` /
- * `gbnf_grammar` may be NULL. When `gbnf_grammar` is a non-empty GBNF
- * source string the session installs a grammar sampler FIRST in the chain
- * so every sampled token is grammar-constrained — this is how the
- * structured-reply envelope is forced on the in-process FFI path.
- * `disable_thinking` is a v1 no-op passthrough. */
+ * `gbnf_grammar` / `cache_type_k` / `cache_type_v` may be NULL. When
+ * `gbnf_grammar` is a non-empty GBNF source string the session installs a
+ * grammar sampler FIRST in the chain so every sampled token is
+ * grammar-constrained — this is how the structured-reply envelope is forced
+ * on the in-process FFI path. `disable_thinking` is a v1 no-op passthrough.
+ *
+ * `mtp_drafter_path` (ABI v8): absolute path of a same-file MTP drafter
+ * GGUF. When set (and `draft_min`/`draft_max` are > 0) `_open` builds a
+ * same-file MTP speculative driver against the SAME model (a second
+ * LLAMA_CONTEXT_TYPE_MTP context) and `_next` drives draft+verify, exactly
+ * mirroring desktop-llama-adapter.ts's same-file MTP path. NULL disables
+ * speculative decoding.
+ *
+ * `n_gpu_layers` (ABI v8): number of model layers to offload to GPU at load.
+ * -1 selects the runtime default (all layers / 99); 0 forces CPU. Replaces
+ * the ELIZA_LLM_USE_GPU env hardcode.
+ *
+ * `cache_type_k` / `cache_type_v` (ABI v8): KV-cache quantization type names
+ * (e.g. "f16", "q8_0", "qjl1_256", "q4_polar"). NULL leaves the llama.cpp
+ * default (f16). Mapped to ggml_type and applied to cparams.type_k/type_v.
+ * Mirrors desktop-llama-adapter.ts's GGML_KV_CACHE_TYPES pass-through. */
 typedef struct {
     int32_t      max_tokens;
     float        temperature;
@@ -687,9 +731,12 @@ typedef struct {
     const char * prompt_cache_key;   /* NULL ok */
     int32_t      draft_min;
     int32_t      draft_max;
-    const char * mtp_drafter_path;   /* NULL disables speculative (v1 ignores) */
+    const char * mtp_drafter_path;   /* NULL disables speculative */
     const char * gbnf_grammar;       /* NULL/empty = no grammar constraint */
     int32_t      disable_thinking;   /* 0/1 — v1 no-op */
+    int32_t      n_gpu_layers;       /* -1 = default (all), 0 = CPU (ABI v8) */
+    const char * cache_type_k;       /* KV K-cache quant name; NULL = f16 (ABI v8) */
+    const char * cache_type_v;       /* KV V-cache quant name; NULL = f16 (ABI v8) */
 } eliza_llm_stream_config_t;
 
 /* Opaque streaming-LLM session. One per active generation. */
@@ -716,9 +763,10 @@ int eliza_inference_llm_stream_prefill(
  * by the per-step cap), writes the committed token ids into `tokens_out`
  * (count into `*num_tokens_out`) and the detokenized UTF-8 into `text_out`
  * (NUL-terminated, up to `text_cap`). `drafter_drafted_out` /
- * `drafter_accepted_out` carry MTP stats (0 for the v1 non-speculative
- * path). Returns 0 (more), 1 (final step), or a negative ELIZA_* code
- * (ELIZA_ERR_CANCELLED on cancel). */
+ * `drafter_accepted_out` carry the per-step MTP stats (drafted + accepted
+ * draft tokens this step; 0 when no MTP drafter is attached). Returns 0
+ * (more), 1 (final step), or a negative ELIZA_* code (ELIZA_ERR_CANCELLED
+ * on cancel). */
 int eliza_inference_llm_stream_next(
     EliLlmStream * stream,
     int32_t * tokens_out,

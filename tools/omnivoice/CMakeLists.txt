@@ -223,7 +223,11 @@ if(TARGET mtmd)
         ${OMNIVOICE_LLAMA_PRIVATE_INCLUDE_DIRS})
     target_include_directories(elizainference PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../mtmd
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        # common/ — speculative.h, sampling.h, common.h for the same-file MTP
+        # speculative-decode engine wired into the streaming-LLM text path
+        # (ABI v8). The DRAFT_MTP driver reuses common/speculative.cpp.
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../common)
     # Link llama + mtmd. The transitive link pulls ggml + the parent
     # build's backend selection in; we never call ggml_backend_*_init()
     # from here directly (patch 0003 — backend_init_auto() consumes the
@@ -237,7 +241,11 @@ if(TARGET mtmd)
     # implementation detail behind the `eliza_inference_*` surface and
     # must NOT be re-exported.
     target_link_libraries(elizainference PUBLIC llama mtmd)
-    target_link_libraries(elizainference PRIVATE eliza_voice_classifiers)
+    # llama-common (PRIVATE): the same-file MTP speculative-decode engine
+    # in the streaming-LLM text path (ABI v8) reuses common/speculative.cpp,
+    # common/sampling.cpp, and common/common.cpp. PRIVATE so the common ABI
+    # is not re-exported from the fused .so (only eliza_inference_* + llama).
+    target_link_libraries(elizainference PRIVATE eliza_voice_classifiers llama-common)
     set_target_properties(elizainference PROPERTIES
         OUTPUT_NAME              elizainference
         POSITION_INDEPENDENT_CODE ON)

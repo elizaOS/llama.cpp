@@ -19,6 +19,17 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+/* common/ — the same-file MTP speculative-decode engine wired into the
+ * streaming-LLM text path (ABI v8) reuses the DRAFT_MTP implementation in
+ * common/speculative.cpp, the host sampler in common/sampling.cpp, and the
+ * batch helpers in common/common.cpp. These are the SAME entry points the
+ * libllama+eliza-llama-shim desktop path drives, so the fused text path
+ * matches it exactly. NOTE: do not pull in httplib.h here — networking stays
+ * out of the in-process FFI path. */
+#include "common.h"
+#include "speculative.h"
+#include "sampling.h"
+
 /* Vendored standalone scalar-C voice-classifier forward graphs (no ggml
  * dependency; their own GGUF reader). These back the fused wake-word,
  * speaker-encoder, diarizer, and Silero VAD ABIs so the whole voice
@@ -838,6 +849,103 @@ static int eliza_load_asr(EliInferenceContext * ctx, char ** out_error) {
  * shared, lazily-loaded text model.
  */
 
+/* ---- Same-file / separate-drafter MTP speculative-decode engine ----- *
+ *
+ * Owns the full draft -> verify -> accept loop natively, wrapping
+ * common/speculative.cpp's DRAFT_MTP implementation. This is a literal port
+ * of the eliza-llama-shim's eliza_mtp_driver.cpp engine
+ * (packages/app-core/scripts/desktop-llama-shim/eliza_mtp_driver.cpp) — the
+ * SAME engine the libllama path drives — so the fused text path matches it.
+ *
+ * Two shapes, mirroring tools/server/server-context.cpp:
+ *   - same-file MTP: the NextN head lives in the target text GGUF. The
+ *     engine creates a second LLAMA_CONTEXT_TYPE_MTP context over the SAME
+ *     model; no separate drafter is loaded (`drafter_path` empty).
+ *   - separate-drafter MTP: a distinct drafter GGUF is loaded and its
+ *     LLAMA_CONTEXT_TYPE_MTP context drafts for the target.
+ *
+ * Single-sequence (seq_id 0). Contexts that allow partial suffix removal
+ * (dense bodies) trim the rejected-draft KV tail directly; FULL/RS bodies
+ * (recurrent / hybrid delta-net, e.g. Qwen3.5) roll back via state
+ * checkpoints. _TYPE_NO (no rollback at all) is refused at create so the
+ * caller falls back to plain decode. */
+namespace eliza_mtp {
+
+constexpr llama_state_seq_flags CKPT_FLAGS =
+    LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+
+struct Engine {
+    llama_model        * model_tgt = nullptr; // borrowed (ctx owns the shared model)
+    llama_model        * model_dft = nullptr; // owned iff separate-drafter
+    llama_context      * ctx_tgt   = nullptr; // owned by the engine
+    llama_context      * ctx_dft   = nullptr; // owned by the engine
+    common_speculative * spec      = nullptr; // owned
+    common_sampler     * smpl      = nullptr; // owned
+
+    std::vector<llama_token> prompt;
+    llama_token              id_last = 0;
+
+    int32_t n_ctx     = 0;
+    int32_t draft_min = 1;
+    int32_t draft_max = 2;
+
+    /* Per-context rollback capability. `use_ckpt_*` is NOT a static property:
+     * an RS (recurrent-state) context rolls back directly via seq_rm when the
+     * draft fits inside its n_rs_seq window, and only needs a checkpoint when
+     * the draft exceeds it. FULL contexts always need a checkpoint; PART
+     * contexts never do. Computed per-step by `use_ckpt()` below, mirroring
+     * tools/server/server-context.cpp:2590-2595. */
+    common_context_seq_rm_type seq_rm_tgt = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    common_context_seq_rm_type seq_rm_dft = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    common_prompt_checkpoint ckpt;
+
+    llama_batch batch{};
+
+    uint64_t st_drafted  = 0;
+    uint64_t st_accepted = 0;
+};
+
+/* Whether a context with rollback type `t` needs a state checkpoint to
+ * retract a draft of `n_draft` tokens, given its `n_rs_seq` window. Mirrors
+ * tools/server/server-context.cpp:2590-2595. */
+inline bool needs_ckpt(common_context_seq_rm_type t, int32_t n_draft, uint32_t n_rs_seq) {
+    return t == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+           (t == COMMON_CONTEXT_SEQ_RM_TYPE_RS && (uint32_t) n_draft > n_rs_seq);
+}
+
+inline void rollback_to_committed(
+        llama_context *                  ctx,
+        bool                             use_ckpt,
+        const common_prompt_checkpoint & ckpt,
+        bool                             is_tgt,
+        int32_t                          n_committed) {
+    if (use_ckpt) {
+        if (is_tgt) {
+            ckpt.load_tgt(ctx, 0, CKPT_FLAGS);
+        } else {
+            ckpt.load_dft(ctx, 0, CKPT_FLAGS);
+        }
+        common_context_seq_rm(ctx, 0, ckpt.pos_max + 1, -1);
+    } else {
+        common_context_seq_rm(ctx, 0, n_committed, -1);
+    }
+}
+
+static void free_engine(Engine * e) {
+    if (!e) return;
+    if (e->batch.token != nullptr || e->batch.embd != nullptr) {
+        llama_batch_free(e->batch);
+    }
+    if (e->smpl) common_sampler_free(e->smpl);
+    if (e->spec) common_speculative_free(e->spec);
+    if (e->ctx_dft) llama_free(e->ctx_dft);
+    if (e->ctx_tgt) llama_free(e->ctx_tgt);
+    if (e->model_dft) llama_model_free(e->model_dft);
+    delete e;
+}
+
+} // namespace eliza_mtp
+
 struct EliLlmStream {
     EliInferenceContext * ctx = nullptr;
     llama_context * lctx = nullptr;
@@ -847,6 +955,14 @@ struct EliLlmStream {
     int max_tokens = 0;
     bool eos = false;
     std::atomic<bool> cancel{false};
+
+    /* MTP speculative engine — non-NULL only when mtp_drafter_path is set
+     * (separate drafter) or the same-file MTP path is requested. When
+     * present, lctx/sampler/n_past are unused (the engine owns ctx_tgt and
+     * samples internally); when NULL the plain fixed-KV loop above runs. */
+    eliza_mtp::Engine * mtp = nullptr;
+    int32_t mtp_first_token = -1; // first token sampled at prefill, emitted first
+    std::vector<int32_t> mtp_step_buf; // scratch for one engine step
 };
 
 /* Resolve the bundle's text GGUF. Picks the single non-mmproj, non-codec,
@@ -870,9 +986,17 @@ static bool eliza_pick_text_file(
     return true;
 }
 
-/* Load the shared text model once. Caller must hold ctx->llm_mutex. */
+/* Load the shared text model once. Caller must hold ctx->llm_mutex.
+ *
+ * `n_gpu_layers` is the per-load GPU-offload count from the session config
+ * (ABI v8): -1 selects the default (all layers), 0 forces CPU. The model is
+ * loaded once and shared across every session anchored to this ctx, so the
+ * FIRST session's `n_gpu_layers` wins; later sessions reuse the resident
+ * model. This mirrors desktop-llama-adapter.ts, where gpuLayers is a
+ * loadModel() (not per-stream) decision. */
 static int eliza_load_llm_model_locked(
     EliInferenceContext * ctx,
+    int32_t n_gpu_layers,
     char ** out_error) {
     if (ctx->llm_model) return ELIZA_OK;
     if (ctx->llm_model_path.empty()) {
@@ -890,8 +1014,12 @@ static int eliza_load_llm_model_locked(
     });
 
     llama_model_params mparams = llama_model_default_params();
+    /* -1 = all layers on GPU (99 per llama.cpp convention); 0 = CPU. The
+     * env knob remains the fallback when the caller passes -1. */
     mparams.n_gpu_layers =
-        eliza_bool_env_or_default("ELIZA_LLM_USE_GPU", true) ? 99 : 0;
+        n_gpu_layers >= 0
+            ? n_gpu_layers
+            : (eliza_bool_env_or_default("ELIZA_LLM_USE_GPU", true) ? 99 : 0);
     mparams.use_mmap = true;
     ctx->llm_model =
         llama_model_load_from_file(ctx->llm_model_path.c_str(), mparams);
@@ -902,6 +1030,35 @@ static int eliza_load_llm_model_locked(
         return ELIZA_ERR_BUNDLE_INVALID;
     }
     return ELIZA_OK;
+}
+
+/* Map a KV-cache quant type NAME (e.g. "f16", "q8_0", "qjl1_256",
+ * "q4_polar") to the corresponding ggml_type. Mirrors GGML_KV_CACHE_TYPES
+ * in desktop-llama-adapter.ts. Returns GGML_TYPE_COUNT and populates
+ * out_error when the name is non-empty but unrecognized; returns
+ * GGML_TYPE_F16 (the llama.cpp default) when name is NULL/empty. */
+static ggml_type eliza_kv_cache_type(const char * name, char ** out_error) {
+    if (!name || name[0] == '\0') return GGML_TYPE_F16;
+    const std::string n = eliza_lower_ascii(std::string(name));
+    static const std::unordered_map<std::string, ggml_type> kKvTypes = {
+        {"f32", GGML_TYPE_F32},        {"f16", GGML_TYPE_F16},
+        {"q4_0", GGML_TYPE_Q4_0},      {"q4_1", GGML_TYPE_Q4_1},
+        {"q5_0", GGML_TYPE_Q5_0},      {"q5_1", GGML_TYPE_Q5_1},
+        {"q8_0", GGML_TYPE_Q8_0},      {"q4_k", GGML_TYPE_Q4_K},
+        {"q5_k", GGML_TYPE_Q5_K},      {"q6_k", GGML_TYPE_Q6_K},
+        {"q8_k", GGML_TYPE_Q8_K},      {"iq4_nl", GGML_TYPE_IQ4_NL},
+        {"bf16", GGML_TYPE_BF16},      {"tbq3_0", GGML_TYPE_TBQ3_0},
+        {"tbq4_0", GGML_TYPE_TBQ4_0},  {"qjl1_256", GGML_TYPE_QJL1_256},
+        {"q4_polar", GGML_TYPE_Q4_POLAR}, {"tbq3_tcq", GGML_TYPE_TBQ3_TCQ},
+    };
+    const auto it = kKvTypes.find(n);
+    if (it == kKvTypes.end()) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] llm_stream: unsupported KV cache "
+                        "type '") + name + "'");
+        return GGML_TYPE_COUNT;
+    }
+    return it->second;
 }
 
 /* Build the per-session sampler chain from cfg. Order (grammar first so it
@@ -963,6 +1120,302 @@ static llama_sampler * eliza_build_llm_sampler_chain(
     }
     return chain;
 }
+
+namespace eliza_mtp {
+
+/* Build the MTP speculative engine. `drafter_path` empty -> same-file MTP
+ * (NextN head in the target GGUF, ctx_dft over the SAME model). Non-empty ->
+ * separate-drafter MTP (load the drafter GGUF, ctx_dft over it). On failure
+ * returns nullptr with out_error populated. cparams_tgt is the fully-built
+ * target context params (n_ctx / n_batch / threads / flash-attn / KV-quant
+ * already applied) so the engine's target context matches the plain path. */
+static Engine * create_engine(
+    llama_model *                model_tgt,
+    const llama_context_params & cparams_tgt,
+    const eliza_llm_stream_config_t * cfg,
+    const std::string &          drafter_path,
+    char **                      out_error) {
+    auto * e = new (std::nothrow) Engine();
+    if (!e) {
+        eliza_set_error(out_error, "[libelizainference] mtp: out of memory");
+        return nullptr;
+    }
+    e->model_tgt = model_tgt;
+    e->draft_min = cfg->draft_min > 0 ? cfg->draft_min : 1;
+    e->draft_max = cfg->draft_max >= e->draft_min ? cfg->draft_max : e->draft_min;
+
+    /* Target context (engine-owned). Mirrors the plain path's cparams, but
+     * sets n_rs_seq = draft_max so a recurrent / hybrid target (Qwen3.5's
+     * Gated Delta Net body) can do bounded RS partial rollback of the
+     * rejected draft tail. This is what tools/server/server-context.cpp gets
+     * via `common_context_params_to_llama` → `need_n_rs_seq()` (= draft.n_max
+     * for MTP). Without it the target falls back to FULL/checkpoint rollback,
+     * which does not correctly retract multi-token draft tails for larger
+     * draft windows — the verifier then rubber-stamps the whole draft and
+     * greedy output diverges from the non-speculative path. A non-recurrent
+     * model ignores n_rs_seq (clamped to 0 by llama_init). */
+    llama_context_params cparams_tgt_mtp = cparams_tgt;
+    cparams_tgt_mtp.n_rs_seq = (uint32_t) e->draft_max;
+    e->ctx_tgt = llama_init_from_model(model_tgt, cparams_tgt_mtp);
+    if (!e->ctx_tgt) {
+        eliza_set_error(out_error,
+            "[libelizainference] mtp: failed to init target context");
+        free_engine(e);
+        return nullptr;
+    }
+    e->n_ctx = (int32_t) llama_n_ctx(e->ctx_tgt);
+
+    e->seq_rm_tgt = common_context_can_seq_rm(e->ctx_tgt);
+    if (e->seq_rm_tgt == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+        eliza_set_error(out_error,
+            "[libelizainference] mtp: target context cannot retract drafts "
+            "(seq_rm_type=NO) — speculative decoding impossible");
+        free_engine(e);
+        return nullptr;
+    }
+
+    /* Draft context. Same-file: MTP context over model_tgt. Separate: load
+     * the drafter GGUF and build an MTP context over it. */
+    llama_model * model_for_dft = model_tgt;
+    if (!drafter_path.empty()) {
+        llama_model_params dmp = llama_model_default_params();
+        dmp.n_gpu_layers =
+            cfg->n_gpu_layers >= 0
+                ? cfg->n_gpu_layers
+                : (eliza_bool_env_or_default("ELIZA_LLM_USE_GPU", true) ? 99 : 0);
+        dmp.use_mmap = true;
+        e->model_dft = llama_model_load_from_file(drafter_path.c_str(), dmp);
+        if (!e->model_dft) {
+            eliza_set_error(out_error,
+                std::string("[libelizainference] mtp: failed to load drafter "
+                            "model: ") + drafter_path);
+            free_engine(e);
+            return nullptr;
+        }
+        model_for_dft = e->model_dft;
+    }
+
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx           = llama_n_ctx(e->ctx_tgt);
+    cp.n_batch         = llama_n_batch(e->ctx_tgt);
+    cp.n_ubatch        = llama_n_ubatch(e->ctx_tgt);
+    cp.n_seq_max       = 1;
+    cp.ctx_type        = LLAMA_CONTEXT_TYPE_MTP;
+    cp.n_rs_seq        = 0; // draft ctx rolls back via PART/checkpoint, not RS
+    cp.n_threads       = cparams_tgt.n_threads;
+    cp.n_threads_batch = cparams_tgt.n_threads_batch;
+
+    e->ctx_dft = llama_init_from_model(model_for_dft, cp);
+    if (!e->ctx_dft) {
+        eliza_set_error(out_error,
+            "[libelizainference] mtp: failed to init MTP draft context");
+        free_engine(e);
+        return nullptr;
+    }
+    e->seq_rm_dft = common_context_can_seq_rm(e->ctx_dft);
+    if (e->seq_rm_dft == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+        eliza_set_error(out_error,
+            "[libelizainference] mtp: draft context cannot retract drafts");
+        free_engine(e);
+        return nullptr;
+    }
+
+    common_params_speculative sp;
+    sp.types         = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    sp.draft.ctx_tgt = e->ctx_tgt;
+    sp.draft.ctx_dft = e->ctx_dft;
+    sp.draft.n_max   = e->draft_max;
+    sp.draft.n_min   = e->draft_min;
+    if (!drafter_path.empty()) sp.draft.mparams.path = drafter_path;
+
+    try {
+        e->spec = common_speculative_init(sp, 1);
+    } catch (...) {
+        e->spec = nullptr;
+    }
+    if (!e->spec) {
+        eliza_set_error(out_error,
+            "[libelizainference] mtp: common_speculative_init failed");
+        free_engine(e);
+        return nullptr;
+    }
+
+    common_params_sampling sparams;
+    sparams.seed  = LLAMA_DEFAULT_SEED;
+    sparams.temp  = cfg->temperature;
+    sparams.top_k = cfg->top_k;
+    sparams.top_p = cfg->top_p;
+    e->smpl = common_sampler_init(model_tgt, sparams);
+    if (!e->smpl) {
+        eliza_set_error(out_error,
+            "[libelizainference] mtp: common_sampler_init failed");
+        free_engine(e);
+        return nullptr;
+    }
+
+    e->batch = llama_batch_init(1 + e->draft_max, 0, 1);
+    return e;
+}
+
+/* Prefill the prompt into the target context, seed the speculative state,
+ * and sample the first token. Returns ELIZA_OK / negative ELIZA_*. */
+static int prefill(Engine * e, const int32_t * tokens, int32_t n_tokens) {
+    if (!e || !tokens || n_tokens <= 0) return ELIZA_ERR_INVALID_ARG;
+    e->prompt.assign(tokens, tokens + n_tokens);
+    llama_set_embeddings(e->ctx_tgt, false);
+
+    /* MTP (DRAFT_MTP) extracts the target's pre-norm embeddings at EVERY
+     * prompt position to seed the NextN draft head, so every prefill token
+     * must carry an output flag (logits=true) — not just the last. This
+     * matches tools/server/server-context.cpp, which sets the per-token
+     * output flag to `slot.need_embd()` while filling the prompt batch. A
+     * last-only flag triggers `get_embeddings_pre_norm_ith: batch.logits[i]
+     * != true` inside common_speculative_process. */
+    const int32_t n_batch = (int32_t) llama_n_batch(e->ctx_tgt);
+    for (int32_t i = 0; i < n_tokens; i += n_batch) {
+        const int32_t cnt = std::min(n_batch, n_tokens - i);
+        llama_batch b = llama_batch_init(cnt, 0, 1);
+        for (int32_t k = 0; k < cnt; ++k) {
+            common_batch_add(b, tokens[i + k], i + k, { 0 }, /* logits= */ true);
+        }
+        const int rc = llama_decode(e->ctx_tgt, b);
+        if (rc != 0) { llama_batch_free(b); return ELIZA_ERR_FFI_FAULT; }
+        if (!common_speculative_process(e->spec, b)) {
+            llama_batch_free(b);
+            return ELIZA_ERR_FFI_FAULT;
+        }
+        llama_batch_free(b);
+    }
+    common_speculative_begin(e->spec, 0, e->prompt);
+    const llama_token id = common_sampler_sample(e->smpl, e->ctx_tgt, n_tokens - 1);
+    common_sampler_accept(e->smpl, id, true);
+    e->id_last = id;
+    return id;
+}
+
+/* Run one speculative step. Writes accepted token ids into `out` (cap >=
+ * 1 + draft_max), returns the count (>=1) or negative ELIZA_*. */
+static int step(Engine * e, int32_t * out, int32_t cap) {
+    if (!e || !out || cap < 1) return ELIZA_ERR_INVALID_ARG;
+
+    const int32_t P    = (int32_t) e->prompt.size();
+    const llama_token seed = e->id_last;
+
+    int32_t n_draft_max = e->draft_max;
+    const int32_t remaining = e->n_ctx - P;
+    if (remaining <= 1) n_draft_max = 0;
+    else if (n_draft_max > remaining - 1) n_draft_max = remaining - 1;
+
+    const uint32_t n_rs_tgt = llama_n_rs_seq(e->ctx_tgt);
+    const uint32_t n_rs_dft = llama_n_rs_seq(e->ctx_dft);
+
+    /* Snapshot the committed-prefix position before the draft pollutes the
+     * draft context's recurrent state. A FULL draft context (no partial
+     * rollback) also needs its state captured here. */
+    const bool ckpt_dft_full = e->seq_rm_dft == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+    {
+        const llama_pos pos_min = llama_memory_seq_pos_min(llama_get_memory(e->ctx_tgt), 0);
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(e->ctx_tgt), 0);
+        e->ckpt.update_pos(P, pos_min, pos_max);
+        if (ckpt_dft_full) e->ckpt.update_dft(e->ctx_dft, 0, CKPT_FLAGS);
+    }
+
+    std::vector<llama_token> draft;
+    auto & dp = common_speculative_get_draft_params(e->spec, 0);
+    if (n_draft_max > 0) {
+        dp = {
+            /* .drafting = */ true,
+            /* .n_max    = */ n_draft_max,
+            /* .n_past   = */ P,
+            /* .id_last  = */ seed,
+            /* .prompt   = */ &e->prompt,
+            /* .result   = */ &draft,
+        };
+        common_speculative_draft(e->spec);
+    } else {
+        dp.drafting = false;
+    }
+    const int32_t D = (int32_t) draft.size();
+
+    /* Per-step checkpoint decision (mirrors server-context.cpp:2590-2595):
+     * FULL contexts always checkpoint; RS contexts checkpoint only when the
+     * draft exceeds their n_rs_seq window; PART contexts never do. */
+    const bool use_ckpt_tgt = needs_ckpt(e->seq_rm_tgt, D, n_rs_tgt);
+    const bool use_ckpt_dft = needs_ckpt(e->seq_rm_dft, D, n_rs_dft);
+
+    /* Restore the draft context to the committed prefix so process() can
+     * cleanly re-mirror the verify batch into it. */
+    if (ckpt_dft_full) {
+        e->ckpt.load_dft(e->ctx_dft, 0, CKPT_FLAGS);
+        common_context_seq_rm(e->ctx_dft, 0, e->ckpt.pos_max + 1, -1);
+    } else {
+        common_context_seq_rm(e->ctx_dft, 0, P, -1);
+    }
+
+    /* Snapshot the target AFTER the draft (the draft does not touch ctx_tgt)
+     * only when this step's draft will need a checkpoint to retract. */
+    if (use_ckpt_tgt && D > 0) {
+        e->ckpt.update_tgt(e->ctx_tgt, 0, CKPT_FLAGS);
+    }
+
+    common_batch_clear(e->batch);
+    std::vector<int> idxs;
+    idxs.reserve((size_t) D + 1);
+    idxs.push_back(0);
+    common_batch_add(e->batch, seed, P, { 0 }, true);
+    for (int32_t i = 0; i < D; ++i) {
+        idxs.push_back(i + 1);
+        common_batch_add(e->batch, draft[i], P + 1 + i, { 0 }, true);
+    }
+
+    llama_set_embeddings(e->ctx_tgt, false);
+    if (llama_decode(e->ctx_tgt, e->batch) != 0) return ELIZA_ERR_FFI_FAULT;
+    if (!common_speculative_process(e->spec, e->batch)) return ELIZA_ERR_FFI_FAULT;
+    e->st_drafted += (uint64_t) D;
+
+    std::vector<llama_token> accepted;
+    if (D > 0) {
+        accepted = common_sampler_sample_and_accept_n(e->smpl, e->ctx_tgt, idxs, draft);
+        common_speculative_accept(e->spec, 0, (uint16_t) (accepted.size() - 1));
+    } else {
+        const llama_token id = common_sampler_sample(e->smpl, e->ctx_tgt, 0);
+        common_sampler_accept(e->smpl, id, true);
+        accepted.push_back(id);
+    }
+    const int32_t A = (int32_t) accepted.size();
+    e->st_accepted += (uint64_t) (A - 1);
+
+    const int32_t n_rollback = (D + 1) - A;
+    const int32_t newP = P + A;
+    if (n_rollback == 0) {
+        /* full acceptance — nothing to retract */
+    } else if (!use_ckpt_tgt && !use_ckpt_dft) {
+        /* PART / RS-within-window: trim the rejected-draft tail directly. */
+        common_context_seq_rm(e->ctx_tgt, 0, newP, -1);
+        common_context_seq_rm(e->ctx_dft, 0, newP, -1);
+    } else {
+        rollback_to_committed(e->ctx_tgt, use_ckpt_tgt, e->ckpt, /* is_tgt= */ true,  P);
+        rollback_to_committed(e->ctx_dft, use_ckpt_dft, e->ckpt, /* is_tgt= */ false, P);
+        common_batch_clear(e->batch);
+        common_batch_add(e->batch, seed, P, { 0 }, true);
+        for (int32_t i = 0; i + 1 < A; ++i) {
+            common_batch_add(e->batch, accepted[i], P + 1 + i, { 0 }, true);
+        }
+        llama_set_embeddings(e->ctx_tgt, false);
+        if (llama_decode(e->ctx_tgt, e->batch) != 0) return ELIZA_ERR_FFI_FAULT;
+        if (!common_speculative_process(e->spec, e->batch)) return ELIZA_ERR_FFI_FAULT;
+    }
+
+    e->prompt.push_back(seed);
+    for (int32_t i = 0; i + 1 < A; ++i) e->prompt.push_back(accepted[i]);
+    e->id_last = accepted.back();
+
+    int32_t n_out = std::min(A, cap);
+    for (int32_t i = 0; i < n_out; ++i) out[i] = accepted[i];
+    return n_out;
+}
+
+} // namespace eliza_mtp
 
 extern "C" {
 
@@ -1982,6 +2435,16 @@ int eliza_inference_llm_stream_supported(void) {
     return 1;
 }
 
+/* ABI v8 capability probes: this build wires the same-file / separate-drafter
+ * MTP speculative engine (reusing common/speculative.cpp's DRAFT_MTP) and the
+ * KV-cache quant pass-through, so both report supported. */
+int eliza_inference_llm_mtp_supported(void) {
+    return 1;
+}
+int eliza_inference_llm_kv_quant_supported(void) {
+    return 1;
+}
+
 EliLlmStream * eliza_inference_llm_stream_open(
     EliInferenceContext * ctx,
     const eliza_llm_stream_config_t * cfg,
@@ -1995,7 +2458,7 @@ EliLlmStream * eliza_inference_llm_stream_open(
     llama_model * model = nullptr;
     {
         std::lock_guard<std::mutex> lock(ctx->llm_mutex);
-        int rc = eliza_load_llm_model_locked(ctx, out_error);
+        int rc = eliza_load_llm_model_locked(ctx, cfg->n_gpu_layers, out_error);
         if (rc != ELIZA_OK) return nullptr;
         model = ctx->llm_model;
     }
@@ -2009,6 +2472,9 @@ EliLlmStream * eliza_inference_llm_stream_open(
     stream->ctx = ctx;
     stream->max_tokens = cfg->max_tokens > 0 ? cfg->max_tokens : 0;
 
+    /* Build the target context params once; shared by the plain path and the
+     * MTP engine's target context so both decode identically (same n_ctx /
+     * batch / threads / flash-attn / KV-quant). */
     llama_context_params cparams = llama_context_default_params();
     const int n_ctx_train = llama_model_n_ctx_train(model);
     int n_ctx = eliza_int_env_or_default("ELIZA_LLM_N_CTX", 8192);
@@ -2019,6 +2485,54 @@ EliLlmStream * eliza_inference_llm_stream_open(
     cparams.n_threads = eliza_thread_count(false);
     cparams.n_threads_batch = eliza_thread_count(true);
     cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+
+    /* KV-cache quant (ABI v8): map names -> ggml_type and set type_k/type_v.
+     * NULL/empty leaves the f16 default. An unrecognized name is a hard error
+     * (no silent fallback). */
+    const ggml_type type_k = eliza_kv_cache_type(cfg->cache_type_k, out_error);
+    if (type_k == GGML_TYPE_COUNT) { delete stream; return nullptr; }
+    const ggml_type type_v = eliza_kv_cache_type(cfg->cache_type_v, out_error);
+    if (type_v == GGML_TYPE_COUNT) { delete stream; return nullptr; }
+    cparams.type_k = type_k;
+    cparams.type_v = type_v;
+
+    /* MTP speculative decoding (ABI v8). Requested when draft bounds are > 0.
+     *   - mtp_drafter_path set  -> separate-drafter MTP (hard error on fail).
+     *   - mtp_drafter_path NULL -> same-file MTP over the target's NextN head
+     *     (falls back to the plain loop when the model has no NextN head,
+     *     mirroring desktop-llama-adapter.ts's mtpEngine===0 fallback). */
+    const bool mtp_requested = cfg->draft_min > 0 && cfg->draft_max > 0;
+    const std::string drafter_path =
+        (cfg->mtp_drafter_path && cfg->mtp_drafter_path[0] != '\0')
+            ? std::string(cfg->mtp_drafter_path)
+            : std::string();
+    if (mtp_requested) {
+        char * mtp_err = nullptr;
+        eliza_mtp::Engine * engine =
+            eliza_mtp::create_engine(model, cparams, cfg, drafter_path, &mtp_err);
+        if (engine) {
+            std::free(mtp_err);
+            stream->mtp = engine;
+            stream->mtp_step_buf.assign((size_t) cfg->draft_max + 2, 0);
+            return stream;
+        }
+        /* A separate drafter is an explicit config that MUST work — surface
+         * the failure. A same-file attempt that fails (no NextN head) falls
+         * back to the plain decode loop below. */
+        if (!drafter_path.empty()) {
+            eliza_set_error(out_error,
+                mtp_err
+                    ? std::string(mtp_err)
+                    : "[libelizainference] llm_stream_open: separate-drafter "
+                      "MTP engine failed to initialize");
+            std::free(mtp_err);
+            delete stream;
+            return nullptr;
+        }
+        std::free(mtp_err);
+        /* fall through to the plain non-speculative loop */
+    }
+
     stream->lctx = llama_init_from_model(model, cparams);
     if (!stream->lctx) {
         delete stream;
@@ -2042,7 +2556,7 @@ int eliza_inference_llm_stream_prefill(
     const int32_t * token_ids,
     size_t num_tokens,
     char ** out_error) {
-    if (!stream || !stream->lctx) {
+    if (!stream || (!stream->lctx && !stream->mtp)) {
         eliza_set_error(out_error,
             "[libelizainference] llm_stream_prefill: invalid session");
         return ELIZA_ERR_INVALID_ARG;
@@ -2052,6 +2566,21 @@ int eliza_inference_llm_stream_prefill(
         eliza_set_error(out_error,
             "[libelizainference] llm_stream_prefill: token_ids is NULL");
         return ELIZA_ERR_INVALID_ARG;
+    }
+
+    /* MTP path: the engine prefills the prompt, seeds the speculative state,
+     * and samples the first token (emitted first by `_next`). */
+    if (stream->mtp) {
+        const int rc =
+            eliza_mtp::prefill(stream->mtp, token_ids, (int32_t) num_tokens);
+        if (rc < 0) {
+            eliza_set_error(out_error,
+                "[libelizainference] llm_stream_prefill: MTP prefill failed rc=" +
+                std::to_string(rc));
+            return rc;
+        }
+        stream->mtp_first_token = rc; /* prefill returns the first token id */
+        return ELIZA_OK;
     }
 
     /* Decode the prompt in n_batch-sized chunks. The final token in the
@@ -2095,7 +2624,7 @@ int eliza_inference_llm_stream_next(
     if (drafter_accepted_out) *drafter_accepted_out = 0;
     if (text_out && text_cap > 0) text_out[0] = '\0';
 
-    if (!stream || !stream->lctx || !stream->sampler) {
+    if (!stream || (!stream->mtp && (!stream->lctx || !stream->sampler))) {
         eliza_set_error(out_error,
             "[libelizainference] llm_stream_next: invalid session");
         return ELIZA_ERR_INVALID_ARG;
@@ -2107,6 +2636,99 @@ int eliza_inference_llm_stream_next(
     }
     if (stream->eos) {
         return 1; /* already finished */
+    }
+
+    /* ---- MTP speculative path ------------------------------------- *
+     * Emit the prefill's first token, then drive draft->verify->accept steps
+     * until the per-call token / text-byte budget is met or EOS is reached.
+     * Each engine step commits a multi-token accepted prefix. */
+    if (stream->mtp) {
+        eliza_mtp::Engine * e = stream->mtp;
+        const llama_vocab * vocab = llama_model_get_vocab(e->model_tgt);
+
+        std::string text;
+        size_t produced = 0;
+        bool final_step = false;
+
+        size_t step_cap = tokens_cap;
+        if (stream->max_tokens > 0) {
+            const size_t remaining = (size_t) std::max(
+                0, stream->max_tokens - stream->generated);
+            if (remaining == 0) { stream->eos = true; return 1; }
+            step_cap = std::min(step_cap, remaining);
+        }
+
+        const uint64_t drafted_before  = e->st_drafted;
+        const uint64_t accepted_before = e->st_accepted;
+
+        /* Append a single committed token to the output buffers; returns
+         * false when it would overflow the text buffer (defer to next call). */
+        auto emit = [&](llama_token token) -> bool {
+            if (llama_vocab_is_eog(vocab, token)) {
+                stream->eos = true;
+                final_step = true;
+                return false;
+            }
+            const std::string piece = eliza_llama_token_piece(vocab, token);
+            if (!piece.empty() && text.size() + piece.size() + 1 > text_cap) {
+                return false; /* overflow — stop the step, keep token uncommitted */
+            }
+            tokens_out[produced] = (int32_t) token;
+            text += piece;
+            produced += 1;
+            stream->generated += 1;
+            if (stream->max_tokens > 0 && stream->generated >= stream->max_tokens) {
+                stream->eos = true;
+                final_step = true;
+            }
+            return true;
+        };
+
+        /* First token from prefill. */
+        if (stream->mtp_first_token >= 0) {
+            const llama_token first = stream->mtp_first_token;
+            stream->mtp_first_token = -1;
+            emit(first);
+        }
+
+        while (!final_step && produced < step_cap) {
+            if (stream->cancel.load(std::memory_order_acquire)) {
+                eliza_set_error(out_error,
+                    "[libelizainference] llm_stream_next: cancelled");
+                return ELIZA_ERR_CANCELLED;
+            }
+            const int n = eliza_mtp::step(
+                e, stream->mtp_step_buf.data(),
+                (int32_t) stream->mtp_step_buf.size());
+            if (n < 0) {
+                eliza_set_error(out_error,
+                    "[libelizainference] llm_stream_next: MTP step failed rc=" +
+                    std::to_string(n));
+                return ELIZA_ERR_FFI_FAULT;
+            }
+            if (n == 0) { final_step = true; break; }
+            bool overflowed = false;
+            for (int i = 0; i < n; ++i) {
+                if (produced >= step_cap) { overflowed = true; break; }
+                if (!emit(stream->mtp_step_buf[i])) {
+                    /* EOS sets final_step; overflow leaves it false but stops. */
+                    overflowed = !final_step;
+                    break;
+                }
+                if (final_step) break;
+            }
+            if (overflowed) break;
+        }
+
+        if (text.size() + 1 > text_cap) text.resize(text_cap - 1);
+        std::memcpy(text_out, text.data(), text.size());
+        text_out[text.size()] = '\0';
+        if (num_tokens_out) *num_tokens_out = produced;
+        if (drafter_drafted_out)
+            *drafter_drafted_out = (int32_t) (e->st_drafted - drafted_before);
+        if (drafter_accepted_out)
+            *drafter_accepted_out = (int32_t) (e->st_accepted - accepted_before);
+        return final_step ? 1 : 0;
     }
 
     const llama_model * model = llama_get_model(stream->lctx);
@@ -2224,6 +2846,10 @@ int eliza_inference_llm_stream_restore_slot(
 
 void eliza_inference_llm_stream_close(EliLlmStream * stream) {
     if (!stream) return;
+    if (stream->mtp) {
+        eliza_mtp::free_engine(stream->mtp);
+        stream->mtp = nullptr;
+    }
     if (stream->sampler) {
         llama_sampler_free(stream->sampler);
         stream->sampler = nullptr;
