@@ -209,6 +209,17 @@ endif()
 # suffix on Linux to keep dlopen() happy on the runtime side). Default
 # visibility is `default` (not hidden) because every `eliza_inference_*`
 # entry the JS loader needs is reachable through dlsym.
+# ELIZA_ENABLE_VISION — ABI v9 mmproj vision describe
+# (`eliza_inference_describe_image` / `eliza_inference_vision_supported`). When
+# ON, the FFI bridge compiles the mtmd vision-describe path (reusing the mtmd
+# machinery already linked for ASR) and `_vision_supported()` returns 1. OFF
+# (default) leaves it stubbed (`_vision_supported() == 0`,
+# `_describe_image` -> ELIZA_ERR_NOT_IMPLEMENTED) so the IMAGE_DESCRIPTION
+# handler falls back to the libllama mtmd path. Mirrors the shim's
+# `-DELIZA_ENABLE_VISION=1` env flag. Defaults ON when LLAMA_BUILD_MTMD is set
+# (the fused build links mtmd anyway), opt out with -DELIZA_ENABLE_VISION=OFF.
+option(ELIZA_ENABLE_VISION "Build the fused mmproj vision-describe ABI (v9)" ON)
+
 if(TARGET mtmd)
     add_library(elizainference SHARED
         ${OMNIVOICE_CORE_SOURCES}
@@ -216,6 +227,9 @@ if(TARGET mtmd)
     target_compile_features(elizainference PUBLIC cxx_std_17)
     target_compile_definitions(elizainference
         PRIVATE OMNIVOICE_BUILD ${OMNIVOICE_COMPILE_DEFINITIONS})
+    if(ELIZA_ENABLE_VISION)
+        target_compile_definitions(elizainference PRIVATE ELIZA_ENABLE_VISION)
+    endif()
     target_include_directories(elizainference PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/include

@@ -131,6 +131,29 @@ extern "C" {
  * load and refuses to bind if they disagree.
  *
  * Changelog:
+ *   v9: the last text-adjacent modalities move off their separate libs into
+ *       the fused handle. Three additive entrypoints + probes:
+ *         - `eliza_inference_embed` + `eliza_inference_embed_supported()` —
+ *           pooled text embeddings over a dedicated embedding context
+ *           (`llama_set_embeddings(true)` + pooling + `llama_get_embeddings_seq`),
+ *           mirroring desktop-llama-adapter.ts's `embed()`. Retires the
+ *           `node-llama-cpp` embedding path: the default TEXT_EMBEDDING handler
+ *           routes through the fused lib.
+ *         - `eliza_inference_describe_image` +
+ *           `eliza_inference_vision_supported()` — mmproj vision for the TEXT
+ *           model, reusing the mtmd machinery already linked for ASR
+ *           (`mtmd_helper_bitmap_init_from_buf`, `mtmd_tokenize`,
+ *           `mtmd_helper_eval_chunks`). Gated on the `-DELIZA_ENABLE_VISION=1`
+ *           build flag. Drops the libllama+shim mmproj vision path.
+ *         - `eliza_inference_tokenize` / `eliza_inference_detokenize` +
+ *           `eliza_inference_tokenize_supported()` + `eliza_inference_free_tokens`
+ *           (reused) — expose `llama_tokenize` / `llama_detokenize` over the
+ *           loaded text model's vocab so the desktop fused runtime stops
+ *           standing up a libllama tokenizer sidecar.
+ *       All v9 additions are additive symbols — a v8 caller is unaffected.
+ *       The version bumps so loaders can require the new surfaces; older
+ *       fused builds are still usable at degraded capability via the per-symbol
+ *       `*_supported()` probes (absent symbol == unsupported).
  *   v8: streaming-LLM text path reaches feature parity with the
  *       libllama+eliza-llama-shim path. `eliza_llm_stream_config_t` grows
  *       `cache_type_k` / `cache_type_v` (KV-cache quant pass-through; names
@@ -145,9 +168,9 @@ extern "C" {
  *   v7: real Silero VAD (same symbol surface as v6).
  *   v6: fused wake-word, speaker, diarizer.
  */
-#define ELIZA_INFERENCE_ABI_VERSION 8
+#define ELIZA_INFERENCE_ABI_VERSION 9
 
-/* Returns a static, NUL-terminated string of the form "8" matching
+/* Returns a static, NUL-terminated string of the form "9" matching
  * ELIZA_INFERENCE_ABI_VERSION at the time the library was built. The
  * pointer is owned by the library — do NOT free. */
 const char * eliza_inference_abi_version(void);
@@ -795,6 +818,161 @@ int eliza_inference_llm_stream_restore_slot(
 
 /* Close + free a streaming-LLM session. Idempotent on NULL. */
 void eliza_inference_llm_stream_close(EliLlmStream * stream);
+
+/* ---- Text embeddings (ABI v9, additive) --------------------------- *
+ *
+ * Pooled sentence embeddings over the bundle's text GGUF. This is what lets
+ * the default TEXT_EMBEDDING handler drop `node-llama-cpp`: the fused lib
+ * loads the text model once into a DEDICATED embedding context
+ * (`llama_set_embeddings(true)` + a non-causal single-ubatch layout sized to
+ * the context + a pooling type), decodes the tokenized text, and reads the
+ * pooled `llama_get_embeddings_seq` vector back. Mirrors
+ * desktop-llama-adapter.ts's `embed()` exactly.
+ *
+ * The embedding context is separate from the streaming-LLM generation
+ * context (embeddings require non-causal attention + pooling, generation
+ * requires causal). It is lazily created on the first `_embed` call against
+ * `ctx` and reused, anchored on the SAME shared text model the streaming-LLM
+ * path loads. Each call clears the embedding KV first so embeddings are
+ * independent (single-sequence, seq_id 0).
+ */
+
+/* Pooling strategy. Mirrors `enum llama_pooling_type`:
+ *   0 = NONE (no pooling — invalid for `_embed`, which needs a pooled vector)
+ *   1 = MEAN (the gte-small / BERT bi-encoder default)
+ *   2 = CLS
+ *   3 = LAST (the `--pooling last` decoder-as-embedder convention) */
+#define ELIZA_POOLING_NONE 0
+#define ELIZA_POOLING_MEAN 1
+#define ELIZA_POOLING_CLS  2
+#define ELIZA_POOLING_LAST 3
+
+/* Capability probe: 1 when this build wires the real embedding path (always
+ * 1 for a v9 build with the text model loadable). A v8 library does not
+ * export this symbol, so absence == unsupported and the loader keeps the
+ * node-llama-cpp / libllama embedding path. */
+int eliza_inference_embed_supported(void);
+
+/* Compute a pooled sentence embedding for `text` (UTF-8, `text_len` bytes,
+ * NUL not required). `pooling` selects the pooling strategy (see
+ * ELIZA_POOLING_*); pass ELIZA_POOLING_MEAN for the gte-small convention or
+ * ELIZA_POOLING_LAST for a decoder-as-embedder.
+ *
+ * On success writes up to `out_capacity` fp32 values into `out_embedding`,
+ * sets `*out_dim` to the model's `n_embd` (the real dimension), and returns
+ * ELIZA_OK. The embedding is L2-normalized (the gte-small convention) before
+ * it is written. If `out_capacity < n_embd` the library writes nothing,
+ * sets `*out_dim = n_embd`, and returns ELIZA_ERR_INVALID_ARG with a
+ * diagnostic in `*out_error` so the caller can resize and retry.
+ *
+ * The text region need not be acquired — embeddings use the text model the
+ * streaming-LLM path loads, resolved from `<bundle>/text/`. The first call
+ * loads it if it is not resident yet. Returns a negative ELIZA_* code on
+ * failure with `*out_error` populated. */
+int eliza_inference_embed(
+    EliInferenceContext * ctx,
+    const char * text,
+    size_t text_len,
+    int pooling,
+    float * out_embedding,
+    size_t out_capacity,
+    int * out_dim,
+    char ** out_error);
+
+/* ---- mmproj vision describe (ABI v9, additive) -------------------- *
+ *
+ * Describe an image with the TEXT model + its mmproj projector, reusing the
+ * mtmd machinery already linked + initialized for ASR
+ * (`mtmd_init_from_file`, `mtmd_helper_bitmap_init_from_buf`,
+ * `mtmd_tokenize`, `mtmd_helper_eval_chunks`). Mirrors
+ * desktop-llama-adapter.ts's `describeImage()`. This drops the
+ * libllama+eliza-llama-shim mmproj vision path: the IMAGE_DESCRIPTION handler
+ * prefers this entry when `eliza_inference_vision_supported() == 1`.
+ *
+ * Gated on the `-DELIZA_ENABLE_VISION=1` build flag (same flag the shim path
+ * uses). A build without it returns 0 from `_vision_supported()` and
+ * ELIZA_ERR_NOT_IMPLEMENTED from `_describe_image`, so the caller falls back
+ * to the libllama mtmd path.
+ */
+
+/* Capability probe: 1 when this build was compiled with ELIZA_ENABLE_VISION
+ * and can describe an image through mmproj; 0 otherwise (the IMAGE_DESCRIPTION
+ * handler then routes through the libllama mtmd path). */
+int eliza_inference_vision_supported(void);
+
+/* Describe `image_bytes` (a raw PNG/JPEG/WebP buffer of `n_bytes`) using the
+ * loaded text model and the mmproj projector at `mmproj_path`. `prompt` may
+ * be NULL (a default "Describe what is in this image." is used). The library
+ * writes a UTF-8 NUL-terminated description into `out_text` (up to
+ * `max_text_bytes - 1` bytes + terminator).
+ *
+ * The text model is loaded on first use (same resident model the
+ * streaming-LLM / embedding paths share); the mmproj context is loaded on
+ * first use per `mmproj_path` and reused. Returns the number of bytes written
+ * (excluding the terminator) on success, ELIZA_ERR_NOT_IMPLEMENTED when the
+ * build lacks vision, or another negative ELIZA_* code on failure with
+ * `*out_error` populated. */
+int eliza_inference_describe_image(
+    EliInferenceContext * ctx,
+    const unsigned char * image_bytes,
+    size_t n_bytes,
+    const char * mmproj_path,
+    const char * prompt,
+    char * out_text,
+    size_t max_text_bytes,
+    char ** out_error);
+
+/* ---- Tokenizer (ABI v9, additive) --------------------------------- *
+ *
+ * Expose `llama_tokenize` / `llama_detokenize` over the loaded text model's
+ * vocab so the desktop fused runtime can stop standing up a libllama
+ * tokenizer sidecar (`desktop-fused-ffi-backend-runtime.ts`'s "tokenization
+ * seam"). The vocab is the SAME shared text model the streaming-LLM path
+ * loads, so the tokenizer matches the generation model exactly with no second
+ * weight load.
+ */
+
+/* Capability probe: 1 when this build exposes the tokenizer over the loaded
+ * text vocab. A v8 library does not export this symbol, so absence ==
+ * unsupported and the desktop fused runtime keeps the libllama sidecar. */
+int eliza_inference_tokenize_supported(void);
+
+/* Tokenize `text` (UTF-8, `text_len` bytes) against the loaded text model's
+ * vocab. `add_special` adds the model's BOS/EOS markers; `parse_special`
+ * renders special tokens from the input text. On success the library
+ * malloc-allocates an int32 token-id array, writes its pointer into
+ * `*out_tokens` and the count into `*out_n`, and returns ELIZA_OK. The caller
+ * MUST release the buffer via `eliza_inference_free_tokens`. A NULL
+ * `out_tokens` / `out_n` is a programmer error. Returns a negative ELIZA_*
+ * code on failure with `*out_error` populated.
+ *
+ * The first call loads the text model from `<bundle>/text/` if it is not
+ * resident yet (shared with the streaming-LLM / embedding paths). */
+int eliza_inference_tokenize(
+    EliInferenceContext * ctx,
+    const char * text,
+    size_t text_len,
+    int add_special,
+    int parse_special,
+    int ** out_tokens,
+    size_t * out_n,
+    char ** out_error);
+
+/* Detokenize `n_tokens` token ids back to UTF-8 text against the loaded text
+ * model's vocab. Writes a NUL-terminated string into `out_text` (up to
+ * `max_text_bytes - 1` bytes + terminator). `remove_special` strips BOS/EOS;
+ * `unparse_special` renders special tokens. Returns the number of bytes
+ * written (excluding the terminator) on success, or a negative ELIZA_* code
+ * on failure with `*out_error` populated. */
+int eliza_inference_detokenize(
+    EliInferenceContext * ctx,
+    const int * tokens,
+    size_t n_tokens,
+    int remove_special,
+    int unparse_special,
+    char * out_text,
+    size_t max_text_bytes,
+    char ** out_error);
 
 /* ---- Memory ownership helpers -------------------------------------- */
 

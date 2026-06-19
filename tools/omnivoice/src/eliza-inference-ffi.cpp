@@ -107,6 +107,21 @@ struct EliInferenceContext {
     std::string llm_model_path;
     llama_model * llm_model = nullptr;
     std::mutex llm_mutex;
+    /* Dedicated embedding context over the shared text model (ABI v9). Lazily
+     * created on the first eliza_inference_embed call. Embeddings require
+     * llama_set_embeddings(true) + a pooling type + a non-causal single-ubatch
+     * layout, so this is a separate llama_context from the generation /
+     * streaming-LLM path. Protected by llm_mutex (it shares the resident
+     * text model). */
+    llama_context * embed_ctx = nullptr;
+    int embed_pooling = -1;   /* the pooling type embed_ctx was built with */
+    int embed_n_ctx = 0;      /* the ctx size embed_ctx was built with */
+    /* mmproj vision context over the shared text model (ABI v9), keyed by the
+     * mmproj path it was initialized from. Lazily created on the first
+     * eliza_inference_describe_image call per mmproj_path and reused.
+     * Protected by llm_mutex. */
+    mtmd_context * vision_mtmd = nullptr;
+    std::string vision_mmproj_path;
     /* Parsed voice presets, keyed by voice id. Populated lazily on the
      * first TTS call that mentions the id. The mutex protects the map
      * itself; presets are immutable once inserted. */
@@ -570,6 +585,18 @@ static std::string eliza_llama_token_piece(const llama_vocab * vocab, llama_toke
     n = llama_token_to_piece(vocab, token, buf.data(), (int32_t) buf.size(), 0, false);
     if (n > 0) return std::string(buf.data(), (size_t) n);
     return "";
+}
+
+/* L2-normalize an embedding vector in place. Mirrors normalizeEmbedding(view,
+ * 2) in desktop-llama-adapter.ts (the gte-small convention). A zero-norm
+ * vector is left untouched (division by ~0 would produce NaNs). */
+static void eliza_l2_normalize(float * vec, int n) {
+    double sum = 0.0;
+    for (int i = 0; i < n; ++i) sum += (double) vec[i] * (double) vec[i];
+    const double norm = std::sqrt(sum);
+    if (norm <= 1e-12) return;
+    const float inv = (float) (1.0 / norm);
+    for (int i = 0; i < n; ++i) vec[i] *= inv;
 }
 
 static std::string eliza_trim_ascii(std::string value);
@@ -1467,6 +1494,14 @@ void eliza_inference_destroy(EliInferenceContext * ctx) {
     }
     {
         std::lock_guard<std::mutex> lock(ctx->llm_mutex);
+        if (ctx->vision_mtmd) {
+            mtmd_free(ctx->vision_mtmd);
+            ctx->vision_mtmd = nullptr;
+        }
+        if (ctx->embed_ctx) {
+            llama_free(ctx->embed_ctx);
+            ctx->embed_ctx = nullptr;
+        }
         if (ctx->llm_model) {
             llama_model_free(ctx->llm_model);
             ctx->llm_model = nullptr;
@@ -2859,6 +2894,475 @@ void eliza_inference_llm_stream_close(EliLlmStream * stream) {
         stream->lctx = nullptr;
     }
     delete stream;
+}
+
+/* ---- Text embeddings (ABI v9) ------------------------------------- *
+ *
+ * Pooled sentence embeddings over the shared text model, mirroring
+ * desktop-llama-adapter.ts's embed(). The embedding context is non-causal,
+ * single-ubatch (sized to n_ctx), and pooled — distinct from the causal
+ * generation context the streaming-LLM path builds.
+ */
+
+int eliza_inference_embed_supported(void) {
+    return 1;
+}
+
+/* Build (or reuse) the dedicated embedding context. Caller must hold
+ * ctx->llm_mutex and have a resident ctx->llm_model. Rebuilds when the
+ * requested pooling type differs from the cached one (a caller that switches
+ * pooling mid-session is rare but supported). */
+static int eliza_ensure_embed_ctx_locked(
+    EliInferenceContext * ctx,
+    int pooling,
+    char ** out_error) {
+    if (ctx->embed_ctx && ctx->embed_pooling == pooling) return ELIZA_OK;
+    if (ctx->embed_ctx) {
+        llama_free(ctx->embed_ctx);
+        ctx->embed_ctx = nullptr;
+    }
+
+    const int n_ctx_train = llama_model_n_ctx_train(ctx->llm_model);
+    int n_ctx = eliza_int_env_or_default("ELIZA_EMBED_N_CTX", 512);
+    if (n_ctx_train > 0 && n_ctx > n_ctx_train) n_ctx = n_ctx_train;
+
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx = (uint32_t) n_ctx;
+    /* Non-causal encoder layout: the whole sequence is decoded in one ubatch
+     * sized to n_ctx (no causal KV streaming). Mirrors the embedding branch in
+     * desktop-llama-adapter.ts (nBatch = nUBatch = ctxSize). */
+    cparams.n_batch = (uint32_t) n_ctx;
+    cparams.n_ubatch = (uint32_t) n_ctx;
+    cparams.n_threads = eliza_thread_count(false);
+    cparams.n_threads_batch = eliza_thread_count(true);
+    cparams.embeddings = true;
+    cparams.pooling_type = (enum llama_pooling_type) pooling;
+
+    llama_context * lctx = llama_init_from_model(ctx->llm_model, cparams);
+    if (!lctx) {
+        eliza_set_error(out_error,
+            "[libelizainference] embed: failed to init embedding context");
+        return ELIZA_ERR_FFI_FAULT;
+    }
+    ctx->embed_ctx = lctx;
+    ctx->embed_pooling = pooling;
+    ctx->embed_n_ctx = n_ctx;
+    return ELIZA_OK;
+}
+
+int eliza_inference_embed(
+    EliInferenceContext * ctx,
+    const char * text,
+    size_t text_len,
+    int pooling,
+    float * out_embedding,
+    size_t out_capacity,
+    int * out_dim,
+    char ** out_error) {
+    if (!ctx || !text || !out_embedding || !out_dim) {
+        eliza_set_error(out_error,
+            "[libelizainference] embed: invalid arguments");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    if (pooling == ELIZA_POOLING_NONE) {
+        eliza_set_error(out_error,
+            "[libelizainference] embed: pooling NONE produces no pooled "
+            "vector; pass MEAN (1), CLS (2), or LAST (3)");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    if (pooling < ELIZA_POOLING_NONE || pooling > ELIZA_POOLING_LAST) {
+        eliza_set_error(out_error,
+            "[libelizainference] embed: invalid pooling type " +
+            std::to_string(pooling));
+        return ELIZA_ERR_INVALID_ARG;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx->llm_mutex);
+    int rc = eliza_load_llm_model_locked(ctx, /* n_gpu_layers= */ -1, out_error);
+    if (rc != ELIZA_OK) return rc;
+    rc = eliza_ensure_embed_ctx_locked(ctx, pooling, out_error);
+    if (rc != ELIZA_OK) return rc;
+
+    const int n_embd = llama_model_n_embd(ctx->llm_model);
+    *out_dim = n_embd;
+    if (out_capacity < (size_t) n_embd) {
+        eliza_set_error(out_error,
+            "[libelizainference] embed: out_capacity " +
+            std::to_string(out_capacity) + " < n_embd " +
+            std::to_string(n_embd));
+        return ELIZA_ERR_INVALID_ARG;
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(ctx->llm_model);
+
+    /* Tokenize (add_special = BOS, parse_special = false), then truncate to
+     * the encoder ctx — a non-causal single-ubatch layout cannot encode
+     * input longer than n_ctx. Mirrors embed() in desktop-llama-adapter.ts. */
+    int32_t need = llama_tokenize(vocab, text, (int32_t) text_len,
+                                  nullptr, 0, true, false);
+    int32_t cap = need < 0 ? -need : need;
+    if (cap == 0) {
+        eliza_set_error(out_error,
+            "[libelizainference] embed: empty token sequence");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    std::vector<llama_token> tokens((size_t) cap);
+    int32_t n_tok = llama_tokenize(vocab, text, (int32_t) text_len,
+                                   tokens.data(), cap, true, false);
+    if (n_tok < 0) {
+        eliza_set_error(out_error,
+            "[libelizainference] embed: llama_tokenize returned " +
+            std::to_string(n_tok));
+        return ELIZA_ERR_FFI_FAULT;
+    }
+    if (n_tok > ctx->embed_n_ctx) n_tok = ctx->embed_n_ctx;
+    tokens.resize((size_t) n_tok);
+
+    /* Fresh KV per call so a previous embedding can't bleed into this one. */
+    llama_memory_clear(llama_get_memory(ctx->embed_ctx), true);
+    llama_set_embeddings(ctx->embed_ctx, true);
+
+    llama_batch batch = llama_batch_get_one(tokens.data(), n_tok);
+    const int decode_rc = llama_decode(ctx->embed_ctx, batch);
+    if (decode_rc != 0) {
+        eliza_set_error(out_error,
+            "[libelizainference] embed: llama_decode rc=" +
+            std::to_string(decode_rc));
+        return ELIZA_ERR_FFI_FAULT;
+    }
+
+    const float * emb = llama_get_embeddings_seq(ctx->embed_ctx, 0);
+    if (!emb) {
+        eliza_set_error(out_error,
+            "[libelizainference] embed: llama_get_embeddings_seq returned NULL "
+            "(pooling_type must not be NONE)");
+        return ELIZA_ERR_FFI_FAULT;
+    }
+    std::memcpy(out_embedding, emb, (size_t) n_embd * sizeof(float));
+    eliza_l2_normalize(out_embedding, n_embd);
+    return ELIZA_OK;
+}
+
+/* ---- mmproj vision describe (ABI v9) ------------------------------ *
+ *
+ * Describe an image through the text model's mmproj projector, reusing the
+ * mtmd machinery already linked for ASR. Gated on ELIZA_ENABLE_VISION at
+ * build time (same flag the libllama+shim path uses). Mirrors
+ * desktop-llama-adapter.ts's describeImage().
+ */
+
+int eliza_inference_vision_supported(void) {
+#if defined(ELIZA_ENABLE_VISION)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+#if defined(ELIZA_ENABLE_VISION)
+
+/* Ensure the mmproj vision context exists for `mmproj_path`. Caller must hold
+ * ctx->llm_mutex and have a resident ctx->llm_model. Reloads when the path
+ * differs from the cached one. */
+static int eliza_ensure_vision_mtmd_locked(
+    EliInferenceContext * ctx,
+    const std::string & mmproj_path,
+    char ** out_error) {
+    if (ctx->vision_mtmd && ctx->vision_mmproj_path == mmproj_path) {
+        return ELIZA_OK;
+    }
+    if (ctx->vision_mtmd) {
+        mtmd_free(ctx->vision_mtmd);
+        ctx->vision_mtmd = nullptr;
+        ctx->vision_mmproj_path.clear();
+    }
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(mmproj_path, ec)) {
+        eliza_set_error(out_error,
+            "[libelizainference] describe_image: mmproj GGUF not found: " +
+            mmproj_path);
+        return ELIZA_ERR_BUNDLE_INVALID;
+    }
+    mtmd_context_params mparams = mtmd_context_params_default();
+    mparams.use_gpu = eliza_bool_env_or_default("ELIZA_VISION_USE_GPU", true);
+    mparams.print_timings = false;
+    mparams.n_threads = eliza_thread_count(true);
+    mtmd_context * mctx =
+        mtmd_init_from_file(mmproj_path.c_str(), ctx->llm_model, mparams);
+    if (!mctx) {
+        eliza_set_error(out_error,
+            "[libelizainference] describe_image: failed to load mmproj: " +
+            mmproj_path);
+        return ELIZA_ERR_BUNDLE_INVALID;
+    }
+    ctx->vision_mtmd = mctx;
+    ctx->vision_mmproj_path = mmproj_path;
+    return ELIZA_OK;
+}
+
+#endif // ELIZA_ENABLE_VISION
+
+int eliza_inference_describe_image(
+    EliInferenceContext * ctx,
+    const unsigned char * image_bytes,
+    size_t n_bytes,
+    const char * mmproj_path,
+    const char * prompt,
+    char * out_text,
+    size_t max_text_bytes,
+    char ** out_error) {
+#if !defined(ELIZA_ENABLE_VISION)
+    (void) ctx; (void) image_bytes; (void) n_bytes; (void) mmproj_path;
+    (void) prompt; (void) out_text; (void) max_text_bytes;
+    eliza_set_error(out_error,
+        "[libelizainference] describe_image: this build was compiled without "
+        "ELIZA_ENABLE_VISION (eliza_inference_vision_supported() == 0); use the "
+        "libllama mtmd path");
+    return ELIZA_ERR_NOT_IMPLEMENTED;
+#else
+    if (!ctx || !image_bytes || n_bytes == 0 || !mmproj_path ||
+        mmproj_path[0] == '\0' || !out_text || max_text_bytes == 0) {
+        eliza_set_error(out_error,
+            "[libelizainference] describe_image: invalid arguments");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx->llm_mutex);
+    int rc = eliza_load_llm_model_locked(ctx, /* n_gpu_layers= */ -1, out_error);
+    if (rc != ELIZA_OK) return rc;
+    rc = eliza_ensure_vision_mtmd_locked(ctx, std::string(mmproj_path), out_error);
+    if (rc != ELIZA_OK) return rc;
+
+    /* A fresh generation context per describe call (causal, no embeddings).
+     * Vision describe is a one-shot per request; a dedicated short-lived ctx
+     * keeps KV clean and avoids interleaving with the streaming-LLM sessions. */
+    llama_context_params cparams = llama_context_default_params();
+    const int n_ctx_train = llama_model_n_ctx_train(ctx->llm_model);
+    int n_ctx = eliza_int_env_or_default("ELIZA_VISION_N_CTX", 4096);
+    if (n_ctx_train > 0 && n_ctx > n_ctx_train) n_ctx = n_ctx_train;
+    cparams.n_ctx = (uint32_t) n_ctx;
+    cparams.n_batch = (uint32_t) eliza_int_env_or_default("ELIZA_VISION_N_BATCH", 512);
+    cparams.n_ubatch = cparams.n_batch;
+    cparams.n_threads = eliza_thread_count(false);
+    cparams.n_threads_batch = eliza_thread_count(true);
+    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+    llama_context * lctx = llama_init_from_model(ctx->llm_model, cparams);
+    if (!lctx) {
+        eliza_set_error(out_error,
+            "[libelizainference] describe_image: failed to init context");
+        return ELIZA_ERR_FFI_FAULT;
+    }
+
+    llama_sampler * sampler = nullptr;
+    mtmd_bitmap * bitmap = nullptr;
+    mtmd_input_chunks * chunks = nullptr;
+    int result = ELIZA_ERR_FFI_FAULT;
+    std::string transcript;
+
+    do {
+        const char * marker = mtmd_default_marker();
+        std::string user_prompt = prompt && prompt[0] != '\0'
+            ? std::string(prompt)
+            : std::string("Describe what is in this image.");
+        std::string prompt_text =
+            (marker && user_prompt.find(marker) != std::string::npos)
+                ? user_prompt
+                : (std::string(marker ? marker : "<__media__>") + "\n" + user_prompt);
+
+        bitmap = mtmd_helper_bitmap_init_from_buf(
+            ctx->vision_mtmd, image_bytes, n_bytes);
+        if (!bitmap) {
+            eliza_set_error(out_error,
+                "[libelizainference] describe_image: image decode failed");
+            result = ELIZA_ERR_INVALID_ARG;
+            break;
+        }
+        chunks = mtmd_input_chunks_init();
+        if (!chunks) {
+            eliza_set_error(out_error,
+                "[libelizainference] describe_image: chunks allocation failed");
+            break;
+        }
+        mtmd_input_text text = { prompt_text.c_str(), true, true };
+        const mtmd_bitmap * bitmaps[] = { bitmap };
+        int32_t tok_rc = mtmd_tokenize(ctx->vision_mtmd, chunks, &text, bitmaps, 1);
+        if (tok_rc != 0) {
+            eliza_set_error(out_error,
+                "[libelizainference] describe_image: mtmd_tokenize rc=" +
+                std::to_string(tok_rc));
+            break;
+        }
+
+        llama_memory_clear(llama_get_memory(lctx), true);
+        llama_pos n_past = 0;
+        int32_t eval_rc = mtmd_helper_eval_chunks(
+            ctx->vision_mtmd, lctx, chunks, n_past, 0,
+            (int32_t) cparams.n_batch, true, &n_past);
+        if (eval_rc != 0) {
+            eliza_set_error(out_error,
+                "[libelizainference] describe_image: mtmd_helper_eval_chunks rc=" +
+                std::to_string(eval_rc));
+            break;
+        }
+
+        llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
+        sampler = llama_sampler_chain_init(sparams);
+        if (!sampler) {
+            eliza_set_error(out_error,
+                "[libelizainference] describe_image: failed to init sampler");
+            break;
+        }
+        llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
+
+        const llama_vocab * vocab = llama_model_get_vocab(ctx->llm_model);
+        const int max_tokens = eliza_int_env_or_default("ELIZA_VISION_MAX_TOKENS", 256);
+        bool overflow = false;
+        for (int i = 0; i < max_tokens; ++i) {
+            llama_token token = llama_sampler_sample(sampler, lctx, -1);
+            if (llama_vocab_is_eog(vocab, token)) break;
+            std::string piece = eliza_llama_token_piece(vocab, token);
+            if (!piece.empty()) {
+                if (transcript.size() + piece.size() + 1 > max_text_bytes) {
+                    overflow = true;
+                    break;
+                }
+                transcript += piece;
+            }
+            llama_sampler_accept(sampler, token);
+            llama_batch batch = llama_batch_get_one(&token, 1);
+            int32_t decode_rc = llama_decode(lctx, batch);
+            if (decode_rc != 0) {
+                eliza_set_error(out_error,
+                    "[libelizainference] describe_image: llama_decode rc=" +
+                    std::to_string(decode_rc));
+                overflow = true; // reuse the error exit
+                transcript.clear();
+                break;
+            }
+        }
+        if (transcript.empty() && overflow) {
+            // decode error path already set out_error
+            break;
+        }
+        if (transcript.size() + 1 > max_text_bytes) {
+            transcript.resize(max_text_bytes - 1);
+        }
+        result = ELIZA_OK;
+    } while (false);
+
+    if (sampler) llama_sampler_free(sampler);
+    if (chunks) mtmd_input_chunks_free(chunks);
+    if (bitmap) mtmd_bitmap_free(bitmap);
+    llama_free(lctx);
+
+    if (result != ELIZA_OK) return result;
+    std::memcpy(out_text, transcript.data(), transcript.size());
+    out_text[transcript.size()] = '\0';
+    return (int) transcript.size();
+#endif // ELIZA_ENABLE_VISION
+}
+
+/* ---- Tokenizer (ABI v9) ------------------------------------------- *
+ *
+ * llama_tokenize / llama_detokenize over the loaded text model's vocab, so the
+ * desktop fused runtime stops standing up a libllama tokenizer sidecar.
+ */
+
+int eliza_inference_tokenize_supported(void) {
+    return 1;
+}
+
+int eliza_inference_tokenize(
+    EliInferenceContext * ctx,
+    const char * text,
+    size_t text_len,
+    int add_special,
+    int parse_special,
+    int ** out_tokens,
+    size_t * out_n,
+    char ** out_error) {
+    if (!ctx || !text || !out_tokens || !out_n) {
+        eliza_set_error(out_error,
+            "[libelizainference] tokenize: invalid arguments");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    *out_tokens = nullptr;
+    *out_n = 0;
+
+    std::lock_guard<std::mutex> lock(ctx->llm_mutex);
+    int rc = eliza_load_llm_model_locked(ctx, /* n_gpu_layers= */ -1, out_error);
+    if (rc != ELIZA_OK) return rc;
+
+    const llama_vocab * vocab = llama_model_get_vocab(ctx->llm_model);
+    int32_t need = llama_tokenize(vocab, text, (int32_t) text_len, nullptr, 0,
+                                  add_special != 0, parse_special != 0);
+    int32_t cap = need < 0 ? -need : need;
+    if (cap == 0) {
+        /* Empty token sequence is valid (e.g. empty input). Return an empty,
+         * non-NULL buffer so the caller's free path is uniform. */
+        int * empty = (int *) std::malloc(1);
+        if (!empty) {
+            eliza_set_error(out_error, "[libelizainference] tokenize: OOM");
+            return ELIZA_ERR_OOM;
+        }
+        *out_tokens = empty;
+        *out_n = 0;
+        return ELIZA_OK;
+    }
+    int * buf = (int *) std::malloc((size_t) cap * sizeof(int));
+    if (!buf) {
+        eliza_set_error(out_error, "[libelizainference] tokenize: OOM");
+        return ELIZA_ERR_OOM;
+    }
+    static_assert(sizeof(llama_token) == sizeof(int32_t),
+                  "llama_token must be int32 for the tokenize ABI");
+    int32_t written = llama_tokenize(vocab, text, (int32_t) text_len,
+                                     (llama_token *) buf, cap,
+                                     add_special != 0, parse_special != 0);
+    if (written < 0) {
+        std::free(buf);
+        eliza_set_error(out_error,
+            "[libelizainference] tokenize: llama_tokenize returned " +
+            std::to_string(written) + " (buffer too small)");
+        return ELIZA_ERR_FFI_FAULT;
+    }
+    *out_tokens = buf;
+    *out_n = (size_t) written;
+    return ELIZA_OK;
+}
+
+int eliza_inference_detokenize(
+    EliInferenceContext * ctx,
+    const int * tokens,
+    size_t n_tokens,
+    int remove_special,
+    int unparse_special,
+    char * out_text,
+    size_t max_text_bytes,
+    char ** out_error) {
+    if (!ctx || (!tokens && n_tokens > 0) || !out_text || max_text_bytes == 0) {
+        eliza_set_error(out_error,
+            "[libelizainference] detokenize: invalid arguments");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx->llm_mutex);
+    int rc = eliza_load_llm_model_locked(ctx, /* n_gpu_layers= */ -1, out_error);
+    if (rc != ELIZA_OK) return rc;
+
+    const llama_vocab * vocab = llama_model_get_vocab(ctx->llm_model);
+    int32_t written = llama_detokenize(
+        vocab, (const llama_token *) tokens, (int32_t) n_tokens,
+        out_text, (int32_t) (max_text_bytes - 1),
+        remove_special != 0, unparse_special != 0);
+    if (written < 0) {
+        eliza_set_error(out_error,
+            "[libelizainference] detokenize: output buffer too small (need " +
+            std::to_string(-written) + " bytes)");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    out_text[written] = '\0';
+    return (int) written;
 }
 
 void eliza_inference_free_string(char * str) {
