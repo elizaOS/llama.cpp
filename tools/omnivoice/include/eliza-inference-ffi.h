@@ -1,5 +1,5 @@
 /*
- * libelizainference FFI ABI v6.
+ * libelizainference FFI ABI v7.
  *
  * Single source of truth for the C-callable surface that the fused
  * omnivoice + llama.cpp build (`libelizainference.{dylib,so,dll}`)
@@ -87,6 +87,22 @@
  * usable at degraded capability via the per-symbol `*_supported()`
  * probes.
  *
+ * ABI v7 promotes the native Silero VAD surface (the v3 symbols
+ * `eliza_inference_vad_supported/open/process/reset/close`) from a stub
+ * (`vad_supported() == 0`, every entry returned NOT_IMPLEMENTED) to a
+ * real backend. It fuses the last standalone voice runtime — the
+ * Silero v5 LSTM speech detector — into libelizainference, replacing
+ * the separate `libsilero_vad.{so,dylib}` standalone, so all FOUR voice
+ * classifiers (VAD, wake-word, speaker, diarizer) now run through one
+ * fused handle. The wrapper owns a context-anchored session, resolves
+ * the Silero GGUF from `<bundle_dir>/vad/` (conventionally
+ * `silero-vad-v5.gguf`), and drives the vendored scalar-C forward graph
+ * under `tools/omnivoice/src/voice-classifiers/vad/`. No new symbols are
+ * added — `vad_supported()` simply now returns 1 and the four entries do
+ * real work — so a v3..v6 caller that already bound the VAD surface
+ * gains a working backend with no recompile. The version bumps so
+ * loaders can require a build whose `vad_supported()` is real.
+ *
  * Errors are propagated via heap-allocated `char *` strings written to
  * `out_error` arguments; callers MUST free them with
  * `eliza_inference_free_string`. A NULL `out_error` parameter is a
@@ -113,9 +129,9 @@ extern "C" {
 /* Bump on any breaking shape change. The Node loader checks the value
  * returned by `eliza_inference_abi_version()` against this constant on
  * load and refuses to bind if they disagree. */
-#define ELIZA_INFERENCE_ABI_VERSION 6
+#define ELIZA_INFERENCE_ABI_VERSION 7
 
-/* Returns a static, NUL-terminated string of the form "6" matching
+/* Returns a static, NUL-terminated string of the form "7" matching
  * ELIZA_INFERENCE_ABI_VERSION at the time the library was built. The
  * pointer is owned by the library — do NOT free. */
 const char * eliza_inference_abi_version(void);
@@ -344,18 +360,25 @@ int eliza_inference_set_verifier_callback(
     void * user_data,
     char ** out_error);
 
-/* ---- Native VAD (ABI v3) ------------------------------------------ *
+/* ---- Native VAD (ABI v3 symbols, real backend at ABI v7) ---------- *
  *
- * Native Silero VAD backend. The shape intentionally mirrors
+ * Native Silero v5 VAD backend. The shape intentionally mirrors
  * `voice/vad.ts::SileroVad`: 16 kHz mono fp32 PCM, 512-sample windows,
- * one probability in [0, 1] per call, and recurrent state reset at
- * utterance boundaries. The JS binding chooses this backend when
- * `eliza_inference_vad_supported() == 1`; otherwise it falls back to the
- * ONNX runtime path unchanged.
+ * one probability in [0, 1] per call, and recurrent (LSTM) state reset
+ * at utterance boundaries. The fused build resolves the Silero GGUF from
+ * `<bundle_dir>/vad/` (conventionally `silero-vad-v5.gguf`) and runs the
+ * vendored scalar-C forward graph under
+ * `tools/omnivoice/src/voice-classifiers/vad/`. The JS binding chooses
+ * this backend when `eliza_inference_vad_supported() == 1`; otherwise it
+ * falls back to the standalone Silero VAD path unchanged.
+ *
+ * These five symbols were declared in ABI v3 but stubbed
+ * (`vad_supported() == 0`) until ABI v7 wired the real backend; the
+ * declarations are unchanged so a v3..v6 caller binds them as-is.
  */
 
-/* Capability probe: 1 when this build implements native VAD, 0 when it
- * does not (stub / VAD-disabled build). */
+/* Capability probe: 1 when this build implements native VAD (ABI v7+),
+ * 0 when it does not (older stub / VAD-disabled build). */
 int eliza_inference_vad_supported(void);
 
 /* Opaque native VAD session. One per detector. */

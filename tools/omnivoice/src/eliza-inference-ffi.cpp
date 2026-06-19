@@ -21,11 +21,13 @@
 
 /* Vendored standalone scalar-C voice-classifier forward graphs (no ggml
  * dependency; their own GGUF reader). These back the fused wake-word,
- * speaker-encoder, and diarizer ABIs so the whole voice pipeline runs
- * through one libelizainference handle instead of separate .so libs. */
+ * speaker-encoder, diarizer, and Silero VAD ABIs so the whole voice
+ * pipeline runs through one libelizainference handle instead of separate
+ * .so libs. */
 extern "C" {
 #include "voice-classifiers/wakeword/include/wakeword/wakeword.h"
 #include "voice-classifiers/voice_classifier/include/voice_classifier/voice_classifier.h"
+#include "voice-classifiers/vad/include/silero_vad/silero_vad.h"
 }
 
 #include <algorithm>
@@ -338,6 +340,17 @@ static std::vector<std::string> eliza_find_ggufs(const std::filesystem::path & d
     }
     std::sort(out.begin(), out.end());
     return out;
+}
+
+/* Pick the single GGUF under <bundle_dir>/<subdir>. Returns "" when none
+ * found. Used by the VAD, speaker, and diarizer wrappers to resolve their
+ * model from the context bundle. */
+static std::string eliza_pick_one_gguf(
+    const std::filesystem::path & bundle_dir,
+    const char * subdir) {
+    std::vector<std::string> ggufs = eliza_find_ggufs(bundle_dir / subdir);
+    if (ggufs.empty()) return std::string();
+    return ggufs[0];
 }
 
 static std::string eliza_lower_ascii(std::string value) {
@@ -1509,27 +1522,68 @@ void eliza_inference_free_tokens(int * tokens) {
     if (tokens) std::free(tokens);
 }
 
-/* ---- Native VAD (ABI v3) ------------------------------------------- *
+/* ---- Native VAD (ABI v3 surface, real backend at ABI v7) ----------- *
  *
- * The JS runtime can use the ONNX Silero path today. Native VAD is an
- * additive fused-runtime backend; until the fused target wires it,
- * advertise unsupported and return structured not-implemented errors.
+ * Thin wrapper over the vendored Silero v5 scalar-C forward graph
+ * (silero_vad_open/process/reset_state/close). The fused build resolves
+ * the Silero GGUF from the context bundle (`<bundle_dir>/vad/` — the
+ * single GGUF there, conventionally `silero-vad-v5.gguf`), then streams
+ * 512-sample 16 kHz windows through the standalone runtime, emitting one
+ * P(speech) ∈ [0, 1] per window. The standalone exposes an in-place
+ * `silero_vad_reset_state`, so unlike the wake-word wrapper this maps
+ * reset 1:1 (no close+reopen). The JS binding routes VAD through this
+ * surface when `eliza_inference_vad_supported() == 1`.
  */
 
+struct EliVad {
+    silero_vad_handle handle = nullptr;
+};
+
 int eliza_inference_vad_supported(void) {
-    return 0;
+    return 1;
 }
 
 EliVad * eliza_inference_vad_open(
     EliInferenceContext * ctx,
     int sample_rate_hz,
     char ** out_error) {
-    (void) ctx;
-    (void) sample_rate_hz;
-    eliza_set_error(out_error,
-        "[libelizainference] native VAD is not implemented in this build "
-        "(eliza_inference_vad_supported() == 0); use the ONNX Silero VAD path");
-    return nullptr;
+    if (!ctx) {
+        eliza_set_error(out_error,
+            "[libelizainference] vad_open: ctx is required");
+        return nullptr;
+    }
+    if (sample_rate_hz != SILERO_VAD_SAMPLE_RATE_HZ) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] vad_open: sample_rate_hz must be ") +
+            std::to_string(SILERO_VAD_SAMPLE_RATE_HZ));
+        return nullptr;
+    }
+
+    const std::string path =
+        eliza_pick_one_gguf(std::filesystem::path(ctx->bundle_dir), "vad");
+    if (path.empty()) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] vad_open: no GGUF found under ") +
+            (std::filesystem::path(ctx->bundle_dir) / "vad").string() +
+            " (expected silero-vad-v5.gguf)");
+        return nullptr;
+    }
+
+    EliVad * vad = new (std::nothrow) EliVad();
+    if (!vad) {
+        eliza_set_error(out_error, "[libelizainference] vad_open: out of memory");
+        return nullptr;
+    }
+    int rc = silero_vad_open(path.c_str(), &vad->handle);
+    if (rc != 0 || !vad->handle) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] vad_open: standalone runtime "
+                        "failed to load ") + path +
+            " (errno-style rc=" + std::to_string(rc) + ")");
+        delete vad;
+        return nullptr;
+    }
+    return vad;
 }
 
 int eliza_inference_vad_process(
@@ -1538,24 +1592,45 @@ int eliza_inference_vad_process(
     size_t n_samples,
     float * out_probability,
     char ** out_error) {
-    (void) vad;
-    (void) pcm;
-    (void) n_samples;
-    (void) out_probability;
-    eliza_set_error(out_error, "[libelizainference] native VAD is not implemented in this build");
-    return ELIZA_ERR_NOT_IMPLEMENTED;
+    if (!vad || !vad->handle || !pcm || !out_probability) {
+        eliza_set_error(out_error,
+            "[libelizainference] vad_process: invalid arguments");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    float prob = 0.0f;
+    int rc = silero_vad_process(vad->handle, pcm, n_samples, &prob);
+    if (rc != 0) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] vad_process: forward failed "
+                        "(errno-style rc=") + std::to_string(rc) + ")");
+        return rc == -EINVAL ? ELIZA_ERR_INVALID_ARG : ELIZA_ERR_FFI_FAULT;
+    }
+    *out_probability = prob;
+    return ELIZA_OK;
 }
 
 int eliza_inference_vad_reset(
     EliVad * vad,
     char ** out_error) {
-    (void) vad;
-    eliza_set_error(out_error, "[libelizainference] native VAD is not implemented in this build");
-    return ELIZA_ERR_NOT_IMPLEMENTED;
+    if (!vad || !vad->handle) {
+        eliza_set_error(out_error,
+            "[libelizainference] vad_reset: invalid session");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    int rc = silero_vad_reset_state(vad->handle);
+    if (rc != 0) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] vad_reset: reset failed "
+                        "(errno-style rc=") + std::to_string(rc) + ")");
+        return ELIZA_ERR_FFI_FAULT;
+    }
+    return ELIZA_OK;
 }
 
 void eliza_inference_vad_close(EliVad * vad) {
-    (void) vad;
+    if (!vad) return;
+    if (vad->handle) silero_vad_close(vad->handle);
+    delete vad;
 }
 
 /* ---- Native wake-word (ABI v5) ------------------------------------ *
@@ -1729,16 +1804,6 @@ void eliza_inference_wakeword_close(EliWakeWord * wake) {
 struct EliSpeaker {
     voice_speaker_handle handle = nullptr;
 };
-
-/* Pick the single GGUF under <bundle_dir>/<subdir>. Returns "" when none
- * found. */
-static std::string eliza_pick_one_gguf(
-    const std::filesystem::path & bundle_dir,
-    const char * subdir) {
-    std::vector<std::string> ggufs = eliza_find_ggufs(bundle_dir / subdir);
-    if (ggufs.empty()) return std::string();
-    return ggufs[0];
-}
 
 int eliza_inference_speaker_supported(void) {
     return 1;

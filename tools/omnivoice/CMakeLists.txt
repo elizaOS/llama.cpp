@@ -82,12 +82,12 @@ set(OMNIVOICE_FFI_SOURCES
 
 # Vendored standalone voice-classifier forward graphs (pure scalar C, no
 # ggml/llama dependency; they carry their own GGUF reader). These back
-# the fused wake-word (ABI v5), speaker-encoder, and diarizer (ABI v6)
-# surfaces so the whole voice pipeline runs through one
-# libelizainference handle instead of separate
-# libvoice_classifier / libwakeword .so libs. Vendored from
-# packages/native/plugins/{wakeword-cpp,voice-classifier-cpp} by the
-# Phase-1 fused-voice consolidation.
+# the fused wake-word (ABI v5), speaker-encoder, diarizer (ABI v6), and
+# Silero VAD (ABI v7) surfaces so the whole voice pipeline runs through
+# one libelizainference handle instead of separate
+# libvoice_classifier / libwakeword / libsilero_vad .so libs. Vendored
+# from packages/native/plugins/{wakeword-cpp,voice-classifier-cpp,
+# silero-vad-cpp} by the Phase-1 fused-voice consolidation.
 set(OMNIVOICE_VOICE_CLASSIFIER_SOURCES
     src/voice-classifiers/wakeword/wakeword_runtime.c
     src/voice-classifiers/wakeword/wakeword_melspec.c
@@ -98,17 +98,23 @@ set(OMNIVOICE_VOICE_CLASSIFIER_SOURCES
     src/voice-classifiers/voice_classifier/voice_mel_features.c
     src/voice-classifiers/voice_classifier/voice_gguf_loader.c
     src/voice-classifiers/voice_classifier/voice_gguf_tensors.c
+    src/voice-classifiers/vad/silero_vad_runtime.c
+    src/voice-classifiers/vad/silero_vad_state.c
+    src/voice-classifiers/vad/silero_vad_resample.c
 )
 
 # Include roots so the vendored TUs resolve their own headers
 # (`voice_classifier/voice_classifier.h`, `voice_gguf_loader.h`,
-# `wakeword/wakeword.h`, `wakeword_internal.h`) and so the FFI bridge can
-# #include the two public ABI headers via their vendored relative paths.
+# `wakeword/wakeword.h`, `wakeword_internal.h`, `silero_vad/silero_vad.h`,
+# `silero_vad_state.h`) and so the FFI bridge can #include the public ABI
+# headers via their vendored relative paths.
 set(OMNIVOICE_VOICE_CLASSIFIER_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/voice-classifiers/wakeword
     ${CMAKE_CURRENT_SOURCE_DIR}/src/voice-classifiers/wakeword/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src/voice-classifiers/voice_classifier
     ${CMAKE_CURRENT_SOURCE_DIR}/src/voice-classifiers/voice_classifier/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/voice-classifiers/vad
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/voice-classifiers/vad/include
 )
 
 # Static archive of the vendored scalar-C forward graphs. Plain C11, no
