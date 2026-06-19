@@ -250,6 +250,21 @@ if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
     add_subdirectory(tools)
 endif()
 
+# Standalone libmtmd build (e.g. for Apple XCFramework packaging) without pulling
+# in the rest of the tools/ tree. When the full tools build is already enabled,
+# mtmd is built by the tools/ subdirectory above; this hook only fires when
+# LLAMA_BUILD_TOOLS is OFF to avoid double-adding the target.
+#
+# This MUST be added before tools/omnivoice below: the fused `elizainference`
+# target in tools/omnivoice/CMakeLists.txt is gated on `if(TARGET mtmd)`, so the
+# mtmd target has to exist by the time omnivoice configures. In the full
+# LLAMA_BUILD_TOOLS=ON path tools/CMakeLists.txt already orders mtmd before
+# omnivoice; this block mirrors that ordering for the embed-as-library case.
+option(LLAMA_BUILD_MTMD "llama: build tools/mtmd library standalone" OFF)
+if (LLAMA_BUILD_MTMD AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
+    add_subdirectory(tools/mtmd)
+endif()
+
 if (LLAMA_BUILD_OMNIVOICE)
     if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/omnivoice/CMakeLists.txt")
         message(FATAL_ERROR
@@ -265,15 +280,6 @@ if (LLAMA_BUILD_OMNIVOICE)
     if (NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
         add_subdirectory(tools/omnivoice)
     endif()
-endif()
-
-# Standalone libmtmd build (e.g. for Apple XCFramework packaging) without pulling
-# in the rest of the tools/ tree. When the full tools build is already enabled,
-# mtmd is built by the tools/ subdirectory above; this hook only fires when
-# LLAMA_BUILD_TOOLS is OFF to avoid double-adding the target.
-option(LLAMA_BUILD_MTMD "llama: build tools/mtmd library standalone" OFF)
-if (LLAMA_BUILD_MTMD AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
-    add_subdirectory(tools/mtmd)
 endif()
 
 # Automatically add all files from the 'licenses' directory
