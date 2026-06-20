@@ -29,19 +29,24 @@ else()
     add_subdirectory(parser)
     add_subdirectory(tts)
     add_subdirectory(mtmd)
+    if (LLAMA_BUILD_KOKORO)
+        # Kokoro-82M (StyleTTS-2 + iSTFTNet) standalone TTS — J2 fork-side
+        # replacement for the ONNX runtime path. Produces kokoro_lib +
+        # the kokoro-tts CLI; when LLAMA_BUILD_SERVER is also on, the
+        # `/v1/audio/speech` handler is mounted via server.cpp.
+        #
+        # MUST precede omnivoice below: the fused `elizainference` target folds
+        # kokoro in via `if(TARGET kokoro_lib)` (ABI v10), so kokoro_lib has to
+        # exist by the time omnivoice configures. The root CMakeLists mirrors
+        # this ordering for the embed-as-library (LLAMA_BUILD_TOOLS=OFF) case.
+        add_subdirectory(kokoro)
+    endif()
     if (LLAMA_BUILD_OMNIVOICE)
         # The merged omnivoice subtree lives under tools/omnivoice/. The
         # top-level CMakeLists.txt has a parallel add_subdirectory hook for
         # the embed-as-library case (LLAMA_BUILD_TOOLS=OFF) ; this gate is
         # the one that fires for the normal standalone build.
         add_subdirectory(omnivoice)
-    endif()
-    if (LLAMA_BUILD_KOKORO)
-        # Kokoro-82M (StyleTTS-2 + iSTFTNet) standalone TTS — J2 fork-side
-        # replacement for the ONNX runtime path. Produces kokoro_lib +
-        # the kokoro-tts CLI; when LLAMA_BUILD_SERVER is also on, the
-        # `/v1/audio/speech` handler is mounted via server.cpp.
-        add_subdirectory(kokoro)
     endif()
     if (GGML_RPC)
         add_subdirectory(rpc)
