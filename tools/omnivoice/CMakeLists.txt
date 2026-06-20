@@ -260,6 +260,17 @@ if(TARGET mtmd)
     # common/sampling.cpp, and common/common.cpp. PRIVATE so the common ABI
     # is not re-exported from the fused .so (only eliza_inference_* + llama).
     target_link_libraries(elizainference PRIVATE eliza_voice_classifiers llama-common)
+    # Kokoro-82M TTS (ABI v10): fold kokoro_lib into the fused .so so the
+    # mobile Kokoro path synthesizes in-process (iOS / Google Play forbid the
+    # local-TCP `llama-server /v1/audio/speech` route). kokoro_lib carries its
+    # own GGUF reader + iSTFT decoder. PRIVATE — the `eliza_kokoro::*` C++ API
+    # is an implementation detail behind the `eliza_inference_kokoro_*` surface.
+    if(TARGET kokoro_lib)
+        target_link_libraries(elizainference PRIVATE kokoro_lib)
+        target_include_directories(elizainference PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../kokoro/include)
+        target_compile_definitions(elizainference PRIVATE ELIZA_ENABLE_KOKORO)
+    endif()
     set_target_properties(elizainference PROPERTIES
         OUTPUT_NAME              elizainference
         POSITION_INDEPENDENT_CODE ON)

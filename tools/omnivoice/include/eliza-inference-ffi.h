@@ -131,6 +131,15 @@ extern "C" {
  * load and refuses to bind if they disagree.
  *
  * Changelog:
+ *   v10: Kokoro-82M TTS folded in-process. `eliza_inference_kokoro_supported()`
+ *        + `_load` + `_synthesize` + `_sample_rate` link kokoro_lib (its own
+ *        GGUF reader + iSTFT decoder) into the fused handle so the mobile
+ *        Kokoro path stops POSTing to the local-TCP `llama-server
+ *        /v1/audio/speech` route (forbidden on iOS / Google Play). Gated on
+ *        the `ELIZA_ENABLE_KOKORO` build flag (TARGET kokoro_lib); a build
+ *        without it reports `kokoro_supported() == 0` and the synth entries
+ *        return ELIZA_ERR_NOT_IMPLEMENTED. Additive symbols — a v9 caller is
+ *        unaffected.
  *   v9: the last text-adjacent modalities move off their separate libs into
  *       the fused handle. Three additive entrypoints + probes:
  *         - `eliza_inference_embed` + `eliza_inference_embed_supported()` —
@@ -168,9 +177,9 @@ extern "C" {
  *   v7: real Silero VAD (same symbol surface as v6).
  *   v6: fused wake-word, speaker, diarizer.
  */
-#define ELIZA_INFERENCE_ABI_VERSION 9
+#define ELIZA_INFERENCE_ABI_VERSION 10
 
-/* Returns a static, NUL-terminated string of the form "9" matching
+/* Returns a static, NUL-terminated string of the form "10" matching
  * ELIZA_INFERENCE_ABI_VERSION at the time the library was built. The
  * pointer is owned by the library — do NOT free. */
 const char * eliza_inference_abi_version(void);
@@ -311,6 +320,50 @@ int eliza_inference_tts_synthesize_stream(
 int eliza_inference_cancel_tts(
     EliInferenceContext * ctx,
     char ** out_error);
+
+/* ---- Kokoro TTS (ABI v10) ----------------------------------------- *
+ *
+ * Kokoro-82M TTS folded in-process so iOS / Google Play builds (which
+ * forbid the local-TCP `llama-server /v1/audio/speech` route) synthesize
+ * through the same dlopen()-ed libelizainference handle as OmniVoice.
+ * Kokoro is a distinct TTS pipeline (phonemes -> duration/F0/style ->
+ * iSTFT decoder, with its own GGUF reader) — separate from the OmniVoice
+ * `eliza_inference_tts_*` path. The loaded model + voice are owned by the
+ * ctx and freed in `eliza_inference_destroy`. */
+
+/* 1 when this build linked kokoro_lib (ELIZA_ENABLE_KOKORO); 0 otherwise
+ * (the synth entry points return ELIZA_ERR_NOT_IMPLEMENTED). */
+int eliza_inference_kokoro_supported(void);
+
+/* Load the Kokoro GGUF at `gguf_path` and the voice preset at
+ * `voice_bin_path` (raw fp32 ref_s, `style_dim` inner dim, 256 for v1.0)
+ * into `ctx`. Replaces any previously-loaded Kokoro model on the ctx.
+ * Returns ELIZA_OK or a negative ELIZA_* code with `*out_error` set. */
+int eliza_inference_kokoro_load(
+    EliInferenceContext * ctx,
+    const char * gguf_path,
+    const char * voice_bin_path,
+    int style_dim,
+    char ** out_error);
+
+/* Synthesize `text` through the loaded Kokoro model+voice. Writes up to
+ * `max_samples` fp32 PCM samples into `out_pcm` at the model's native rate
+ * (24 kHz for v1.0; query `eliza_inference_kokoro_sample_rate`). `speed`
+ * scales predicted durations (1.0 = native). Returns the number of samples
+ * written (>= 0), or a negative ELIZA_* code (ELIZA_ERR_INVALID_ARG with the
+ * required size in `*out_error` when the buffer is too small). */
+int eliza_inference_kokoro_synthesize(
+    EliInferenceContext * ctx,
+    const char * text,
+    size_t text_len,
+    float speed,
+    float * out_pcm,
+    size_t max_samples,
+    char ** out_error);
+
+/* The loaded Kokoro model's audio sample rate (24000 for v1.0), or a
+ * negative ELIZA_* code if no Kokoro model is loaded. */
+int eliza_inference_kokoro_sample_rate(EliInferenceContext * ctx);
 
 /* ---- OmniVoice reference encode (ABI v4) -------------------------- *
  *

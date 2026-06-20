@@ -265,6 +265,22 @@ if (LLAMA_BUILD_MTMD AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
     add_subdirectory(tools/mtmd)
 endif()
 
+# Kokoro-82M TTS (kokoro_lib) — embed-as-library hook (mirrors mtmd/omnivoice
+# above). MUST be added before tools/omnivoice: the fused `elizainference`
+# target folds kokoro in via `if(TARGET kokoro_lib)` (ABI v10), so kokoro_lib
+# has to exist by the time omnivoice configures. In the LLAMA_BUILD_TOOLS=ON
+# path tools/CMakeLists.txt orders kokoro before omnivoice; this mirrors it for
+# the embed-as-library (fused) case so libelizainference carries Kokoro on
+# desktop/Android/iOS without building the rest of the CLI tools.
+if (LLAMA_BUILD_KOKORO AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
+    if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/kokoro/CMakeLists.txt")
+        message(FATAL_ERROR
+            "LLAMA_BUILD_KOKORO=ON but tools/kokoro/CMakeLists.txt is missing. "
+            "Verify the fork is at the Kokoro-J2 tag or later.")
+    endif()
+    add_subdirectory(tools/kokoro)
+endif()
+
 if (LLAMA_BUILD_OMNIVOICE)
     if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/omnivoice/CMakeLists.txt")
         message(FATAL_ERROR

@@ -41,6 +41,14 @@ extern "C" {
 #include "voice-classifiers/vad/include/silero_vad/silero_vad.h"
 }
 
+#ifdef ELIZA_ENABLE_KOKORO
+/* Kokoro-82M TTS (ABI v10) — folded in-process. kokoro_lib is a C++ API
+ * (namespace eliza_kokoro) with its own GGUF reader + iSTFT decoder, so it
+ * is included OUTSIDE the extern "C" block. The include dir is added by the
+ * omnivoice CMakeLists when TARGET kokoro_lib exists. */
+#include "kokoro.h"
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -127,6 +135,15 @@ struct EliInferenceContext {
      * itself; presets are immutable once inserted. */
     std::mutex preset_mutex;
     std::unordered_map<std::string, EliVoicePreset> presets;
+#ifdef ELIZA_ENABLE_KOKORO
+    /* Kokoro TTS (ABI v10): the loaded Kokoro model + voice preset, owned by
+     * the ctx. Loaded via eliza_inference_kokoro_load, freed in destroy.
+     * Protected by kokoro_mutex. */
+    eliza_kokoro::kokoro_model_ptr kokoro_model;
+    eliza_kokoro::kokoro_voice_preset kokoro_voice;
+    bool kokoro_loaded = false;
+    std::mutex kokoro_mutex;
+#endif
 };
 
 /* ELZ2 magic 'ELZ1' (the ascii bytes 'E','L','Z','1' little-endian).
@@ -1507,7 +1524,128 @@ void eliza_inference_destroy(EliInferenceContext * ctx) {
             ctx->llm_model = nullptr;
         }
     }
+#ifdef ELIZA_ENABLE_KOKORO
+    {
+        std::lock_guard<std::mutex> lock(ctx->kokoro_mutex);
+        ctx->kokoro_model.reset();   /* kokoro_model_deleter frees the GGUF */
+        ctx->kokoro_loaded = false;
+    }
+#endif
     delete ctx;
+}
+
+/* ===================================================================== *
+ * Kokoro TTS (ABI v10) — in-process fold. No local-TCP llama-server route
+ * (forbidden on iOS / Google Play). kokoro_lib is a distinct TTS pipeline
+ * with its own GGUF reader; loaded once per ctx, owned by the ctx.
+ * ===================================================================== */
+
+int eliza_inference_kokoro_supported(void) {
+#ifdef ELIZA_ENABLE_KOKORO
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int eliza_inference_kokoro_load(
+    EliInferenceContext * ctx,
+    const char * gguf_path,
+    const char * voice_bin_path,
+    int style_dim,
+    char ** out_error) {
+#ifdef ELIZA_ENABLE_KOKORO
+    if (!ctx || !gguf_path || !voice_bin_path) {
+        eliza_set_error(out_error, "[libelizainference] kokoro_load: null argument");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    if (style_dim <= 0) style_dim = 256;
+    std::lock_guard<std::mutex> lock(ctx->kokoro_mutex);
+    std::string err;
+    eliza_kokoro::kokoro_model_ptr model =
+        eliza_kokoro::kokoro_load_model(gguf_path, err);
+    if (!model) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] kokoro_load_model failed: ") + err);
+        return ELIZA_ERR_BUNDLE_INVALID;
+    }
+    eliza_kokoro::kokoro_voice_preset voice;
+    eliza_kokoro::kokoro_status st =
+        eliza_kokoro::kokoro_load_voice_preset(voice_bin_path, style_dim, voice, err);
+    if (st != eliza_kokoro::KOKORO_OK) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] kokoro_load_voice_preset failed: ") + err);
+        return ELIZA_ERR_BUNDLE_INVALID;
+    }
+    ctx->kokoro_model = std::move(model);
+    ctx->kokoro_voice = std::move(voice);
+    ctx->kokoro_loaded = true;
+    return ELIZA_OK;
+#else
+    (void) ctx; (void) gguf_path; (void) voice_bin_path; (void) style_dim;
+    eliza_set_error(out_error,
+        "[libelizainference] kokoro not built (ELIZA_ENABLE_KOKORO off)");
+    return ELIZA_ERR_NOT_IMPLEMENTED;
+#endif
+}
+
+int eliza_inference_kokoro_synthesize(
+    EliInferenceContext * ctx,
+    const char * text,
+    size_t text_len,
+    float speed,
+    float * out_pcm,
+    size_t max_samples,
+    char ** out_error) {
+#ifdef ELIZA_ENABLE_KOKORO
+    if (!ctx || !text || !out_pcm) {
+        eliza_set_error(out_error, "[libelizainference] kokoro_synthesize: null argument");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::mutex> lock(ctx->kokoro_mutex);
+    if (!ctx->kokoro_loaded || !ctx->kokoro_model) {
+        eliza_set_error(out_error,
+            "[libelizainference] kokoro_synthesize: no model loaded (call kokoro_load first)");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    if (speed <= 0.0f) speed = 1.0f;
+    const std::string in(text, text_len ? text_len : std::strlen(text));
+    eliza_kokoro::kokoro_audio audio;
+    std::string err;
+    eliza_kokoro::kokoro_status st = eliza_kokoro::kokoro_synthesize(
+        ctx->kokoro_model.get(), ctx->kokoro_voice, in, speed, audio, err);
+    if (st != eliza_kokoro::KOKORO_OK) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] kokoro_synthesize failed: ") + err);
+        return ELIZA_ERR_FFI_FAULT;
+    }
+    if (audio.samples.size() > max_samples) {
+        eliza_set_error(out_error,
+            "[libelizainference] kokoro_synthesize: out_pcm too small; required samples=" +
+            std::to_string(audio.samples.size()));
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    std::memcpy(out_pcm, audio.samples.data(), audio.samples.size() * sizeof(float));
+    return (int) audio.samples.size();
+#else
+    (void) ctx; (void) text; (void) text_len; (void) speed;
+    (void) out_pcm; (void) max_samples;
+    eliza_set_error(out_error,
+        "[libelizainference] kokoro not built (ELIZA_ENABLE_KOKORO off)");
+    return ELIZA_ERR_NOT_IMPLEMENTED;
+#endif
+}
+
+int eliza_inference_kokoro_sample_rate(EliInferenceContext * ctx) {
+#ifdef ELIZA_ENABLE_KOKORO
+    if (!ctx) return ELIZA_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lock(ctx->kokoro_mutex);
+    if (!ctx->kokoro_loaded || !ctx->kokoro_model) return ELIZA_ERR_INVALID_ARG;
+    return eliza_kokoro::kokoro_sample_rate(ctx->kokoro_model.get());
+#else
+    (void) ctx;
+    return ELIZA_ERR_NOT_IMPLEMENTED;
+#endif
 }
 
 int eliza_inference_mmap_acquire(
