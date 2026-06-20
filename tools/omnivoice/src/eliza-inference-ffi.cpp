@@ -124,6 +124,16 @@ struct EliInferenceContext {
     llama_context * embed_ctx = nullptr;
     int embed_pooling = -1;   /* the pooling type embed_ctx was built with */
     int embed_n_ctx = 0;      /* the ctx size embed_ctx was built with */
+    /* Dedicated CAUSAL scoring context over the shared text model (ABI v11).
+     * Lazily created on the first eliza_inference_llm_eot_score call. EOT
+     * scoring needs the causal next-token logit distribution at the final
+     * position (the fused replacement for the retired node-llama-cpp
+     * controlledEvaluate() the EOT classifiers used) — distinct from embed_ctx
+     * (non-causal + pooled, exposes no per-token logits) and from the
+     * per-session streaming-LLM KV. KV is cleared per call so each score is
+     * independent. Protected by llm_mutex. */
+    llama_context * eot_ctx = nullptr;
+    int eot_n_ctx = 0;        /* the ctx size eot_ctx was built with */
     /* mmproj vision context over the shared text model (ABI v9), keyed by the
      * mmproj path it was initialized from. Lazily created on the first
      * eliza_inference_describe_image call per mmproj_path and reused.
@@ -1518,6 +1528,10 @@ void eliza_inference_destroy(EliInferenceContext * ctx) {
         if (ctx->embed_ctx) {
             llama_free(ctx->embed_ctx);
             ctx->embed_ctx = nullptr;
+        }
+        if (ctx->eot_ctx) {
+            llama_free(ctx->eot_ctx);
+            ctx->eot_ctx = nullptr;
         }
         if (ctx->llm_model) {
             llama_model_free(ctx->llm_model);
@@ -3178,6 +3192,151 @@ int eliza_inference_embed(
     }
     std::memcpy(out_embedding, emb, (size_t) n_embd * sizeof(float));
     eliza_l2_normalize(out_embedding, n_embd);
+    return ELIZA_OK;
+}
+
+/* ---- End-of-turn scoring (ABI v11) -------------------------------- *
+ *
+ * Single causal forward pass over a pre-tokenized context, returning the
+ * next-token softmax probability of `target_token_id` (the chat template's
+ * end-of-turn marker, e.g. <|im_end|>). This is the fused replacement for the
+ * retired node-llama-cpp `controlledEvaluate()` the EOT classifiers depended
+ * on: the JS side formats the partial ASR transcript as a user turn, tokenizes
+ * it via eliza_inference_tokenize, and reads back P(end-of-turn). Runs on a
+ * DEDICATED causal context (logits at the final position), lazily created and
+ * reused, KV cleared per call so scores are independent. Does not touch the
+ * streaming-LLM generation context or the embedding context.
+ */
+
+int eliza_inference_llm_eot_supported(void) {
+    return 1;
+}
+
+/* Build (or reuse) the dedicated causal scoring context. Caller must hold
+ * ctx->llm_mutex and have a resident ctx->llm_model. Causal layout (no
+ * embeddings, no pooling) so the next-token logit distribution at the final
+ * position is readable via llama_get_logits_ith. */
+static int eliza_ensure_eot_ctx_locked(
+    EliInferenceContext * ctx,
+    char ** out_error) {
+    if (ctx->eot_ctx) return ELIZA_OK;
+
+    const int n_ctx_train = llama_model_n_ctx_train(ctx->llm_model);
+    int n_ctx = eliza_int_env_or_default("ELIZA_EOT_N_CTX", 512);
+    if (n_ctx_train > 0 && n_ctx > n_ctx_train) n_ctx = n_ctx_train;
+
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx = (uint32_t) n_ctx;
+    cparams.n_batch = (uint32_t) n_ctx;
+    cparams.n_ubatch = (uint32_t) n_ctx;
+    cparams.n_threads = eliza_thread_count(false);
+    cparams.n_threads_batch = eliza_thread_count(true);
+    cparams.embeddings = false; /* causal generation layout, per-token logits */
+
+    llama_context * lctx = llama_init_from_model(ctx->llm_model, cparams);
+    if (!lctx) {
+        eliza_set_error(out_error,
+            "[libelizainference] eot: failed to init scoring context");
+        return ELIZA_ERR_FFI_FAULT;
+    }
+    ctx->eot_ctx = lctx;
+    ctx->eot_n_ctx = n_ctx;
+    return ELIZA_OK;
+}
+
+int eliza_inference_llm_eot_score(
+    EliInferenceContext * ctx,
+    const int32_t * token_ids,
+    size_t num_tokens,
+    int32_t target_token_id,
+    float * out_target_prob,
+    int32_t * out_top_token,
+    float * out_top_prob,
+    char ** out_error) {
+    if (out_target_prob) *out_target_prob = 0.0f;
+    if (out_top_token) *out_top_token = -1;
+    if (out_top_prob) *out_top_prob = 0.0f;
+
+    if (!ctx || !token_ids || num_tokens == 0 || !out_target_prob) {
+        eliza_set_error(out_error,
+            "[libelizainference] eot: invalid arguments");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx->llm_mutex);
+    int rc = eliza_load_llm_model_locked(ctx, /* n_gpu_layers= */ -1, out_error);
+    if (rc != ELIZA_OK) return rc;
+    rc = eliza_ensure_eot_ctx_locked(ctx, out_error);
+    if (rc != ELIZA_OK) return rc;
+
+    const llama_vocab * vocab = llama_model_get_vocab(ctx->llm_model);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    if (target_token_id < 0 || target_token_id >= n_vocab) {
+        eliza_set_error(out_error,
+            "[libelizainference] eot: target_token_id " +
+            std::to_string(target_token_id) + " out of range [0," +
+            std::to_string(n_vocab) + ")");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+
+    /* Keep the TAIL when the context overflows the scoring ctx — the most
+     * recent tokens drive the turn-completion decision. */
+    size_t n_tok = num_tokens;
+    const int32_t * toks = token_ids;
+    if (n_tok > (size_t) ctx->eot_n_ctx) {
+        toks = token_ids + (n_tok - (size_t) ctx->eot_n_ctx);
+        n_tok = (size_t) ctx->eot_n_ctx;
+    }
+
+    /* Fresh KV per call so a previous score can't bleed into this one. */
+    llama_memory_clear(llama_get_memory(ctx->eot_ctx), true);
+    llama_set_embeddings(ctx->eot_ctx, false);
+
+    std::vector<llama_token> tokens(toks, toks + n_tok);
+    llama_batch batch = llama_batch_get_one(tokens.data(), (int32_t) n_tok);
+    const int decode_rc = llama_decode(ctx->eot_ctx, batch);
+    if (decode_rc != 0) {
+        eliza_set_error(out_error,
+            "[libelizainference] eot: llama_decode rc=" +
+            std::to_string(decode_rc));
+        return ELIZA_ERR_FFI_FAULT;
+    }
+
+    /* Next-token logits at the final position (llama_batch_get_one enables
+     * logits on the last token). Softmax in a numerically-stable pass: read the
+     * argmax and the target probability. */
+    const float * logits = llama_get_logits_ith(ctx->eot_ctx, -1);
+    if (!logits) {
+        eliza_set_error(out_error,
+            "[libelizainference] eot: llama_get_logits_ith returned NULL");
+        return ELIZA_ERR_FFI_FAULT;
+    }
+
+    float max_logit = logits[0];
+    int32_t top_token = 0;
+    for (int i = 1; i < n_vocab; ++i) {
+        if (logits[i] > max_logit) {
+            max_logit = logits[i];
+            top_token = i;
+        }
+    }
+    double sum_exp = 0.0;
+    for (int i = 0; i < n_vocab; ++i) {
+        sum_exp += std::exp((double) (logits[i] - max_logit));
+    }
+    if (sum_exp <= 0.0) {
+        eliza_set_error(out_error,
+            "[libelizainference] eot: degenerate logit distribution");
+        return ELIZA_ERR_FFI_FAULT;
+    }
+    const double target_p =
+        std::exp((double) (logits[target_token_id] - max_logit)) / sum_exp;
+    /* The argmax carries the max logit, so its unnormalized weight is exp(0)=1. */
+    const double top_p = 1.0 / sum_exp;
+
+    *out_target_prob = (float) target_p;
+    if (out_top_token) *out_top_token = top_token;
+    if (out_top_prob) *out_top_prob = (float) top_p;
     return ELIZA_OK;
 }
 

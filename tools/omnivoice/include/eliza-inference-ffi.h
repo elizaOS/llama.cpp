@@ -131,6 +131,15 @@ extern "C" {
  * load and refuses to bind if they disagree.
  *
  * Changelog:
+ *   v11: end-of-turn scoring folded in-process. `eliza_inference_llm_eot_supported()`
+ *        + `_llm_eot_score` run a single causal forward pass over a tokenized
+ *        partial transcript and read the next-token probability of the
+ *        end-of-turn marker (e.g. <|im_end|>), replacing the retired
+ *        node-llama-cpp `controlledEvaluate()` the EOT classifiers needed. The
+ *        model-based EOT detector now runs through the fused lib instead of a
+ *        JS-only heuristic. Additive symbols — a v10 caller is unaffected; a
+ *        v10 library reports `llm_eot_supported() == 0` and the loader keeps
+ *        the heuristic classifier.
  *   v10: Kokoro-82M TTS folded in-process. `eliza_inference_kokoro_supported()`
  *        + `_load` + `_synthesize` + `_sample_rate` link kokoro_lib (its own
  *        GGUF reader + iSTFT decoder) into the fused handle so the mobile
@@ -177,9 +186,9 @@ extern "C" {
  *   v7: real Silero VAD (same symbol surface as v6).
  *   v6: fused wake-word, speaker, diarizer.
  */
-#define ELIZA_INFERENCE_ABI_VERSION 10
+#define ELIZA_INFERENCE_ABI_VERSION 11
 
-/* Returns a static, NUL-terminated string of the form "10" matching
+/* Returns a static, NUL-terminated string of the form "11" matching
  * ELIZA_INFERENCE_ABI_VERSION at the time the library was built. The
  * pointer is owned by the library — do NOT free. */
 const char * eliza_inference_abi_version(void);
@@ -930,6 +939,41 @@ int eliza_inference_embed(
     float * out_embedding,
     size_t out_capacity,
     int * out_dim,
+    char ** out_error);
+
+/* ---- End-of-turn scoring (ABI v11, additive) --------------------- *
+ *
+ * Score whether the user has finished their turn by reading the next-token
+ * probability of the chat template's end-of-turn marker (e.g. <|im_end|>)
+ * after a partial ASR transcript. This is the fused replacement for the
+ * retired node-llama-cpp `controlledEvaluate()` path the EOT classifiers used:
+ * the JS side formats the partial transcript as a user turn, tokenizes it via
+ * `eliza_inference_tokenize`, looks up the end-of-turn token id, and reads back
+ * P(end-of-turn). Runs on a dedicated CAUSAL context over the resident text
+ * model (logits at the final position), lazily created and reused, KV cleared
+ * per call so each score is independent. A v10 library does not export these
+ * symbols, so absence == unsupported and the loader keeps the heuristic EOT
+ * classifier.
+ */
+
+/* Capability probe: 1 when this build wires the real EOT scoring path. */
+int eliza_inference_llm_eot_supported(void);
+
+/* Single causal forward pass over `token_ids` (`num_tokens` int32s the library
+ * copies). Writes the next-token softmax probability of `target_token_id` into
+ * `*out_target_prob`. Optionally also writes the argmax next-token id into
+ * `*out_top_token` and its probability into `*out_top_prob` (pass NULL to skip
+ * either). The context is truncated to its scoring window from the TAIL when it
+ * overflows. Returns ELIZA_OK or a negative ELIZA_* code with `*out_error`
+ * populated. */
+int eliza_inference_llm_eot_score(
+    EliInferenceContext * ctx,
+    const int32_t * token_ids,
+    size_t num_tokens,
+    int32_t target_token_id,
+    float * out_target_prob,
+    int32_t * out_top_token,
+    float * out_top_prob,
     char ** out_error);
 
 /* ---- mmproj vision describe (ABI v9, additive) -------------------- *
