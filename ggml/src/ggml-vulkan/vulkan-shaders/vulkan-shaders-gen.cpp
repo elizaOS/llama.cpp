@@ -334,7 +334,15 @@ compile_count_guard acquire_compile_slot() {
 }
 
 void string_to_spv_func(std::string name, std::string in_path, std::string out_path, std::map<std::string, std::string> defines, bool coopmat, bool dep_file, compile_count_guard slot) {
-    std::string target_env = (name.find("_cm2") != std::string::npos) ? "--target-env=vulkan1.3" : "--target-env=vulkan1.2";
+    // get_rel_pos's f16 variant requires Vulkan 1.3 features (it fails to
+    // compile under the default vulkan1.2 target-env, leaving its _data/_len
+    // symbols undefined at link). Modern mobile GPUs (Mali-G715 / Adreno 7xx)
+    // support 1.3, so bump just that shader rather than the whole set.
+    std::string target_env =
+        (name.find("_cm2") != std::string::npos ||
+         name.find("get_rel_pos") != std::string::npos)
+            ? "--target-env=vulkan1.3"
+            : "--target-env=vulkan1.2";
 
     #ifdef _WIN32
         std::vector<std::string> cmd = {GLSLC, "-fshader-stage=compute", target_env, "\"" + in_path + "\"", "-o", "\"" + out_path + "\""};
@@ -345,7 +353,12 @@ void string_to_spv_func(std::string name, std::string in_path, std::string out_p
     // disable spirv-opt for coopmat shaders for https://github.com/ggml-org/llama.cpp/issues/10734
     // disable spirv-opt for bf16 shaders for https://github.com/ggml-org/llama.cpp/issues/15344
     // disable spirv-opt for rope shaders for https://github.com/ggml-org/llama.cpp/issues/16860
-    if (!coopmat && name.find("bf16") == std::string::npos && name.find("rope") == std::string::npos) {
+    // disable spirv-opt for get_rel_pos: its f16 variant emits a redundant
+    // half->half OpFConvert that spirv-opt rejects ("Expected input to have
+    // different bit width from Result Type"). It compiles fine unoptimized.
+    if (!coopmat && name.find("bf16") == std::string::npos &&
+        name.find("rope") == std::string::npos &&
+        name.find("get_rel_pos") == std::string::npos) {
         cmd.push_back("-O");
     }
 
