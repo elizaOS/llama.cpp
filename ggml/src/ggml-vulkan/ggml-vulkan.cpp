@@ -7017,6 +7017,34 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     GGML_ASSERT(wg0 <= ctx->device->properties.limits.maxComputeWorkGroupCount[0] &&
                 wg1 <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
                 wg2 <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
+    if (ctx->descriptor_set_idx >= ctx->descriptor_sets.size()) {
+        // Grow-on-demand safety net for the lazy single-pass descriptor model.
+        // The pool is sized eagerly as each op calls
+        // ggml_pipeline_request_descriptor_sets and consumed one set per
+        // dispatch; the invariant holds only if every op requests exactly as
+        // many sets as it dispatches. The OmniVoice MaskGIT batched-LM graph
+        // (fused rms_norm_mul_rope / swiglu / aligned-matmul / cont pipelines)
+        // accumulates a net under-request, so descriptor_set_idx can reach
+        // descriptor_sets.size() mid-graph and the assert below would abort
+        // (device-confirmed on Mali-G715: GPU OmniVoice synth crashed here and
+        // completes correctly once the pool grows). Force requirements above the
+        // current index so the allocator actually grows (its size>=requirements
+        // early-return no longer triggers) and the graph completes with a valid,
+        // unused set at [idx]. The re-request is a pure host-side pool allocate
+        // (the pipeline is already compiled here, so no shader recompile /
+        // re-entrancy), idempotent, and self-limiting (<=1 new set per overrun).
+        // Set ELIZA_VK_DESC_DIAG=1 to name the overrun pipeline.
+        static const bool desc_diag = getenv("ELIZA_VK_DESC_DIAG") != nullptr;
+        if (desc_diag) {
+            fprintf(stderr, "[eliza-vk-desc] descriptor overrun: pipeline=%s idx=%u size=%zu req=%u — growing\n",
+                    pipeline->name.c_str(), ctx->descriptor_set_idx,
+                    (size_t) ctx->descriptor_sets.size(), ctx->pipeline_descriptor_set_requirements);
+        }
+        const uint32_t need = ctx->descriptor_set_idx + 1;
+        if (ctx->pipeline_descriptor_set_requirements < need) {
+            ggml_pipeline_request_descriptor_sets(ctx, pipeline, need - ctx->pipeline_descriptor_set_requirements);
+        }
+    }
     GGML_ASSERT(ctx->descriptor_set_idx < ctx->descriptor_sets.size());
     GGML_ASSERT(descriptor_buffer_infos.size() <= MAX_PARAMETER_COUNT);
     GGML_ASSERT(pipeline->parameter_count == descriptor_buffer_infos.size());
