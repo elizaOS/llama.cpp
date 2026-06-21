@@ -19,6 +19,17 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+// ABI guard: the TS loader (ffi-llm-streaming-abi.ts) marshals
+// eliza_llm_stream_config_t by hand-written field offsets, so any reorder /
+// insert / type change on the C side silently corrupts every streaming-LLM
+// call. Pin the on-the-wire layout (documented "sizeof config = 80" since v8):
+// 6×int32 + 5×ptr + 4-byte fields packed to 80 bytes on a 64-bit ABI. Adding a
+// field is an ABI bump — update this assert AND the TS marshaller together.
+static_assert(
+    sizeof(eliza_llm_stream_config_t) == 80,
+    "eliza_llm_stream_config_t layout changed — bump ABI + update the TS "
+    "marshaller in ffi-llm-streaming-abi.ts, then update this assert.");
+
 /* common/ — the same-file MTP speculative-decode engine wired into the
  * streaming-LLM text path (ABI v8) reuses the DRAFT_MTP implementation in
  * common/speculative.cpp, the host sampler in common/sampling.cpp, and the
@@ -572,17 +583,17 @@ static bool eliza_running_on_android() {
 #endif
 }
 
-// Flash-attention selection for the text-LLM context. The Vulkan/Mali
-// flash-attention kernel corrupts attention output once the prefilled sequence
-// grows past a few hundred tokens: long prompts (~2k+ tokens) decode into
-// degenerate token repetition (" His!!!!"), while short prompts stay clean. The
-// ASR path already force-disables FA on the Android profile for the same class
-// of kernel issue (see eliza_asr_android_cpu_profile); the text-LLM path was
-// left on AUTO and inherited the corruption. Default OFF on Android, with an
-// override for bisecting and for non-Mali Android GPUs that handle FA correctly:
+// Flash-attention selection for the text-LLM context. Flash-attn is ENABLED on
+// all platforms (AUTO). The earlier Mali corruption — long prompts (~few-hundred+
+// tokens) decoding into degenerate token repetition (" His!!!!") while short
+// prompts stayed clean — was the Vulkan split-K FA reduce on ARM Mali, now fixed
+// in ggml-vulkan by forcing single-chunk FA on that vendor (the VK_VENDOR_ID_ARM
+// split_k gate in ggml_vk_flash_attn). FA itself is correct, so we keep it on
+// (fused attention is far faster than the non-FA path for long prefills). The
+// override remains for bisecting / pinning a setting per device:
 //   ELIZA_LLM_FLASH_ATTN = off|0|false|disabled -> DISABLED
 //                        = on|1|true|enabled     -> ENABLED
-//                        = auto                   -> AUTO (llama.cpp decides)
+//                        = auto (default)         -> AUTO (llama.cpp decides)
 static enum llama_flash_attn_type eliza_llm_flash_attn_type() {
     if (const char * env = std::getenv("ELIZA_LLM_FLASH_ATTN")) {
         std::string v = env;
@@ -592,12 +603,8 @@ static enum llama_flash_attn_type eliza_llm_flash_attn_type() {
             return LLAMA_FLASH_ATTN_TYPE_DISABLED;
         if (v == "on" || v == "1" || v == "true" || v == "yes" || v == "enabled")
             return LLAMA_FLASH_ATTN_TYPE_ENABLED;
-        if (v == "auto")
-            return LLAMA_FLASH_ATTN_TYPE_AUTO;
     }
-    return eliza_running_on_android()
-        ? LLAMA_FLASH_ATTN_TYPE_DISABLED
-        : LLAMA_FLASH_ATTN_TYPE_AUTO;
+    return LLAMA_FLASH_ATTN_TYPE_AUTO;
 }
 
 static bool eliza_asr_android_cpu_profile() {

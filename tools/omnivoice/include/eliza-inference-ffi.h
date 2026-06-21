@@ -1,5 +1,8 @@
 /*
- * libelizainference FFI ABI v7.
+ * libelizainference FFI ABI v12.
+ *
+ * (Banner tracks ELIZA_INFERENCE_ABI_VERSION below; the per-version history is
+ * at the end of this header preamble, newest first.)
  *
  * Single source of truth for the C-callable surface that the fused
  * omnivoice + llama.cpp build (`libelizainference.{dylib,so,dll}`)
