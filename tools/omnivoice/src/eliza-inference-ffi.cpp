@@ -603,8 +603,22 @@ static enum llama_flash_attn_type eliza_llm_flash_attn_type() {
             return LLAMA_FLASH_ATTN_TYPE_DISABLED;
         if (v == "on" || v == "1" || v == "true" || v == "yes" || v == "enabled")
             return LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        if (v == "auto")
+            return LLAMA_FLASH_ATTN_TYPE_AUTO;
     }
-    return LLAMA_FLASH_ATTN_TYPE_AUTO;
+    // FA is DISABLED on Android. The Vulkan FA scalar kernel (flash_attn.comp) is
+    // intermittently NON-DETERMINISTIC on Mali (~50-67% " His!!!!" under greedy
+    // decode, device-verified) — a race in the kernel CORE that the ARM mitigations
+    // (split_k=1 + disable_subgroups in ggml_vk_flash_attn / get_fa_tuning_params_scalar)
+    // reduce the surface of but do NOT eliminate: it is NOT split-K and NOT the
+    // subgroup reduction. FA-off is perf-NEUTRAL on Mali anyway (no cooperative-matrix
+    // support → FA runs the scalar path at the same speed as the non-FA mul_mat path)
+    // and is reliably correct (verified 6/6). The real on-device attention
+    // optimization is the fused QJL/Polar kernel (elizaOS/eliza#8848), which bypasses
+    // flash_attn.comp entirely. Override per-device with ELIZA_LLM_FLASH_ATTN=on.
+    return eliza_running_on_android()
+        ? LLAMA_FLASH_ATTN_TYPE_DISABLED
+        : LLAMA_FLASH_ATTN_TYPE_AUTO;
 }
 
 static bool eliza_asr_android_cpu_profile() {

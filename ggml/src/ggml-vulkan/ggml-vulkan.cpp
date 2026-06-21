@@ -3028,6 +3028,18 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
         // Disable subgroup use due to performance issues when enforcing subgroup sizes
         result.subgroup_size = 32;
         result.disable_subgroups = true;
+    } else if (device->vendor_id == VK_VENDOR_ID_ARM) {
+        // ARM Mali (Valhall / Mali-G7xx) does not reliably honor the required
+        // subgroup size for the FA shader's subgroupShuffleXor reductions: the
+        // actual runtime subgroup size diverges from the SubGroupSize spec
+        // constant, so the reduction reads the wrong lanes and produces
+        // NON-DETERMINISTIC output (~50% intermittent " His!!!!" degeneration
+        // under greedy decode, device-verified on Mali-G715). Route the m/l/O
+        // reduction to the deterministic shared-memory path (SubGroupSize spec
+        // = 0, require_full_subgroups=false, required_subgroup_size=0), exactly
+        // like the Intel mitigation above. Override with GGML_VK_FA_ALLOW_SUBGROUPS.
+        result.subgroup_size = device->subgroup_size;
+        result.disable_subgroups = (getenv("GGML_VK_FA_ALLOW_SUBGROUPS") == nullptr);
     } else if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture != AMD_GCN) {
         result.subgroup_size = n_rows < 4 ? 32 : device->subgroup_size;
     } else {
