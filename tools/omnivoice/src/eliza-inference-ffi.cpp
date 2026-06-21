@@ -413,12 +413,29 @@ static std::string eliza_lower_ascii(std::string value) {
     return value;
 }
 
+// Kokoro ships its own GGUF under tts/kokoro/ and is loaded through the
+// dedicated eliza_inference_kokoro_load path with an explicit file argument.
+// eliza_find_ggufs recurses, so without this filter the OmniVoice picker below
+// would pull tts/kokoro/kokoro-*.gguf into its candidate list and (sorting
+// before "omnivoice-*") mis-select it as the OmniVoice LM — ov_init then aborts
+// with "tensor 'llm.embed_tokens.weight' not found" on every tier that bundles
+// both backends (0_8b/2b/4b/9b). Drop any candidate under a kokoro/ subdir.
+static void eliza_drop_kokoro_ggufs(std::vector<std::string> & ggufs) {
+    ggufs.erase(
+        std::remove_if(ggufs.begin(), ggufs.end(), [](const std::string & p) {
+            return p.find("/kokoro/") != std::string::npos;
+        }),
+        ggufs.end());
+}
+
 static bool eliza_pick_voice_files(
     const std::filesystem::path & bundle_dir,
     std::string & tts_model,
     std::string & codec_model) {
     std::vector<std::string> tts = eliza_find_ggufs(bundle_dir / "tts");
     std::vector<std::string> codec = eliza_find_ggufs(bundle_dir / "codec");
+    eliza_drop_kokoro_ggufs(tts);
+    eliza_drop_kokoro_ggufs(codec);
     if (tts.empty()) tts = eliza_find_ggufs(bundle_dir / "voice");
     if (tts.empty()) return false;
     tts_model = tts[0];
