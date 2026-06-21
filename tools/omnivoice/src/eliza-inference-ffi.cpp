@@ -599,14 +599,22 @@ static int eliza_asr_batch_size() {
     return eliza_int_env_or_default("ELIZA_ASR_N_BATCH", eliza_asr_android_cpu_profile() ? 64 : 512);
 }
 
-// OmniVoice TTS backend selection. The MaskGIT batched LM forward
-// (pipeline_tts_llm_forward_batched) over-runs the ggml-vulkan descriptor-set
-// pool on the Android Mali Vulkan driver — ggml-vulkan.cpp:7020
-// GGML_ASSERT(descriptor_set_idx < descriptor_sets.size()) aborts mid-synthesis.
-// The model is correct on CPU (device-verified: 45120 samples / 1.88 s for a
-// short phrase). Until the Vulkan MaskGIT descriptor accounting is fixed,
-// default TTS to CPU on Android, mirroring the ASR Android-CPU profile. Desktop
-// keeps GPU (no crash evidence there). Override with ELIZA_TTS_USE_GPU=1.
+// OmniVoice TTS backend selection. Default CPU on Android, GPU elsewhere
+// (mirrors the ASR Android-CPU profile); override with ELIZA_TTS_USE_GPU=1.
+//
+// History: the MaskGIT batched LM forward (pipeline_tts_llm_forward_batched)
+// used to abort the Android Mali Vulkan driver — its fused pipelines net
+// under-request ggml-vulkan descriptor sets and tripped
+// GGML_ASSERT(descriptor_set_idx < descriptor_sets.size()) mid-synthesis. That
+// crash is now handled by the grow-on-demand safety net in
+// ggml_vk_dispatch_pipeline, so GPU TTS runs correctly (device-verified: 45120
+// samples / 1.88 s, identical to CPU). CPU remains the Android DEFAULT for two
+// reasons, neither of which is the old crash: (1) the iterative MaskGIT denoise
+// uses small matrices where Mali GPU dispatch overhead cancels any speedup (GPU
+// is not faster than CPU here on a Pixel 9a); (2) in the fused voice pipeline
+// the text LM already runs on the GPU, so keeping TTS on the CPU lets the two
+// run on separate compute units concurrently instead of contending for the GPU.
+// Desktop/discrete-GPU keeps GPU TTS (where it can actually win).
 static bool eliza_tts_use_gpu() {
     if (eliza_running_on_android()) {
         return eliza_bool_env_or_default("ELIZA_TTS_USE_GPU", false);
