@@ -115,6 +115,7 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 #define VK_VENDOR_ID_NVIDIA 0x10de
 #define VK_VENDOR_ID_QUALCOMM 0x5143
 #define VK_VENDOR_ID_IMAGINATION 0x1010
+#define VK_VENDOR_ID_ARM 0x13b5
 
 #define VK_DEVICE_DESCRIPTOR_POOL_SIZE 256
 
@@ -9672,6 +9673,18 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         if (total_wgs_no_split < shader_core_count * 2) {
             split_k = shader_core_count * 2 / total_wgs_no_split;
         }
+    }
+
+    // ARM Mali: the split-K flash-attention reduce corrupts output on long KV.
+    // With split_k>1 the KV is split into chunks that each run the FA shader and
+    // are combined by flash_attn_split_k_reduce; on Mali that combine produces
+    // degenerate token repetition once a prompt grows past a few hundred tokens
+    // (short prompts never split, so they were clean). Keep flash-attn ENABLED
+    // but single-chunk on this vendor until the reduce path is fixed for Mali.
+    // Overridable for bisecting / once the reduce is fixed.
+    if (ctx->device->vendor_id == VK_VENDOR_ID_ARM &&
+        getenv("GGML_VK_FA_ALLOW_SPLIT_K") == nullptr) {
+        split_k = 1;
     }
 
     if (split_k > 1) {
