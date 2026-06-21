@@ -131,6 +131,20 @@ extern "C" {
  * load and refuses to bind if they disagree.
  *
  * Changelog:
+ *   v12: ASR word timestamps folded into the fused ASR.
+ *        `eliza_inference_asr_timestamps_supported()` + `_asr_transcribe_timed`
+ *        run the SAME audio-in/text-out decode as `_asr_transcribe` and
+ *        additionally return per-word [start_ms, end_ms) spans. Qwen3-ASR is
+ *        autoregressive (no acoustic frame alignment, and this build's
+ *        flash-attention fuses the QK-softmax so cross-attention is not
+ *        materialized), so the timing is the honest single-model signal:
+ *        duration-proportional, character-weighted, monotonic over the cleaned
+ *        transcript words, anchored on the exactly-known total audio duration
+ *        (T_ms = 1000 * n_samples / sample_rate_hz). Single pipe — every
+ *        platform that loads the fused lib gets word-synced transcripts.
+ *        Additive symbols — a v11 caller is unaffected; a v11 library reports
+ *        `asr_timestamps_supported() == 0` and the loader falls back to the
+ *        text-only `_asr_transcribe`.
  *   v11: end-of-turn scoring folded in-process. `eliza_inference_llm_eot_supported()`
  *        + `_llm_eot_score` run a single causal forward pass over a tokenized
  *        partial transcript and read the next-token probability of the
@@ -186,9 +200,9 @@ extern "C" {
  *   v7: real Silero VAD (same symbol surface as v6).
  *   v6: fused wake-word, speaker, diarizer.
  */
-#define ELIZA_INFERENCE_ABI_VERSION 11
+#define ELIZA_INFERENCE_ABI_VERSION 12
 
-/* Returns a static, NUL-terminated string of the form "11" matching
+/* Returns a static, NUL-terminated string of the form "12" matching
  * ELIZA_INFERENCE_ABI_VERSION at the time the library was built. The
  * pointer is owned by the library — do NOT free. */
 const char * eliza_inference_abi_version(void);
@@ -669,6 +683,37 @@ int eliza_inference_asr_transcribe(
     size_t max_text_bytes,
     char ** out_error);
 
+/* ---- ASR word timestamps (ABI v12) -------------------------------- */
+
+/* Capability probe: returns 1 when this build can emit per-word timestamps
+ * from `eliza_inference_asr_transcribe_timed`, 0 otherwise. A v11 library
+ * lacks the symbol entirely (loader treats absent == unsupported). */
+int eliza_inference_asr_timestamps_supported(void);
+
+/* Transcribe like `eliza_inference_asr_transcribe` AND return per-word timing.
+ * `out_text` receives the same UTF-8 NUL-terminated transcript. The caller
+ * provides `out_word_start_ms` / `out_word_end_ms` as int arrays each of
+ * capacity `*io_n_words`; the library writes one [start_ms, end_ms) pair per
+ * whitespace-delimited word of the transcript (in order), and updates
+ * `*io_n_words` to the count actually written. The word boundaries match a
+ * plain whitespace split of `out_text`, so the caller zips the two. Timing is
+ * duration-proportional + character-weighted + monotonic over the words,
+ * anchored on the exact input duration (see the v12 changelog).
+ *
+ * Returns the number of transcript bytes written (excluding the terminator)
+ * on success, or a negative ELIZA_* code on failure. */
+int eliza_inference_asr_transcribe_timed(
+    EliInferenceContext * ctx,
+    const float * pcm,
+    size_t n_samples,
+    int sample_rate_hz,
+    char * out_text,
+    size_t max_text_bytes,
+    int * out_word_start_ms,
+    int * out_word_end_ms,
+    size_t * io_n_words,
+    char ** out_error);
+
 /* ---- Streaming ASR (ABI v2) --------------------------------------- *
  *
  * A streaming ASR session: feed PCM frames as they arrive (post-VAD-gate)
@@ -877,6 +922,13 @@ int eliza_inference_llm_stream_restore_slot(
     EliLlmStream * stream,
     const char * filename,
     char ** out_error);
+
+/* Reset a streaming-LLM session for reuse: clears the KV cache, resets the
+ * sampler + counters so the next prefill starts a fresh prompt on the SAME
+ * llama_context. Lets a caller keep one warm context alive across turns instead
+ * of open/close per turn (faster, and avoids the shared-GPU-weights lctx-churn
+ * corruption). Non-MTP streams only; returns ELIZA_ERR_INVALID_ARG otherwise. */
+int eliza_inference_llm_stream_reset(EliLlmStream * stream);
 
 /* Close + free a streaming-LLM session. Idempotent on NULL. */
 void eliza_inference_llm_stream_close(EliLlmStream * stream);

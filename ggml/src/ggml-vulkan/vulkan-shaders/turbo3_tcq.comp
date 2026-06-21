@@ -1,5 +1,5 @@
 // ELIZA-VK-DISPATCH-PATCH-V1 — staged from packages/inference/vulkan/turbo3_tcq.comp by
-// build-llama-cpp-dflash.mjs. Frozen — do not edit in fork.
+// build-llama-cpp-mtp.mjs. Frozen — do not edit in fork.
 // Hardware-verified on Intel ARL (Mesa 25.2.8) + lavapipe (Mesa 25.2.8 LLVMpipe)
 // — 8/8 PASS for the 8-token fixture (see packages/inference/README.md
 // "Verification matrix" and reports/porting/2026-05-09-w4/vulkan-turbo-fix.md).

@@ -1,5 +1,5 @@
 // ELIZA-VK-DISPATCH-PATCH-V1 — staged from packages/inference/vulkan/polar.comp by
-// build-llama-cpp-dflash.mjs. Frozen — do not edit in fork.
+// build-llama-cpp-mtp.mjs. Frozen — do not edit in fork.
 // COMPILE-VERIFIED on macOS (glslc 2026.2, target Vulkan 1.1 / SPIR-V 1.3).
 // Wave-4-B parity port: the in-place Hadamard butterfly is now executed by
 // 32 threads cooperatively (mirrors metal/polar.metal). The (1/QK_POLAR)

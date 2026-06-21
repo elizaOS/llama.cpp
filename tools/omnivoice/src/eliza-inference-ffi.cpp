@@ -1781,20 +1781,20 @@ int eliza_inference_tts_synthesize(
     return written;
 }
 
-int eliza_inference_asr_transcribe(
+/* Shared ASR decode core. Takes the asr_mutex, runs the audio-in/text-out
+ * decode, and yields the cleaned transcript. Both eliza_inference_asr_transcribe
+ * and eliza_inference_asr_transcribe_timed call this so the decode lives in
+ * exactly one place. Returns 0 on success or a negative ELIZA_* code. */
+static int eliza_asr_decode_core(
     EliInferenceContext * ctx,
     const float * pcm,
     size_t n_samples,
     int sample_rate_hz,
-    char * out_text,
     size_t max_text_bytes,
+    std::string & out_transcript,
     char ** out_error) {
-    if (!ctx || !pcm || !out_text || max_text_bytes == 0 || sample_rate_hz <= 0) {
-        eliza_set_error(out_error, "[libelizainference] asr_transcribe: invalid arguments");
-        return ELIZA_ERR_INVALID_ARG;
-    }
+    out_transcript.clear();
     if (n_samples == 0) {
-        out_text[0] = '\0';
         return 0;
     }
 
@@ -1897,16 +1897,107 @@ int eliza_inference_asr_transcribe(
             "[libelizainference] asr_transcribe: decode reached token cap before EOG; "
             "refusing to return a possibly truncated transcript");
         return ELIZA_ERR_FFI_FAULT;
-    } else {
-        transcript = eliza_clean_asr_transcript(transcript);
     }
+    out_transcript = eliza_clean_asr_transcript(transcript);
+    return 0;
+}
 
+int eliza_inference_asr_transcribe(
+    EliInferenceContext * ctx,
+    const float * pcm,
+    size_t n_samples,
+    int sample_rate_hz,
+    char * out_text,
+    size_t max_text_bytes,
+    char ** out_error) {
+    if (!ctx || !pcm || !out_text || max_text_bytes == 0 || sample_rate_hz <= 0) {
+        eliza_set_error(out_error, "[libelizainference] asr_transcribe: invalid arguments");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    std::string transcript;
+    int rc = eliza_asr_decode_core(ctx, pcm, n_samples, sample_rate_hz, max_text_bytes, transcript, out_error);
+    if (rc < 0) {
+        return rc;
+    }
     if (transcript.size() + 1 > max_text_bytes) {
         eliza_set_error(out_error, "[libelizainference] asr_transcribe: output buffer too small after transcript normalization");
         return ELIZA_ERR_INVALID_ARG;
     }
     std::memcpy(out_text, transcript.data(), transcript.size());
     out_text[transcript.size()] = '\0';
+    return (int) transcript.size();
+}
+
+int eliza_inference_asr_timestamps_supported(void) {
+    return 1;
+}
+
+int eliza_inference_asr_transcribe_timed(
+    EliInferenceContext * ctx,
+    const float * pcm,
+    size_t n_samples,
+    int sample_rate_hz,
+    char * out_text,
+    size_t max_text_bytes,
+    int * out_word_start_ms,
+    int * out_word_end_ms,
+    size_t * io_n_words,
+    char ** out_error) {
+    if (!ctx || !pcm || !out_text || max_text_bytes == 0 || sample_rate_hz <= 0 ||
+        !out_word_start_ms || !out_word_end_ms || !io_n_words) {
+        eliza_set_error(out_error, "[libelizainference] asr_transcribe_timed: invalid arguments");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    const size_t word_cap = *io_n_words;
+    *io_n_words = 0;
+
+    std::string transcript;
+    int rc = eliza_asr_decode_core(ctx, pcm, n_samples, sample_rate_hz, max_text_bytes, transcript, out_error);
+    if (rc < 0) {
+        return rc;
+    }
+    if (transcript.size() + 1 > max_text_bytes) {
+        eliza_set_error(out_error, "[libelizainference] asr_transcribe_timed: output buffer too small after transcript normalization");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    std::memcpy(out_text, transcript.data(), transcript.size());
+    out_text[transcript.size()] = '\0';
+
+    /* Per-word timing: duration-proportional, character-weighted, monotonic over
+     * the cleaned transcript words, anchored on the exact input duration. The
+     * honest single-model signal — Qwen3-ASR exposes no acoustic frame alignment
+     * and flash-attention fuses the cross-attention softmax (see the v12 ABI
+     * changelog). Word boundaries are a plain whitespace split, matching the
+     * caller's split of out_text. */
+    struct WordSpan { size_t begin; size_t end; };
+    std::vector<WordSpan> words;
+    {
+        const size_t n = transcript.size();
+        size_t i = 0;
+        while (i < n) {
+            while (i < n && std::isspace((unsigned char) transcript[i])) ++i;
+            if (i >= n) break;
+            const size_t begin = i;
+            while (i < n && !std::isspace((unsigned char) transcript[i])) ++i;
+            words.push_back(WordSpan{ begin, i });
+        }
+    }
+    size_t total_chars = 0;
+    for (const auto & w : words) total_chars += (w.end - w.begin);
+
+    const double t_ms = 1000.0 * (double) n_samples / (double) sample_rate_hz;
+    size_t written = 0;
+    size_t cum = 0;
+    for (size_t w = 0; w < words.size() && written < word_cap; ++w) {
+        const size_t wlen = words[w].end - words[w].begin;
+        const double start = total_chars > 0 ? t_ms * (double) cum / (double) total_chars : 0.0;
+        cum += wlen;
+        const double end = total_chars > 0 ? t_ms * (double) cum / (double) total_chars : t_ms;
+        out_word_start_ms[written] = (int) std::llround(start);
+        out_word_end_ms[written] = (int) std::llround(end);
+        ++written;
+    }
+    *io_n_words = written;
     return (int) transcript.size();
 }
 
@@ -3029,6 +3120,25 @@ int eliza_inference_llm_stream_restore_slot(
     eliza_set_error(out_error,
         "[libelizainference] llm_stream_restore_slot is not implemented in this build");
     return ELIZA_ERR_INVALID_ARG;
+}
+
+int eliza_inference_llm_stream_reset(EliLlmStream * stream) {
+    /* Clear the KV cache + sampler + counters so a PERSISTENT stream can be
+     * reused for a fresh prompt without re-creating its llama_context. This is
+     * the warm-reuse path: keeping one lctx alive (instead of open/close per
+     * turn) avoids the per-turn Vulkan pipeline/KV re-init AND the
+     * shared-GPU-weights-across-lctx-lifecycle corruption seen when streams are
+     * created/destroyed repeatedly. Non-MTP fixed-KV path only — the in-process
+     * bionic host opens with no drafter; an MTP engine owns its own KV. */
+    if (!stream) return ELIZA_ERR_INVALID_ARG;
+    if (stream->mtp || !stream->lctx) return ELIZA_ERR_INVALID_ARG;
+    llama_memory_clear(llama_get_memory(stream->lctx), true);
+    if (stream->sampler) llama_sampler_reset(stream->sampler);
+    stream->n_past = 0;
+    stream->generated = 0;
+    stream->eos = false;
+    stream->cancel.store(false);
+    return ELIZA_OK;
 }
 
 void eliza_inference_llm_stream_close(EliLlmStream * stream) {

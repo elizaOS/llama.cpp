@@ -1,5 +1,5 @@
 // ELIZA-VK-DISPATCH-PATCH-V1 — staged from packages/inference/vulkan/turbo3_tcq_multi.comp by
-// build-llama-cpp-dflash.mjs. Frozen — do not edit in fork.
+// build-llama-cpp-mtp.mjs. Frozen — do not edit in fork.
 // Multi-block-per-workgroup variant of turbo3_tcq.comp. Identical decode math
 // (9-bit sliding-window TCQ + Q·K); one workgroup processes BLOCKS_PER_WG
 // consecutive KV indices serially in a 32-thread loop. BLOCKS_PER_WG is a

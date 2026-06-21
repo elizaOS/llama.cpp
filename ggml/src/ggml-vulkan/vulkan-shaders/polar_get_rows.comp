@@ -1,5 +1,5 @@
 // ELIZA-VK-DISPATCH-PATCH-V1 — staged from packages/inference/vulkan/polar_get_rows.comp by
-// build-llama-cpp-dflash.mjs. Frozen — do not edit in fork.
+// build-llama-cpp-mtp.mjs. Frozen — do not edit in fork.
 // DRAFT: COMPILE-VERIFIED on Linux. Sister kernel to polar.comp.
 // Wave-4-D: match polar.comp's threadgroup-cooperative residual add and
 // Hadamard butterfly so get_rows fallback has the same parallel shape as the

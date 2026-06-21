@@ -1,5 +1,5 @@
 // ELIZA-VK-DISPATCH-PATCH-V1 — staged from packages/inference/vulkan/polar_preht.comp by
-// build-llama-cpp-dflash.mjs. Frozen — do not edit in fork.
+// build-llama-cpp-mtp.mjs. Frozen — do not edit in fork.
 // COMPILE/HARNESS VERIFIED: pre-Hadamard-query hot path for PolarQuant.
 //
 // This is the Vulkan sibling of metal/polar.metal's

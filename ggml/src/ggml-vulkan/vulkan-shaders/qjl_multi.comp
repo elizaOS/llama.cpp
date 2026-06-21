@@ -1,5 +1,5 @@
 // ELIZA-VK-DISPATCH-PATCH-V1 — staged from packages/inference/vulkan/qjl_multi.comp by
-// build-llama-cpp-dflash.mjs. Frozen — do not edit in fork.
+// build-llama-cpp-mtp.mjs. Frozen — do not edit in fork.
 // Multi-token-per-workgroup variant of qjl.comp (the QJL attention-score hot
 // path). Identical math; one workgroup processes TOKENS_PER_WG consecutive
 // tokens along the t axis serially in a 32-thread loop, amortising launch tax.

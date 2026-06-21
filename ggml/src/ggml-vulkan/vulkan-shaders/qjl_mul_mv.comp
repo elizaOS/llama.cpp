@@ -1,5 +1,5 @@
 // ELIZA-VK-DISPATCH-PATCH-V1 — staged from packages/inference/vulkan/qjl_mul_mv.comp by
-// build-llama-cpp-dflash.mjs. Frozen — do not edit in fork.
+// build-llama-cpp-mtp.mjs. Frozen — do not edit in fork.
 // DRAFT: COMPILE-VERIFIED on Linux. Sister kernel to qjl.comp.
 // Ports `kernel_mul_mv_qjl1_256_f32` from metal/qjl.metal — matrix-vector
 // multiply against an fp32 query sketch (non-attention call sites).
