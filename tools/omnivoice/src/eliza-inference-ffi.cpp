@@ -572,6 +572,34 @@ static bool eliza_running_on_android() {
 #endif
 }
 
+// Flash-attention selection for the text-LLM context. The Vulkan/Mali
+// flash-attention kernel corrupts attention output once the prefilled sequence
+// grows past a few hundred tokens: long prompts (~2k+ tokens) decode into
+// degenerate token repetition (" His!!!!"), while short prompts stay clean. The
+// ASR path already force-disables FA on the Android profile for the same class
+// of kernel issue (see eliza_asr_android_cpu_profile); the text-LLM path was
+// left on AUTO and inherited the corruption. Default OFF on Android, with an
+// override for bisecting and for non-Mali Android GPUs that handle FA correctly:
+//   ELIZA_LLM_FLASH_ATTN = off|0|false|disabled -> DISABLED
+//                        = on|1|true|enabled     -> ENABLED
+//                        = auto                   -> AUTO (llama.cpp decides)
+static enum llama_flash_attn_type eliza_llm_flash_attn_type() {
+    if (const char * env = std::getenv("ELIZA_LLM_FLASH_ATTN")) {
+        std::string v = env;
+        std::transform(v.begin(), v.end(), v.begin(),
+                       [](unsigned char c) { return (char) std::tolower(c); });
+        if (v == "off" || v == "0" || v == "false" || v == "no" || v == "disabled")
+            return LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        if (v == "on" || v == "1" || v == "true" || v == "yes" || v == "enabled")
+            return LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        if (v == "auto")
+            return LLAMA_FLASH_ATTN_TYPE_AUTO;
+    }
+    return eliza_running_on_android()
+        ? LLAMA_FLASH_ATTN_TYPE_DISABLED
+        : LLAMA_FLASH_ATTN_TYPE_AUTO;
+}
+
 static bool eliza_asr_android_cpu_profile() {
     if (eliza_running_on_android()) {
         return eliza_bool_env_or_default("ELIZA_ASR_ANDROID_CPU_PROFILE", true);
@@ -1933,13 +1961,16 @@ static int eliza_asr_decode_core(
             transcript += piece;
             std::string cleaned_partial = eliza_clean_asr_transcript(transcript);
             if (eliza_asr_has_text_payload(cleaned_partial)) {
-                const char last = cleaned_partial.back();
-                const bool sentence_complete = last == '.' || last == '?' || last == '!';
+                // Stop only on a real end-of-turn marker — NOT on the first
+                // sentence-final '.'/'?'/'!'. Sentence-final early-stop truncated
+                // any multi-sentence utterance after its first clause (e.g.
+                // "Hello there. How are you?" -> "Hello there."). Qwen3-ASR emits
+                // an EOG / <|im_end|> at the true end of the transcript, which the
+                // EOG check above and the sentinels here already catch.
                 if (piece.find('\n') != std::string::npos ||
                     transcript.find("<|im_end|>") != std::string::npos ||
                     transcript.find("<|endoftext|>") != std::string::npos ||
-                    transcript.find("</s>") != std::string::npos ||
-                    sentence_complete) {
+                    transcript.find("</s>") != std::string::npos) {
                     completed = true;
                     break;
                 }
@@ -1954,10 +1985,20 @@ static int eliza_asr_decode_core(
         }
     }
     if (!completed) {
-        eliza_set_error(out_error,
-            "[libelizainference] asr_transcribe: decode reached token cap before EOG; "
-            "refusing to return a possibly truncated transcript");
-        return ELIZA_ERR_FFI_FAULT;
+        // Decode hit the token cap without an explicit end marker. The old
+        // behaviour hard-failed here, which surfaced as a spurious transcription
+        // error on long or unusually-tokenized audio (the cap is sized for
+        // typical speech). Return the best-effort transcript instead so the
+        // caller gets a usable result; only an EMPTY decode stays an error so a
+        // genuine failure is still visible.
+        std::string best = eliza_clean_asr_transcript(transcript);
+        if (best.empty()) {
+            eliza_set_error(out_error,
+                "[libelizainference] asr_transcribe: decode produced no text before the token cap");
+            return ELIZA_ERR_FFI_FAULT;
+        }
+        out_transcript = best;
+        return 0;
     }
     out_transcript = eliza_clean_asr_transcript(transcript);
     return 0;
@@ -2823,7 +2864,7 @@ EliLlmStream * eliza_inference_llm_stream_open(
     cparams.n_ubatch = cparams.n_batch;
     cparams.n_threads = eliza_thread_count(false);
     cparams.n_threads_batch = eliza_thread_count(true);
-    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+    cparams.flash_attn_type = eliza_llm_flash_attn_type();
 
     /* KV-cache quant (ABI v8): map names -> ggml_type and set type_k/type_v.
      * NULL/empty leaves the f16 default. An unrecognized name is a hard error
@@ -3613,7 +3654,7 @@ int eliza_inference_describe_image(
     cparams.n_ubatch = cparams.n_batch;
     cparams.n_threads = eliza_thread_count(false);
     cparams.n_threads_batch = eliza_thread_count(true);
-    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+    cparams.flash_attn_type = eliza_llm_flash_attn_type();
     llama_context * lctx = llama_init_from_model(ctx->llm_model, cparams);
     if (!lctx) {
         eliza_set_error(out_error,
