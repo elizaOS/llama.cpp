@@ -582,6 +582,21 @@ static int eliza_asr_batch_size() {
     return eliza_int_env_or_default("ELIZA_ASR_N_BATCH", eliza_asr_android_cpu_profile() ? 64 : 512);
 }
 
+// OmniVoice TTS backend selection. The MaskGIT batched LM forward
+// (pipeline_tts_llm_forward_batched) over-runs the ggml-vulkan descriptor-set
+// pool on the Android Mali Vulkan driver — ggml-vulkan.cpp:7020
+// GGML_ASSERT(descriptor_set_idx < descriptor_sets.size()) aborts mid-synthesis.
+// The model is correct on CPU (device-verified: 45120 samples / 1.88 s for a
+// short phrase). Until the Vulkan MaskGIT descriptor accounting is fixed,
+// default TTS to CPU on Android, mirroring the ASR Android-CPU profile. Desktop
+// keeps GPU (no crash evidence there). Override with ELIZA_TTS_USE_GPU=1.
+static bool eliza_tts_use_gpu() {
+    if (eliza_running_on_android()) {
+        return eliza_bool_env_or_default("ELIZA_TTS_USE_GPU", false);
+    }
+    return eliza_bool_env_or_default("ELIZA_TTS_USE_GPU", true);
+}
+
 static std::vector<float> eliza_resample_linear(
     const float * pcm,
     size_t n_samples,
@@ -795,7 +810,28 @@ static int eliza_load_tts(EliInferenceContext * ctx, char ** out_error) {
     params.model_path = ctx->tts_model_path.c_str();
     params.codec_path = ctx->codec_model_path.c_str();
     params.use_fa = true;
+
+    // OmniVoice's backend_init_auto() picks the first GPU unless GGML_BACKEND
+    // forces a device by name. When TTS-on-GPU is disabled (default on Android,
+    // see eliza_tts_use_gpu) pin the OmniVoice sched to CPU for the duration of
+    // ov_init. Restore the prior value so we don't leak the override to other
+    // backend inits. ov_init is one-time and runs under tts_mutex, so the
+    // global-env window is bounded.
+    const bool   force_cpu_tts = !eliza_tts_use_gpu();
+    const char * prev_backend  = force_cpu_tts ? getenv("GGML_BACKEND") : nullptr;
+    const std::string prev_backend_saved = prev_backend ? std::string(prev_backend) : std::string();
+    const bool   had_prev_backend = prev_backend != nullptr;
+    if (force_cpu_tts) {
+        setenv("GGML_BACKEND", "CPU", 1);
+    }
     ctx->ov = ov_init(&params);
+    if (force_cpu_tts) {
+        if (had_prev_backend) {
+            setenv("GGML_BACKEND", prev_backend_saved.c_str(), 1);
+        } else {
+            unsetenv("GGML_BACKEND");
+        }
+    }
     if (!ctx->ov) {
         std::string msg = "[libelizainference] ov_init failed: ";
         msg += ov_last_error();
