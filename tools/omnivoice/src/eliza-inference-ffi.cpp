@@ -163,6 +163,12 @@ struct EliInferenceContext {
     eliza_kokoro::kokoro_model_ptr kokoro_model;
     eliza_kokoro::kokoro_voice_preset kokoro_voice;
     bool kokoro_loaded = false;
+    /* Paths of the currently-loaded Kokoro GGUF + voice preset, so a repeat
+     * load with the same paths is a no-op (idempotent) instead of re-reading
+     * the ~80MB GGUF every synth — the resident-host TTS streams many short
+     * clauses per reply and must not reload per clause. */
+    std::string kokoro_gguf_path;
+    std::string kokoro_voice_path;
     std::mutex kokoro_mutex;
 #endif
 };
@@ -1702,6 +1708,12 @@ int eliza_inference_kokoro_load(
     }
     if (style_dim <= 0) style_dim = 256;
     std::lock_guard<std::mutex> lock(ctx->kokoro_mutex);
+    /* Idempotent: already loaded with these exact paths → reuse, no reload. */
+    if (ctx->kokoro_loaded && ctx->kokoro_model &&
+        ctx->kokoro_gguf_path == gguf_path &&
+        ctx->kokoro_voice_path == voice_bin_path) {
+        return ELIZA_OK;
+    }
     std::string err;
     eliza_kokoro::kokoro_model_ptr model =
         eliza_kokoro::kokoro_load_model(gguf_path, err);
@@ -1720,6 +1732,8 @@ int eliza_inference_kokoro_load(
     }
     ctx->kokoro_model = std::move(model);
     ctx->kokoro_voice = std::move(voice);
+    ctx->kokoro_gguf_path = gguf_path;
+    ctx->kokoro_voice_path = voice_bin_path;
     ctx->kokoro_loaded = true;
     return ELIZA_OK;
 #else
