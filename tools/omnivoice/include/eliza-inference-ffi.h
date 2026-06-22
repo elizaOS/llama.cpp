@@ -930,7 +930,9 @@ int eliza_inference_llm_stream_restore_slot(
  * sampler + counters so the next prefill starts a fresh prompt on the SAME
  * llama_context. Lets a caller keep one warm context alive across turns instead
  * of open/close per turn (faster, and avoids the shared-GPU-weights lctx-churn
- * corruption). Non-MTP streams only; returns ELIZA_ERR_INVALID_ARG otherwise. */
+ * corruption). Resets MTP streams too: clears both the target and draft KV
+ * caches + drops the speculative accumulator so the next prefill re-arms
+ * cleanly. Returns ELIZA_ERR_INVALID_ARG only when the stream is NULL/unopened. */
 int eliza_inference_llm_stream_reset(EliLlmStream * stream);
 
 /* Close + free a streaming-LLM session. Idempotent on NULL. */
