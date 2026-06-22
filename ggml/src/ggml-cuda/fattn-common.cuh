@@ -2,7 +2,6 @@
 
 #include "common.cuh"
 #include "convert.cuh"
-#include "turboquant.cuh"
 #include "vecdotq.cuh"
 
 #include <cstdint>
@@ -329,77 +328,6 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
     return sum;
 }
 
-// NOTE: TBQ decode produces a per-thread `float[QK_TBQ]` buffer and runs a fully-unrolled
-// length-32 fast Hadamard transform. When this function is __forceinline__d into the outer
-// flash_attn_ext_vec kernel, the outer #pragma unroll over `i_KQ_0 = 0..nthreads_KQ` (up to
-// 8 iterations) plus the inner #pragma unroll over `k_KQ_0` (up to 4 iterations for D=256)
-// keeps dozens of 32-float decode buffers live simultaneously, blowing AMD's 256-VGPR-per-
-// thread budget by 4-20x (CI observed 1100-5300 total VGPRs incl. spill for D=128/256).
-//
-// On HIP we mark this __noinline__ so the decode/FHT stays a real function call and the
-// transient `float block[32]` buffer cannot be replicated across unrolled call sites. On
-// NVIDIA we keep the original __forceinline__ since CUDA targets have larger register files
-// and the AMD-specific issue does not manifest.
-template <typename block_tbq, int D, int nthreads>
-#ifdef GGML_USE_HIP
-static __device__ __attribute__((noinline)) float vec_dot_fattn_vec_KQ_tbq(
-#else
-static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq(
-#endif
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
-
-    const block_tbq * K_tbq = (const block_tbq *) K_c;
-    GGML_UNUSED(Q_q8);
-    GGML_UNUSED(Q_ds_v);
-
-    constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
-    constexpr int cpy_ne = cpy_nb / 4;
-
-    const int lane = nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads;
-
-    float sum = 0.0f;
-
-    // Intentionally not #pragma unroll'd on HIP: the per-iteration `float block[QK_TBQ]`
-    // decode buffer + length-32 FHT is too heavy to keep multiple copies live.
-    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
-        const int i_half2 = k_KQ_0 + lane*cpy_ne;
-        const int i_elem = 2*i_half2;
-        const int ib = i_elem / QK_TBQ;
-        const int iqs = i_elem % QK_TBQ;
-
-        __align__(16) float block[QK_TBQ];
-        tbq_decode_block_cuda(K_tbq[ib], block);
-
-#ifdef V_DOT2_F32_F16_AVAILABLE
-        const half2 * Q_h2 = (const half2 *) Q_v;
-#pragma unroll
-        for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
-            ggml_cuda_mad(sum, make_half2(block[iqs + 2*k_KQ_1 + 0], block[iqs + 2*k_KQ_1 + 1]), Q_h2[k_KQ_0/nthreads + k_KQ_1]);
-        }
-#else
-        const float2 * Q_f2 = (const float2 *) Q_v;
-#pragma unroll
-        for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
-            ggml_cuda_mad(sum, make_float2(block[iqs + 2*k_KQ_1 + 0], block[iqs + 2*k_KQ_1 + 1]), Q_f2[k_KQ_0/nthreads + k_KQ_1]);
-        }
-#endif // V_DOT2_F32_F16_AVAILABLE
-    }
-
-    return sum;
-}
-
-template <int D, int nthreads>
-static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_0(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
-    return vec_dot_fattn_vec_KQ_tbq<block_tbq3_0, D, nthreads>(K_c, Q_v, Q_q8, Q_ds_v);
-}
-
-template <int D, int nthreads>
-static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_0(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
-    return vec_dot_fattn_vec_KQ_tbq<block_tbq4_0, D, nthreads>(K_c, Q_v, Q_q8, Q_ds_v);
-}
-
 template <typename Tds, int ni>
 static __device__ __forceinline__ void quantize_q8_1_to_shared(
     const float * __restrict__ x, const float scale, int * __restrict__ yq32, void * __restrict__ yds) {
@@ -689,51 +617,6 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     }
 }
 
-// See comment on vec_dot_fattn_vec_KQ_tbq: __noinline__ on HIP to prevent the outer kernel
-// from replicating the 32-float decode buffer across its unrolled V-iteration loop.
-template <typename block_tbq, typename T, int ne>
-#ifdef GGML_USE_HIP
-static __device__ __attribute__((noinline)) void dequantize_V_tbq(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
-#else
-static __device__ __forceinline__ void dequantize_V_tbq(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
-#endif
-    const block_tbq * x = (const block_tbq *) vx;
-
-    const int64_t ib = i0 / QK_TBQ;
-    const int iqs = i0 % QK_TBQ;
-
-    __align__(16) float block[QK_TBQ];
-    tbq_decode_block_cuda(x[ib], block);
-
-#ifdef FP16_AVAILABLE
-    if constexpr (std::is_same_v<T, half>) {
-        static_assert(ne % 2 == 0, "bad ne");
-#pragma unroll
-        for (int l0 = 0; l0 < ne; l0 += 2) {
-            ((half2 *) dst)[l0/2] = make_half2(block[iqs + l0 + 0], block[iqs + l0 + 1]);
-        }
-    } else
-#endif // FP16_AVAILABLE
-    if constexpr (std::is_same_v<T, float>) {
-#pragma unroll
-        for (int l = 0; l < ne; ++l) {
-            ((float *) dst)[l] = block[iqs + l];
-        }
-    } else {
-        static_assert(std::is_same_v<T, void>, "unsupported type");
-    }
-}
-
-template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_tbq3_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
-    dequantize_V_tbq<block_tbq3_0, T, ne>(vx, dst, i0);
-}
-
-template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_tbq4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
-    dequantize_V_tbq<block_tbq4_0, T, ne>(vx, dst, i0);
-}
-
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -750,10 +633,6 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
-    } else if constexpr (type_K == GGML_TYPE_TBQ3_0) {
-        return vec_dot_fattn_vec_KQ_tbq3_0<D, nthreads>;
-    } else if constexpr (type_K == GGML_TYPE_TBQ4_0) {
-        return vec_dot_fattn_vec_KQ_tbq4_0<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -776,10 +655,6 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q8_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
-    } else if constexpr (type_V == GGML_TYPE_TBQ3_0) {
-        return dequantize_V_tbq3_0<T, ne>;
-    } else if constexpr (type_V == GGML_TYPE_TBQ4_0) {
-        return dequantize_V_tbq4_0<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;
@@ -1030,7 +905,7 @@ static __global__ void flash_attn_stream_k_fixup_general(
     }
 
     // Write back final result:
-    *dst = dst_val == 0.0f && rowsum == 0.0f ? 0.0f : dst_val / rowsum;
+    *dst = dst_val / rowsum;
 }
 
 template<int D> // D == head size
@@ -1088,7 +963,7 @@ static __global__ void flash_attn_combine_results(
         VKQ_denominator += KQ_max_scale * meta[l].y;
     }
 
-    dst[tid] = VKQ_numerator == 0.0f && VKQ_denominator == 0.0f ? 0.0f : VKQ_numerator / VKQ_denominator;
+    dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
 template <int DV, int ncols1, int ncols2>

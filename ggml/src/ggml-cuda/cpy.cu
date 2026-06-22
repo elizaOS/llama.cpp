@@ -41,7 +41,7 @@ static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne
     cpy_1(cx + x_offset, cdst + dst_offset);
 }
 
-template <typename T, int swap>
+template <typename T>
 static __global__ void cpy_scalar_transpose(const char * cx, char * cdst, const int64_t ne,
                                const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
                                const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11,
@@ -53,10 +53,10 @@ static __global__ void cpy_scalar_transpose(const char * cx, char * cdst, const 
     const int64_t nmat = ne / (ne00 * ne01);
     const int64_t n = ne00 * ne01;
 
-    const int x = (swap == 0 ? blockIdx.x : blockIdx.y) * CUDA_CPY_TILE_DIM_2D + threadIdx.x;
-    const int y = (swap == 0 ? blockIdx.y : blockIdx.x) * CUDA_CPY_TILE_DIM_2D + threadIdx.y;
-    const int tx = (swap == 0 ? blockIdx.y : blockIdx.x) * CUDA_CPY_TILE_DIM_2D + threadIdx.x;  // transpose block offset
-    const int ty = (swap == 0 ? blockIdx.x : blockIdx.y) * CUDA_CPY_TILE_DIM_2D + threadIdx.y;
+    const int x = blockIdx.x * CUDA_CPY_TILE_DIM_2D + threadIdx.x;
+    const int y = blockIdx.y * CUDA_CPY_TILE_DIM_2D + threadIdx.y;
+    const int tx = blockIdx.y * CUDA_CPY_TILE_DIM_2D + threadIdx.x;  // transpose block offset
+    const int ty = blockIdx.x * CUDA_CPY_TILE_DIM_2D + threadIdx.y;
 
     __shared__ float tile[2][CUDA_CPY_TILE_DIM_2D][CUDA_CPY_TILE_DIM_2D+1];
     int cur_tile_buf = 0;
@@ -264,58 +264,6 @@ static void ggml_cpy_q8_0_f32_cuda(
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
 }
 
-static void ggml_cpy_f32_tbq3_0_cuda(
-    const char * cx, char * cdst, const int64_t ne,
-    const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
-    const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13, cudaStream_t stream) {
-
-    GGML_ASSERT(ne % QK_TBQ == 0);
-    const int64_t num_blocks = ne / QK_TBQ;
-    GGML_ASSERT(num_blocks < UINT_MAX);
-    cpy_f32_q<cpy_blck_f32_tbq3_0, QK_TBQ><<<num_blocks, 1, 0, stream>>>
-        (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
-}
-
-static void ggml_cpy_tbq3_0_f32_cuda(
-    const char * cx, char * cdst, const int64_t ne,
-    const int64_t ne00, const int64_t ne01, const int64_t ne02,
-    const int64_t nb00, const int64_t nb01, const int64_t nb02,
-    const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12,
-    const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13,
-    cudaStream_t stream) {
-    const int64_t num_blocks = ne;
-    GGML_ASSERT(num_blocks < UINT_MAX);
-    cpy_q_f32<cpy_blck_q_f32<dequantize_tbq3_0, QK_TBQ>, QK_TBQ><<<num_blocks, 1, 0, stream>>>(
-        cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
-         ne10, ne11, ne12, nb10, nb11, nb12, nb13);
-}
-
-static void ggml_cpy_f32_tbq4_0_cuda(
-    const char * cx, char * cdst, const int64_t ne,
-    const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
-    const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13, cudaStream_t stream) {
-
-    GGML_ASSERT(ne % QK_TBQ == 0);
-    const int64_t num_blocks = ne / QK_TBQ;
-    GGML_ASSERT(num_blocks < UINT_MAX);
-    cpy_f32_q<cpy_blck_f32_tbq4_0, QK_TBQ><<<num_blocks, 1, 0, stream>>>
-        (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
-}
-
-static void ggml_cpy_tbq4_0_f32_cuda(
-    const char * cx, char * cdst, const int64_t ne,
-    const int64_t ne00, const int64_t ne01, const int64_t ne02,
-    const int64_t nb00, const int64_t nb01, const int64_t nb02,
-    const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12,
-    const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13,
-    cudaStream_t stream) {
-    const int64_t num_blocks = ne;
-    GGML_ASSERT(num_blocks < UINT_MAX);
-    cpy_q_f32<cpy_blck_q_f32<dequantize_tbq4_0, QK_TBQ>, QK_TBQ><<<num_blocks, 1, 0, stream>>>(
-        cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
-         ne10, ne11, ne12, nb10, nb11, nb12, nb13);
-}
-
 static void ggml_cpy_f32_q4_0_cuda(
     const char * cx, char * cdst, const int64_t ne,
     const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
@@ -436,15 +384,9 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     const int64_t ne = ggml_nelements(src0);
     GGML_ASSERT(ne == ggml_nelements(src1));
 
-    GGML_ASSERT(ggml_nbytes(src0) <= INT_MAX);
-    GGML_ASSERT(ggml_nbytes(src1) <= INT_MAX);
-
-    // Note: not const — the can_be_transposed branches below reassign these
-    // to flattened/folded dims (ne00n/ne01n/ne02n) so downstream kernels see
-    // the rewritten shape. HIP clang `-Werror` (gcc CUDA host accepts silently).
-    int64_t ne00 = src0->ne[0];
-    int64_t ne01 = src0->ne[1];
-    int64_t ne02 = src0->ne[2];
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne01 = src0->ne[1];
+    const int64_t ne02 = src0->ne[2];
 
     //GGML_ASSERT(src0->ne[3] == 1);
 
@@ -470,39 +412,8 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     char * src1_ddc = (char *) src1->data;
 
     const bool contiguous_srcs = ggml_is_contiguous(src0) && ggml_is_contiguous(src1);
-
-    bool can_be_transposed = false;
-    if (src0->ne[3] == 1 ) {
-        int64_t ne00n, ne01n, ne02n;
-        if (nb01 == (int64_t)ggml_element_size(src0) &&
-           (nb02 == ne00 * ne01 * (int64_t)ggml_element_size(src0) ||
-            nb00 == ne01 * ne02 * (int64_t)ggml_element_size(src0))) {
-            if (nb00 <= nb02) { // most likely safe to handle nb00 = nb02 case here
-                ne00n = ne00;
-                ne01n = ne01;
-                ne02n = ne02;
-            } else {
-                ne00n = ne00;
-                ne01n = ne01*ne02;
-                ne02n = 1;
-            }
-            ne00 = ne00n;
-            ne01 = ne01n;
-            ne02 = ne02n;
-            can_be_transposed = true;
-        }
-        if ((nb02 == (int64_t)ggml_element_size(src0) && nb00 <= nb01 &&
-            nb01 == ne02 * ne00 * (int64_t)ggml_element_size(src0))) {
-            // GGML_ASSERT(nb00 <= nb01);
-            ne00n = ne00*ne01;
-            ne01n = ne02;
-            ne02n = 1; // not used
-            ne00 = ne00n;
-            ne01 = ne01n;
-            ne02 = ne02n;
-            can_be_transposed = true;
-        }
-    }
+    const bool can_be_transposed = nb01 == (int64_t)ggml_element_size(src0) &&
+        src0->ne[3] == 1 && nb02 == ne00 * ne01 * (int64_t)ggml_element_size(src0);
 
     if (src0->type == src1->type && contiguous_srcs) {
         GGML_ASSERT(ggml_nbytes(src0) == ggml_nbytes(src1));
@@ -543,18 +454,6 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_F32) {
         ggml_cpy_q8_0_f32_cuda
-                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
-    } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_TBQ3_0) {
-        ggml_cpy_f32_tbq3_0_cuda
-                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
-    } else if (src0->type == GGML_TYPE_TBQ3_0 && src1->type == GGML_TYPE_F32) {
-        ggml_cpy_tbq3_0_f32_cuda
-                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
-    } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_TBQ4_0) {
-        ggml_cpy_f32_tbq4_0_cuda
-                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
-    } else if (src0->type == GGML_TYPE_TBQ4_0 && src1->type == GGML_TYPE_F32) {
-        ggml_cpy_tbq4_0_f32_cuda
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_Q4_0) {
         ggml_cpy_f32_q4_0_cuda

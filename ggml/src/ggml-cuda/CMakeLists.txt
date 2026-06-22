@@ -56,13 +56,6 @@ if (CUDAToolkit_FOUND)
         endif()
     endif()
 
-    if(NOT DEFINED CMAKE_CUDA_COMPILER)
-        if(WIN32)
-            set(CMAKE_CUDA_COMPILER "${CUDAToolkit_BIN_DIR}/nvcc.exe")
-        else()
-            set(CMAKE_CUDA_COMPILER "${CUDAToolkit_BIN_DIR}/nvcc")
-        endif()
-    endif()
     enable_language(CUDA)
 
     # TODO: Remove once CCCL 3.2 has been released and bundled with CUDA Toolkit
@@ -129,14 +122,6 @@ if (CUDAToolkit_FOUND)
             template-instances/fattn-vec-instance-q4_0-q4_0.cu
             template-instances/fattn-vec-instance-q8_0-q8_0.cu
             template-instances/fattn-vec-instance-bf16-bf16.cu)
-        file(GLOB   SRCS "template-instances/fattn-vec*tbq3_0-tbq3_0.cu")
-        list(APPEND GGML_SOURCES_CUDA ${SRCS})
-        file(GLOB   SRCS "template-instances/fattn-vec*tbq3_0-tbq4_0.cu")
-        list(APPEND GGML_SOURCES_CUDA ${SRCS})
-        file(GLOB   SRCS "template-instances/fattn-vec*tbq4_0-tbq3_0.cu")
-        list(APPEND GGML_SOURCES_CUDA ${SRCS})
-        file(GLOB   SRCS "template-instances/fattn-vec*tbq4_0-tbq4_0.cu")
-        list(APPEND GGML_SOURCES_CUDA ${SRCS})
     endif()
 
     ggml_add_backend_library(ggml-cuda
@@ -169,30 +154,6 @@ if (CUDAToolkit_FOUND)
     if (GGML_CUDA_NO_PEER_COPY)
         add_compile_definitions(GGML_CUDA_NO_PEER_COPY)
     endif()
-
-    # Eliza fork: opt-in CUDA paths for QJL / PolarQuant / TBQ3_TCQ. Default ON
-    # so the standard `-DGGML_CUDA=ON` build picks them up; the .cu files are
-    # always globbed in (above) but their bodies are gated by these macros.
-    if (GGML_CUDA_QJL)
-        add_compile_definitions(GGML_CUDA_QJL)
-    endif()
-    if (GGML_CUDA_POLARQUANT)
-        add_compile_definitions(GGML_CUDA_POLARQUANT)
-    endif()
-    if (GGML_CUDA_TBQ3_TCQ)
-        add_compile_definitions(GGML_CUDA_TBQ3_TCQ)
-    endif()
-
-# ELIZA-CUDA-FUSED-ATTN-QJL
-# Fused QJL-K + TBQ-V attention (packages/inference/cuda/fused-attn-qjl-tbq.cu,
-# staged in by patchCudaKernels). Body is #ifdef GGML_CUDA_FUSED_ATTN_QJL; this
-# flips that define on when -DGGML_CUDA_FUSED_ATTN_QJL=ON is passed. Same shape
-# as the GGML_CUDA_QJL / POLARQUANT / TBQ3_TCQ blocks above. Optional kernel
-# (packages/inference/AGENTS.md §3) — off by default.
-if (GGML_CUDA_FUSED_ATTN_QJL)
-    add_compile_definitions(GGML_CUDA_FUSED_ATTN_QJL)
-    message(STATUS "ggml-cuda: GGML_CUDA_FUSED_ATTN_QJL enabled (fused QJL-K + TBQ-V attention)")
-endif()
 
     if (GGML_STATIC)
         if (WIN32)
