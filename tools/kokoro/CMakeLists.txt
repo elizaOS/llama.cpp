@@ -45,10 +45,16 @@ endif()
 
 target_compile_features(kokoro_lib PUBLIC cxx_std_17)
 
-# Standalone CLI harness — required by J2 verification (tools/voice-kokoro/).
-add_executable(kokoro-tts tools/kokoro-tts.cpp)
-target_link_libraries(kokoro-tts PRIVATE kokoro_lib)
-install(TARGETS kokoro-tts RUNTIME)
+# Standalone CLI harness — host-only (required by J2 verification,
+# tools/voice-kokoro/). Skipped on iOS: there an executable is implicitly a
+# MACOSX_BUNDLE app, so `install(TARGETS ... RUNTIME)` fails configure with
+# "no BUNDLE DESTINATION". The fused mobile slice only needs kokoro_lib folded
+# into libelizainference, never the CLI.
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    add_executable(kokoro-tts tools/kokoro-tts.cpp)
+    target_link_libraries(kokoro-tts PRIVATE kokoro_lib)
+    install(TARGETS kokoro-tts RUNTIME)
+endif()
 
 # Server-mount handler: compiled into kokoro_lib only when the server target
 # exists. The handler is guarded by `#ifdef LLAMA_BUILD_KOKORO` and pulls in
