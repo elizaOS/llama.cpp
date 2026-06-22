@@ -11,24 +11,6 @@
 #include "llama.h"
 #include "log.h"
 
-// ELIZA-OMNIVOICE-AUDIO-SPEECH-ROUTE-V1 — the route handler used to live
-// here as a large inline `#ifdef ELIZA_FUSE_OMNIVOICE` block. H2.c moved
-// it into `tools/omnivoice/src/server-mount.cpp` so a fresh checkout of
-// the fork carries the production route without any build-time patcher.
-#ifdef ELIZA_FUSE_OMNIVOICE
-#include "server-mount.h"
-#endif // ELIZA_FUSE_OMNIVOICE
-// end // ELIZA-OMNIVOICE-AUDIO-SPEECH-ROUTE-V1
-
-// ELIZA-KOKORO-AUDIO-SPEECH-ROUTE-V1 — J2 (2026-05-15). When
-// LLAMA_BUILD_KOKORO=ON, the Kokoro fork-side TTS pipeline owns
-// `/v1/audio/speech` whenever --kokoro-model is set. Falls back to the
-// OmniVoice handler otherwise. The dispatcher lives in main() below.
-#ifdef LLAMA_BUILD_KOKORO
-#include "kokoro-server-mount.h"
-#endif // LLAMA_BUILD_KOKORO
-// end // ELIZA-KOKORO-AUDIO-SPEECH-ROUTE-V1
-
 #include <atomic>
 #include <clocale>
 #include <exception>
@@ -89,45 +71,16 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
     };
 }
 
-int main(int argc, char ** argv) {
+// satisfies -Wmissing-declarations
+int llama_server(int argc, char ** argv);
+
+int llama_server(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
     // own arguments required by this example
     common_params params;
 
     common_init();
-
-#if defined(ELIZA_FUSE_OMNIVOICE) || defined(LLAMA_BUILD_KOKORO)
-    // Strip fused-TTS-only flags before common_params_parse so the upstream
-    // parser doesn't reject them. Values feed the lazily-created OmniVoice
-    // and Kokoro contexts (see the eliza_omnivoice / eliza_kokoro
-    // namespaces).
-    {
-        std::vector<char *> filtered;
-        filtered.reserve((size_t)argc);
-        for (int i = 0; i < argc; ++i) {
-            const std::string a = argv[i];
-#ifdef ELIZA_FUSE_OMNIVOICE
-            if ((a == "--omnivoice-model" || a == "--omnivoice-codec") && i + 1 < argc) {
-                if (a == "--omnivoice-model") eliza_omnivoice::g_model_path = argv[++i];
-                else                          eliza_omnivoice::g_codec_path = argv[++i];
-                continue;
-            }
-#endif
-#ifdef LLAMA_BUILD_KOKORO
-            if ((a == "--kokoro-model" || a == "--kokoro-voices-dir") && i + 1 < argc) {
-                if (a == "--kokoro-model")       eliza_kokoro::g_model_path = argv[++i];
-                else                             eliza_kokoro::g_voices_dir = argv[++i];
-                continue;
-            }
-#endif
-            filtered.push_back(argv[i]);
-        }
-        static std::vector<char *> s_filtered = filtered;
-        argc = (int) s_filtered.size();
-        argv = s_filtered.data();
-    }
-#endif
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)) {
         return 1;
@@ -137,29 +90,34 @@ int main(int argc, char ** argv) {
     llama_numa_init(params.numa);
 
     // router server never loads a model and must not touch the GPU
+    const bool is_router_server = params.model.path.empty()
+                               && params.model.hf_repo.empty();
+
     // skip device enumeration so the CUDA primary context stays uncreated
-    const bool is_router_server = params.model.path.empty();
     common_params_print_info(params, !is_router_server);
 
-    // validate batch size for embeddings
-    // embeddings require all tokens to be processed in a single ubatch
-    // see https://github.com/ggml-org/llama.cpp/issues/12836
-    if (params.embedding && params.n_batch > params.n_ubatch) {
-        SRV_WRN("embeddings enabled with n_batch (%d) > n_ubatch (%d)\n", params.n_batch, params.n_ubatch);
-        SRV_WRN("setting n_batch = n_ubatch = %d to avoid assertion failure\n", params.n_ubatch);
-        params.n_batch = params.n_ubatch;
-    }
+    if (!is_router_server) {
+        // validate batch size for embeddings
+        // embeddings require all tokens to be processed in a single ubatch
+        // see https://github.com/ggml-org/llama.cpp/issues/12836
+        if (params.embedding && params.n_batch > params.n_ubatch) {
+            SRV_WRN("embeddings enabled with n_batch (%d) > n_ubatch (%d)\n", params.n_batch, params.n_ubatch);
+            SRV_WRN("setting n_batch = n_ubatch = %d to avoid assertion failure\n", params.n_ubatch);
+            params.n_batch = params.n_ubatch;
+        }
 
-    if (params.n_parallel < 0) {
-        SRV_INF("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
+        if (params.n_parallel < 0) {
+            SRV_INF("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
 
-        params.n_parallel = 4;
-        params.kv_unified = true;
+            params.n_parallel = 4;
+            params.kv_unified = true;
+        }
     }
 
     // for consistency between server router mode and single-model mode, we set the same model name as alias
-    if (params.model_alias.empty() && !params.model.name.empty()) {
-        params.model_alias.insert(params.model.name);
+    auto model_name = params.model.get_name();
+    if (params.model_alias.empty() && !model_name.empty()) {
+        params.model_alias.insert(model_name);
     }
 
     // struct that contains llama context and inference
@@ -176,6 +134,7 @@ int main(int argc, char ** argv) {
     //
 
     // register API routes
+    server_child child; // only used in non-router mode
     server_routes routes(params, ctx_server);
     server_tools tools;
 
@@ -196,6 +155,7 @@ int main(int argc, char ** argv) {
         routes.post_completions            = models_routes->proxy_post;
         routes.post_completions_oai        = models_routes->proxy_post;
         routes.post_chat_completions       = models_routes->proxy_post;
+        routes.post_control                = models_routes->proxy_post;
         routes.post_responses_oai          = models_routes->proxy_post;
         routes.post_transcriptions_oai     = models_routes->proxy_post;
         routes.post_anthropic_messages     = models_routes->proxy_post;
@@ -207,6 +167,8 @@ int main(int argc, char ** argv) {
         routes.post_tokenize               = models_routes->proxy_post;
         routes.post_detokenize             = models_routes->proxy_post;
         routes.post_apply_template         = models_routes->proxy_post;
+        routes.post_chat_completions_tok   = models_routes->proxy_post;
+        routes.post_responses_tok_oai      = models_routes->proxy_post;
         routes.get_lora_adapters           = models_routes->proxy_get;
         routes.post_lora_adapters          = models_routes->proxy_post;
         routes.get_slots                   = models_routes->proxy_get;
@@ -216,8 +178,11 @@ int main(int argc, char ** argv) {
         routes.get_props                   = models_routes->get_router_props;
         routes.get_models                  = models_routes->get_router_models;
 
+        ctx_http.post("/models",               ex_wrapper(models_routes->post_router_models));
         ctx_http.post("/models/load",          ex_wrapper(models_routes->post_router_models_load));
         ctx_http.post("/models/unload",        ex_wrapper(models_routes->post_router_models_unload));
+        ctx_http.get ("/models/sse",           ex_wrapper(models_routes->get_router_models_sse));
+        ctx_http.del ("/models",               ex_wrapper(models_routes->del_router_models));
     }
 
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
@@ -232,30 +197,12 @@ int main(int argc, char ** argv) {
     ctx_http.post("/v1/completions",           ex_wrapper(routes.post_completions_oai));
     ctx_http.post("/chat/completions",         ex_wrapper(routes.post_chat_completions));
     ctx_http.post("/v1/chat/completions",      ex_wrapper(routes.post_chat_completions));
+    ctx_http.post("/v1/chat/completions/control", ex_wrapper(routes.post_control));
     ctx_http.post("/v1/responses",             ex_wrapper(routes.post_responses_oai));
     ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
     ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));
     ctx_http.post("/audio/transcriptions",     ex_wrapper(routes.post_transcriptions_oai));
-    // Fused TTS — /v1/audio/speech dispatcher. When --kokoro-model is set
-    // and LLAMA_BUILD_KOKORO=ON, the Kokoro path owns the route; otherwise
-    // (and when LLAMA_BUILD_KOKORO=OFF), the OmniVoice path takes it.
-    // Picking the handler at registration time (vs per-request) keeps the
-    // route's hot path branch-free and lets each handler own its own
-    // server-mount mutex / context.
-#ifdef LLAMA_BUILD_KOKORO
-    if (eliza_kokoro::is_enabled()) {
-        ctx_http.post("/v1/audio/speech",      ex_wrapper(eliza_kokoro::audio_speech_handler()));
-        ctx_http.post("/audio/speech",         ex_wrapper(eliza_kokoro::audio_speech_handler()));
-    } else
-#endif
-    {
-#ifdef ELIZA_FUSE_OMNIVOICE
-        ctx_http.post("/v1/audio/speech",      ex_wrapper(eliza_omnivoice::audio_speech_handler()));
-        ctx_http.post("/audio/speech",         ex_wrapper(eliza_omnivoice::audio_speech_handler()));
-#endif
-    }
     ctx_http.post("/v1/messages",              ex_wrapper(routes.post_anthropic_messages)); // anthropic messages API
-    ctx_http.post("/v1/messages/count_tokens", ex_wrapper(routes.post_anthropic_count_tokens)); // anthropic token counting
     ctx_http.post("/infill",                   ex_wrapper(routes.post_infill));
     ctx_http.post("/embedding",                ex_wrapper(routes.post_embeddings)); // legacy
     ctx_http.post("/embeddings",               ex_wrapper(routes.post_embeddings));
@@ -267,6 +214,12 @@ int main(int argc, char ** argv) {
     ctx_http.post("/tokenize",                 ex_wrapper(routes.post_tokenize));
     ctx_http.post("/detokenize",               ex_wrapper(routes.post_detokenize));
     ctx_http.post("/apply-template",           ex_wrapper(routes.post_apply_template));
+    // token counting
+    ctx_http.post("/chat/completions/input_tokens",    ex_wrapper(routes.post_chat_completions_tok));
+    ctx_http.post("/v1/chat/completions/input_tokens", ex_wrapper(routes.post_chat_completions_tok));
+    ctx_http.post("/responses/input_tokens",           ex_wrapper(routes.post_responses_tok_oai));
+    ctx_http.post("/v1/responses/input_tokens",        ex_wrapper(routes.post_responses_tok_oai));
+    ctx_http.post("/v1/messages/count_tokens",         ex_wrapper(routes.post_anthropic_count_tokens)); // anthropic token counting
     // LoRA adapters hotswap
     ctx_http.get ("/lora-adapters",            ex_wrapper(routes.get_lora_adapters));
     ctx_http.post("/lora-adapters",            ex_wrapper(routes.post_lora_adapters));
@@ -278,7 +231,7 @@ int main(int argc, char ** argv) {
     ctx_http.register_gcp_compat();
 
     // CORS proxy (EXPERIMENTAL, only used by the Web UI for MCP)
-    if (params.webui_mcp_proxy) {
+    if (params.ui_mcp_proxy) {
         SRV_WRN("%s", "-----------------\n");
         SRV_WRN("%s", "CORS proxy is enabled, do not expose server to untrusted environments\n");
         SRV_WRN("%s", "This feature is EXPERIMENTAL and may be removed or changed in future versions\n");
@@ -303,6 +256,17 @@ int main(int argc, char ** argv) {
     }
 
     //
+    // Handle downloading model
+    //
+
+    if (child.is_child() && child.get_mode() == SERVER_CHILD_MODE_DOWNLOAD) {
+        return child.run_download(params);
+    } else if (!is_router_server) {
+        // single-model mode (NOT spawned by router)
+        common_params_handle_models(params, LLAMA_EXAMPLE_SERVER);
+    }
+
+    //
     // Start the server
     //
 
@@ -314,6 +278,7 @@ int main(int argc, char ** argv) {
         clean_up = [&models_routes]() {
             SRV_INF("%s: cleaning up before exit...\n", __func__);
             if (models_routes.has_value()) {
+                models_routes->stopping.store(true); // maybe redundant, but just to be safe
                 models_routes->models.unload_all();
             }
             llama_backend_free();
@@ -327,6 +292,10 @@ int main(int argc, char ** argv) {
         ctx_http.is_ready.store(true);
 
         shutdown_handler = [&](int) {
+            if (models_routes.has_value()) {
+                // important to disconnect any SSE clients
+                models_routes->stopping.store(true);
+            }
             ctx_http.stop();
         };
 
@@ -346,14 +315,15 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
-        // load the model
-        SRV_INF("%s", "loading model\n");
-
-        if (server_models::is_child_server()) {
-            ctx_server.on_sleeping_changed([&](bool sleeping) {
-                server_models::notify_router_sleeping_state(sleeping);
+        // setup communication child --> router if necessary
+        if (child.is_child()) {
+            ctx_server.set_state_callback([&](server_state state, json payload) {
+                child.notify_to_router(server_state_to_str(state), payload);
             });
         }
+
+        // load the model
+        SRV_INF("%s", "loading model\n");
 
         if (!ctx_server.load_model(params)) {
             clean_up();
@@ -394,6 +364,12 @@ int main(int argc, char ** argv) {
         SRV_INF("router server is listening on %s\n", ctx_http.listening_address.c_str());
         SRV_WRN("%s", "NOTE: router mode is experimental\n");
         SRV_WRN("%s", "      it is not recommended to use this mode in untrusted environments\n");
+
+        if (!params.models_preset_hf.empty()) {
+            SRV_WRN(      "NOTE: using preset.ini from HF repo '%s'\n", params.models_preset_hf.c_str());
+            SRV_WRN("%s", "      please only use presets that you can trust! Unknown presets may be unsafe\n");
+        }
+
         if (ctx_http.thread.joinable()) {
             ctx_http.thread.join(); // keep the main thread alive
         }
@@ -405,20 +381,10 @@ int main(int argc, char ** argv) {
 
         // optionally, notify router server that this instance is ready
         std::thread monitor_thread;
-        if (server_models::is_child_server()) {
-            json model_info = routes.get_model_info();
-            monitor_thread = server_models::setup_child_server(shutdown_handler, model_info);
+        if (child.is_child()) {
+            monitor_thread = child.setup(shutdown_handler);
+            child.notify_to_router(server_state_to_str(SERVER_STATE_READY), routes.get_model_info());
         }
-
-        // TODO(dflash-native-events): after verifier batch completes, emit:
-        // { "type": "dflash_event", "native": true, "draft_tokens": [...],
-        //   "accept_count": N, "reject_range": [s,e]|null,
-        //   "accept_tokens": [...], "timing": { "proposal_ms": X, "verify_ms": Y } }
-        // Use send_event(slot_id, json_str) which already exists in this file.
-        // Flag: --dflash-emit-events (default on when drafter loaded).
-        // The speculative-decode slot loop (server-context.h) is the emission
-        // point: hook into the post-verify step where llama_speculative_decode
-        // returns the accepted token mask and corrected token.
 
         // this call blocks the main thread until queue_tasks.terminate() is called
         ctx_server.start_loop();
