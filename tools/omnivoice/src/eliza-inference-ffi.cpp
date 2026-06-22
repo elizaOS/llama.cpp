@@ -80,6 +80,19 @@ extern "C" {
 #include <unordered_map>
 #include <vector>
 
+#ifdef _WIN32
+/* MSVC has no POSIX setenv/unsetenv. The only use below pins/restores
+ * GGML_BACKEND around ov_init (overwrite is always 1); map both onto
+ * _putenv_s (from <cstdlib>), which removes the variable when value is "". */
+static inline int setenv(const char *name, const char *value, int overwrite) {
+  if (!overwrite && std::getenv(name) != nullptr) {
+    return 0;
+  }
+  return _putenv_s(name, value);
+}
+static inline int unsetenv(const char *name) { return _putenv_s(name, ""); }
+#endif
+
 /* OmniVoice voice-preset payload parsed from
  * <bundle_dir>/cache/voice-preset-<id>.bin (ELZ2 v2 binary format). v1
  * presets (Kokoro-style: embedding + phrase-cache seed only) parse with
