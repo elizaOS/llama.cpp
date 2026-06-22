@@ -2106,12 +2106,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             return il < hparams.n_layer() && hparams.is_recr(il);
                         };
                     } else if (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) {
-                        const uint32_t n_main = hparams.n_layer - hparams.nextn_predict_layers;
+                        const uint32_t n_main = hparams.n_layer() - hparams.n_layer_nextn;
                         filter_attn = [&, n_main](int32_t il) {
-                            return (uint32_t)il < n_main && !hparams.is_recurrent(il);
+                            return (uint32_t)il < n_main && !hparams.is_recr(il);
                         };
                         filter_recr = [&, n_main](int32_t il) {
-                            return (uint32_t)il < n_main && hparams.is_recurrent(il);
+                            return (uint32_t)il < n_main && hparams.is_recr(il);
                         };
                     }
 
@@ -2419,12 +2419,6 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_NEMOTRON_H:
         case LLM_ARCH_NEMOTRON_H_MOE:
         case LLM_ARCH_KIMI_LINEAR:
-        // EAGLE3 is a stub speculative-draft arch (upstream PR #18039 scaffolding,
-        // wired in commit 8b5574cd3). No graph / RoPE path exists yet; listed
-        // here only to satisfy -Werror=switch on the closed enum. Real EAGLE3
-        // draft heads inherit RoPE from their target model and would dispatch
-        // via that target, not via this switch.
-        case LLM_ARCH_EAGLE3:
             return LLAMA_ROPE_TYPE_NONE;
 
         // use what we call a normal RoPE, operating on pairs of consecutive head values

@@ -38,7 +38,7 @@ void llama_model_dflash_draft::load_arch_hparams(llama_model_loader & ml) {
         }
     }
 
-    switch (hparams.n_layer) {
+    switch (hparams.n_layer()) {
         case 5: type = LLM_TYPE_0_6B; break;
         default: type = LLM_TYPE_UNKNOWN;
     }
