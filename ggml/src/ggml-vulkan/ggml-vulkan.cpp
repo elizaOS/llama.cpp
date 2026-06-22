@@ -67,16 +67,10 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <future>
 #include <condition_variable>
 #include <thread>
-#include <regex>
 
 #if defined(_MSC_VER)
 # define NOMINMAX 1
 # include <windows.h>
-// windows.h (winnt.h) defines MemoryBarrier as a macro that expands to an
-// intrinsic call (e.g. __faststorefence()). That collides with vk::MemoryBarrier
-// and causes MSVC C2146 syntax errors. Undefine it; nothing in this TU needs
-// the Win32 MemoryBarrier intrinsic.
-# undef MemoryBarrier
 # define YIELD() YieldProcessor()
 #elif defined(__clang__) || defined(__GNUC__)
 # if defined(__x86_64__) ||defined(__i386__)
@@ -143,8 +137,6 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 #define VK_VENDOR_ID_INTEL 0x8086
 #define VK_VENDOR_ID_NVIDIA 0x10de
 #define VK_VENDOR_ID_QUALCOMM 0x5143
-#define VK_VENDOR_ID_IMAGINATION 0x1010
-#define VK_VENDOR_ID_ARM 0x13b5
 
 #define VK_DEVICE_DESCRIPTOR_POOL_SIZE 256
 
@@ -241,6 +233,7 @@ struct vk_queue;
 
 struct vk_command_buffer {
     vk::CommandBuffer buf;
+    uint64_t use_counter = 0;
     bool in_use = false;
 };
 
@@ -685,7 +678,6 @@ struct vk_device_struct {
     bool subgroup_ballot;
     bool subgroup_clustered;
     bool subgroup_vote;
-    bool subgroups_gcn_enabled;
     bool multi_add;
     bool shader_int64;
     bool buffer_device_address;
@@ -761,7 +753,6 @@ struct vk_device_struct {
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat[GGML_TYPE_COUNT];
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_COUNT];
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_COUNT];
-    vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_transa[GGML_TYPE_COUNT];
 
     vk_matmul_pipeline pipeline_matmul_id_f32 {};
     vk_matmul_pipeline pipeline_matmul_id_bf16 {};
@@ -785,39 +776,6 @@ struct vk_device_struct {
     vk_pipeline pipeline_mul_mat_vec_p021_f16_f32[p021_max_gqa_ratio];
     vk_pipeline pipeline_mul_mat_vec_nc_f16_f32;
     vk_pipeline pipeline_get_rows[GGML_TYPE_COUNT];
-    // ELIZA-VK-DISPATCH-PATCH-V1 BEGIN — eliza turbo / qjl / polar pipelines
-    // Pre-allocated pipeline slots for the 9 eliza standalone shaders. These
-    // fields keep the pipelines reachable from the device struct so the
-    // shader symbols are referenced at link time. Op-level dispatch wiring is
-    // deferred (see kernel-patches/vulkan-dispatch-patches/02-ggml-vulkan-pipelines.patch
-    // header comment for scope).
-    vk_pipeline pipeline_eliza_turbo3;
-    vk_pipeline pipeline_eliza_turbo4;
-    vk_pipeline pipeline_eliza_turbo3_tcq;
-    vk_pipeline pipeline_eliza_qjl;
-    vk_pipeline pipeline_eliza_qjl_get_rows;
-    vk_pipeline pipeline_eliza_qjl_mul_mv;
-    vk_pipeline pipeline_eliza_polar;
-    vk_pipeline pipeline_eliza_polar_preht;
-    vk_pipeline pipeline_eliza_polar_get_rows;
-    // Multi-block-per-workgroup score variants (constant_id=0 spec constant
-    // BLOCKS_PER_WG / TOKENS_PER_WG set at create time) — long-context /
-    // non-voice scoring amortises launch tax across several KV indices.
-    vk_pipeline pipeline_eliza_turbo3_multi;
-    vk_pipeline pipeline_eliza_turbo4_multi;
-    vk_pipeline pipeline_eliza_turbo3_tcq_multi;
-    vk_pipeline pipeline_eliza_qjl_multi;
-    // Device-policy fold factors actually baked into the _multi pipelines above
-    // (see ggml_vk_load_shaders). The runtime dispatch must divide the grid by
-    // exactly these — discrete-GPU classes (NVIDIA, big AMD) want a much larger
-    // fold than the conservative iGPU value. Defaults are the conservative 4.
-    uint32_t eliza_vk_tbq_multiblock_factor = 4;
-    uint32_t eliza_vk_qjl_multiblock_factor = 4;
-    // Fused attention (QJL-K score + V-mix, online softmax, score never
-    // materialised) — GGML_OP_FUSED_ATTN_QJL_TBQ + Polar V-mix variant.
-    vk_pipeline pipeline_eliza_fused_attn_qjl_tbq;
-    vk_pipeline pipeline_eliza_fused_attn_qjl_polar;
-    // ELIZA-VK-DISPATCH-PATCH-V1 END
     vk_pipeline pipeline_get_rows_f32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_acc_f32;
     vk_pipeline pipeline_set_f32;
@@ -928,7 +886,6 @@ struct vk_device_struct {
     vk_pipeline pipeline_rope_neox_f32, pipeline_rope_neox_f16, pipeline_rope_neox_f32_f16;
     vk_pipeline pipeline_rope_multi_f32, pipeline_rope_multi_f16, pipeline_rope_multi_f32_f16;
     vk_pipeline pipeline_rope_vision_f32, pipeline_rope_vision_f16;
-    vk_pipeline pipeline_get_rel_pos_f32, pipeline_get_rel_pos_f16;
     vk_pipeline pipeline_argsort_f32[num_argsort_pipelines];
     vk_pipeline pipeline_argsort_large_f32[num_argsort_pipelines];
     vk_pipeline pipeline_topk_f32[num_topk_pipelines];
@@ -952,7 +909,6 @@ struct vk_device_struct {
     vk_pipeline pipeline_snake_f16;
     vk_pipeline pipeline_snake_bf16;
     vk_pipeline pipeline_pool2d_f32;
-    vk_pipeline pipeline_istft_f32;
     vk_pipeline pipeline_rwkv_wkv6_f32;
     vk_pipeline pipeline_rwkv_wkv7_f32;
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
@@ -994,7 +950,6 @@ struct vk_device_struct {
     bool disable_host_visible_vidmem;
     bool allow_sysmem_fallback;
     bool disable_graph_optimize;
-    bool transpose_a;
 
     std::unique_ptr<vk_memory_logger> memory_logger;
 
@@ -1071,19 +1026,24 @@ struct vk_subbuffer {
     }
 };
 
-// vk_event is used for the event-related backend interfaces. It uses 'event' for
-// event_wait and 'fence' for event_synchronize. Polling on an event for
-// event_synchronize wouldn't be sufficient to wait for command buffers to complete,
-// and would lead to validation errors.
-struct vk_event {
-    vk::Event event;
-    vk::Fence fence;
-    vk_command_buffer* cmd_buffer = nullptr;
-};
-
 struct vk_semaphore {
     vk::Semaphore s;
     uint64_t value;
+};
+
+// vk_event is used for the event-related backend interfaces. It uses vk::Events for
+// event_wait and a timeline semaphore for event_synchronize. Polling on an event for
+// event_synchronize wouldn't be sufficient to wait for command buffers to complete,
+// and would lead to validation errors.
+struct vk_event {
+    std::vector<vk::Event> events_free; // Events available for reuse
+    std::vector<vk::Event> events_submitted; // Events that are fully submitted and can be reused on next synchronize
+    vk::Event event;
+    bool has_event;
+
+    vk_semaphore tl_semaphore;
+    vk_command_buffer* cmd_buffer = nullptr;
+    uint64_t cmd_buffer_use_counter = 0;
 };
 
 struct vk_submission {
@@ -1108,7 +1068,6 @@ struct vk_mat_mat_push_constants {
 #define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
-#define MAT_VEC_FUSION_FLAGS_TRANSPOSE_A 0x10
 
 struct vk_mat_vec_push_constants {
     uint32_t ncols;
@@ -1637,17 +1596,6 @@ struct vk_op_pool2d_push_constants {
     int32_t p0; int32_t p1;
 };
 
-// # ELIZA-ISTFT-DISPATCH-V1 — single-pass IDFT + OLA push constants.
-// Must mirror the Params block in vulkan-shaders/istft.comp.
-struct vk_op_istft_push_constants {
-    uint32_t n_fft;
-    uint32_t hop_length;
-    uint32_t win_length;
-    uint32_t T;          // number of frames
-    uint32_t n_out;      // total output samples
-    uint32_t use_window; // 1 when src1 (window tensor) is bound, 0 otherwise
-};
-
 struct vk_op_rwkv_wkv6_push_constants {
     uint32_t B;
     uint32_t T;
@@ -2074,7 +2022,6 @@ struct ggml_backend_vk_context {
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
-    bool needs_host_barrier {};
     bool almost_ready_fence_pending {};
     // Set before op_add and unset after op_rms_norm to indicate that the add should
     // write partial sums to accumulate the square of the vector components
@@ -2123,11 +2070,6 @@ struct ggml_backend_vk_context {
     int fused_ops_write_mask {};
     topk_moe_mode fused_topk_moe_mode {};
     bool fused_topk_moe_scale {};
-
-    // ELIZA-VK-RUNTIME-DISPATCH-V1
-    // Persistent device-side TCQ codebook used by GGML_OP_ATTN_SCORE_TBQ when
-    // packed_k is GGML_TYPE_TBQ3_TCQ. Created lazily on first dispatch.
-    vk_buffer eliza_turbo3_tcq_codebook;
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
@@ -2229,7 +2171,7 @@ void vk_memory_logger::log_allocation(vk_buffer_ref buf_ref, size_t size) {
     allocations[buf->buffer] = size;
     total_device += device ? size : 0;
     total_host += device ? 0 : size;
-    VK_LOG_MEMORY(buf->device->name << ": +" << format_size(size) << " " << type << " at " << static_cast<VkBuffer>(buf->buffer) << ". Total device: " << format_size(total_device) << ", total host: " << format_size(total_host));
+    VK_LOG_MEMORY(buf->device->name << ": +" << format_size(size) << " " << type << " at " << buf->buffer << ". Total device: " << format_size(total_device) << ", total host: " << format_size(total_host));
 }
 
 void vk_memory_logger::log_deallocation(vk_buffer_ref buf_ref) {
@@ -2248,7 +2190,7 @@ void vk_memory_logger::log_deallocation(vk_buffer_ref buf_ref) {
         VK_LOG_MEMORY(buf->device->name << ": -" << format_size(it->second) << " " << type << " at " << buf->buffer << ". Total device: " << format_size(total_device) << ", total host: " << format_size(total_host));
         allocations.erase(it);
     } else {
-        VK_LOG_MEMORY("ERROR " << buf->device->name << ": Attempted to deallocate unknown " << type << " memory at " << static_cast<VkBuffer>(buf->buffer));
+        VK_LOG_MEMORY("ERROR " << buf->device->name << ": Attempted to deallocate unknown " << type << " memory at " << buf->buffer);
     }
 }
 
@@ -2737,7 +2679,7 @@ static vk_command_buffer* ggml_vk_create_cmd_buffer(vk_device& device, vk_comman
         vk::CommandBufferLevel::ePrimary,
         1);
     const std::vector<vk::CommandBuffer> cmd_buffers = device->device.allocateCommandBuffers(command_buffer_alloc_info);
-    p.cmd_buffers.push_back({ cmd_buffers.front(), true });
+    p.cmd_buffers.push_back({ cmd_buffers.front(), 0, true });
     return &p.cmd_buffers[p.cmd_buffers.size()-1];
 }
 
@@ -3208,6 +3150,15 @@ static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subct
     );
 }
 
+static void ggml_vk_reset_event(vk_context& ctx, vk::Event& event) {
+    VK_LOG_DEBUG("ggml_vk_set_event()");
+
+    ctx->s->buffer->buf.resetEvent(
+        event,
+        ctx->p->q->stage_flags
+    );
+}
+
 static void ggml_vk_set_event(vk_context& ctx, vk::Event& event) {
     VK_LOG_DEBUG("ggml_vk_set_event()");
 
@@ -3265,18 +3216,6 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
         // Disable subgroup use due to performance issues when enforcing subgroup sizes
         result.subgroup_size = 32;
         result.disable_subgroups = true;
-    } else if (device->vendor_id == VK_VENDOR_ID_ARM) {
-        // ARM Mali (Valhall / Mali-G7xx) does not reliably honor the required
-        // subgroup size for the FA shader's subgroupShuffleXor reductions: the
-        // actual runtime subgroup size diverges from the SubGroupSize spec
-        // constant, so the reduction reads the wrong lanes and produces
-        // NON-DETERMINISTIC output (~50% intermittent " His!!!!" degeneration
-        // under greedy decode, device-verified on Mali-G715). Route the m/l/O
-        // reduction to the deterministic shared-memory path (SubGroupSize spec
-        // = 0, require_full_subgroups=false, required_subgroup_size=0), exactly
-        // like the Intel mitigation above. Override with GGML_VK_FA_ALLOW_SUBGROUPS.
-        result.subgroup_size = device->subgroup_size;
-        result.disable_subgroups = (getenv("GGML_VK_FA_ALLOW_SUBGROUPS") == nullptr);
     } else if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture != AMD_GCN) {
         result.subgroup_size = n_rows < 4 ? 32 : device->subgroup_size;
     } else {
@@ -4264,17 +4203,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             CREATE_MM2(GGML_TYPE_Q2_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q2_K], matmul_q2_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
             CREATE_MM2(GGML_TYPE_Q3_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q3_K], matmul_q3_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
             CREATE_MM2(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_K], matmul_q4_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
-            if (device->transpose_a) {
-                CREATE_MM2(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat_transa[GGML_TYPE_Q4_K], matmul_q4_k_f32_transa, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
-            }
             CREATE_MM2(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q5_K], matmul_q5_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
-            if (device->transpose_a) {
-                CREATE_MM2(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat_transa[GGML_TYPE_Q5_K], matmul_q5_k_f32_transa, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
-            }
             CREATE_MM2(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q6_K], matmul_q6_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
-            if (device->transpose_a) {
-                CREATE_MM2(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat_transa[GGML_TYPE_Q6_K], matmul_q6_k_f32_transa, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
-            }
             CREATE_MM2(GGML_TYPE_IQ1_S,   pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ1_S],   matmul_iq1_s_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
             CREATE_MM2(GGML_TYPE_IQ1_M,   pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ1_M],   matmul_iq1_m_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
             CREATE_MM2(GGML_TYPE_IQ2_XXS, pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ2_XXS], matmul_iq2_xxs_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
@@ -4297,17 +4227,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             CREATE_MM(GGML_TYPE_Q2_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q2_K].f32acc, matmul_q2_k_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
             CREATE_MM(GGML_TYPE_Q3_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q3_K].f32acc, matmul_q3_k_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
             CREATE_MM(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_K].f32acc, matmul_q4_k_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
-            if (device->transpose_a) {
-                CREATE_MM(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat_transa[GGML_TYPE_Q4_K].f32acc, matmul_q4_k_f32_transa, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
-            }
             CREATE_MM(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q5_K].f32acc, matmul_q5_k_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
-            if (device->transpose_a) {
-                CREATE_MM(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat_transa[GGML_TYPE_Q5_K].f32acc, matmul_q5_k_f32_transa, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
-            }
             CREATE_MM(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q6_K].f32acc, matmul_q6_k_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
-            if (device->transpose_a) {
-                CREATE_MM(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat_transa[GGML_TYPE_Q6_K].f32acc, matmul_q6_k_f32_transa, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
-            }
             CREATE_MM(GGML_TYPE_IQ1_S,   pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ1_S].f32acc,   matmul_iq1_s_f32,   , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
             CREATE_MM(GGML_TYPE_IQ1_M,   pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ1_M].f32acc,   matmul_iq1_m_f32,   , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
             CREATE_MM(GGML_TYPE_IQ2_XXS, pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ2_XXS].f32acc, matmul_iq2_xxs_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
@@ -4422,17 +4343,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_MM2(GGML_TYPE_Q2_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q2_K], matmul_q2_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM2(GGML_TYPE_Q3_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q3_K], matmul_q3_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM2(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_K], matmul_q4_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
-        if (device->transpose_a) {
-            CREATE_MM2(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat_transa[GGML_TYPE_Q4_K], matmul_q4_k_f32_transa, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
-        }
         CREATE_MM2(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q5_K], matmul_q5_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
-        if (device->transpose_a) {
-            CREATE_MM2(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat_transa[GGML_TYPE_Q5_K], matmul_q5_k_f32_transa, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
-        }
         CREATE_MM2(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q6_K], matmul_q6_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
-        if (device->transpose_a) {
-            CREATE_MM2(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat_transa[GGML_TYPE_Q6_K], matmul_q6_k_f32_transa, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
-        }
         CREATE_MM2(GGML_TYPE_IQ1_S,   pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ1_S],   matmul_iq1_s_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM2(GGML_TYPE_IQ1_M,   pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ1_M],   matmul_iq1_m_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM2(GGML_TYPE_IQ2_XXS, pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ2_XXS], matmul_iq2_xxs_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
@@ -4599,17 +4511,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_MM(GGML_TYPE_Q2_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q2_K].f32acc, matmul_q2_k_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM(GGML_TYPE_Q3_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q3_K].f32acc, matmul_q3_k_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_K].f32acc, matmul_q4_k_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
-        if (device->transpose_a) {
-            CREATE_MM(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat_transa[GGML_TYPE_Q4_K].f32acc, matmul_q4_k_f32_transa, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
-        }
         CREATE_MM(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q5_K].f32acc, matmul_q5_k_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
-        if (device->transpose_a) {
-            CREATE_MM(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat_transa[GGML_TYPE_Q5_K].f32acc, matmul_q5_k_f32_transa, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
-        }
         CREATE_MM(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q6_K].f32acc, matmul_q6_k_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
-        if (device->transpose_a) {
-            CREATE_MM(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat_transa[GGML_TYPE_Q6_K].f32acc, matmul_q6_k_f32_transa, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
-        }
         CREATE_MM(GGML_TYPE_IQ1_S,   pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ1_S].f32acc,   matmul_iq1_s_f32,   , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM(GGML_TYPE_IQ1_M,   pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ1_M].f32acc,   matmul_iq1_m_f32,   , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM(GGML_TYPE_IQ2_XXS, pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ2_XXS].f32acc, matmul_iq2_xxs_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
@@ -4738,7 +4641,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
     uint32_t rm_iq = 2 * rm_kq;
 
-    const bool use_subgroups = device->subgroup_arithmetic && (device->architecture != vk_device_architecture::AMD_GCN || device->subgroups_gcn_enabled);
+    const bool use_subgroups = device->subgroup_arithmetic && device->architecture != vk_device_architecture::AMD_GCN;
     // Ensure a subgroup size >= 16 is available
     const bool use_subgroups16 = use_subgroups && subgroup_min_size_16;
 
@@ -4754,20 +4657,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const uint32_t wg_size_subgroup   = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size : (subgroup_size * 4);
         const uint32_t wg_size_subgroup16 = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size16 : (subgroup_size16 * 4);
 
-        shader_reduction_mode reduc = (use_subgroups && w == DMMV_WG_SIZE_SUBGROUP) ? SHADER_REDUCTION_MODE_SUBGROUP :
-                                      (use_subgroups && w == DMMV_WG_SIZE_LARGE) ? SHADER_REDUCTION_MODE_HYBRID :
-                                      SHADER_REDUCTION_MODE_SHMEM;
+        const shader_reduction_mode reduc = (use_subgroups && w == DMMV_WG_SIZE_SUBGROUP) ? SHADER_REDUCTION_MODE_SUBGROUP :
+                                            (use_subgroups && w == DMMV_WG_SIZE_LARGE) ? SHADER_REDUCTION_MODE_HYBRID :
+                                            SHADER_REDUCTION_MODE_SHMEM;
 
-        shader_reduction_mode reduc16 = (use_subgroups16 && w == DMMV_WG_SIZE_SUBGROUP) ? SHADER_REDUCTION_MODE_SUBGROUP :
-                                        (use_subgroups16 && w == DMMV_WG_SIZE_LARGE) ? SHADER_REDUCTION_MODE_HYBRID :
-                                        SHADER_REDUCTION_MODE_SHMEM;
-
-        // PowerVR DXT: subgroup_no_shmem variant crashes driver compiler with NUM_COLS >= 2.
-        // Fall back to hybrid (subgroup + shared memory) which works correctly.
-        if (device->vendor_id == VK_VENDOR_ID_IMAGINATION) {
-            if (reduc == SHADER_REDUCTION_MODE_SUBGROUP) reduc = SHADER_REDUCTION_MODE_HYBRID;
-            if (reduc16 == SHADER_REDUCTION_MODE_SUBGROUP) reduc16 = SHADER_REDUCTION_MODE_HYBRID;
-        }
+        const shader_reduction_mode reduc16 = (use_subgroups16 && w == DMMV_WG_SIZE_SUBGROUP) ? SHADER_REDUCTION_MODE_SUBGROUP :
+                                              (use_subgroups16 && w == DMMV_WG_SIZE_LARGE) ? SHADER_REDUCTION_MODE_HYBRID :
+                                              SHADER_REDUCTION_MODE_SHMEM;
 
         for (uint32_t i = 0; i < mul_mat_vec_max_cols; ++i) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F32 ][i], "mul_mat_vec_f32_f32_f32",  arr_dmmv_f32_f32_f32_len[reduc],  arr_dmmv_f32_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {wg_size_subgroup, 1, i+1}, 1, false, use_subgroups, force_subgroup_size);
@@ -4827,9 +4723,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 const uint32_t subgroup_size_int = (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control) ? device->subgroup_min_size : device->subgroup_size;
                 const uint32_t wg_size_subgroup_int = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size_int : (subgroup_size_int * 4);
 
-                const auto * mmv_q4_0_q8_1_f32_len = device->fp16 ? arr_dmmv_q4_0_q8_1_f16_f32_len : arr_dmmv_q4_0_q8_1_f32_len;
-                const auto * mmv_q4_0_q8_1_f32_data = device->fp16 ? arr_dmmv_q4_0_q8_1_f16_f32_data : arr_dmmv_q4_0_q8_1_f32_data;
-                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0][i], "mul_mat_vec_q4_0_q8_1_f32", mmv_q4_0_q8_1_f32_len[reduc], mmv_q4_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0][i], "mul_mat_vec_q4_0_q8_1_f32", arr_dmmv_q4_0_q8_1_f32_len[reduc], arr_dmmv_q4_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_1][i], "mul_mat_vec_q4_1_q8_1_f32", arr_dmmv_q4_1_q8_1_f32_len[reduc], arr_dmmv_q4_1_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q5_0][i], "mul_mat_vec_q5_0_q8_1_f32", arr_dmmv_q5_0_q8_1_f32_len[reduc], arr_dmmv_q5_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q5_1][i], "mul_mat_vec_q5_1_q8_1_f32", arr_dmmv_q5_1_q8_1_f32_len[reduc], arr_dmmv_q5_1_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
@@ -4881,9 +4775,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const uint32_t subgroup_size_int = (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control) ? device->subgroup_min_size : device->subgroup_size;
             const uint32_t wg_size_subgroup_int = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size_int : (subgroup_size_int * 4);
 
-            const auto * mmv_id_q4_0_q8_1_f32_len = device->fp16 ? arr_dmmv_id_q4_0_q8_1_f16_f32_len : arr_dmmv_id_q4_0_q8_1_f32_len;
-            const auto * mmv_id_q4_0_q8_1_f32_data = device->fp16 ? arr_dmmv_id_q4_0_q8_1_f16_f32_data : arr_dmmv_id_q4_0_q8_1_f32_data;
-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q4_0], "mul_mat_vec_id_q4_0_q8_1_f32", mmv_id_q4_0_q8_1_f32_len[reduc], mmv_id_q4_0_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int}, 1, true, use_subgroups, subgroup_size_int);
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q4_0], "mul_mat_vec_id_q4_0_q8_1_f32", arr_dmmv_id_q4_0_q8_1_f32_len[reduc], arr_dmmv_id_q4_0_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int}, 1, true, use_subgroups, subgroup_size_int);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q4_1], "mul_mat_vec_id_q4_1_q8_1_f32", arr_dmmv_id_q4_1_q8_1_f32_len[reduc], arr_dmmv_id_q4_1_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int}, 1, true, use_subgroups, subgroup_size_int);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q5_0], "mul_mat_vec_id_q5_0_q8_1_f32", arr_dmmv_id_q5_0_q8_1_f32_len[reduc], arr_dmmv_id_q5_0_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int}, 1, true, use_subgroups, subgroup_size_int);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q5_1], "mul_mat_vec_id_q5_1_q8_1_f32", arr_dmmv_id_q5_1_q8_1_f32_len[reduc], arr_dmmv_id_q5_1_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int}, 1, true, use_subgroups, subgroup_size_int);
@@ -5237,9 +5129,6 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_rope_neox_f32_f16, "rope_neox_f32_f16", rope_neox_f32_f16_len, rope_neox_f32_f16_data, "main", 5, sizeof(vk_op_rope_push_constants), {1, 512, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_rope_multi_f32_f16, "rope_multi_f32_f16", rope_multi_f32_f16_len, rope_multi_f32_f16_data, "main", 5, sizeof(vk_op_rope_push_constants), {1, 512, 1}, {}, 1);
 
-    ggml_vk_create_pipeline(device, device->pipeline_get_rel_pos_f32, "get_rel_pos_f32", get_rel_pos_f32_len, get_rel_pos_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_get_rel_pos_f16, "get_rel_pos_f16", get_rel_pos_f16_len, get_rel_pos_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
-
     for (uint32_t i = 0; i < num_argsort_pipelines; ++i) {
         uint32_t BLOCK_SIZE = 1u << std::min(i, device->max_workgroup_size_log2);
         if (i <= device->max_workgroup_size_log2 &&
@@ -5337,15 +5226,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_snake_f16,  "snake_f16",  snake_f16_len,  snake_f16_data,  "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_snake_bf16, "snake_bf16", snake_bf16_len, snake_bf16_data, "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
 
-    ggml_vk_create_pipeline(device, device->pipeline_snake_f32,  "snake_f32",  snake_f32_len,  snake_f32_data,  "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_snake_f16,  "snake_f16",  snake_f16_len,  snake_f16_data,  "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_snake_bf16, "snake_bf16", snake_bf16_len, snake_bf16_data, "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
-
     ggml_vk_create_pipeline(device, device->pipeline_pool2d_f32, "pool2d_f32", pool2d_f32_len, pool2d_f32_data, "main", 2, sizeof(vk_op_pool2d_push_constants), {512, 1, 1}, {}, 1);
-
-    // iSTFT: single-pass, one thread per output sample (2 bindings: mag_phase, dst)
-    // Window is computed from push-constant win_length — no window tensor binding.
-    ggml_vk_create_pipeline(device, device->pipeline_istft_f32, "istft_f32", istft_f32_len, istft_f32_data, "main", 3, sizeof(vk_op_istft_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_rwkv_wkv6_f32, "rwkv_wkv6_f32", rwkv_wkv6_f32_len, rwkv_wkv6_f32_data, "main", 7, sizeof(vk_op_rwkv_wkv6_push_constants), {1, 1, 1}, {device->subgroup_size}, 1);
 
@@ -5602,52 +5483,6 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     }
 
-    // ELIZA-VK-DISPATCH-PATCH-V1 BEGIN — create eliza turbo / qjl / polar pipelines
-    // Push-constant sizes / bind counts are taken from the matching .comp files.
-    //   turbo3 / turbo4    : 3 storage buffers (q, k_blocks, scores)            + 5*u32 push
-    //   turbo3_tcq         : 4 storage buffers (q, k_blocks, scores, codebook)  + 5*u32 push
-    //   qjl (score)        : 3 storage buffers (q_sketch, packed_k, scores)     + 4*u32 push
-    //   qjl_get_rows       : 3 storage buffers (k_packed, prj, out)             + 2*u32 push
-    //   qjl_mul_mv         : 3 storage buffers (k_blocks, q_sketch, y)          + 2*u32 push
-    //   polar              : 3 storage buffers (k_blocks, q, y)                 + 6*u32 push
-    //   polar_preht        : 3 storage buffers (k_blocks, H*q, y)               + 6*u32 push
-    //   polar_get_rows     : 2 storage buffers (k_block, out)                   + 2*u32 push
-    ggml_vk_create_pipeline(device, device->pipeline_eliza_turbo3,         "eliza_turbo3",         eliza_turbo3_len,         eliza_turbo3_data,         "main", 3, 5 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_eliza_turbo4,         "eliza_turbo4",         eliza_turbo4_len,         eliza_turbo4_data,         "main", 3, 5 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_eliza_turbo3_tcq,     "eliza_turbo3_tcq",     eliza_turbo3_tcq_len,     eliza_turbo3_tcq_data,     "main", 4, 5 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_eliza_qjl,            "eliza_qjl",            eliza_qjl_len,            eliza_qjl_data,            "main", 3, 4 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_eliza_qjl_get_rows,   "eliza_qjl_get_rows",   eliza_qjl_get_rows_len,   eliza_qjl_get_rows_data,   "main", 3, 2 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_eliza_qjl_mul_mv,     "eliza_qjl_mul_mv",     eliza_qjl_mul_mv_len,     eliza_qjl_mul_mv_data,     "main", 3, 2 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_eliza_polar,          "eliza_polar",          eliza_polar_len,          eliza_polar_data,          "main", 3, 6 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_eliza_polar_preht,    "eliza_polar_preht",    eliza_polar_preht_len,    eliza_polar_preht_data,    "main", 3, 6 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_eliza_polar_get_rows, "eliza_polar_get_rows", eliza_polar_get_rows_len, eliza_polar_get_rows_data, "main", 2, 2 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
-    // Multi-block variants. constant_id=0 = BLOCKS_PER_WG (turbo* score) /
-    // TOKENS_PER_WG (qjl). Device-policy table from vulkan_bench
-    // (VK_QUERY_TYPE_TIMESTAMP per-dispatch sweep over {1,2,4,8,16}):
-    //   * NVIDIA discrete (RTX 5080 Laptop, ANV→nvidia ICD): factor 16 for the
-    //     turbo* score kernels (386us→48us at 4k, ~3.2x at 32k) and factor 8
-    //     for QJL (4742us→374us at 4k, ~8.6x at 32k; 16 is a wash vs 8 there,
-    //     8 keeps more WGs in flight under contention) — measured 2026-05-11.
-    //   * Intel Arc/Xe iGPU (Mesa ANV 25.2.8): factor 4 — bandwidth-bound at
-    //     n_kv>=512, the fold is a wash below 32k; only the engage threshold
-    //     moves (see runtime dispatch). Keep 4 (also the conservative
-    //     cross-device default for unprofiled Adreno/Mali/AMD).
-    {
-        const bool eliza_vk_discrete = device->vendor_id == VK_VENDOR_ID_NVIDIA;
-        device->eliza_vk_tbq_multiblock_factor = eliza_vk_discrete ? 16u : 4u;
-        device->eliza_vk_qjl_multiblock_factor = eliza_vk_discrete ? 8u  : 4u;
-    }
-    ggml_vk_create_pipeline(device, device->pipeline_eliza_turbo3_multi,     "eliza_turbo3_multi",     eliza_turbo3_multi_len,     eliza_turbo3_multi_data,     "main", 3, 5 * sizeof(uint32_t), {1, 1, 1}, {device->eliza_vk_tbq_multiblock_factor}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_eliza_turbo4_multi,     "eliza_turbo4_multi",     eliza_turbo4_multi_len,     eliza_turbo4_multi_data,     "main", 3, 5 * sizeof(uint32_t), {1, 1, 1}, {device->eliza_vk_tbq_multiblock_factor}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_eliza_turbo3_tcq_multi, "eliza_turbo3_tcq_multi", eliza_turbo3_tcq_multi_len, eliza_turbo3_tcq_multi_data, "main", 4, 5 * sizeof(uint32_t), {1, 1, 1}, {device->eliza_vk_tbq_multiblock_factor}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_eliza_qjl_multi,        "eliza_qjl_multi",        eliza_qjl_multi_len,        eliza_qjl_multi_data,        "main", 3, 4 * sizeof(uint32_t), {1, 1, 1}, {device->eliza_vk_qjl_multiblock_factor}, 1);
-    // Fused attention: 4 storage buffers (q_sketch, packed_k, packed_v, out).
-    //   fused_attn_qjl_tbq  : 6*u32 push (n_heads, n_kv_heads, n_tokens, q_pos, sm_scale_bits, kv_tile)
-    //   fused_attn_qjl_polar: 7*u32 push (… + v_use_qjl before kv_tile)
-    ggml_vk_create_pipeline(device, device->pipeline_eliza_fused_attn_qjl_tbq,   "eliza_fused_attn_qjl_tbq",   eliza_fused_attn_qjl_tbq_len,   eliza_fused_attn_qjl_tbq_data,   "main", 4, 8 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_eliza_fused_attn_qjl_polar, "eliza_fused_attn_qjl_polar", eliza_fused_attn_qjl_polar_len, eliza_fused_attn_qjl_polar_data, "main", 4, 9 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
-    // ELIZA-VK-DISPATCH-PATCH-V1 END
-
     // Drop compile_mutex so other threads can walk while we compile.
     compile_lock.unlock();
 
@@ -5708,8 +5543,6 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         const char* GGML_VK_DISABLE_GRAPH_OPTIMIZE = getenv("GGML_VK_DISABLE_GRAPH_OPTIMIZE");
         device->disable_graph_optimize = GGML_VK_DISABLE_GRAPH_OPTIMIZE != nullptr;
-
-        device->transpose_a = getenv("GGML_VK_NO_TRANSPOSE_A") == nullptr;
 
         bool fp16_storage = false;
         bool fp16_compute = false;
@@ -5860,15 +5693,6 @@ static vk_device ggml_vk_get_device(size_t idx) {
         if (!device->support_async) {
             GGML_LOG_DEBUG("ggml_vulkan: WARNING: Async execution disabled on certain Intel devices.\n");
         }
-
-        // Enable subgroup operations on AMD GCN 5.0/5.1 GPUs
-        static const std::regex s_gcn_regex("^.*(Radeon.*(VII|Vega)|Instinct.*MI(25|50|60)).*$");
-        device->subgroups_gcn_enabled = (device->vendor_id == VK_VENDOR_ID_AMD &&
-                                         std::regex_match(std::string(device->properties.deviceName.data()), s_gcn_regex));
-        if (device->subgroups_gcn_enabled) {
-            GGML_LOG_DEBUG("ggml_vulkan: subgroup operations enabled on AMD GCN GPU: %s\n", device->properties.deviceName.data());
-        }
-
 
         const char* GGML_VK_FORCE_MAX_ALLOCATION_SIZE = getenv("GGML_VK_FORCE_MAX_ALLOCATION_SIZE");
 
@@ -7503,6 +7327,7 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
 static vk_command_buffer* ggml_vk_get_or_create_cmd_buffer(vk_device& device, vk_command_pool& pool) {
     for (auto& cmd_buffer : pool.cmd_buffers) {
         if (!cmd_buffer.in_use) {
+            cmd_buffer.use_counter++;
             cmd_buffer.in_use = true;
             return &cmd_buffer;
         }
@@ -7560,34 +7385,6 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     GGML_ASSERT(wg0 <= ctx->device->properties.limits.maxComputeWorkGroupCount[0] &&
                 wg1 <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
                 wg2 <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
-    if (ctx->descriptor_set_idx >= ctx->descriptor_sets.size()) {
-        // Grow-on-demand safety net for the lazy single-pass descriptor model.
-        // The pool is sized eagerly as each op calls
-        // ggml_pipeline_request_descriptor_sets and consumed one set per
-        // dispatch; the invariant holds only if every op requests exactly as
-        // many sets as it dispatches. The OmniVoice MaskGIT batched-LM graph
-        // (fused rms_norm_mul_rope / swiglu / aligned-matmul / cont pipelines)
-        // accumulates a net under-request, so descriptor_set_idx can reach
-        // descriptor_sets.size() mid-graph and the assert below would abort
-        // (device-confirmed on Mali-G715: GPU OmniVoice synth crashed here and
-        // completes correctly once the pool grows). Force requirements above the
-        // current index so the allocator actually grows (its size>=requirements
-        // early-return no longer triggers) and the graph completes with a valid,
-        // unused set at [idx]. The re-request is a pure host-side pool allocate
-        // (the pipeline is already compiled here, so no shader recompile /
-        // re-entrancy), idempotent, and self-limiting (<=1 new set per overrun).
-        // Set ELIZA_VK_DESC_DIAG=1 to name the overrun pipeline.
-        static const bool desc_diag = getenv("ELIZA_VK_DESC_DIAG") != nullptr;
-        if (desc_diag) {
-            fprintf(stderr, "[eliza-vk-desc] descriptor overrun: pipeline=%s idx=%u size=%zu req=%u — growing\n",
-                    pipeline->name.c_str(), ctx->descriptor_set_idx,
-                    (size_t) ctx->descriptor_sets.size(), ctx->pipeline_descriptor_set_requirements);
-        }
-        const uint32_t need = ctx->descriptor_set_idx + 1;
-        if (ctx->pipeline_descriptor_set_requirements < need) {
-            ggml_pipeline_request_descriptor_sets(ctx, pipeline, need - ctx->pipeline_descriptor_set_requirements);
-        }
-    }
     GGML_ASSERT(ctx->descriptor_set_idx < ctx->descriptor_sets.size());
     GGML_ASSERT(descriptor_buffer_infos.size() <= MAX_PARAMETER_COUNT);
     GGML_ASSERT(pipeline->parameter_count == descriptor_buffer_infos.size());
@@ -7636,24 +7433,11 @@ static vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx) {
 
         ctx->compute_ctx = result;
         ggml_vk_ctx_begin(ctx->device, result);
-
-        if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
-            result->s->wait_semaphores.push_back(ctx->transfer_semaphore);
-            ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
-        }
     }
 
-    if (ctx->needs_host_barrier) {
-        vk::MemoryBarrier barrier{
-            vk::AccessFlagBits::eHostWrite,
-            vk::AccessFlagBits::eShaderRead
-        };
-        result->s->buffer->buf.pipelineBarrier(
-            vk::PipelineStageFlagBits::eHost,
-            vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer,
-            {}, barrier, nullptr, nullptr
-        );
-        ctx->needs_host_barrier = false;
+    if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
+        result->s->wait_semaphores.push_back(ctx->transfer_semaphore);
+        ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
     }
 
     return result;
@@ -7848,21 +7632,6 @@ static bool ggml_vk_buffer_write_2d_async(vk_context subctx, vk_buffer& dst, siz
         subctx->s->buffer->buf.copyBuffer(buf->buffer, dst->buffer, slices);
         return true;
     }
-
-    // UMA zero-copy: destination is directly mapped, skip staging buffer
-    if (dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible &&
-        dst->device->uma) {
-        if (width == spitch) {
-            deferred_memcpy((uint8_t *)dst->ptr + offset, src, width * height, &subctx->in_memcpys);
-        } else {
-            for (size_t i = 0; i < height; i++) {
-                deferred_memcpy((uint8_t *)dst->ptr + offset + i * width,
-                                (const uint8_t *)src + i * spitch, width, &subctx->in_memcpys);
-            }
-        }
-        return true;
-    }
-
     VK_LOG_DEBUG("STAGING");
 
     if (!sync_staging) {
@@ -7891,7 +7660,7 @@ static bool ggml_vk_buffer_write_2d_async(vk_context subctx, vk_buffer& dst, siz
     }
 
     ggml_vk_sync_buffers(nullptr, subctx);
-    subctx->s->buffer->buf.copyBuffer(staging_buffer->buffer, dst->buffer, slices);
+    subctx->s->buffer->buf.copyBuffer((VkBuffer)staging_buffer->buffer, (VkBuffer)dst->buffer, slices);
 
     if (width == spitch) {
         deferred_memcpy((uint8_t *)staging_buffer->ptr, src, staging_size, &subctx->in_memcpys);
@@ -7985,21 +7754,6 @@ static bool ggml_vk_buffer_read_2d_async(vk_context subctx, vk_buffer& src, size
 
         return true;
     }
-
-    // UMA zero-copy: source is directly mapped, skip staging buffer
-    if (src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible &&
-        src->device->uma) {
-        if (width == spitch && width == dpitch) {
-            deferred_memcpy(dst, (const uint8_t *)src->ptr + offset, width * height, &subctx->out_memcpys);
-        } else {
-            for (size_t i = 0; i < height; i++) {
-                deferred_memcpy((uint8_t *)dst + i * dpitch,
-                                (const uint8_t *)src->ptr + offset + i * spitch, width, &subctx->out_memcpys);
-            }
-        }
-        return true;
-    }
-
     VK_LOG_DEBUG("STAGING");
 
     if (!sync_staging) {
@@ -8045,7 +7799,7 @@ static bool ggml_vk_buffer_read_async(vk_context subctx, vk_buffer& src, size_t 
 }
 
 static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, size_t spitch, size_t dpitch, size_t width, size_t height) {
-    VK_LOG_DEBUG("ggml_vk_buffer_read_2d(" << static_cast<VkBuffer>(src->buffer) << ", " << offset << ", " << width << ", " << height << ")");
+    VK_LOG_DEBUG("ggml_vk_buffer_read_2d(" << src->buffer << ", " << offset << ", " << width << ", " << height << ")");
 
     // If the device is not an UMA device the memory is host-accessible through rebar. While writing
     // through PCIe is sufficient fast reading back data from PCIe is slower than going through
@@ -8098,7 +7852,7 @@ static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, si
 }
 
 static void ggml_vk_buffer_read(vk_buffer& src, size_t offset, void * dst, size_t size) {
-    VK_LOG_DEBUG("ggml_vk_buffer_read(" << static_cast<VkBuffer>(src->buffer) << ", " << offset << ", " << size << ")");
+    VK_LOG_DEBUG("ggml_vk_buffer_read(" << src->buffer << ", " << offset << ", " << size << ")");
     ggml_vk_buffer_read_2d(src, offset, dst, size, size, size, 1);
 }
 
@@ -8271,7 +8025,7 @@ static void ggml_vk_matmul(
         uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t batch_stride_d,
         uint32_t split_k, uint32_t batch, uint32_t ne02, uint32_t ne12, uint32_t broadcast2, uint32_t broadcast3,
         uint32_t padded_n) {
-        VK_LOG_DEBUG("ggml_vk_matmul(a: (" << static_cast<VkBuffer>(a.buffer->buffer) << ", " << a.offset << ", " << a.size << "), b: (" << static_cast<VkBuffer>(b.buffer->buffer) << ", " << b.offset << ", " << b.size << "), d: (" << static_cast<VkBuffer>(d.buffer->buffer) << ", " << d.offset << ", " << d.size << "), split_k: (" << (split_k_buffer.buffer != nullptr ? static_cast<VkBuffer>(split_k_buffer.buffer->buffer) : VkBuffer{}) << ", " << split_k_buffer.offset << ", " << split_k_buffer.size << "), m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", split_k: " << split_k << ", batch: " << batch << ", ne02: " << ne02 << ", ne12: " << ne12 << ", broadcast2: " << broadcast2 << ", broadcast3: " << broadcast3 << ", padded_n: " << padded_n << ")");
+        VK_LOG_DEBUG("ggml_vk_matmul(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), split_k: (" << (split_k_buffer.buffer != nullptr ? split_k_buffer.buffer->buffer : VK_NULL_HANDLE) << ", " << split_k_buffer.offset << ", " << split_k_buffer.size << "), m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", split_k: " << split_k << ", batch: " << batch << ", ne02: " << ne02 << ", ne12: " << ne12 << ", broadcast2: " << broadcast2 << ", broadcast3: " << broadcast3 << ", padded_n: " << padded_n << ")");
     if (split_k == 1) {
         ggml_pipeline_request_descriptor_sets(ctx, pipeline, CEIL_DIV(batch, ctx->device->properties.limits.maxComputeWorkGroupCount[2]));
 
@@ -8358,7 +8112,7 @@ static void ggml_vk_matmul_id(
         uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t batch_stride_d,
         uint32_t n_as, uint32_t nei0, uint32_t nei1, uint32_t nbi1, uint32_t ne11,
         uint32_t padded_n) {
-    VK_LOG_DEBUG("ggml_vk_matmul_id(a: (" << static_cast<VkBuffer>(a.buffer->buffer) << ", " << a.offset << ", " << a.size << "), b: (" << static_cast<VkBuffer>(b.buffer->buffer) << ", " << b.offset << ", " << b.size << "), d: (" << static_cast<VkBuffer>(d.buffer->buffer) << ", " << d.offset << ", " << d.size << "), ids: (" << static_cast<VkBuffer>(ids.buffer->buffer) << ", " << ids.offset << ", " << ids.size << "), expert_count: (" << static_cast<VkBuffer>(expert_count_buf.buffer->buffer) << ", " << expert_count_buf.offset << ", " << expert_count_buf.size << "), " <<
+    VK_LOG_DEBUG("ggml_vk_matmul_id(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), ids: (" << ids.buffer->buffer << ", " << ids.offset << ", " << ids.size << "), expert_count: (" << expert_count_buf.buffer->buffer << ", " << expert_count_buf.offset << ", " << expert_count_buf.size << "), " <<
         "m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", " <<
         "batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", " <<
         "n_as: " << n_as << ", nei0: " << nei0 << ", nei1: " << nei1 << ", nbi1: " << nbi1 << ", ne11: " << ne11 << ")");
@@ -8674,26 +8428,6 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, f16_type, y_f32_kernel ? GGML_TYPE_F32 : f16_type, (ggml_prec)dst->op_params[0]);
     }
 
-    // Use transposed-A pipeline when the weight data was repacked in set_tensor.
-    // The repack only happens for 2D tensors (ne[2]==1, ne[3]==1) that are not dequantized.
-    if (ctx->device->transpose_a && !qx_needs_dequant &&
-        ne02 == 1 && ne03 == 1 &&
-        (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K) &&
-        src0->name != nullptr && strstr(src0->name, "token_embd") == nullptr) {
-        vk_matmul_pipeline2 & transa = ctx->device->pipeline_dequant_mul_mat_mat_transa[src0->type];
-        if (ctx->device->coopmat_support) {
-            vk_matmul_pipeline candidate = (ctx->device->fp16 && ctx->device->coopmat_acc_f16_support && (ggml_prec)dst->op_params[0] == GGML_PREC_DEFAULT) ? transa.f16acc : transa.f32acc;
-            if (candidate && !candidate->is_empty()) {
-                mmp = candidate;
-            }
-        } else {
-            vk_matmul_pipeline candidate = (ctx->device->fp16 && (ggml_prec)dst->op_params[0] == GGML_PREC_DEFAULT) ? transa.f16acc : transa.f32acc;
-            if (candidate && !candidate->is_empty()) {
-                mmp = candidate;
-            }
-        }
-    }
-
     // Not implemented
     GGML_ASSERT(y_non_contig || !qy_needs_dequant);  // NOLINT
 
@@ -8950,12 +8684,6 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
             return false;
         }
 
-        if (device->architecture == vk_device_architecture::INTEL_XE2) {
-            if (src0_type == GGML_TYPE_Q2_K || src0_type == GGML_TYPE_Q3_K || src0_type == GGML_TYPE_Q6_K) {
-                return true;
-            }
-        }
-
         if (k < 2048) {
             return false;
         }
@@ -9167,15 +8895,6 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     }
 
     uint32_t fusion_flags = 0;
-
-    // Token embedding weights are used as a lookup table (single-row gather),
-    // not as a matrix multiply operand, so transposing them would be incorrect.
-    if (ctx->device->transpose_a && !x_non_contig &&
-        (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K) &&
-        src0->ne[2] == 1 && src0->ne[3] == 1 &&
-        src0->name != nullptr && strstr(src0->name, "token_embd") == nullptr) {
-        fusion_flags |= MAT_VEC_FUSION_FLAGS_TRANSPOSE_A;
-    }
 
     vk_subbuffer d_F0 = d_D;
     if (ctx->num_additional_fused_ops > 0) {
@@ -10393,18 +10112,6 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         }
     }
 
-    // ARM Mali: the split-K flash-attention reduce corrupts output on long KV.
-    // With split_k>1 the KV is split into chunks that each run the FA shader and
-    // are combined by flash_attn_split_k_reduce; on Mali that combine produces
-    // degenerate token repetition once a prompt grows past a few hundred tokens
-    // (short prompts never split, so they were clean). Keep flash-attn ENABLED
-    // but single-chunk on this vendor until the reduce path is fixed for Mali.
-    // Overridable for bisecting / once the reduce is fixed.
-    if (ctx->device->vendor_id == VK_VENDOR_ID_ARM &&
-        getenv("GGML_VK_FA_ALLOW_SPLIT_K") == nullptr) {
-        split_k = 1;
-    }
-
     if (split_k > 1) {
         // Try to evenly split KV into split_k chunks, but it needs to be a multiple
         // of "align", so recompute split_k based on that.
@@ -11044,11 +10751,6 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_pool2d_f32;
         }
         return nullptr;
-    case GGML_OP_ISTFT:
-        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-            return ctx->device->pipeline_istft_f32;
-        }
-        return nullptr;
     case GGML_OP_RWKV_WKV6:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_rwkv_wkv6_f32;
@@ -11205,14 +10907,6 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
         if (dst->type == GGML_TYPE_F16) {
             return ctx->device->pipeline_fill_f16;
-        }
-        return nullptr;
-    case GGML_OP_GET_REL_POS:
-        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-            return ctx->device->pipeline_get_rel_pos_f32;
-        }
-        if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
-            return ctx->device->pipeline_get_rel_pos_f16;
         }
         return nullptr;
     default:
@@ -11552,7 +11246,6 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     case GGML_OP_UNARY:
     case GGML_OP_GLU:
     case GGML_OP_CONV_2D_DW:
-    case GGML_OP_GET_REL_POS:
         {
             uint32_t ne = ggml_nelements(dst);
             if (op == GGML_OP_CPY && ggml_is_quantized(src0->type) && ggml_is_quantized(dst->type)) {
@@ -11620,18 +11313,6 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             elements = { nr, n_t, n_s };
         }
         break;
-    case GGML_OP_ISTFT:
-        {
-            // One thread per output sample.  n_out = dst->ne[0].
-            const uint32_t n_out = (uint32_t) dst->ne[0];
-            if (n_out > 262144) {
-                elements = { 512, 512, CEIL_DIV(n_out, 262144) };
-            } else if (n_out > 256) {
-                elements = { 256, CEIL_DIV(n_out, 256), 1 };
-            } else {
-                elements = { n_out, 1, 1 };
-            }
-        } break;
     default:
         elements = { (uint32_t)ggml_nelements(src0), 1, 1 };
         break;
@@ -11982,7 +11663,6 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     const ggml_tensor * src_q     = dst->src[0];
     const ggml_tensor * src_v     = dst->src[2];
     const ggml_tensor * src_beta  = dst->src[4];
-    const ggml_tensor * src_state = dst->src[5];
 
     GGML_ASSERT(dst->buffer != nullptr);
 
@@ -12878,11 +12558,6 @@ static void ggml_vk_rope(ggml_backend_vk_context * ctx, vk_context& subctx, cons
         ggml_vk_make_rope_constants(cgraph->nodes[node_idx], src0, src2 != nullptr, backprop, set_rows_stride));
 }
 
-static void ggml_vk_get_rel_pos(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
-    vk_op_unary_push_constants pc = vk_op_unary_push_constants_init(src0, dst, ggml_nelements(dst));
-    ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_GET_REL_POS, pc);
-}
-
 static void ggml_vk_argsort(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
     const uint32_t * op_params = (const uint32_t *)dst->op_params;
 
@@ -13401,39 +13076,6 @@ static void ggml_vk_pool_2d(ggml_backend_vk_context * ctx, vk_context& subctx, c
         op,
         k0, k1, s0, s1, p0, p1,
     });
-}
-
-static void ggml_vk_istft(ggml_backend_vk_context * ctx, vk_context& subctx,
-                          const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    // # ELIZA-ISTFT-DISPATCH-V1
-    // src0: mag_phase F32 [2, F, T]  (ne[0]=2 mag/phase channel, ne[1]=F, ne[2]=T)
-    // src1: window    F32 [win_length] — optional; when NULL the shader
-    //                                    synthesises a periodic Hann window.
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
-    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
-
-    const int32_t * op_params = (const int32_t *) dst->op_params;
-    const uint32_t n_fft      = (uint32_t) op_params[0];
-    const uint32_t hop_length = (uint32_t) op_params[1];
-    const uint32_t win_length = (uint32_t) op_params[2];
-    const uint32_t T          = (uint32_t) src0->ne[2];
-    const uint32_t n_out      = (uint32_t) dst->ne[0];
-
-    const bool has_window = (src1 != nullptr);
-
-    vk_op_istft_push_constants pc{};
-    pc.n_fft      = n_fft;
-    pc.hop_length = hop_length;
-    pc.win_length = win_length;
-    pc.T          = T;
-    pc.n_out      = n_out;
-    pc.use_window = has_window ? 1u : 0u;
-
-    // 3-binding dispatch: src0=mag_phase, src1=window (or src0 again when NULL
-    // to keep the descriptor set populated; shader gates on use_window), dst.
-    // We pass src1 unconditionally so ggml_vk_op_f32 takes the use_src1 path.
-    const ggml_tensor * window_src = has_window ? src1 : src0;
-    ggml_vk_op_f32<vk_op_istft_push_constants>(ctx, subctx, src0, window_src, nullptr, nullptr, dst, GGML_OP_ISTFT, std::move(pc));
 }
 
 static void ggml_vk_conv_2d(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * src0,
@@ -14447,364 +14089,6 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
     }
 }
 
-// ELIZA-VK-RUNTIME-DISPATCH-V1
-struct eliza_vk_qjl_score_push {
-    uint32_t n_heads;
-    uint32_t n_kv_heads;
-    uint32_t n_tokens;
-    uint32_t proj_dim;
-};
-
-struct eliza_vk_tbq_score_push {
-    uint32_t head_dim;
-    uint32_t n_kv;
-    uint32_t kv_stride_blocks;
-    uint32_t q_head;
-    uint32_t head_offset_bytes;
-};
-
-struct eliza_vk_polar_score_push {
-    uint32_t n_rows;
-    uint32_t head_dim;
-    uint32_t use_qjl;
-    uint32_t k_offset_bytes;
-    uint32_t q_offset;
-    uint32_t y_offset;
-};
-
-struct eliza_vk_fused_attn_push {
-    uint32_t n_heads;
-    uint32_t n_kv_heads;
-    uint32_t n_tokens;
-    uint32_t q_pos;
-    uint32_t sm_scale_bits;
-    uint32_t kv_tile;
-    uint32_t causal;
-    uint32_t q_pos_base;
-};
-
-// Long-context / non-voice scoring amortises the per-dispatch launch tax by
-// folding several KV indices (resp. tokens) into one workgroup via the
-// constant_id=0 spec constant (BLOCKS_PER_WG / TOKENS_PER_WG) baked into the
-// _multi pipeline at create time. Voice / small-n_kv stays single-block.
-//
-// The *fold factor* is device-policy: it is chosen by vendor in
-// ggml_vk_load_shaders (02-ggml-vulkan-pipelines.patch hunk 2) and stored on
-// device->eliza_vk_{tbq,qjl}_multiblock_factor. The dispatch here reads that
-// field so the grid divisor always matches whatever the pipeline was created
-// with. From vulkan_bench (VK_QUERY_TYPE_TIMESTAMP per-dispatch sweep over
-// {1,2,4,8,16}; vulkan_kopt_2026-05-11.json):
-//   * NVIDIA discrete (RTX 5080 Laptop): TBQ factor 16 (turbo3 386us→48us at
-//     4k, ~3.2x at 32k), QJL factor 8 (4742us→374us at 4k, ~8.6x at 32k).
-//   * Intel Arc/Xe iGPU (Mesa ANV 25.2.8): bandwidth-bound at n_kv>=512, both
-//     factors stay 4 — only the engage threshold matters. QJL engages from
-//     1024 tokens (the fold hoists the 256-wide q_sketch + sign vector out of
-//     the per-token loop, ~1.3x at 512 / ~1.8x at 4k); TBQ engages only at
-//     n_kv>=8192 (it's a wash at 512 and a slight regression at 4k on ANV).
-//   * Default / unprofiled (Adreno, Mali, AMD): conservative factor 4 and the
-//     same thresholds — safe everywhere. AMD wave64 wants its own sweep.
-// (The thresholds below are the same on every device; only the fold factor
-// diverges. The discrete-GPU thresholds being identical to the iGPU ones is
-// deliberate — on NVIDIA the _multi path is a win at *every* measured length
-// (e.g. turbo3 512: 83us single → 30us folded), so engaging from 1024/8192
-// only loses a little of the available speedup at the very small end.)
-static const int64_t  ELIZA_VK_QJL_MULTIBLOCK_THRESHOLD = 1024;
-static const int64_t  ELIZA_VK_TBQ_MULTIBLOCK_THRESHOLD = 8192;
-
-static const float k_eliza_tbq3_tcq_codebook[512] = {
--0.14559399f, -0.09062801f, -0.054925077f, -0.03699251f, -0.006363985f, +0.026264573f, +0.067378916f, +0.121981815f,
-    -0.18648055f, -0.106522456f, -0.052047577f, -0.011695214f, +0.021953275f, +0.059698727f, +0.09831437f, +0.16083933f,
-    -0.16390342f, -0.12639847f, -0.09513180f, -0.05938352f, -0.028396897f, +0.005973862f, +0.049104784f, +0.11334257f,
-    -0.25952467f, -0.079778515f, -0.036024813f, +0.0003641268f, +0.031858794f, +0.073280424f, +0.11835553f, +0.19738495f,
-    -0.14218009f, -0.10224814f, -0.062498566f, -0.027066832f, +0.00393002f, +0.04069300f, +0.08257346f, +0.14548601f,
-    -0.18673635f, -0.13438253f, -0.088401966f, -0.05205436f, -0.02032501f, +0.012399545f, +0.05127183f, +0.10316186f,
-    -0.10807011f, -0.065903045f, -0.032206114f, -0.0062006037f, +0.020679146f, +0.04422085f, +0.08313074f, +0.16821936f,
-    -0.22979105f, -0.14431947f, -0.07689272f, -0.02755307f, +0.009225173f, +0.046684854f, +0.08834142f, +0.13766693f,
-    -0.22114082f, -0.12612148f, -0.06890522f, -0.016128855f, +0.03691900f, +0.08474852f, +0.14940020f, +0.23229980f,
-    -0.14933491f, -0.099693604f, -0.06738499f, -0.037100967f, -0.009332986f, +0.023535024f, +0.060272533f, +0.109464675f,
-    -0.20200425f, -0.07398328f, -0.038700905f, -0.01714807f, +0.011161969f, +0.04528101f, +0.08902637f, +0.19573534f,
-    -0.16645233f, -0.124482535f, -0.089342155f, -0.04427387f, -0.007353691f, +0.028033108f, +0.066108435f, +0.15552913f,
-    -0.22295763f, -0.059887577f, -0.018804537f, +0.020141022f, +0.059682943f, +0.097920544f, +0.14080113f, +0.25698325f,
-    -0.14248224f, -0.089685425f, -0.050101686f, -0.017257255f, +0.011412255f, +0.040830314f, +0.07400172f, +0.11997315f,
-    -0.18649384f, -0.113997504f, -0.067775466f, -0.033394672f, +0.006586988f, +0.05312057f, +0.10433043f, +0.22344802f,
-    -0.16138338f, -0.108194515f, -0.07600300f, -0.05135381f, -0.023365447f, +0.0087320795f, +0.045431953f, +0.09113002f,
-    -0.12630440f, -0.07225349f, -0.032280035f, +0.0029231994f, +0.019239848f, +0.05081419f, +0.077840395f, +0.121695265f,
-    -0.08928155f, -0.044983763f, -0.009889568f, +0.020831043f, +0.05684458f, +0.09409702f, +0.13867535f, +0.19084482f,
-    -0.14182915f, -0.11380146f, -0.06904074f, -0.002002765f, +0.034864165f, +0.070399575f, +0.11403063f, +0.15394832f,
-    -0.10876417f, -0.056122433f, -0.02267638f, +0.011113975f, +0.039639056f, +0.074084364f, +0.10155376f, +0.12540291f,
-    -0.17693359f, -0.13940524f, -0.10049578f, -0.06796275f, -0.036915872f, +0.00062823476f, +0.042142134f, +0.17906062f,
-    -0.09253492f, -0.04290128f, -0.006311852f, +0.023908244f, +0.049849935f, +0.078770354f, +0.10818172f, +0.15166481f,
-    -0.12429565f, -0.07392063f, -0.029114135f, +0.0059440783f, +0.042675965f, +0.08425635f, +0.13836108f, +0.18634140f,
-    -0.11795639f, -0.07033707f, -0.034163877f, -0.0008773357f, +0.03334606f, +0.07188203f, +0.12216825f, +0.17097956f,
-    -0.18718453f, -0.14090346f, -0.097799584f, -0.059522875f, -0.019208657f, +0.03079176f, +0.09334672f, +0.15811224f,
-    -0.27198875f, -0.16546582f, -0.11433405f, -0.06933013f, -0.04026183f, -0.0061146915f, +0.029263576f, +0.07322499f,
-    -0.18471734f, -0.102074504f, -0.06492570f, -0.034418534f, -0.009636157f, +0.023043344f, +0.05751496f, +0.09905984f,
-    -0.22826399f, -0.15946552f, -0.09913176f, -0.06585259f, -0.03252090f, +0.001313243f, +0.03556729f, +0.21612854f,
-    -0.13243781f, -0.087299444f, -0.049820945f, -0.016216082f, +0.01799807f, +0.057916876f, +0.09001349f, +0.13221787f,
-    -0.19516511f, -0.120894566f, -0.076130204f, -0.051442243f, -0.029535033f, -0.0020043184f, +0.029452588f, +0.075566076f,
-    -0.27272871f, -0.15841717f, -0.105432935f, -0.06792948f, -0.024532158f, +0.014960791f, +0.054415092f, +0.101517834f,
-    -0.21153601f, -0.15015371f, -0.08676790f, -0.04414934f, -0.0042129597f, +0.033762872f, +0.07589151f, +0.12768789f,
-    -0.090428725f, -0.037582967f, +0.0013173596f, +0.03900247f, +0.06840049f, +0.116906695f, +0.16584939f, +0.25382105f,
-    -0.13446195f, -0.07865091f, -0.039625354f, -0.0028398742f, +0.03019514f, +0.06799379f, +0.11850997f, +0.17521496f,
-    -0.11350345f, -0.058599845f, -0.017512511f, +0.019431496f, +0.055897832f, +0.093173414f, +0.14820710f, +0.22092152f,
-    -0.15165758f, -0.08869354f, -0.04974287f, -0.01705474f, +0.013134752f, +0.04367713f, +0.07733791f, +0.12430801f,
-    -0.09329869f, -0.04673005f, -0.00045857552f, +0.042781368f, +0.07802363f, +0.11887439f, +0.16250038f, +0.28612965f,
-    -0.12571070f, -0.07786012f, -0.03843933f, -0.0075433915f, +0.025822964f, +0.066053316f, +0.12021536f, +0.18341768f,
-    -0.16079275f, -0.04921760f, -0.006114644f, +0.026215268f, +0.05699377f, +0.09813471f, +0.16080129f, +0.23786584f,
-    -0.09980837f, -0.048535258f, -0.0096120685f, +0.025387142f, +0.05979822f, +0.09875251f, +0.14474337f, +0.20324114f,
-    -0.15846540f, -0.09938028f, -0.061492465f, -0.03523542f, -0.0061364113f, +0.024916094f, +0.06037314f, +0.106796466f,
-    -0.20557843f, -0.123237535f, -0.07734871f, -0.044549115f, -0.017114898f, +0.01616654f, +0.049574375f, +0.092319444f,
-    -0.19221115f, -0.14642999f, -0.091701314f, -0.055265956f, -0.021026207f, +0.017720066f, +0.05786183f, +0.110154524f,
-    -0.09956386f, -0.03870283f, +0.003052007f, +0.034851722f, +0.06256365f, +0.09628840f, +0.13979156f, +0.16582295f,
-    -0.18026546f, -0.12448310f, -0.07424377f, -0.03954519f, -0.01221123f, +0.028641058f, +0.100819774f, +0.18240699f,
-    -0.21520759f, -0.15573645f, -0.09820838f, -0.051450998f, -0.012993679f, +0.021135861f, +0.058727216f, +0.105848536f,
-    -0.11207385f, -0.08335689f, -0.048542723f, -0.023198519f, +0.0039304253f, +0.037778318f, +0.07813917f, +0.13106476f,
-    -0.17849164f, -0.120988995f, -0.078016765f, -0.043093704f, -0.016565649f, +0.015182641f, +0.050754096f, +0.09595712f,
-    -0.22132620f, -0.13407415f, -0.065785654f, -0.013291034f, +0.032098345f, +0.07478225f, +0.12431934f, +0.19174045f,
-    -0.095454164f, -0.051898945f, -0.015116375f, -0.012596778f, +0.018636847f, +0.05006925f, +0.087654814f, +0.13754296f,
-    -0.15254061f, -0.09576059f, -0.052086458f, -0.01596074f, +0.017607626f, +0.04778498f, +0.08950204f, +0.14901252f,
-    -0.26057002f, -0.12472382f, -0.074396215f, -0.03764066f, +0.0011168446f, +0.061569117f, +0.10793752f, +0.19771695f,
-    -0.08661132f, -0.045195263f, -0.016098704f, +0.012780116f, +0.040476497f, +0.074102715f, +0.074102715f, +0.12635531f,
-    -0.14047913f, -0.059587404f, -0.016261123f, +0.019801628f, +0.053541403f, +0.096650146f, +0.15005490f, +0.21051759f,
-    -0.22986396f, -0.11964334f, -0.07266585f, -0.026522418f, +0.018169926f, +0.058630653f, +0.100647695f, +0.15919648f,
-    -0.13251697f, -0.077567816f, -0.042766172f, -0.011389967f, +0.01831755f, +0.05304656f, +0.09620367f, +0.15567583f,
-    -0.119819686f, -0.06772876f, -0.028123451f, +0.00876240f, +0.014405836f, +0.048829112f, +0.08422175f, +0.13823749f,
-    -0.16379014f, -0.08956941f, -0.041652776f, +0.008921398f, +0.05473602f, +0.10037984f, +0.16022855f, +0.23457925f,
-    -0.115844205f, -0.05939626f, -0.020390417f, +0.01374377f, +0.044976473f, +0.07873563f, +0.12207942f, +0.18412720f,
-    -0.19048831f, -0.07587487f, -0.03220580f, -0.00011795067f, +0.02721784f, +0.04380719f, +0.07886723f, +0.13193911f,
-    -0.13935551f, -0.092902906f, -0.052706074f, -0.017797327f, +0.015312965f, +0.056098964f, +0.11203423f, +0.24448302f,
-    -0.17986591f, -0.10738580f, -0.06376371f, -0.026595421f, +0.00842492f, +0.04272362f, +0.08608052f, +0.15240218f,
-    -0.10953678f, -0.057022586f, -0.012483291f, +0.024463262f, +0.06076792f, +0.09776234f, +0.12983681f, +0.18648379f,
-    -0.16471463f, -0.089491285f, -0.037574016f, +0.004444791f, +0.039293647f, +0.07845859f, +0.12893885f, +0.23508036f,
-};
-
-static vk_pipeline eliza_vk_pipeline_for_tbq(ggml_backend_vk_context * ctx, ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_TBQ3_0:   return ctx->device->pipeline_eliza_turbo3;
-        case GGML_TYPE_TBQ4_0:   return ctx->device->pipeline_eliza_turbo4;
-        case GGML_TYPE_TBQ3_TCQ: return ctx->device->pipeline_eliza_turbo3_tcq;
-        default: GGML_ABORT("eliza_vk_pipeline_for_tbq: unsupported type");
-    }
-}
-
-static vk_pipeline eliza_vk_pipeline_for_tbq_multi(ggml_backend_vk_context * ctx, ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_TBQ3_0:   return ctx->device->pipeline_eliza_turbo3_multi;
-        case GGML_TYPE_TBQ4_0:   return ctx->device->pipeline_eliza_turbo4_multi;
-        case GGML_TYPE_TBQ3_TCQ: return ctx->device->pipeline_eliza_turbo3_tcq_multi;
-        default: GGML_ABORT("eliza_vk_pipeline_for_tbq_multi: unsupported type");
-    }
-}
-
-static vk_buffer eliza_vk_turbo3_tcq_codebook(ggml_backend_vk_context * ctx) {
-    if (ctx->eliza_turbo3_tcq_codebook == nullptr) {
-        ctx->eliza_turbo3_tcq_codebook = ggml_vk_create_buffer_device(ctx->device, sizeof(k_eliza_tbq3_tcq_codebook));
-        ggml_vk_buffer_write(ctx->eliza_turbo3_tcq_codebook, 0, k_eliza_tbq3_tcq_codebook, sizeof(k_eliza_tbq3_tcq_codebook));
-    }
-    return ctx->eliza_turbo3_tcq_codebook;
-}
-
-static void ggml_vk_eliza_attn_score_qjl(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
-    const ggml_tensor * q  = dst->src[0];
-    const ggml_tensor * pk = dst->src[1];
-    GGML_ASSERT(q != nullptr && pk != nullptr);
-    GGML_ASSERT(q->type == GGML_TYPE_F32);
-    GGML_ASSERT(pk->type == GGML_TYPE_QJL1_256);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(q->ne[0] == 256 && pk->ne[0] == 128);
-    GGML_ASSERT(q->ne[2] == 1 && q->ne[3] == 1 && pk->ne[3] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1);
-    GGML_ASSERT(ggml_is_contiguous_rows(q));
-    GGML_ASSERT(ggml_is_contiguous_rows(pk));
-    GGML_ASSERT(ggml_is_contiguous_rows(dst));
-
-    const uint32_t n_heads    = (uint32_t) q->ne[1];
-    const uint32_t n_kv_heads = (uint32_t) ((const int32_t *) dst->op_params)[0];
-    const uint32_t n_tokens   = (uint32_t) pk->ne[1];
-    GGML_ASSERT(n_kv_heads > 0 && (n_heads % n_kv_heads) == 0);
-    GGML_ASSERT(pk->ne[2] == (int64_t) n_kv_heads);
-    GGML_ASSERT(dst->ne[0] == (int64_t) n_tokens && dst->ne[1] == (int64_t) n_heads);
-    GGML_ASSERT(pk->nb[1] == ggml_row_size(GGML_TYPE_QJL1_256, 128));
-    GGML_ASSERT(pk->nb[2] == (size_t) n_tokens * pk->nb[1]);
-
-    const bool multi = (int64_t) n_tokens >= ELIZA_VK_QJL_MULTIBLOCK_THRESHOLD;
-    const uint32_t qjl_fold = ctx->device->eliza_vk_qjl_multiblock_factor;
-    vk_pipeline pipeline = multi ? ctx->device->pipeline_eliza_qjl_multi
-                                 : ctx->device->pipeline_eliza_qjl;
-    const uint32_t grid_y = multi ? (n_tokens + qjl_fold - 1u) / qjl_fold : n_tokens;
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-    const eliza_vk_qjl_score_push pc = { n_heads, n_kv_heads, n_tokens, 256u };
-    ggml_vk_dispatch_pipeline(
-        ctx, subctx, pipeline,
-        { ggml_vk_tensor_subbuffer(ctx, q), ggml_vk_tensor_subbuffer(ctx, pk), ggml_vk_tensor_subbuffer(ctx, dst) },
-        pc, { n_heads, grid_y, 1 });
-}
-
-static void ggml_vk_eliza_attn_score_tbq(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
-    const ggml_tensor * q  = dst->src[0];
-    const ggml_tensor * pk = dst->src[1];
-    GGML_ASSERT(q != nullptr && pk != nullptr);
-    GGML_ASSERT(q->type == GGML_TYPE_F32);
-    GGML_ASSERT(pk->type == GGML_TYPE_TBQ3_0 || pk->type == GGML_TYPE_TBQ4_0 || pk->type == GGML_TYPE_TBQ3_TCQ);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(q->ne[0] == 128 && pk->ne[0] == 128);
-    GGML_ASSERT(q->ne[2] == 1 && q->ne[3] == 1 && pk->ne[3] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1);
-    GGML_ASSERT(ggml_is_contiguous_rows(q));
-    GGML_ASSERT(ggml_is_contiguous_rows(pk));
-    GGML_ASSERT(ggml_is_contiguous_rows(dst));
-
-    const uint32_t n_heads    = (uint32_t) q->ne[1];
-    const uint32_t n_kv_heads = (uint32_t) ((const int32_t *) dst->op_params)[0];
-    const uint32_t n_tokens   = (uint32_t) pk->ne[1];
-    const uint32_t gqa        = n_heads / n_kv_heads;
-    const uint32_t blocks_per_kv = (uint32_t) (pk->ne[0] / ggml_blck_size(pk->type));
-    GGML_ASSERT(n_kv_heads > 0 && (n_heads % n_kv_heads) == 0);
-    GGML_ASSERT(pk->ne[2] == (int64_t) n_kv_heads);
-    GGML_ASSERT(dst->ne[0] == (int64_t) n_tokens && dst->ne[1] == (int64_t) n_heads);
-    GGML_ASSERT(pk->nb[1] == ggml_row_size(pk->type, 128));
-    GGML_ASSERT(pk->nb[2] == (size_t) n_tokens * pk->nb[1]);
-
-    const bool multi = (int64_t) n_tokens >= ELIZA_VK_TBQ_MULTIBLOCK_THRESHOLD;
-    const uint32_t tbq_fold = ctx->device->eliza_vk_tbq_multiblock_factor;
-    vk_pipeline pipeline = multi ? eliza_vk_pipeline_for_tbq_multi(ctx, pk->type)
-                                 : eliza_vk_pipeline_for_tbq(ctx, pk->type);
-    const uint32_t grid_x = multi ? (n_tokens + tbq_fold - 1u) / tbq_fold : n_tokens;
-    const vk_subbuffer q_buf   = ggml_vk_tensor_subbuffer(ctx, q);
-    const vk_subbuffer pk_buf  = ggml_vk_tensor_subbuffer(ctx, pk);
-    const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
-    const bool is_tcq = pk->type == GGML_TYPE_TBQ3_TCQ;
-    const vk_subbuffer codebook_buf = is_tcq ? ggml_vk_subbuffer(ctx, eliza_vk_turbo3_tcq_codebook(ctx)) : vk_subbuffer{};
-
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, n_heads);
-    for (uint32_t h = 0; h < n_heads; ++h) {
-        const uint32_t h_k = h / gqa;
-        const uint64_t head_offset = (uint64_t) h_k * (uint64_t) pk->nb[2];
-        GGML_ASSERT(head_offset <= UINT32_MAX);
-        const eliza_vk_tbq_score_push pc = {
-            128u,
-            n_tokens,
-            blocks_per_kv,
-            h,
-            (uint32_t) head_offset,
-        };
-        if (is_tcq) {
-            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, pk_buf, dst_buf, codebook_buf }, pc, { grid_x, 1, 1 });
-        } else {
-            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, pk_buf, dst_buf }, pc, { grid_x, 1, 1 });
-        }
-    }
-}
-
-static void ggml_vk_eliza_attn_score_polar(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
-    const ggml_tensor * q  = dst->src[0];
-    const ggml_tensor * pk = dst->src[1];
-    GGML_ASSERT(q != nullptr && pk != nullptr);
-    GGML_ASSERT(q->type == GGML_TYPE_F32);
-    GGML_ASSERT(pk->type == GGML_TYPE_Q4_POLAR);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(q->ne[0] == 128 && pk->ne[0] == 128);
-    GGML_ASSERT(q->ne[2] == 1 && q->ne[3] == 1 && pk->ne[3] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1);
-    GGML_ASSERT(ggml_is_contiguous_rows(q));
-    GGML_ASSERT(ggml_is_contiguous_rows(pk));
-    GGML_ASSERT(ggml_is_contiguous_rows(dst));
-
-    const int32_t * params = (const int32_t *) dst->op_params;
-    const uint32_t n_heads    = (uint32_t) q->ne[1];
-    const uint32_t n_kv_heads = (uint32_t) params[0];
-    const uint32_t n_tokens   = (uint32_t) pk->ne[1];
-    const uint32_t use_qjl    = (uint32_t) (params[1] != 0);
-    const uint32_t gqa        = n_heads / n_kv_heads;
-    GGML_ASSERT(n_kv_heads > 0 && (n_heads % n_kv_heads) == 0);
-    GGML_ASSERT(pk->ne[2] == (int64_t) n_kv_heads);
-    GGML_ASSERT(dst->ne[0] == (int64_t) n_tokens && dst->ne[1] == (int64_t) n_heads);
-    GGML_ASSERT(pk->nb[1] == ggml_row_size(GGML_TYPE_Q4_POLAR, 128));
-    GGML_ASSERT(pk->nb[2] == (size_t) n_tokens * pk->nb[1]);
-
-    vk_pipeline pipeline = ctx->device->pipeline_eliza_polar;
-    const vk_subbuffer pk_buf  = ggml_vk_tensor_subbuffer(ctx, pk);
-    const vk_subbuffer q_buf   = ggml_vk_tensor_subbuffer(ctx, q);
-    const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
-
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, n_heads);
-    for (uint32_t h = 0; h < n_heads; ++h) {
-        const uint32_t h_k = h / gqa;
-        const uint64_t k_offset = (uint64_t) h_k * (uint64_t) pk->nb[2];
-        const uint64_t q_offset = ((uint64_t) h * (uint64_t) q->nb[1]) / sizeof(float);
-        const uint64_t y_offset = ((uint64_t) h * (uint64_t) dst->nb[1]) / sizeof(float);
-        GGML_ASSERT(k_offset <= UINT32_MAX && q_offset <= UINT32_MAX && y_offset <= UINT32_MAX);
-        const eliza_vk_polar_score_push pc = {
-            n_tokens,
-            128u,
-            use_qjl,
-            (uint32_t) k_offset,
-            (uint32_t) q_offset,
-            (uint32_t) y_offset,
-        };
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { pk_buf, q_buf, dst_buf }, pc, { n_tokens, 1, 1 });
-    }
-}
-
-// GGML_OP_FUSED_ATTN_QJL_TBQ — fused QJL-K score + TBQ3-V mix, online softmax,
-// the per-token score vector never materialised. Mirrors the C reference
-// eliza_fused_attn_qjl_tbq3() / fused_attn_qjl_tbq_ref() and the op contract
-// reports/porting/2026-05-11/fused-attn-op-contract.md §3/§6:
-//   src[0] = q          F32      [proj_dim=256, n_heads, n_q_pos, ne3]  (pre-projected QJL sketch)
-//   src[1] = packed_k   QJL1_256 [head_dim=128, n_kv, n_kv_heads, ne3]  (nb[1] == 34)
-//   src[2] = packed_v   TBQ3_0   [head_dim=128, n_kv, n_kv_heads, ne3]  (nb[1] == 56, 4 chunks/token)
-//   dst    = out        F32      [head_dim=128, n_heads, n_q_pos, ne3]
-//   op_params[0] = n_kv_heads, [1] = sm_scale (float bits), [2] = v_use_qjl (TBQ ignores it),
-//   [3] = kv_tile, [4] = causal, [5] = q_pos_base
-// One workgroup per (q_head); q_pos is a push constant, so n_q_pos > 1 is a
-// loop of dispatches (decode = 1). Conservative shape (ne3 == 1) matching the
-// other eliza graph routes; the unfused score → softmax → V-mix path covers
-// the wider shapes (AGENTS.md §3 — no silent degradation).
-static void ggml_vk_eliza_fused_attn_qjl_tbq(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
-    const ggml_tensor * q  = dst->src[0];
-    const ggml_tensor * pk = dst->src[1];
-    const ggml_tensor * pv = dst->src[2];
-    GGML_ASSERT(q != nullptr && pk != nullptr && pv != nullptr);
-    GGML_ASSERT(q->type == GGML_TYPE_F32);
-    GGML_ASSERT(pk->type == GGML_TYPE_QJL1_256);
-    GGML_ASSERT(pv->type == GGML_TYPE_TBQ3_0);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(q->ne[0] == 256 && pk->ne[0] == 128 && pv->ne[0] == 128 && dst->ne[0] == 128);
-    GGML_ASSERT(q->ne[3] == 1 && pk->ne[3] == 1 && pv->ne[3] == 1 && dst->ne[3] == 1);
-    GGML_ASSERT(ggml_is_contiguous(q));
-    GGML_ASSERT(ggml_is_contiguous(pk));
-    GGML_ASSERT(ggml_is_contiguous(pv));
-    GGML_ASSERT(ggml_is_contiguous(dst));
-
-    const int32_t * params = (const int32_t *) dst->op_params;
-    const uint32_t n_heads    = (uint32_t) q->ne[1];
-    const uint32_t n_kv_heads = (uint32_t) params[0];
-    const uint32_t sm_bits    = (uint32_t) params[1];
-    const uint32_t kv_tile    = (uint32_t) params[3];
-    const uint32_t causal     = (uint32_t) (params[4] != 0);
-    const uint32_t q_pos_base = (uint32_t) params[5];
-    const uint32_t n_tokens   = (uint32_t) pk->ne[1];
-    const int64_t  n_q_pos    = q->ne[2];
-    GGML_ASSERT(n_kv_heads > 0 && (n_heads % n_kv_heads) == 0);
-    GGML_ASSERT(pk->ne[2] == (int64_t) n_kv_heads && pv->ne[2] == (int64_t) n_kv_heads);
-    GGML_ASSERT(dst->ne[1] == (int64_t) n_heads && dst->ne[2] == n_q_pos);
-    GGML_ASSERT(pk->nb[1] == ggml_row_size(GGML_TYPE_QJL1_256, 128));
-    GGML_ASSERT(pv->nb[1] == ggml_row_size(GGML_TYPE_TBQ3_0, 128));
-    GGML_ASSERT(pk->nb[2] == (size_t) n_tokens * pk->nb[1]);
-    GGML_ASSERT(pv->nb[2] == (size_t) n_tokens * pv->nb[1]);
-
-    vk_pipeline pipeline = ctx->device->pipeline_eliza_fused_attn_qjl_tbq;
-    const vk_subbuffer q_buf   = ggml_vk_tensor_subbuffer(ctx, q);
-    const vk_subbuffer pk_buf  = ggml_vk_tensor_subbuffer(ctx, pk);
-    const vk_subbuffer pv_buf  = ggml_vk_tensor_subbuffer(ctx, pv);
-    const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
-
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, (uint32_t) n_q_pos);
-    for (int64_t p = 0; p < n_q_pos; ++p) {
-        const eliza_vk_fused_attn_push pc = {
-            n_heads, n_kv_heads, n_tokens, (uint32_t) p, sm_bits, kv_tile, causal, q_pos_base,
-        };
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, pk_buf, pv_buf, dst_buf }, pc, { n_heads, 1, 1 });
-    }
-}
-
 static void ggml_vk_compute_forward(ggml_backend_vk_context* ctx, ggml_cgraph * cgraph, ggml_tensor* tensor, int tensor_idx, bool almost_ready);
 
 // Returns true if node has enqueued work into the queue, false otherwise
@@ -15163,10 +14447,6 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ggml_vk_rope(ctx, compute_ctx, cgraph, node_idx, true);
 
         break;
-    case GGML_OP_GET_REL_POS:
-        ggml_vk_get_rel_pos(ctx, compute_ctx, src0, node);
-
-        break;
     case GGML_OP_ARGSORT:
         if (ctx->fused_topk_moe_mode != TOPK_MOE_COUNT) {
             ggml_vk_topk_moe(ctx, compute_ctx, cgraph, node_idx);
@@ -15231,10 +14511,6 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ggml_vk_pool_2d(ctx, compute_ctx, src0, node);
 
         break;
-    case GGML_OP_ISTFT:
-        ggml_vk_istft(ctx, compute_ctx, src0, src1, node);
-
-        break;
     case GGML_OP_CONV_2D:
     case GGML_OP_CONV_TRANSPOSE_2D:
         ggml_vk_conv_2d(ctx, compute_ctx, src0, src1, node);
@@ -15254,23 +14530,6 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
     case GGML_OP_MUL_MAT_ID:
         ggml_vk_mul_mat_id(ctx, compute_ctx, cgraph, node_idx);
-
-        break;
-
-    case GGML_OP_ATTN_SCORE_QJL:
-        ggml_vk_eliza_attn_score_qjl(ctx, compute_ctx, node);
-
-        break;
-    case GGML_OP_ATTN_SCORE_TBQ:
-        ggml_vk_eliza_attn_score_tbq(ctx, compute_ctx, node);
-
-        break;
-    case GGML_OP_ATTN_SCORE_POLAR:
-        ggml_vk_eliza_attn_score_polar(ctx, compute_ctx, node);
-
-        break;
-    case GGML_OP_FUSED_ATTN_QJL_TBQ:
-        ggml_vk_eliza_fused_attn_qjl_tbq(ctx, compute_ctx, node);
 
         break;
 
@@ -15549,34 +14808,6 @@ static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml
         return;
     }
 
-    // Repack weight blocks from [row, k_block] to [k_block, row] order.
-    // Token embedding is excluded: it is used as a lookup table, not a matmul operand.
-    if (buf_ctx->device.lock()->transpose_a && offset == 0 && tensor->ne[2] == 1 && tensor->ne[3] == 1
-        && (tensor->type == GGML_TYPE_Q4_K || tensor->type == GGML_TYPE_Q5_K || tensor->type == GGML_TYPE_Q6_K)
-        && tensor->name != nullptr && strstr(tensor->name, "token_embd") == nullptr) {
-        const size_t block_size = ggml_type_size(tensor->type);
-        const int64_t n_rows = tensor->ne[1];
-        const int64_t blocks_per_row = tensor->ne[0] / ggml_blck_size(tensor->type);
-        const size_t total_blocks = n_rows * blocks_per_row;
-
-        if (size == total_blocks * block_size) {
-            std::vector<uint8_t> transposed(size);
-            const uint8_t * src = (const uint8_t *)data;
-            uint8_t * dst = transposed.data();
-
-            for (int64_t row = 0; row < n_rows; row++) {
-                for (int64_t kb = 0; kb < blocks_per_row; kb++) {
-                    memcpy(dst + (kb * n_rows + row) * block_size,
-                           src + (row * blocks_per_row + kb) * block_size,
-                           block_size);
-                }
-            }
-
-            ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs, transposed.data(), size);
-            return;
-        }
-    }
-
     ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
 }
 
@@ -15605,32 +14836,6 @@ static void ggml_backend_vk_buffer_get_tensor(ggml_backend_buffer_t buffer, cons
     vk_buffer buf = buf_ctx->dev_buffer;
 
     ggml_vk_buffer_read(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
-
-    // Un-transpose: convert back from [k_block, row] to [row, k_block] order.
-    if (buf_ctx->device.lock()->transpose_a && offset == 0 && tensor->ne[2] == 1 && tensor->ne[3] == 1
-        && (tensor->type == GGML_TYPE_Q4_K || tensor->type == GGML_TYPE_Q5_K || tensor->type == GGML_TYPE_Q6_K)
-        && tensor->name != nullptr && strstr(tensor->name, "token_embd") == nullptr) {
-        const size_t block_size = ggml_type_size(tensor->type);
-        const int64_t n_rows = tensor->ne[1];
-        const int64_t blocks_per_row = tensor->ne[0] / ggml_blck_size(tensor->type);
-        const size_t total_blocks = n_rows * blocks_per_row;
-
-        if (size == total_blocks * block_size) {
-            std::vector<uint8_t> original(size);
-            const uint8_t * src = (const uint8_t *)data;
-            uint8_t * dst = original.data();
-
-            for (int64_t row = 0; row < n_rows; row++) {
-                for (int64_t kb = 0; kb < blocks_per_row; kb++) {
-                    memcpy(dst + (row * blocks_per_row + kb) * block_size,
-                           src + (kb * n_rows + row) * block_size,
-                           block_size);
-                }
-            }
-
-            memcpy(data, original.data(), size);
-        }
-    }
 }
 
 static void ggml_backend_vk_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset,
@@ -15845,28 +15050,8 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
 
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
 
-    vk_buffer buf = buf_ctx->dev_buffer;
-    auto dst_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
-
-    if (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
-        GGML_ASSERT(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
-
-        uint8_t* dst = (uint8_t*)buf->ptr + dst_offset;
-
-        if (stride_data == size && stride_tensor == size) {
-            memcpy(dst, data, size * n_copies);
-        } else {
-            for (size_t i = 0; i < n_copies; i++) {
-                memcpy(dst + i * stride_tensor,
-                       (const uint8_t*)data + i * stride_data, size);
-            }
-        }
-
-        ctx->needs_host_barrier = true;
-        return;
-    }
-
     vk_context cpy_ctx;
+
     if (ctx->device->async_use_transfer_queue) {
         if (ctx->transfer_ctx.expired()) {
             cpy_ctx = ggml_vk_create_context(ctx, ctx->transfer_cmd_pool);
@@ -15878,6 +15063,10 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
     } else {
         cpy_ctx = ggml_vk_get_compute_ctx(ctx);
     }
+
+    vk_buffer buf = buf_ctx->dev_buffer;
+
+    auto dst_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
 
     bool ret = ggml_vk_buffer_write_2d_async(cpy_ctx, buf, dst_offset, data, stride_data, stride_tensor, size, n_copies);
 
@@ -16087,6 +15276,7 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         ctx->submit_pending = false;
         if (cmd_buf) {
             cmd_buf->in_use = false;
+            cmd_buf->buf.reset();
         }
     }
 
@@ -16096,8 +15286,6 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         }
         ctx->compute_ctx.reset();
     }
-
-    ctx->needs_host_barrier = false;
 }
 
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
@@ -17307,38 +16495,32 @@ static void ggml_backend_vk_event_record(ggml_backend_t backend, ggml_backend_ev
     vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
     auto* cmd_buf = compute_ctx->s->buffer; // retrieve pointer before it gets reset
 
-    // the backend interface doesn't have an explicit reset, so reset it here
-    // before we record the command to set it
-    ctx->device->device.resetEvent(vkev->event);
-    ctx->device->device.resetFences({ vkev->fence });
+    if (vkev->has_event) {
+        // Move existing event into submitted
+        vkev->events_submitted.push_back(vkev->event);
+    }
+
+    // Grab the next event and record it, create one if necessary
+    if (vkev->events_free.empty()) {
+        vkev->event = ctx->device->device.createEvent({});
+    } else {
+        vkev->event = vkev->events_free.back();
+        vkev->events_free.pop_back();
+    }
+
+    vkev->has_event = true;
 
     ggml_vk_set_event(compute_ctx, vkev->event);
 
+    vkev->tl_semaphore.value++;
+    compute_ctx->s->signal_semaphores.push_back(vkev->tl_semaphore);
     ggml_vk_ctx_end(compute_ctx);
 
-    // Drain deferred H2D copies before submit (UMA zero-copy queues them here).
-    for (auto& cpy : compute_ctx->in_memcpys) {
-        memcpy(cpy.dst, cpy.src, cpy.n);
-    }
-    compute_ctx->in_memcpys.clear();
-
-    // Preserve D2H copies across context reset (drained by synchronize after fence).
-    auto preserved_out_memcpys = std::move(compute_ctx->out_memcpys);
-    const size_t preserved_count = preserved_out_memcpys.size();
-
-    ggml_vk_submit(compute_ctx, {vkev->fence});
+    ggml_vk_submit(compute_ctx, {});
     ctx->submit_pending = true;
     vkev->cmd_buffer = cmd_buf;
+    vkev->cmd_buffer_use_counter = cmd_buf->use_counter;
     ctx->compute_ctx.reset();
-
-    // Restore D2H copies into fresh context for synchronize to drain.
-    if (!preserved_out_memcpys.empty()) {
-        compute_ctx = ggml_vk_create_context(ctx, ctx->compute_cmd_pool);
-        ctx->compute_ctx = compute_ctx;
-        ggml_vk_ctx_begin(ctx->device, compute_ctx);
-        compute_ctx->out_memcpys = std::move(preserved_out_memcpys);
-        GGML_ASSERT(compute_ctx->out_memcpys.size() == preserved_count);
-    }
 }
 
 static void ggml_backend_vk_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
@@ -17348,9 +16530,10 @@ static void ggml_backend_vk_event_wait(ggml_backend_t backend, ggml_backend_even
 
     vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
 
-    ggml_vk_wait_events(compute_ctx, {vkev->event});
-    ggml_vk_ctx_end(compute_ctx);
-    ctx->compute_ctx.reset();
+    if (vkev->has_event) {
+        // Wait for latest event
+        ggml_vk_wait_events(compute_ctx, { vkev->event });
+    }
 }
 
 // TODO: enable async and synchronize
@@ -17698,77 +16881,6 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
 
                 return true;
             }
-        case GGML_OP_ATTN_SCORE_QJL:
-            return op->type == GGML_TYPE_F32 &&
-                   op->src[0] != nullptr &&
-                   op->src[1] != nullptr &&
-                   op->src[0]->type == GGML_TYPE_F32 &&
-                   op->src[1]->type == GGML_TYPE_QJL1_256 &&
-                   op->src[0]->ne[0] == 256 &&
-                   op->src[1]->ne[0] == 128 &&
-                   op->src[0]->ne[2] == 1 &&
-                   op->src[0]->ne[3] == 1 &&
-                   op->src[1]->ne[3] == 1 &&
-                   op->ne[2] == 1 &&
-                   op->ne[3] == 1 &&
-                   ggml_is_contiguous_rows(op) &&
-                   ggml_is_contiguous_rows(op->src[0]) &&
-                   ggml_is_contiguous_rows(op->src[1]);
-        case GGML_OP_ATTN_SCORE_TBQ:
-            return op->type == GGML_TYPE_F32 &&
-                   op->src[0] != nullptr &&
-                   op->src[1] != nullptr &&
-                   op->src[0]->type == GGML_TYPE_F32 &&
-                   (op->src[1]->type == GGML_TYPE_TBQ3_0 ||
-                    op->src[1]->type == GGML_TYPE_TBQ4_0 ||
-                    op->src[1]->type == GGML_TYPE_TBQ3_TCQ) &&
-                   op->src[0]->ne[0] == 128 &&
-                   op->src[1]->ne[0] == 128 &&
-                   op->src[0]->ne[2] == 1 &&
-                   op->src[0]->ne[3] == 1 &&
-                   op->src[1]->ne[3] == 1 &&
-                   op->ne[2] == 1 &&
-                   op->ne[3] == 1 &&
-                   ggml_is_contiguous_rows(op) &&
-                   ggml_is_contiguous_rows(op->src[0]) &&
-                   ggml_is_contiguous_rows(op->src[1]);
-        case GGML_OP_ATTN_SCORE_POLAR:
-            return op->type == GGML_TYPE_F32 &&
-                   op->src[0] != nullptr &&
-                   op->src[1] != nullptr &&
-                   op->src[0]->type == GGML_TYPE_F32 &&
-                   op->src[1]->type == GGML_TYPE_Q4_POLAR &&
-                   op->src[0]->ne[0] == 128 &&
-                   op->src[1]->ne[0] == 128 &&
-                   op->src[0]->ne[2] == 1 &&
-                   op->src[0]->ne[3] == 1 &&
-                   op->src[1]->ne[3] == 1 &&
-                   op->ne[2] == 1 &&
-                   op->ne[3] == 1 &&
-                   ggml_is_contiguous_rows(op) &&
-                   ggml_is_contiguous_rows(op->src[0]) &&
-                   ggml_is_contiguous_rows(op->src[1]);
-        case GGML_OP_FUSED_ATTN_QJL_TBQ:
-            return op->type == GGML_TYPE_F32 &&
-                   op->src[0] != nullptr &&
-                   op->src[1] != nullptr &&
-                   op->src[2] != nullptr &&
-                   op->src[0]->type == GGML_TYPE_F32 &&
-                   op->src[1]->type == GGML_TYPE_QJL1_256 &&
-                   op->src[2]->type == GGML_TYPE_TBQ3_0 &&
-                   op->src[0]->ne[0] == 256 &&
-                   op->src[1]->ne[0] == 128 &&
-                   op->src[2]->ne[0] == 128 &&
-                   op->ne[0] == 128 &&
-                   op->src[0]->ne[3] == 1 &&
-                   op->src[1]->ne[3] == 1 &&
-                   op->src[2]->ne[3] == 1 &&
-                   op->ne[3] == 1 &&
-                   ggml_is_contiguous(op) &&
-                   ggml_is_contiguous(op->src[0]) &&
-                   ggml_is_contiguous(op->src[1]) &&
-                   ggml_is_contiguous(op->src[2]);
-
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 bool coopmat2 = device->coopmat2;
@@ -17982,9 +17094,6 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_DIAG:
             return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                    op->type == op->src[0]->type;
-        case GGML_OP_GET_REL_POS:
-            return (op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) ||
-                    (op->src[0]->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16);
         case GGML_OP_ARGSORT:
             {
                 if (!ggml_is_contiguous(op) || !ggml_is_contiguous(op->src[0])) {
@@ -18100,14 +17209,6 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_POOL_2D:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
-        case GGML_OP_ISTFT:
-            {
-                if (!ggml_is_contiguous(op->src[0]) || op->src[0]->type != GGML_TYPE_F32) return false;
-                const int32_t * pp = (const int32_t *) op->op_params;
-                const int n_fft = pp[0];
-                // shared memory limit: n_fft must be <= 2048 for the IDFT kernel
-                return (n_fft > 0 && n_fft <= 2048);
-            }
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
             return true; // all inputs are contiguous, see ggml.c
@@ -18232,10 +17333,13 @@ static ggml_backend_event_t ggml_backend_vk_device_event_new(ggml_backend_dev_t 
         return nullptr;
     }
 
-    // The event/fence is expected to initially be in the signaled state.
-    vkev->event = device->device.createEvent({});
-    vkev->fence = device->device.createFence({vk::FenceCreateFlagBits::eSignaled});
-    device->device.setEvent(vkev->event);
+    // No events initially, they get created on demand
+    vkev->has_event = false;
+
+    vk::SemaphoreTypeCreateInfo tci{ vk::SemaphoreType::eTimeline, 0 };
+    vk::SemaphoreCreateInfo ci{};
+    ci.setPNext(&tci);
+    vkev->tl_semaphore = { device->device.createSemaphore(ci), 0 };
 
     return new ggml_backend_event {
         /* .device  = */ dev,
@@ -18249,8 +17353,16 @@ static void ggml_backend_vk_device_event_free(ggml_backend_dev_t dev, ggml_backe
 
     vk_event *vkev = (vk_event *)event->context;
 
-    device->device.destroyFence(vkev->fence);
-    device->device.destroyEvent(vkev->event);
+    device->device.destroySemaphore(vkev->tl_semaphore.s);
+    for (auto& event : vkev->events_free) {
+        device->device.destroyEvent(event);
+    }
+    for (auto& event : vkev->events_submitted) {
+        device->device.destroyEvent(event);
+    }
+    if (vkev->has_event) {
+        device->device.destroyEvent(vkev->event);
+    }
     delete vkev;
     delete event;
 }
@@ -18261,10 +17373,29 @@ static void ggml_backend_vk_device_event_synchronize(ggml_backend_dev_t dev, ggm
     auto device = ggml_vk_get_device(ctx->device);
     vk_event *vkev = (vk_event *)event->context;
 
-    VK_CHECK(device->device.waitForFences({ vkev->fence }, true, UINT64_MAX), "event_synchronize");
-    // Finished using current command buffer so we flag for reuse
-    if (vkev->cmd_buffer) {
-        vkev->cmd_buffer->in_use = false;
+    // Only do something if the event has actually been used
+    if (vkev->has_event) {
+        vk::Semaphore sem = vkev->tl_semaphore.s;
+        uint64_t val = vkev->tl_semaphore.value;
+        vk::SemaphoreWaitInfo swi{vk::SemaphoreWaitFlags{}, sem, val};
+        VK_CHECK(device->device.waitSemaphores(swi, UINT64_MAX), "event_synchronize");
+
+        // Reset and move submitted events
+        for (auto& event : vkev->events_submitted) {
+            device->device.resetEvent(event);
+        }
+        vkev->events_free.insert(vkev->events_free.end(), vkev->events_submitted.begin(), vkev->events_submitted.end());
+        vkev->events_submitted.clear();
+
+        // Finished using current command buffer so we flag for reuse
+        if (vkev->cmd_buffer) {
+            // Only flag for reuse if it hasn't been reused already
+            if (vkev->cmd_buffer_use_counter == vkev->cmd_buffer->use_counter) {
+                vkev->cmd_buffer->in_use = false;
+                vkev->cmd_buffer->buf.reset();
+            }
+            vkev->cmd_buffer = nullptr;
+        }
     }
 }
 
@@ -18989,11 +18120,6 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             const int32_t p1 = tensor->op_params[6];
 
             tensor_clone = ggml_pool_2d(ggml_ctx, src_clone[0], op, k0, k1, s0, s1, p0, p1);
-        } else if (tensor->op == GGML_OP_ISTFT) {
-            const int32_t n_fft      = tensor->op_params[0];
-            const int32_t hop_length = tensor->op_params[1];
-            const int32_t win_length = tensor->op_params[2];
-            tensor_clone = ggml_istft(ggml_ctx, src_clone[0], src_clone[1], n_fft, hop_length, win_length);
         } else if (tensor->op == GGML_OP_CONV_2D) {
             const int32_t s0 = tensor->op_params[0];
             const int32_t s1 = tensor->op_params[1];
