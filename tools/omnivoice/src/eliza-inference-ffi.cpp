@@ -1108,6 +1108,23 @@ static void free_engine(Engine * e) {
     delete e;
 }
 
+/* Reset an MTP engine for warm reuse: clear both KV caches, reset the outer
+ * sampler, and zero the committed-token accumulator. The DRAFT_MTP driver's
+ * per-sequence accumulators (pending_h / verify_h / i_batch_*) are re-seeded by
+ * the next prefill (common_speculative_process per ubatch + common_speculative_begin),
+ * so there is nothing else to retract here. `ckpt` is re-snapshotted by step()
+ * before every use, so a stale value is never read. This is the close+reopen
+ * path minus the context teardown — identical re-prefill cost, no second
+ * LLAMA_CONTEXT_TYPE_MTP context re-init per turn. */
+static void reset_engine(Engine * e) {
+    if (!e) return;
+    if (e->ctx_tgt) llama_memory_clear(llama_get_memory(e->ctx_tgt), true);
+    if (e->ctx_dft) llama_memory_clear(llama_get_memory(e->ctx_dft), true);
+    if (e->smpl) common_sampler_reset(e->smpl);
+    e->prompt.clear();
+    e->id_last = 0;
+}
+
 } // namespace eliza_mtp
 
 struct EliLlmStream {
@@ -3251,13 +3268,24 @@ int eliza_inference_llm_stream_reset(EliLlmStream * stream) {
      * the warm-reuse path: keeping one lctx alive (instead of open/close per
      * turn) avoids the per-turn Vulkan pipeline/KV re-init AND the
      * shared-GPU-weights-across-lctx-lifecycle corruption seen when streams are
-     * created/destroyed repeatedly. Non-MTP fixed-KV path only — the in-process
-     * bionic host opens with no drafter; an MTP engine owns its own KV. */
+     * created/destroyed repeatedly. Handles both the plain fixed-KV stream and
+     * the MTP speculative engine (which owns its own target/draft KV). */
     if (!stream) return ELIZA_ERR_INVALID_ARG;
-    if (stream->mtp || !stream->lctx) return ELIZA_ERR_INVALID_ARG;
-    llama_memory_clear(llama_get_memory(stream->lctx), true);
-    if (stream->sampler) llama_sampler_reset(stream->sampler);
-    stream->n_past = 0;
+    if (!stream->mtp && !stream->lctx) return ELIZA_ERR_INVALID_ARG;
+    if (stream->mtp) {
+        /* MTP stream: clear both the target and draft KV caches, reset the
+         * outer sampler, and drop the committed-token accumulator. The next
+         * prefill re-seeds the speculative driver (common_speculative_process +
+         * common_speculative_begin), so close+reopen of the second
+         * LLAMA_CONTEXT_TYPE_MTP context per turn is no longer needed. */
+        eliza_mtp::reset_engine(stream->mtp);
+        stream->mtp_first_token = -1;
+        stream->mtp_step_buf.assign(stream->mtp_step_buf.size(), 0);
+    } else {
+        llama_memory_clear(llama_get_memory(stream->lctx), true);
+        if (stream->sampler) llama_sampler_reset(stream->sampler);
+        stream->n_past = 0;
+    }
     stream->generated = 0;
     stream->eos = false;
     stream->cancel.store(false);
