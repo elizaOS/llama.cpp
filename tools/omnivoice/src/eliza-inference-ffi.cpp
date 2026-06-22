@@ -3306,6 +3306,37 @@ int eliza_inference_llm_stream_reset(EliLlmStream * stream) {
     return ELIZA_OK;
 }
 
+int eliza_inference_llm_stream_reset_keep(EliLlmStream * stream, int32_t n_keep) {
+    /* Prefix-preserving reset: KEEP the first n_keep tokens of KV resident and
+     * drop everything after, so the next prefill only decodes the per-turn delta
+     * (the system + tool-schema prefix is identical turn-to-turn, and on Mali's
+     * scalar-matmul prefill the prefix is the dominant per-turn latency). The
+     * non-MTP prefill (`llama_batch_get_one`) appends at stream->n_past, so after
+     * this the host prefills only tokens[n_keep:] and the prefix is reused.
+     *
+     * Non-MTP streams only: the MTP engine seeds a speculative draft head from
+     * EVERY prompt position during prefill, so partial-prefix reuse there needs
+     * separate (riskier) handling — prefix-reuse mode opens the resident stream
+     * without MTP, trading MTP's ~1.5x decode for the much larger prefill cut. */
+    if (!stream) return ELIZA_ERR_INVALID_ARG;
+    if (stream->mtp || !stream->lctx) return ELIZA_ERR_INVALID_ARG;
+    if (n_keep < 0) n_keep = 0;
+    if (n_keep > stream->n_past) n_keep = stream->n_past;
+    /* Drop KV positions >= n_keep for the stream's sequence (0). */
+    if (!llama_memory_seq_rm(llama_get_memory(stream->lctx), 0, n_keep, -1)) {
+        /* A partial sequence that can't be trimmed — fall back to a full clear
+         * so we never decode against a stale tail. */
+        llama_memory_clear(llama_get_memory(stream->lctx), true);
+        n_keep = 0;
+    }
+    if (stream->sampler) llama_sampler_reset(stream->sampler);
+    stream->n_past = n_keep;
+    stream->generated = 0;
+    stream->eos = false;
+    stream->cancel.store(false);
+    return n_keep;
+}
+
 void eliza_inference_llm_stream_close(EliLlmStream * stream) {
     if (!stream) return;
     if (stream->mtp) {
