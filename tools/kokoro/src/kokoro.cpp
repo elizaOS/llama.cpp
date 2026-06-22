@@ -213,9 +213,16 @@ kokoro_model_ptr kokoro_load_model(
     h.sample_rate        = gguf_i32(model->gguf, "kokoro.audio.sample_rate",   h.sample_rate);
 
     // Bind backend (CPU only for now — GGML graph below is CPU-friendly).
-    model->backend = ggml_backend_cpu_init();
+    // Use the registry API rather than ggml_backend_cpu_init(): under
+    // -DGGML_BACKEND_DL (the Android build) the CPU backend is a dynamically
+    // loaded module and ggml_backend_cpu_init() is not linked, so a direct call
+    // is an undefined symbol at link time. ggml_backend_load_all() is idempotent
+    // and registers the CPU device in both the DL and statically-linked builds,
+    // matching how the sibling omnivoice tool initializes its CPU backend.
+    ggml_backend_load_all();
+    model->backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     if (!model->backend) {
-        err_out = "ggml_backend_cpu_init failed";
+        err_out = "ggml_backend_init_by_type(CPU) failed";
         return {nullptr, kokoro_model_deleter{}};
     }
 

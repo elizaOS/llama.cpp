@@ -33,6 +33,16 @@ add_library(kokoro_lib STATIC
 target_include_directories(kokoro_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
+# kokoro_lib is folded into the fused libelizainference SHARED library
+# (tools/omnivoice/CMakeLists.txt links it PRIVATE). When the parent build is
+# configured with BUILD_SHARED_LIBS=ON (e.g. the OpenVINO Linux CI job), the
+# static archive's objects must be position-independent or ld refuses to fold
+# them into a -shared object ("relocation R_X86_64_PC32 ... can not be used
+# when making a shared object; recompile with -fPIC"). PIC is not transitive
+# from the SHARED consumer, so set it on the static target itself — mirroring
+# eliza_voice_classifiers / omnivoice_lib in the sibling omnivoice subtree.
+set_target_properties(kokoro_lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # ggml + llama are already configured by the parent build; pulling them via
 # target_link_libraries gives us the include paths and the link line.
 target_link_libraries(kokoro_lib PUBLIC ggml)
@@ -48,6 +58,12 @@ target_compile_features(kokoro_lib PUBLIC cxx_std_17)
 # Standalone CLI harness — required by J2 verification (tools/voice-kokoro/).
 add_executable(kokoro-tts tools/kokoro-tts.cpp)
 target_link_libraries(kokoro-tts PRIVATE kokoro_lib)
+# kokoro-tts is a CLI harness, not a GUI app. On Apple platforms CMake defaults
+# executables to MACOSX_BUNDLE, and install(TARGETS ... RUNTIME) on a bundle
+# target fails configure with "install TARGETS given no BUNDLE DESTINATION for
+# MACOSX_BUNDLE executable" on every ios/tvos/visionos/macos build. Force the
+# bundle flag off so the plain RUNTIME install is valid on all platforms.
+set_target_properties(kokoro-tts PROPERTIES MACOSX_BUNDLE OFF)
 install(TARGETS kokoro-tts RUNTIME)
 
 # Server-mount handler: compiled into kokoro_lib only when the server target
