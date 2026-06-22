@@ -4614,13 +4614,14 @@ bool clip_has_audio_encoder(const struct clip_ctx * ctx) {
 
 bool clip_encode_float_image (struct clip_ctx * ctx, int n_threads, float * img, int h, int w, float * vec) {
     clip_image_f32 clip_img;
-    clip_img.buf.resize(h * w * 3);
+    // clip_image_f32 encapsulated nx_/ny_/buf upstream; use the public setters.
+    clip_img.set_size(clip_image_size{ w, h }, /*is_placeholder=*/false, /*is_audio=*/false);
+    std::vector<float> in_buf((size_t) h * w * 3);
     for (int i = 0; i < h*w*3; i++)
     {
-        clip_img.buf[i] = img[i];
+        in_buf[i] = img[i];
     }
-    clip_img.nx = w;
-    clip_img.ny = h;
+    clip_img.cpy_buf(in_buf);
     std::vector<float> out_vec;
     if (!clip_image_encode(ctx, n_threads, &clip_img, out_vec)) {
         return false;

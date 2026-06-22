@@ -3842,8 +3842,10 @@ int eliza_inference_describe_image(
                 ? user_prompt
                 : (std::string(marker ? marker : "<__media__>") + "\n" + user_prompt);
 
+        // Upstream now returns a wrapper {bitmap, video_ctx}; for a single
+        // still image we only need the bitmap pointer (video_ctx is null).
         bitmap = mtmd_helper_bitmap_init_from_buf(
-            ctx->vision_mtmd, image_bytes, n_bytes);
+            ctx->vision_mtmd, image_bytes, n_bytes, /*placeholder=*/false).bitmap;
         if (!bitmap) {
             eliza_set_error(out_error,
                 "[libelizainference] describe_image: image decode failed");
