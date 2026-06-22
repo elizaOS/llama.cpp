@@ -78,6 +78,11 @@ set(OMNIVOICE_CORE_SOURCES
 # llama + mtmd into a single ABI-stable C surface.
 set(OMNIVOICE_FFI_SOURCES
     src/eliza-inference-ffi.cpp
+    # Multi-runtime streaming-LLM backend seam (cutover plan M3). The selector
+    # is always compiled; it is inert until a -DELIZA_ENABLE_* accelerator
+    # backend below registers itself, so the default build keeps the in-tree
+    # llama.cpp path.
+    src/llm-backend-selector.cpp
 )
 
 # Vendored standalone voice-classifier forward graphs (pure scalar C, no
@@ -220,6 +225,19 @@ endif()
 # (the fused build links mtmd anyway), opt out with -DELIZA_ENABLE_VISION=OFF.
 option(ELIZA_ENABLE_VISION "Build the fused mmproj vision-describe ABI (v9)" ON)
 
+# ELIZA_ENABLE_LITERT — compile the LiteRT-LM in-process streaming-LLM backend
+# (cutover plan M4 — Android NPU: Tensor / Qualcomm QNN / MediaTek NeuroPilot).
+# OFF by default: the selector registers no LiteRT backend and the streaming-LLM
+# pipe keeps the in-tree llama.cpp path. ON requires the LiteRT-LM SDK
+# (ELIZA_LITERT_SDK_DIR) — a host/device cross-build concern, not the Linux CI
+# default. See docs/multi-backend-ffi-seam.md.
+option(ELIZA_ENABLE_LITERT "Build the LiteRT-LM in-process LLM backend (M4)" OFF)
+
+# ELIZA_ENABLE_MLX — compile the CoreML/MLX in-process streaming-LLM backend
+# (cutover plan M5 — Apple Silicon). OFF by default; ON is Apple-only and
+# requires the MLX / CoreML toolchain. See docs/multi-backend-ffi-seam.md.
+option(ELIZA_ENABLE_MLX "Build the CoreML/MLX in-process LLM backend (M5)" OFF)
+
 if(TARGET mtmd)
     add_library(elizainference SHARED
         ${OMNIVOICE_CORE_SOURCES}
@@ -270,6 +288,48 @@ if(TARGET mtmd)
         target_include_directories(elizainference PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/../kokoro/include)
         target_compile_definitions(elizainference PRIVATE ELIZA_ENABLE_KOKORO)
+    endif()
+    # ── Multi-runtime streaming-LLM accelerator backends (cutover M4/M5) ────
+    # The M3 selector (src/llm-backend-selector.cpp) is always compiled in via
+    # OMNIVOICE_FFI_SOURCES. These accelerator backends each link an external
+    # SDK, so they are opt-in. When a gate is OFF its source is not compiled,
+    # the selector's `#ifdef`-guarded factory declaration + registration drop
+    # out, and the streaming-LLM pipe keeps the in-tree llama.cpp path — so the
+    # default desktop/CI build is byte-for-byte the pre-seam behavior.
+    if(ELIZA_ENABLE_LITERT)
+        target_sources(elizainference PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/litert-backend.cpp)
+        target_compile_definitions(elizainference PRIVATE ELIZA_ENABLE_LITERT)
+        # LiteRT-LM SDK (github.com/google-ai-edge/LiteRT-LM). Point at a built
+        # SDK with -DELIZA_LITERT_SDK_DIR=<dir>; the device/host cross-build
+        # links its libs + the NPU delegates with -DELIZA_LITERT_LIBS=<libs>.
+        if(ELIZA_LITERT_SDK_DIR)
+            target_include_directories(elizainference PRIVATE ${ELIZA_LITERT_SDK_DIR}/include)
+            target_link_directories(elizainference PRIVATE ${ELIZA_LITERT_SDK_DIR}/lib)
+        endif()
+        if(ELIZA_LITERT_LIBS)
+            target_link_libraries(elizainference PRIVATE ${ELIZA_LITERT_LIBS})
+        endif()
+    endif()
+    if(ELIZA_ENABLE_MLX)
+        if(NOT APPLE)
+            message(FATAL_ERROR
+                "ELIZA_ENABLE_MLX requires an Apple host (CoreML/MLX are Apple-only).")
+        endif()
+        target_sources(elizainference PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/mlx-coreml-backend.mm)
+        target_compile_definitions(elizainference PRIVATE ELIZA_ENABLE_MLX)
+        # MLX C API (ml-explore/mlx-c) via -DELIZA_MLX_C_DIR / -DELIZA_MLX_LIBS,
+        # plus the system CoreML / Metal / Foundation frameworks.
+        if(ELIZA_MLX_C_DIR)
+            target_include_directories(elizainference PRIVATE ${ELIZA_MLX_C_DIR}/include)
+            target_link_directories(elizainference PRIVATE ${ELIZA_MLX_C_DIR}/lib)
+        endif()
+        if(ELIZA_MLX_LIBS)
+            target_link_libraries(elizainference PRIVATE ${ELIZA_MLX_LIBS})
+        endif()
+        target_link_libraries(elizainference PRIVATE
+            "-framework Foundation" "-framework CoreML" "-framework Metal")
     endif()
     set_target_properties(elizainference PROPERTIES
         OUTPUT_NAME              elizainference
