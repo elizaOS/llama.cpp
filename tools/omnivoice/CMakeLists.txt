@@ -128,6 +128,14 @@ target_include_directories(eliza_voice_classifiers PUBLIC
     ${OMNIVOICE_VOICE_CLASSIFIER_INCLUDE_DIRS})
 if(MSVC)
     target_compile_options(eliza_voice_classifiers PRIVATE /W3 /wd4100)
+    # The vendored voice-classifier C sources include <sys/mman.h> and
+    # <unistd.h> (POSIX) to mmap their GGUF files read-only and use
+    # open/close/read. MSVC ships neither header; this compat dir provides
+    # thin shims (mmap over Win32 file mapping; unistd over <io.h>) so the
+    # static lib — folded into the fused elizainference DLL — builds on
+    # Windows. Prepended via BEFORE so <sys/mman.h>/<unistd.h> resolve here.
+    target_include_directories(eliza_voice_classifiers BEFORE PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/compat/msvc)
 else()
     target_compile_options(eliza_voice_classifiers PRIVATE
         -O3 -Wall -Wextra -Wno-unused-parameter)
@@ -273,7 +281,14 @@ if(TARGET mtmd)
     endif()
     set_target_properties(elizainference PROPERTIES
         OUTPUT_NAME              elizainference
-        POSITION_INDEPENDENT_CODE ON)
+        POSITION_INDEPENDENT_CODE ON
+        # On Windows/MSVC symbols are NOT exported by default (unlike the Unix
+        # `default` visibility this target relies on), so the extern "C"
+        # eliza_inference_* / ov_* FFI surface the JS loader dlsym()s would be
+        # absent from the DLL (bun:ffi: "Symbol eliza_inference_abi_version not
+        # found"). Auto-generate an export table for every symbol so Windows
+        # matches the Unix default-export behavior the runtime assumes.
+        WINDOWS_EXPORT_ALL_SYMBOLS ON)
     # Apple re-exports llama symbols so the fused .dylib carries everything
     # JS will dlopen() without a second handle. Mirrors the legacy fork-root
     # graft block.

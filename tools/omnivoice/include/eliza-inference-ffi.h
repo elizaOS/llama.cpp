@@ -935,6 +935,16 @@ int eliza_inference_llm_stream_restore_slot(
  * cleanly. Returns ELIZA_ERR_INVALID_ARG only when the stream is NULL/unopened. */
 int eliza_inference_llm_stream_reset(EliLlmStream * stream);
 
+/* Prefix-preserving reset: KEEP the first n_keep tokens of KV cache resident and
+ * drop everything after, so the next prefill only decodes the per-turn delta (the
+ * system + tool-schema prefix is identical turn-to-turn and dominates per-turn
+ * latency on Mali's scalar-matmul prefill). The next prefill then appends at
+ * position n_keep. Non-MTP streams only (MTP would need its speculative draft
+ * head re-seeded for the skipped prefix). Returns the n_keep actually applied
+ * (>= 0; may be clamped to n_past or 0 on a partial-trim fallback), or a negative
+ * ELIZA_* on a NULL/MTP/unopened stream. */
+int eliza_inference_llm_stream_reset_keep(EliLlmStream * stream, int32_t n_keep);
+
 /* Close + free a streaming-LLM session. Idempotent on NULL. */
 void eliza_inference_llm_stream_close(EliLlmStream * stream);
 
