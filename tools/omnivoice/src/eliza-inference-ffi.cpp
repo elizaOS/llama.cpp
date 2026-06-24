@@ -1407,6 +1407,11 @@ static Engine * create_engine(
     cp.n_rs_seq        = 0; // draft ctx rolls back via PART/checkpoint, not RS
     cp.n_threads       = cparams_tgt.n_threads;
     cp.n_threads_batch = cparams_tgt.n_threads_batch;
+    // Separate-drafter MTP archs that reach into the target context for its
+    // token embeddings + hidden state (e.g. gemma4-assistant) require
+    // `ctx_other` = the target context; the llama-context ctor hard-fails
+    // without it. Inert for archs that don't consult ctx_other (same-file MTP).
+    cp.ctx_other       = e->ctx_tgt;
 
     e->ctx_dft = llama_init_from_model(model_for_dft, cp);
     if (!e->ctx_dft) {
