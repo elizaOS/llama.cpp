@@ -45,10 +45,12 @@ llama_memory_hybrid::llama_memory_hybrid(
         n_pad,
         n_swa,
         swa_type,
+        nullptr, // mem_other
         filter_attn == nullptr ?
             [&](int32_t il) { return !hparams.is_recurrent(il); }
             : filter_attn,
-        nullptr,
+        nullptr, // reuse
+        nullptr, // share
         kv_size_max
     )),
     mem_recr(new llama_memory_recurrent(
