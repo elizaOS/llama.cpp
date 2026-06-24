@@ -866,21 +866,28 @@ private:
                 return false;
             }
 
+            const bool spec_mtp = std::find(params_base.speculative.types.begin(),
+                                            params_base.speculative.types.end(),
+                                            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+
             // Upstream PR #22660: for SWA draft models, force swa_full on the
             // draft context so prefix reuse (seq_rm + seq_add) works beyond
             // the SWA window during speculation. Without this, the draft has
             // to re-decode from the window edge on every long-context request
             // and acceptance length degrades sharply.
-            if (llama_model_n_swa(model_dft.get()) > 0 && !params_dft.swa_full) {
+            //
+            // Exception: an MTP drafter that shares the target's KV cache (e.g.
+            // gemma4-assistant via ctx_other) must size its SWA cache to match
+            // the target's exactly. Forcing swa_full here would make the drafter
+            // expect a full-size SWA cache while the shared target tensor is
+            // small-SWA-sized, overflowing the view in get_k/get_v.
+            if (!spec_mtp && llama_model_n_swa(model_dft.get()) > 0 && !params_dft.swa_full) {
                 SRV_INF("%s", "draft model uses SWA - enabling swa_full for the draft context\n");
                 params_dft.swa_full = true;
             }
 
             auto cparams = common_context_params_to_llama(params_dft);
 
-            const bool spec_mtp = std::find(params_base.speculative.types.begin(),
-                                            params_base.speculative.types.end(),
-                                            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
             if (spec_mtp) {
                 cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
                 // gemma4-assistant-style MTP drafters read the target model's

@@ -204,6 +204,12 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
     res->t_h_nextn = h_next;
     ggml_set_output(res->t_h_nextn);
 
+    // Route the next-token hidden state through the existing pre-norm extraction
+    // seam so the MTP runtime (common/speculative.cpp) can chain it back as the
+    // drafter's input hidden for the next speculative step. The pre-norm/nextn
+    // hidden width is n_embd_out (the backbone width), not the drafter's n_embd.
+    res->t_h_pre_norm = h_next;
+
     ggml_build_forward_expand(gf, logits);
     ggml_build_forward_expand(gf, h_next);
 }

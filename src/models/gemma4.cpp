@@ -376,6 +376,13 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             model.output_norm, nullptr,
             LLM_NORM_RMS, -1);
 
+    // Expose the post-output-norm hidden state (the LM-head input feature) through
+    // the pre-norm extraction seam so gemma4-assistant MTP draft contexts can read
+    // it as the recurrent h input. This matches the reference (transformers/vLLM/
+    // SGLang), which feeds the drafter the target's post-final-norm hidden state.
+    cb(cur, "h_nextn", -1);
+    res->t_h_pre_norm = cur;
+
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
