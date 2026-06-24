@@ -196,9 +196,11 @@ static inline float sigmoidf(float x) {
     }
 }
 
-/* One-direction LSTM step. Gates packed in I, F, G, O order
- * (matches the converter's reorder). `x_dot_W` is the
- * pre-computed x @ W_ih^T + b_ih, shape [T, 4H]. */
+/* One-direction LSTM step. The GGUF packs the gates in ONNX LSTM order
+ * I, O, F, C(=G) — NOT PyTorch's I, F, G, O. Reading them as IFGO scrambled the
+ * forget/output/cell gates and made the diarizer over-detect overlap on inputs
+ * near the decision boundary (it passed the small parity-fixture suite by luck);
+ * see #9460. `x_dot_W` is the pre-computed x @ W_ih^T + b_ih, shape [T, 4H]. */
 static void lstm_run_dir(const float *x_dot_W,
                          int T, int H,
                          const float *W_hh,   /* [4H, H] */
@@ -223,11 +225,11 @@ static void lstm_run_dir(const float *x_dot_W,
             gate_buf[g] = acc;
         }
 
-        /* Apply nonlinearities. Gate order I, F, G, O. */
+        /* Apply nonlinearities. ONNX LSTM gate order I, O, F, C(=G). */
         const float *gi = gate_buf + 0 * H;
-        const float *gf = gate_buf + 1 * H;
-        const float *gg = gate_buf + 2 * H;
-        const float *go = gate_buf + 3 * H;
+        const float *go = gate_buf + 1 * H;
+        const float *gf = gate_buf + 2 * H;
+        const float *gg = gate_buf + 3 * H;
         for (int j = 0; j < H; ++j) {
             const float i_t = sigmoidf(gi[j]);
             const float f_t = sigmoidf(gf[j]);
