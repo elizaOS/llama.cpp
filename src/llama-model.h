@@ -549,6 +549,10 @@ struct llama_model {
     struct ggml_tensor * dflash_fc          = nullptr;
     struct ggml_tensor * dflash_hidden_norm = nullptr;
 
+    // gemma4-assistant (MTP next-token drafter) projections.
+    struct ggml_tensor * nextn_proj_pre  = nullptr;
+    struct ggml_tensor * nextn_proj_post = nullptr;
+
     struct ggml_tensor * conv1d   = nullptr;
     struct ggml_tensor * conv1d_b = nullptr;
 

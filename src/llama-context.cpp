@@ -106,6 +106,18 @@ llama_context::llama_context(
 
     cparams.ctx_type          = params.ctx_type;
 
+    cparams.ctx_other = nullptr;
+
+    // gemma4-assistant reads the target model's token embeddings and shares its
+    // KV cache, so it requires a sibling target context to be supplied.
+    if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+        if (params.ctx_other == nullptr) {
+            throw std::runtime_error("Gemma4Assistant requires ctx_other to be set (this warning is normal during memory fitting)");
+        }
+
+        cparams.ctx_other = params.ctx_other;
+    }
+
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
     // re-reserve when graph nodes change.
@@ -318,10 +330,11 @@ llama_context::llama_context(
     // init the memory module
     if (!hparams.vocab_only) {
         llama_memory_params params_mem = {
-            /*.type_k   =*/ params.type_k,
-            /*.type_v   =*/ params.type_v,
-            /*.swa_full =*/ params.swa_full,
-            /*.ctx_type= */ cparams.ctx_type,
+            /*.type_k    =*/ params.type_k,
+            /*.type_v    =*/ params.type_v,
+            /*.swa_full  =*/ params.swa_full,
+            /*.ctx_type  =*/ cparams.ctx_type,
+            /*.mem_other =*/ cparams.ctx_other ? llama_get_memory(cparams.ctx_other) : nullptr,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -3358,6 +3371,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_dynamic                  =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
+        /*.ctx_other                   =*/ nullptr,
     };
 
     return result;
@@ -3495,6 +3509,10 @@ uint32_t llama_n_rs_seq(const llama_context * ctx) {
 
 const llama_model * llama_get_model(const llama_context * ctx) {
     return &ctx->get_model();
+}
+
+llama_context * llama_get_ctx_other(llama_context * ctx) {
+    return ctx->get_cparams().ctx_other;
 }
 
 enum llama_pooling_type llama_pooling_type(const llama_context * ctx) {
