@@ -15,6 +15,11 @@
 
 #include "eliza-inference-ffi.h"
 #include "llm-backend.h"
+#include "embed-backend.h"
+#include "vision-backend.h"
+#include "asr-backend.h"
+#include "tts-backend.h"
+#include "eot-backend.h"
 #include "omnivoice.h"
 #include "llama.h"
 #include "mtmd.h"
@@ -1880,6 +1885,24 @@ int eliza_inference_tts_synthesize(
         return ELIZA_ERR_INVALID_ARG;
     }
 
+    /* Per-op backend seam: a TTS backend (e.g. LiteRT/NPU) serves this when it
+     * ships <bundle>/tts/*; otherwise fall through to the in-tree OmniVoice path
+     * below. Inert by default (no backend registered). */
+    {
+        char * be_error = nullptr;
+        TtsBackendFactory * be =
+            tts_backend_select(llm_backend_context_bundle_dir(ctx), &be_error);
+        if (be_error) {
+            eliza_set_error(out_error, std::string(be_error));
+            std::free(be_error);
+            return ELIZA_ERR_BUNDLE_INVALID;
+        }
+        if (be) {
+            return be->tts_synthesize(ctx, text, text_len, speaker_preset_id,
+                                      out_pcm, max_samples, out_error);
+        }
+    }
+
     std::lock_guard<std::mutex> lock(ctx->tts_mutex);
     if (!ctx->ov) {
         eliza_set_error(out_error, "[libelizainference] tts_synthesize: TTS region is not acquired; call mmap_acquire(\"tts\") after arming voice");
@@ -2081,6 +2104,25 @@ int eliza_inference_asr_transcribe(
         eliza_set_error(out_error, "[libelizainference] asr_transcribe: invalid arguments");
         return ELIZA_ERR_INVALID_ARG;
     }
+
+    /* Per-op backend seam: an ASR backend (e.g. LiteRT/NPU) serves this when it
+     * ships <bundle>/asr/*; otherwise fall through to the in-tree ggml path
+     * below. Inert by default (no backend registered). */
+    {
+        char * be_error = nullptr;
+        AsrBackendFactory * be =
+            asr_backend_select(llm_backend_context_bundle_dir(ctx), &be_error);
+        if (be_error) {
+            eliza_set_error(out_error, std::string(be_error));
+            std::free(be_error);
+            return ELIZA_ERR_BUNDLE_INVALID;
+        }
+        if (be) {
+            return be->asr_transcribe(ctx, pcm, n_samples, sample_rate_hz,
+                                      out_text, max_text_bytes, out_error);
+        }
+    }
+
     std::string transcript;
     int rc = eliza_asr_decode_core(ctx, pcm, n_samples, sample_rate_hz, max_text_bytes, transcript, out_error);
     if (rc < 0) {
@@ -3505,6 +3547,24 @@ int eliza_inference_embed(
         return ELIZA_ERR_INVALID_ARG;
     }
 
+    /* Per-op backend seam: an embedding backend (e.g. LiteRT/NPU) serves this
+     * when it ships <bundle>/embedding/*; otherwise fall through to the in-tree
+     * ggml encoder below. Inert by default (no backend registered). */
+    {
+        char * be_error = nullptr;
+        EmbedBackendFactory * be =
+            embed_backend_select(llm_backend_context_bundle_dir(ctx), &be_error);
+        if (be_error) {
+            eliza_set_error(out_error, std::string(be_error));
+            std::free(be_error);
+            return ELIZA_ERR_BUNDLE_INVALID;
+        }
+        if (be) {
+            return be->embed(ctx, text, text_len, pooling, out_embedding,
+                             out_capacity, out_dim, out_error);
+        }
+    }
+
     std::lock_guard<std::mutex> lock(ctx->llm_mutex);
     int rc = eliza_load_llm_model_locked(ctx, /* n_gpu_layers= */ -1, out_error);
     if (rc != ELIZA_OK) return rc;
@@ -3637,6 +3697,25 @@ int eliza_inference_llm_eot_score(
         eliza_set_error(out_error,
             "[libelizainference] eot: invalid arguments");
         return ELIZA_ERR_INVALID_ARG;
+    }
+
+    /* Per-op backend seam: an EOT backend (e.g. LiteRT/NPU) serves this when it
+     * ships <bundle>/eot/*; otherwise fall through to the in-tree ggml
+     * causal-scoring path below. Inert by default (no backend registered). */
+    {
+        char * be_error = nullptr;
+        EotBackendFactory * be =
+            eot_backend_select(llm_backend_context_bundle_dir(ctx), &be_error);
+        if (be_error) {
+            eliza_set_error(out_error, std::string(be_error));
+            std::free(be_error);
+            return ELIZA_ERR_BUNDLE_INVALID;
+        }
+        if (be) {
+            return be->eot_score(ctx, token_ids, num_tokens, target_token_id,
+                                 out_target_prob, out_top_token, out_top_prob,
+                                 out_error);
+        }
     }
 
     std::lock_guard<std::mutex> lock(ctx->llm_mutex);
@@ -3798,6 +3877,24 @@ int eliza_inference_describe_image(
         eliza_set_error(out_error,
             "[libelizainference] describe_image: invalid arguments");
         return ELIZA_ERR_INVALID_ARG;
+    }
+
+    /* Per-op backend seam: a vision backend (e.g. LiteRT/NPU) serves this when it
+     * ships <bundle>/vision/*; otherwise fall through to the in-tree ggml mmproj
+     * path below. Inert by default (no backend registered). */
+    {
+        char * be_error = nullptr;
+        VisionBackendFactory * be =
+            vision_backend_select(llm_backend_context_bundle_dir(ctx), &be_error);
+        if (be_error) {
+            eliza_set_error(out_error, std::string(be_error));
+            std::free(be_error);
+            return ELIZA_ERR_BUNDLE_INVALID;
+        }
+        if (be) {
+            return be->describe_image(ctx, image_bytes, n_bytes, mmproj_path,
+                                      prompt, out_text, max_text_bytes, out_error);
+        }
     }
 
     std::lock_guard<std::mutex> lock(ctx->llm_mutex);

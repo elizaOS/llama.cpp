@@ -83,6 +83,14 @@ set(OMNIVOICE_FFI_SOURCES
     # backend below registers itself, so the default build keeps the in-tree
     # llama.cpp path.
     src/llm-backend-selector.cpp
+    # Per-op backend seams (cutover M3+). Each modality's selector reuses the
+    # shared eliza_backend::Registry (backend-registry.h) and is inert until a
+    # gated backend registers — so the default build keeps the ggml path per-op.
+    src/embed-backend-selector.cpp
+    src/vision-backend-selector.cpp
+    src/asr-backend-selector.cpp
+    src/tts-backend-selector.cpp
+    src/eot-backend-selector.cpp
 )
 
 # Vendored standalone voice-classifier forward graphs (pure scalar C, no
@@ -231,7 +239,12 @@ option(ELIZA_ENABLE_VISION "Build the fused mmproj vision-describe ABI (v9)" ON)
 # pipe keeps the in-tree llama.cpp path. ON requires the LiteRT-LM SDK
 # (ELIZA_LITERT_SDK_DIR) — a host/device cross-build concern, not the Linux CI
 # default. See docs/multi-backend-ffi-seam.md.
-option(ELIZA_ENABLE_LITERT "Build the LiteRT-LM in-process LLM backend (M4)" OFF)
+option(ELIZA_ENABLE_LITERT "Build the LiteRT C-API per-op backends, e.g. embed (M4)" OFF)
+
+# ELIZA_ENABLE_LITERT_LM — the streaming-LLM backend on the heavier LiteRT-LM
+# Engine SDK (litert::lm), separate from the LiteRT C runtime above. OFF until
+# that SDK is built; point -DELIZA_LITERT_LM_SDK_DIR / -DELIZA_LITERT_LM_LIBS at it.
+option(ELIZA_ENABLE_LITERT_LM "Build the LiteRT-LM in-process streaming-LLM backend" OFF)
 
 # ELIZA_ENABLE_MLX — compile the CoreML/MLX in-process streaming-LLM backend
 # (cutover plan M5 — Apple Silicon). OFF by default; ON is Apple-only and
@@ -297,18 +310,35 @@ if(TARGET mtmd)
     # out, and the streaming-LLM pipe keeps the in-tree llama.cpp path — so the
     # default desktop/CI build is byte-for-byte the pre-seam behavior.
     if(ELIZA_ENABLE_LITERT)
+        # LiteRT C-API per-op backends (embed today; vision/etc. as artifacts
+        # ship). SDK = the LiteRT C runtime (github.com/google-ai-edge/LiteRT,
+        # libLiteRt.so + the GPU/NPU delegate). Point at a built SDK with
+        # -DELIZA_LITERT_SDK_DIR=<dir> and link with -DELIZA_LITERT_LIBS=LiteRt.
         target_sources(elizainference PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/litert-backend.cpp)
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/litert-embed-backend.cpp)
         target_compile_definitions(elizainference PRIVATE ELIZA_ENABLE_LITERT)
-        # LiteRT-LM SDK (github.com/google-ai-edge/LiteRT-LM). Point at a built
-        # SDK with -DELIZA_LITERT_SDK_DIR=<dir>; the device/host cross-build
-        # links its libs + the NPU delegates with -DELIZA_LITERT_LIBS=<libs>.
         if(ELIZA_LITERT_SDK_DIR)
             target_include_directories(elizainference PRIVATE ${ELIZA_LITERT_SDK_DIR}/include)
             target_link_directories(elizainference PRIVATE ${ELIZA_LITERT_SDK_DIR}/lib)
         endif()
         if(ELIZA_LITERT_LIBS)
             target_link_libraries(elizainference PRIVATE ${ELIZA_LITERT_LIBS})
+        endif()
+    endif()
+    if(ELIZA_ENABLE_LITERT_LM)
+        # The streaming-LLM backend needs the heavier LiteRT-LM Engine SDK
+        # (litert::lm, github.com/google-ai-edge/LiteRT-LM) — separate from the
+        # LiteRT C runtime above. Point at it with -DELIZA_LITERT_LM_SDK_DIR /
+        # -DELIZA_LITERT_LM_LIBS.
+        target_sources(elizainference PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/litert-backend.cpp)
+        target_compile_definitions(elizainference PRIVATE ELIZA_ENABLE_LITERT_LM)
+        if(ELIZA_LITERT_LM_SDK_DIR)
+            target_include_directories(elizainference PRIVATE ${ELIZA_LITERT_LM_SDK_DIR}/include)
+            target_link_directories(elizainference PRIVATE ${ELIZA_LITERT_LM_SDK_DIR}/lib)
+        endif()
+        if(ELIZA_LITERT_LM_LIBS)
+            target_link_libraries(elizainference PRIVATE ${ELIZA_LITERT_LM_LIBS})
         endif()
     endif()
     if(ELIZA_ENABLE_MLX)
