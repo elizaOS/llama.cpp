@@ -4118,32 +4118,13 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
                 }
             } break;
         case PROJECTOR_TYPE_QWEN3A:
-            {
-                // Block-diagonal attention mask: [n_pos, n_pos], column-major.
-                // 0.0 for (query, key) pairs in the same 25-token conv chunk,
-                // -inf across chunks — matches cu_seqlens local attention in Python.
-                // NOTE: only QWEN3A's graph (tools/mtmd/models/qwen3a.cpp) actually
-                // registers an "attn_mask" graph input. The siglip / internvl /
-                // nemotron-v2-vl / mobilenetv5 graphs used by GEMMA3, GEMMA3NV,
-                // IDEFICS3, INTERNVL, NEMOTRON_V2_VL do NOT — fanning those
-                // projector types into this case (as upstream PR #23073 did)
-                // crashed clip_image_batch_encode at "Failed to get tensor
-                // attn_mask" the first time any of those models was asked to
-                // process an image (e.g. the Anthropic vision base64 test).
-                const int n_frames         = image_size_width;
-                const int chunk_size       = 200;
-                const int tokens_per_chunk = 25;
-                const int n_pos            = (n_frames / chunk_size) * tokens_per_chunk;
-                std::vector<float> mask(n_pos * n_pos, -INFINITY);
-                for (int q = 0; q < n_pos; q++) {
-                    int start = (q / tokens_per_chunk) * tokens_per_chunk;
-                    int end   = start + tokens_per_chunk;
-                    for (int k = start; k < end; k++) {
-                        mask[k + n_pos * q] = 0.0f;
-                    }
-                }
-                set_input_f32("attn_mask", mask);
-            } break;
+            // qwen3a.cpp does block-diagonal attention by batching each
+            // 100-frame conv chunk as a separate element of the encoder's
+            // ggml_view_4d (build_vit is called with a null mask), so the
+            // graph registers no "attn_mask" input. The earlier code here
+            // uploaded a [n_pos, n_pos] mask with a divergent 200/25 chunk
+            // geometry, which aborted at "Failed to get tensor attn_mask"
+            // against the merged maskless graph. Fall through to the no-op.
         case PROJECTOR_TYPE_GEMMA3:
         case PROJECTOR_TYPE_GEMMA3NV:
         case PROJECTOR_TYPE_IDEFICS3:
