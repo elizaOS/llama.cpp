@@ -134,6 +134,16 @@ extern "C" {
  * load and refuses to bind if they disagree.
  *
  * Changelog:
+ *   v13: token-by-token vision describe. `eliza_inference_vision_stream_supported()`
+ *        + `_describe_image_stream` run the SAME mmproj-prefill + greedy decode as
+ *        `_describe_image`, but invoke an `eliza_vision_chunk_cb` with each decoded
+ *        UTF-8 text piece as it is produced (then once more with `is_final == 1`),
+ *        so the IMAGE_DESCRIPTION handler streams a description into the dashboard
+ *        through the SAME per-token pipe as chat text (mirrors the streaming-TTS
+ *        `eliza_tts_chunk_cb` cancellation contract). Additive symbols — a v12
+ *        caller is unaffected; a v12 library reports `vision_stream_supported() == 0`
+ *        and the loader falls back to the buffered `_describe_image`. Gated on the
+ *        same `-DELIZA_ENABLE_VISION=1` build flag.
  *   v12: ASR word timestamps folded into the fused ASR.
  *        `eliza_inference_asr_timestamps_supported()` + `_asr_transcribe_timed`
  *        run the SAME audio-in/text-out decode as `_asr_transcribe` and
@@ -203,9 +213,9 @@ extern "C" {
  *   v7: real Silero VAD (same symbol surface as v6).
  *   v6: fused wake-word, speaker, diarizer.
  */
-#define ELIZA_INFERENCE_ABI_VERSION 12
+#define ELIZA_INFERENCE_ABI_VERSION 13
 
-/* Returns a static, NUL-terminated string of the form "12" matching
+/* Returns a static, NUL-terminated string of the form "13" matching
  * ELIZA_INFERENCE_ABI_VERSION at the time the library was built. The
  * pointer is owned by the library — do NOT free. */
 const char * eliza_inference_abi_version(void);
@@ -1084,6 +1094,38 @@ int eliza_inference_describe_image(
     const char * prompt,
     char * out_text,
     size_t max_text_bytes,
+    char ** out_error);
+
+/* ---- Streaming mmproj vision describe (ABI v13, additive) --------- *
+ *
+ * Token-by-token vision. `_describe_image_stream_open` runs the SAME
+ * mmproj-prefill as `_describe_image` (mtmd_tokenize + mtmd_helper_eval_chunks),
+ * but instead of decoding the whole description into a buffer it returns an
+ * `EliLlmStream *` whose KV is primed with the image + prompt and whose sampler
+ * (greedy) + `max_tokens` (ELIZA_VISION_MAX_TOKENS) match `_describe_image`.
+ * The caller then PULLS tokens with the existing `eliza_inference_llm_stream_next`
+ * loop and releases the handle with `eliza_inference_llm_stream_close` — the
+ * exact same machinery (and JS FfiStreamingRunner) that drives chat text, so a
+ * description streams into the dashboard through one pipe with no event-loop
+ * blocking (each `_next` step yields between tokens). The returned stream has no
+ * MTP engine (vision uses the plain fixed-KV decode path).
+ *
+ * Gated on `-DELIZA_ENABLE_VISION=1` (same flag as `_describe_image`). A build
+ * without it returns 0 from `_vision_stream_supported()` and NULL (+ *out_error)
+ * from `_describe_image_stream_open`; the IMAGE_DESCRIPTION handler then falls
+ * back to the buffered `_describe_image`. */
+
+/* Capability probe: 1 when this build wires the streaming vision-describe path
+ * (ELIZA_ENABLE_VISION compiled in), 0 otherwise. Callers pick the streaming
+ * open + `_llm_stream_next` loop vs the buffered `_describe_image` off this. */
+int eliza_inference_vision_stream_supported(void);
+
+EliLlmStream * eliza_inference_describe_image_stream_open(
+    EliInferenceContext * ctx,
+    const unsigned char * image_bytes,
+    size_t n_bytes,
+    const char * mmproj_path,
+    const char * prompt,
     char ** out_error);
 
 /* ---- Tokenizer (ABI v9, additive) --------------------------------- *
