@@ -23,12 +23,20 @@
 #include "kokoro-crispasr.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
 namespace eliza_kokoro {
 
 namespace {
+
+// Truthy env check (matches CrispASR's own `env_bool`, which is file-local to
+// kokoro-crispasr.cpp and not reachable here).
+bool adapter_env_bool(const char * k) {
+    const char * v = std::getenv(k);
+    return v && *v && std::strcmp(v, "0") != 0 && std::strcmp(v, "false") != 0;
+}
 
 // Decide whether `s` is already an IPA / misaki phoneme string (skip the G2P)
 // or raw text to be phonemized. Phoneme strings carry codepoints that never
@@ -91,6 +99,21 @@ kokoro_model_ptr kokoro_load_model(
     const std::string & gguf_path,
     std::string & err_out) noexcept {
     ::kokoro_context_params params = ::kokoro_context_default_params();
+    // Run the whole Kokoro forward (predictor + text encoder + PLBERT + iSTFT
+    // generator) on the CPU backend. The fused engine lib may carry a GPU
+    // backend (Vulkan on Mali, CUDA on desktop) for the LLM, and
+    // `ggml_backend_init_best()` would otherwise pin Kokoro's predictor/encoder
+    // graph onto it — but the GPU kernels for Kokoro's op set
+    // (conv_transpose_1d / col2im_1d / istft and the StyleTTS2 predictor) do
+    // NOT match the CPU reference numerically on every backend, which yields
+    // garbled low-frequency audio instead of speech. Kokoro-82M is tiny
+    // (~80M params, <100 ms CPU TTFB), so CPU is both correct and fast; the LLM
+    // keeps its own GPU backend independently. The `KOKORO_GEN_GPU` /
+    // `KOKORO_GEN_FORCE_METAL` env knobs remain available to opt a verified
+    // backend back in for lab runs.
+    if (!adapter_env_bool("KOKORO_GEN_GPU") && !adapter_env_bool("KOKORO_GEN_FORCE_METAL")) {
+        params.use_gpu = false;
+    }
     ::kokoro_context * ctx = ::kokoro_init_from_file(gguf_path.c_str(), params);
     if (!ctx) {
         err_out = "kokoro_init_from_file failed for " + gguf_path;
