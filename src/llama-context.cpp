@@ -205,6 +205,7 @@ llama_context::llama_context(
 
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
+    cparams.fa_dequant_kv = false;
 
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
@@ -324,6 +325,54 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: %10s  output buffer size = %8.2f MiB\n", __func__,
                     ggml_backend_buffer_name    (buf_output.get()),
                     ggml_backend_buffer_get_size(buf_output.get()) / 1024.0 / 1024.0);
+        }
+    }
+
+    // Eliza custom KV cache types (TBQ3_0, TBQ4_0, Q4_POLAR) are scored natively
+    // by the CPU flash-attention path (vec_dot / to_float traits), but other
+    // backends (e.g. Metal) only accept a fixed set of K/V types in
+    // FLASH_ATTN_EXT. Probe each offloaded KV layer's device with the requested
+    // cache types; only when a device cannot run FA on them natively does the
+    // graph dequantize the cache to F16 before FA. CPU-resident KV (CPU-only
+    // builds, --no-kv-offload, CPU-assigned layers) never takes the extra cast.
+    if (!hparams.vocab_only && cparams.flash_attn && cparams.offload_kqv) {
+        const auto is_custom_kv = [](ggml_type t) {
+            return t == GGML_TYPE_TBQ3_0 || t == GGML_TYPE_TBQ4_0 || t == GGML_TYPE_Q4_POLAR;
+        };
+        if (is_custom_kv(params.type_k) || is_custom_kv(params.type_v)) {
+            ggml_init_params ip = {
+                /*.mem_size   =*/ 8*ggml_tensor_overhead(),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context_ptr ctx_probe { ggml_init(ip) };
+            for (uint32_t il = 0; il < hparams.n_layer && !cparams.fa_dequant_kv; ++il) {
+                ggml_backend_dev_t dev = model.dev_layer(il);
+                if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    continue;
+                }
+                const int64_t dk   = hparams.n_embd_head_k(il);
+                const int64_t dv   = hparams.n_embd_head_v(il);
+                const int64_t n_kv = 256;
+                const int64_t n_h  = std::max<int64_t>(1, hparams.n_head(il));
+                const int64_t n_hk = std::max<int64_t>(1, hparams.n_head_kv(il));
+                if (dk <= 0 || dv <= 0 || dk % ggml_blck_size(params.type_k) != 0 || dv % ggml_blck_size(params.type_v) != 0) {
+                    continue;
+                }
+                ggml_tensor * q = ggml_new_tensor_4d(ctx_probe.get(), GGML_TYPE_F32, dk, 1, n_h, 1);
+                ggml_tensor * k = ggml_new_tensor_4d(ctx_probe.get(), params.type_k, dk, n_kv, n_hk, 1);
+                ggml_tensor * v = ggml_new_tensor_4d(ctx_probe.get(), params.type_v, dv, n_kv, n_hk, 1);
+                ggml_tensor * m = ggml_new_tensor_4d(ctx_probe.get(), GGML_TYPE_F16, n_kv, 1, 1, 1);
+                ggml_tensor * fa = ggml_flash_attn_ext(ctx_probe.get(), q, k, v, m, 1.0f, 0.0f, 0.0f);
+                ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+                if (!ggml_backend_dev_supports_op(dev, fa)) {
+                    cparams.fa_dequant_kv = true;
+                    LLAMA_LOG_INFO("%s: device %s has no native flash attention for K=%s V=%s; "
+                            "dequantizing custom KV cache types to F16 before FA\n", __func__,
+                            ggml_backend_dev_name(dev), ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+                }
+                ggml_reset(ctx_probe.get());
+            }
         }
     }
 
