@@ -509,6 +509,310 @@ void quantize_iq4_nl(device const float * src, device block_iq4_nl & dst) {
     dst.d = sumq2 > 0 ? sumqx/sumq2 : d;
 }
 
+constant float k_tbq3_codebook_set_rows[8] = {
+    -2.1519457f, -1.3439093f, -0.7560053f, -0.2450942f,
+     0.2450942f,  0.7560053f,  1.3439093f,  2.1519457f,
+};
+
+constant float k_tbq4_codebook_set_rows[16] = {
+    -2.7321365f, -2.0685055f, -1.6175243f, -1.2557391f,
+    -0.9419147f, -0.6564307f, -0.3878412f, -0.1283243f,
+     0.1283243f,  0.3878412f,  0.6564307f,  0.9419147f,
+     1.2557391f,  1.6175243f,  2.0685055f,  2.7321365f,
+};
+
+constant float k_tbq_signs_set_rows[QK_TBQ] = {
+     1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f, -1.0f, -1.0f,
+     1.0f,  1.0f, -1.0f,  1.0f, -1.0f, -1.0f,  1.0f, -1.0f,
+    -1.0f,  1.0f,  1.0f, -1.0f,  1.0f, -1.0f, -1.0f,  1.0f,
+     1.0f, -1.0f,  1.0f, -1.0f, -1.0f,  1.0f, -1.0f,  1.0f,
+};
+
+static inline void tbq_hadamard32_set_rows(thread float * x) {
+    for (int len = 1; len < QK_TBQ; len <<= 1) {
+        for (int i = 0; i < QK_TBQ; i += 2 * len) {
+            for (int j = 0; j < len; ++j) {
+                const float a = x[i + j];
+                const float b = x[i + j + len];
+                x[i + j]       = a + b;
+                x[i + j + len] = a - b;
+            }
+        }
+    }
+
+    constexpr float norm = 0.1767766952966369f;
+    for (int i = 0; i < QK_TBQ; ++i) {
+        x[i] *= norm;
+    }
+}
+
+static inline uint8_t tbq_best_index_set_rows(constant const float * codebook, int n, float x) {
+    uint8_t best = 0;
+    float best_dist = fabs(x - codebook[0]);
+
+    for (int i = 1; i < n; ++i) {
+        const float dist = fabs(x - codebook[i]);
+        if (dist < best_dist) {
+            best = (uint8_t) i;
+            best_dist = dist;
+        }
+    }
+
+    return best;
+}
+
+static inline void tbq3_set_code_set_rows(device uint8_t * qs, int idx, uint8_t code) {
+    const int bit = idx * 3;
+    const int byte = bit >> 3;
+    const int shift = bit & 7;
+
+    qs[byte] = (uint8_t) (qs[byte] | ((code & 0x7u) << shift));
+    if (shift > 5 && byte + 1 < (int) (QK_TBQ * 3 / 8)) {
+        qs[byte + 1] = (uint8_t) (qs[byte + 1] | ((code & 0x7u) >> (8 - shift)));
+    }
+}
+
+static inline void tbq4_set_code_set_rows(device uint8_t * qs, int idx, uint8_t code) {
+    const int j = idx % (QK_TBQ / 2);
+    if (idx < QK_TBQ / 2) {
+        qs[j] = (uint8_t) ((qs[j] & 0xF0) | (code & 0x0F));
+    } else {
+        qs[j] = (uint8_t) ((qs[j] & 0x0F) | ((code & 0x0F) << 4));
+    }
+}
+
+static inline uint8_t tbq3_get_code_set_rows(device const uint8_t * qs, int idx) {
+    const int bit = idx * 3;
+    const int byte = bit >> 3;
+    const int shift = bit & 7;
+    uint16_t raw = qs[byte];
+    if (byte + 1 < (int) (QK_TBQ * 3 / 8)) {
+        raw = (uint16_t) (raw | ((uint16_t) qs[byte + 1] << 8));
+    }
+    return (uint8_t) ((raw >> shift) & 0x7u);
+}
+
+static inline uint8_t tbq4_get_code_set_rows(device const uint8_t * qs, int idx) {
+    const int j = idx % (QK_TBQ / 2);
+    return idx < QK_TBQ / 2 ? (qs[j] & 0x0Fu) : (qs[j] >> 4);
+}
+
+static inline void tbq_precondition_block_set_rows(device const float * src, thread float * rotated) {
+    for (int i = 0; i < QK_TBQ; ++i) {
+        rotated[i] = src[i] * k_tbq_signs_set_rows[i];
+    }
+    tbq_hadamard32_set_rows(rotated);
+}
+
+static inline void tbq_uncondition_block_set_rows(thread float * x) {
+    tbq_hadamard32_set_rows(x);
+    for (int i = 0; i < QK_TBQ; ++i) {
+        x[i] *= k_tbq_signs_set_rows[i];
+    }
+}
+
+void quantize_tbq3_0(device const float * src, device block_tbq3_0 & dst) {
+#pragma METAL fp math_mode(safe)
+    thread float rotated[QK_TBQ];
+    tbq_precondition_block_set_rows(src, rotated);
+
+    float sumsq = 0.0f;
+    for (int i = 0; i < QK_TBQ; ++i) {
+        sumsq = fma(rotated[i], rotated[i], sumsq);
+    }
+
+    const float d = sqrt(sumsq / float(QK_TBQ));
+    dst.d = (half) d;
+    for (int i = 0; i < QK_TBQ * 3 / 8; ++i) {
+        dst.qs[i] = 0;
+    }
+
+    if (d == 0.0f) {
+        return;
+    }
+
+    const float id = 1.0f / d;
+    for (int i = 0; i < QK_TBQ; ++i) {
+        const uint8_t code = tbq_best_index_set_rows(k_tbq3_codebook_set_rows, 8, rotated[i] * id);
+        tbq3_set_code_set_rows(dst.qs, i, code);
+    }
+}
+
+void quantize_tbq4_0(device const float * src, device block_tbq4_0 & dst) {
+#pragma METAL fp math_mode(safe)
+    thread float rotated[QK_TBQ];
+    tbq_precondition_block_set_rows(src, rotated);
+
+    float sumsq = 0.0f;
+    for (int i = 0; i < QK_TBQ; ++i) {
+        sumsq = fma(rotated[i], rotated[i], sumsq);
+    }
+
+    const float d = sqrt(sumsq / float(QK_TBQ));
+    dst.d = (half) d;
+    for (int i = 0; i < QK_TBQ / 2; ++i) {
+        dst.qs[i] = 0;
+    }
+
+    if (d == 0.0f) {
+        return;
+    }
+
+    const float id = 1.0f / d;
+    for (int i = 0; i < QK_TBQ; ++i) {
+        const uint8_t code = tbq_best_index_set_rows(k_tbq4_codebook_set_rows, 16, rotated[i] * id);
+        tbq4_set_code_set_rows(dst.qs, i, code);
+    }
+}
+
+constant float k_polar_q4_centroids_set_rows[16] = {
+    -2.754354807f, -2.093562707f, -1.643041510f, -1.279739752f,
+    -0.962640978f, -0.672392117f, -0.397897103f, -0.131757782f,
+     0.131757782f,  0.397897103f,  0.672392117f,  0.962640978f,
+     1.279739752f,  1.643041510f,  2.093562707f,  2.754354807f,
+};
+
+constant float k_polar_q4_boundaries_set_rows[15] = {
+    -2.423958757f, -1.868302108f, -1.461390631f, -1.121190365f,
+    -0.817516548f, -0.535144610f, -0.264827443f,  0.0f,
+     0.264827443f,  0.535144610f,  0.817516548f,  1.121190365f,
+     1.461390631f,  1.868302108f,  2.423958757f,
+};
+
+static inline void polar_hadamard128_set_rows(thread float * x) {
+    for (int h = 1; h < QK_POLAR; h <<= 1) {
+        for (int i = 0; i < QK_POLAR; i += (h << 1)) {
+            for (int j = i; j < i + h; ++j) {
+                const float a = x[j];
+                const float b = x[j + h];
+                x[j]     = a + b;
+                x[j + h] = a - b;
+            }
+        }
+    }
+}
+
+static inline uint8_t polar_q4_bucketize_set_rows(float v) {
+    uint8_t code = 0;
+    for (int i = 0; i < 15; ++i) {
+        if (v > k_polar_q4_boundaries_set_rows[i]) {
+            code = (uint8_t) (i + 1);
+        }
+    }
+    return code;
+}
+
+void quantize_q4_polar(device const float * src, device block_q4_polar & dst) {
+#pragma METAL fp math_mode(safe)
+    float sumsq = 0.0f;
+    for (int i = 0; i < QK_POLAR; ++i) {
+        sumsq = fma(src[i], src[i], sumsq);
+    }
+
+    const float l2 = sqrt(sumsq);
+    const float inv_l2 = l2 > 1e-10f ? 1.0f / l2 : 0.0f;
+    dst.d = (half) l2;
+
+    thread float buf[QK_POLAR];
+    for (int i = 0; i < QK_POLAR; ++i) {
+        buf[i] = src[i] * inv_l2;
+    }
+
+    polar_hadamard128_set_rows(buf);
+
+    thread uint8_t codes[QK_POLAR];
+    for (int i = 0; i < QK_POLAR; ++i) {
+        codes[i] = polar_q4_bucketize_set_rows(buf[i]);
+    }
+
+    for (int i = 0; i < QK_POLAR / 2; ++i) {
+        const uint8_t lo = codes[2 * i];
+        const uint8_t hi = codes[2 * i + 1];
+        dst.qs[i] = (uint8_t) ((hi << 4) | (lo & 0x0F));
+    }
+
+    for (int i = 0; i < QJL_RESIDUAL_BYTES; ++i) {
+        dst.qjl[i] = 0;
+    }
+
+    float proj = 0.0f;
+    uint state = 42u;
+    for (int i = 0; i < QK_POLAR; ++i) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        const float sign = (state & 1u) ? 1.0f : -1.0f;
+        const float c = k_polar_q4_centroids_set_rows[codes[i]];
+        proj = fma(buf[i] - c, sign, proj);
+    }
+    dst.qjl[0] = proj >= 0.0f ? 1u : 0u;
+}
+
+template <typename type4x4>
+static inline void store_dequant_chunk_set_rows(thread float * decoded, short il, thread type4x4 & reg) {
+    float4x4 reg_f;
+    const int base = il * 16;
+    for (int i = 0; i < 16; ++i) {
+        reg_f[i / 4][i % 4] = decoded[base + i];
+    }
+    reg = (type4x4) reg_f;
+}
+
+template <typename type4x4>
+void dequantize_tbq3_0(device const block_tbq3_0 * xb, short il, thread type4x4 & reg) {
+    thread float decoded[QK_TBQ];
+    const float d = xb->d;
+    if (d == 0.0f) {
+        for (int i = 0; i < QK_TBQ; ++i) {
+            decoded[i] = 0.0f;
+        }
+    } else {
+        for (int i = 0; i < QK_TBQ; ++i) {
+            decoded[i] = d * k_tbq3_codebook_set_rows[tbq3_get_code_set_rows(xb->qs, i)];
+        }
+        tbq_uncondition_block_set_rows(decoded);
+    }
+    store_dequant_chunk_set_rows(decoded, il, reg);
+}
+
+template <typename type4x4>
+void dequantize_tbq4_0(device const block_tbq4_0 * xb, short il, thread type4x4 & reg) {
+    thread float decoded[QK_TBQ];
+    const float d = xb->d;
+    if (d == 0.0f) {
+        for (int i = 0; i < QK_TBQ; ++i) {
+            decoded[i] = 0.0f;
+        }
+    } else {
+        for (int i = 0; i < QK_TBQ; ++i) {
+            decoded[i] = d * k_tbq4_codebook_set_rows[tbq4_get_code_set_rows(xb->qs, i)];
+        }
+        tbq_uncondition_block_set_rows(decoded);
+    }
+    store_dequant_chunk_set_rows(decoded, il, reg);
+}
+
+template <typename type4x4>
+void dequantize_q4_polar(device const block_q4_polar * xb, short il, thread type4x4 & reg) {
+    thread float decoded[QK_POLAR];
+    for (int i = 0; i < QK_POLAR / 2; ++i) {
+        const uint8_t byte = xb->qs[i];
+        decoded[2 * i]     = k_polar_q4_centroids_set_rows[byte & 0x0Fu];
+        decoded[2 * i + 1] = k_polar_q4_centroids_set_rows[(byte >> 4) & 0x0Fu];
+    }
+
+    // Match the CPU default: QJL residual correction is opt-in and disabled
+    // unless runtime metadata enables it.
+    polar_hadamard128_set_rows(decoded);
+
+    const float scale = ((float) xb->d) / float(QK_POLAR);
+    for (int i = 0; i < QK_POLAR; ++i) {
+        decoded[i] *= scale;
+    }
+
+    store_dequant_chunk_set_rows(decoded, il, reg);
+}
+
 template <typename type4x4>
 void dequantize_q4_1(device const block_q4_1 * xb, short il, thread type4x4 & reg) {
     device const uint16_t * qs = ((device const uint16_t *)xb + 2);
@@ -7863,6 +8167,9 @@ template [[host_name("kernel_cpy_f32_q4_1")]]   kernel cpy_f_q_t kernel_cpy_f32_
 template [[host_name("kernel_cpy_f32_q5_0")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK5_0,  block_q5_0,   quantize_q5_0>;
 template [[host_name("kernel_cpy_f32_q5_1")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK5_1,  block_q5_1,   quantize_q5_1>;
 template [[host_name("kernel_cpy_f32_iq4_nl")]] kernel cpy_f_q_t kernel_cpy_f32_q<QK4_NL, block_iq4_nl, quantize_iq4_nl>;
+template [[host_name("kernel_cpy_f32_tbq3_0")]] kernel cpy_f_q_t kernel_cpy_f32_q<QK_TBQ, block_tbq3_0, quantize_tbq3_0>;
+template [[host_name("kernel_cpy_f32_tbq4_0")]] kernel cpy_f_q_t kernel_cpy_f32_q<QK_TBQ, block_tbq4_0, quantize_tbq4_0>;
+template [[host_name("kernel_cpy_f32_q4_polar")]] kernel cpy_f_q_t kernel_cpy_f32_q<QK_POLAR, block_q4_polar, quantize_q4_polar>;
 
 template<typename T4x4, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread T4x4 &)>
 kernel void kernel_cpy_q_f32(
@@ -7904,6 +8211,9 @@ template [[host_name("kernel_cpy_q4_1_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<
 template [[host_name("kernel_cpy_q5_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q5_0, 2, dequantize_q5_0>;
 template [[host_name("kernel_cpy_q5_1_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q5_1, 2, dequantize_q5_1>;
 template [[host_name("kernel_cpy_q8_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q8_0, 2, dequantize_q8_0>;
+template [[host_name("kernel_cpy_tbq3_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_tbq3_0, 2, dequantize_tbq3_0>;
+template [[host_name("kernel_cpy_tbq4_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_tbq4_0, 2, dequantize_tbq4_0>;
+template [[host_name("kernel_cpy_q4_polar_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q4_polar, 8, dequantize_q4_polar>;
 
 template [[host_name("kernel_cpy_q1_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q1_0, 8, dequantize_q1_0>;
 template [[host_name("kernel_cpy_q4_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q4_0, 2, dequantize_q4_0>;
@@ -7911,6 +8221,9 @@ template [[host_name("kernel_cpy_q4_1_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<
 template [[host_name("kernel_cpy_q5_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q5_0, 2, dequantize_q5_0>;
 template [[host_name("kernel_cpy_q5_1_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q5_1, 2, dequantize_q5_1>;
 template [[host_name("kernel_cpy_q8_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q8_0, 2, dequantize_q8_0>;
+template [[host_name("kernel_cpy_tbq3_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_tbq3_0, 2, dequantize_tbq3_0>;
+template [[host_name("kernel_cpy_tbq4_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_tbq4_0, 2, dequantize_tbq4_0>;
+template [[host_name("kernel_cpy_q4_polar_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q4_polar, 8, dequantize_q4_polar>;
 
 kernel void kernel_concat(
     constant ggml_metal_kargs_concat & args,
@@ -9852,6 +10165,37 @@ kernel void kernel_set_rows_q32(
     }
 }
 
+template<typename TI, typename block_q, void (*quantize_func)(device const float *, device block_q &)>
+kernel void kernel_set_rows_q128(
+        constant ggml_metal_kargs_set_rows & args,
+        device const  void * src0,
+        device const  void * src1,
+        device       float * dst,
+        uint3                tgpig[[threadgroup_position_in_grid]],
+        uint                 tiitg[[thread_index_in_threadgroup]],
+        uint3                tptg [[threads_per_threadgroup]]) {
+    const int32_t i03 = tgpig.z;
+    const int32_t i02 = tgpig.y;
+
+    const int32_t i12 = i03%args.ne12;
+    const int32_t i11 = i02%args.ne11;
+
+    const int32_t i01 = tgpig.x*tptg.y + tiitg/tptg.x;
+    if (i01 >= args.ne01) {
+        return;
+    }
+
+    const int32_t i10 = i01;
+    const TI      i1  = ((const device TI *) ((const device char *) src1 + i10*args.nb10 + i11*args.nb11 + i12*args.nb12))[0];
+
+          device block_q * dst_row = (      device block_q *) ((      device char *) dst  +  i1*args.nb1  + i02*args.nb2  + i03*args.nb3);
+    const device float   * src_row = (const device float   *) ((const device char *) src0 + i01*args.nb01 + i02*args.nb02 + i03*args.nb03);
+
+    for (int ind = tiitg%tptg.x; ind < args.nk0; ind += tptg.x) {
+        quantize_func(src_row + QK_POLAR*ind, dst_row[ind]);
+    }
+}
+
 template<typename T, typename TI>
 kernel void kernel_set_rows_f(
         constant ggml_metal_kargs_set_rows & args,
@@ -10694,6 +11038,14 @@ template [[host_name("kernel_set_rows_q5_1_i64")]]   kernel set_rows_q32_t kerne
 template [[host_name("kernel_set_rows_q5_1_i32")]]   kernel set_rows_q32_t kernel_set_rows_q32<int32_t, block_q5_1,   quantize_q5_1>;
 template [[host_name("kernel_set_rows_iq4_nl_i64")]] kernel set_rows_q32_t kernel_set_rows_q32<int64_t, block_iq4_nl, quantize_iq4_nl>;
 template [[host_name("kernel_set_rows_iq4_nl_i32")]] kernel set_rows_q32_t kernel_set_rows_q32<int32_t, block_iq4_nl, quantize_iq4_nl>;
+template [[host_name("kernel_set_rows_tbq3_0_i64")]] kernel set_rows_q32_t kernel_set_rows_q32<int64_t, block_tbq3_0, quantize_tbq3_0>;
+template [[host_name("kernel_set_rows_tbq3_0_i32")]] kernel set_rows_q32_t kernel_set_rows_q32<int32_t, block_tbq3_0, quantize_tbq3_0>;
+template [[host_name("kernel_set_rows_tbq4_0_i64")]] kernel set_rows_q32_t kernel_set_rows_q32<int64_t, block_tbq4_0, quantize_tbq4_0>;
+template [[host_name("kernel_set_rows_tbq4_0_i32")]] kernel set_rows_q32_t kernel_set_rows_q32<int32_t, block_tbq4_0, quantize_tbq4_0>;
+
+typedef decltype(kernel_set_rows_q128<int64_t, block_q4_polar, quantize_q4_polar>) set_rows_q128_t;
+template [[host_name("kernel_set_rows_q4_polar_i64")]] kernel set_rows_q128_t kernel_set_rows_q128<int64_t, block_q4_polar, quantize_q4_polar>;
+template [[host_name("kernel_set_rows_q4_polar_i32")]] kernel set_rows_q128_t kernel_set_rows_q128<int32_t, block_q4_polar, quantize_q4_polar>;
 
 //
 // matrix-matrix multiplication

@@ -2410,6 +2410,12 @@ struct test_set_rows : public test_case {
     }
 
     double max_nmse_err() override {
+        if (type == GGML_TYPE_TBQ3_0 || type == GGML_TYPE_TBQ4_0) {
+            return 1e-5;
+        }
+        if (type == GGML_TYPE_Q4_POLAR) {
+            return 5e-4;
+        }
         if (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 || type == GGML_TYPE_IQ4_NL ||
             type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q8_0) {
             // estimate what the max nmse error would be if one quantized value is
@@ -7962,6 +7968,12 @@ static const ggml_type eliza_custom_quant_types_cpy[] = {
     GGML_TYPE_TBQ3_TCQ,
 };
 
+static const ggml_type eliza_custom_quant_types_set_rows[] = {
+    GGML_TYPE_TBQ3_0,
+    GGML_TYPE_TBQ4_0,
+    GGML_TYPE_Q4_POLAR,
+};
+
 // Mul-mat: only the types that register a vec_dot in the CPU traits table.
 // QJL1_256 and TBQ3_TCQ are intentionally absent (no vec_dot - they are
 // scored via dedicated GGML_OP_ATTN_SCORE_QJL / fused attention paths).
@@ -8087,6 +8099,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_Q8_0, GGML_TYPE_I32, { 256, 5, 1, 3 }, { 1, 1, }, 1, false));
+    for (ggml_type type : eliza_custom_quant_types_set_rows) {
+        for (bool v : {false, true}) {
+            test_cases.emplace_back(new test_set_rows(type, GGML_TYPE_I64, { 128, 5, 2, 1 }, { 1, 1 }, 2, v));
+            test_cases.emplace_back(new test_set_rows(type, GGML_TYPE_I32, { 128, 7, 1, 2 }, { 1, 1 }, 2, v));
+        }
+    }
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
             for (bool v : {false, true}) {
@@ -8489,12 +8507,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, type_dst, {256, 4, 4, 4}));
     }
     for (ggml_type type_src : eliza_custom_quant_types_cpy) {
-        // Skip QJL/POLAR/TCQ for the dequant-to-F32 path: their to_float
-        // is defined but only via cache-attention codepaths, not the
-        // generic ggml_compute_forward_dup_q path. The standard quants
-        // (g32/g128/TBQ3_0/TBQ4_0/K-variants) are full participants.
+        // Skip QJL/TCQ for the dequant-to-F32 path: their to_float is
+        // defined but only via cache-attention codepaths, not the generic
+        // ggml_compute_forward_dup_q path. Q4_POLAR now participates in the
+        // generic path because flash-attention fallback dequantizes it.
         if (type_src == GGML_TYPE_QJL1_256 ||
-            type_src == GGML_TYPE_Q4_POLAR ||
             type_src == GGML_TYPE_TBQ3_TCQ) {
             continue;
         }
