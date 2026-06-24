@@ -4,14 +4,15 @@
 //
 // Usage:
 //     kokoro-tts
-//         --model    <path-to-kokoro-v1.0.gguf>
-//         --voice    <path-to-voices/af_sam.bin>
-//         --text     "Hello world."
+//         --model    <path-to-kokoro-crispasr.gguf>
+//         --voice    <path-to-voices/<id>.voice.gguf>
+//         --text     "həlˈO wˈɜɹld."   (already-IPA phonemes — the synthesis
+//                                        entry skips espeak/G2P)
 //         --output   <out.wav>
 //         [--speed 1.0]
 //
-// Exits 0 on a non-blank WAV being written; non-zero on any failure. Used
-// by the J2 verification step + the `tools/voice-kokoro/` test harness.
+// Exits 0 on a non-blank WAV being written; non-zero on any failure. Used by
+// the synthesis verification step + the `tools/voice-kokoro/` test harness.
 
 #include "kokoro.h"
 

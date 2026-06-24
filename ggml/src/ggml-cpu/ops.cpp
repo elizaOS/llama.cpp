@@ -6772,7 +6772,8 @@ static inline int64_t ggml_wrap_around(int64_t coord, int64_t size) {
 // ggml_compute_forward_col2im_1d
 //
 // Scatter-add columns [K*OC, T_in] -> signal [T_out, OC]
-// where T_out = (T_in - 1)*s + K - 2*p.  Gather approach: each output reads ceil(K/s) inputs.
+// where T_out = (T_in - 1)*s + K - p (p0 is a single-sided crop offset; the
+// gather uses t_abs = t_out + p0). Gather approach: each output reads ceil(K/s) inputs.
 // Parallelized over the time axis so the split stays balanced whatever OC is.
 // Supports F32, F16, BF16 input/output (same type), F32 accumulator.
 

@@ -4665,7 +4665,13 @@ struct ggml_tensor * ggml_col2im_1d(
     const int64_t K_OC = a->ne[0];
     const int64_t T_in = a->ne[1];
     const int64_t K = K_OC / oc;
-    const int64_t T_out = (T_in - 1) * s0 + K - 2 * p0;
+    // p0 is a single-sided crop offset (crop_left): the CPU/CUDA/Vulkan
+    // kernels gather with t_abs = t_out + p0, so the output length is
+    // (T_in-1)*s0 + K - p0 (one p0, not two). This matches the decomposed
+    // ConvTranspose1d contract documented in tools/kokoro/include/core/conv.h
+    // ("T_raw = (T_in-1)*stride + K - crop_left") that the Kokoro iSTFTNet
+    // generator depends on.
+    const int64_t T_out = (T_in - 1) * s0 + K - p0;
 
     GGML_ASSERT(K_OC == K * oc);  // a->ne[0] must be a whole number of oc blocks
     GGML_ASSERT(K > 0 && T_out > 0);
