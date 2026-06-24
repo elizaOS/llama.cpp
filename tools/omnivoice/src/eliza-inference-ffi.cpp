@@ -3878,6 +3878,167 @@ int eliza_inference_describe_image(
 #endif // ELIZA_ENABLE_VISION
 }
 
+/* ---- Streaming mmproj vision describe (ABI v13) ------------------- *
+ *
+ * Token-by-token vision: open primes an EliLlmStream's KV with the image +
+ * prompt (the same mtmd prefill as _describe_image), and the caller drives the
+ * existing _llm_stream_next loop to pull tokens — so vision streams through the
+ * exact same path (and JS FfiStreamingRunner) as chat text. The returned stream
+ * carries a greedy sampler + ELIZA_VISION_MAX_TOKENS cap and no MTP engine. */
+
+int eliza_inference_vision_stream_supported(void) {
+#if defined(ELIZA_ENABLE_VISION)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+EliLlmStream * eliza_inference_describe_image_stream_open(
+    EliInferenceContext * ctx,
+    const unsigned char * image_bytes,
+    size_t n_bytes,
+    const char * mmproj_path,
+    const char * prompt,
+    char ** out_error) {
+#if !defined(ELIZA_ENABLE_VISION)
+    (void) ctx; (void) image_bytes; (void) n_bytes; (void) mmproj_path;
+    (void) prompt;
+    eliza_set_error(out_error,
+        "[libelizainference] describe_image_stream_open: this build was compiled "
+        "without ELIZA_ENABLE_VISION (eliza_inference_vision_stream_supported() == "
+        "0); use the buffered _describe_image path");
+    return nullptr;
+#else
+    if (!ctx || !image_bytes || n_bytes == 0 || !mmproj_path ||
+        mmproj_path[0] == '\0') {
+        eliza_set_error(out_error,
+            "[libelizainference] describe_image_stream_open: invalid arguments");
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx->llm_mutex);
+    int rc = eliza_load_llm_model_locked(ctx, /* n_gpu_layers= */ -1, out_error);
+    if (rc != ELIZA_OK) return nullptr;
+    rc = eliza_ensure_vision_mtmd_locked(ctx, std::string(mmproj_path), out_error);
+    if (rc != ELIZA_OK) return nullptr;
+
+    /* A fresh generation context (causal, no embeddings), owned by the returned
+     * stream and freed by eliza_inference_llm_stream_close. Same params as the
+     * buffered _describe_image so streamed and buffered describes decode
+     * identically. */
+    llama_context_params cparams = llama_context_default_params();
+    const int n_ctx_train = llama_model_n_ctx_train(ctx->llm_model);
+    int n_ctx = eliza_int_env_or_default("ELIZA_VISION_N_CTX", 4096);
+    if (n_ctx_train > 0 && n_ctx > n_ctx_train) n_ctx = n_ctx_train;
+    cparams.n_ctx = (uint32_t) n_ctx;
+    cparams.n_batch = (uint32_t) eliza_int_env_or_default("ELIZA_VISION_N_BATCH", 512);
+    cparams.n_ubatch = cparams.n_batch;
+    cparams.n_threads = eliza_thread_count(false);
+    cparams.n_threads_batch = eliza_thread_count(true);
+    cparams.flash_attn_type = eliza_llm_flash_attn_type();
+    llama_context * lctx = llama_init_from_model(ctx->llm_model, cparams);
+    if (!lctx) {
+        eliza_set_error(out_error,
+            "[libelizainference] describe_image_stream_open: failed to init context");
+        return nullptr;
+    }
+
+    llama_sampler * sampler = nullptr;
+    mtmd_bitmap * bitmap = nullptr;
+    mtmd_input_chunks * chunks = nullptr;
+    bool ok = false;
+    llama_pos n_past = 0;
+
+    do {
+        const char * marker = mtmd_default_marker();
+        std::string user_prompt = prompt && prompt[0] != '\0'
+            ? std::string(prompt)
+            : std::string("Describe what is in this image.");
+        std::string prompt_text =
+            (marker && user_prompt.find(marker) != std::string::npos)
+                ? user_prompt
+                : (std::string(marker ? marker : "<__media__>") + "\n" + user_prompt);
+
+        bitmap = mtmd_helper_bitmap_init_from_buf(
+            ctx->vision_mtmd, image_bytes, n_bytes);
+        if (!bitmap) {
+            eliza_set_error(out_error,
+                "[libelizainference] describe_image_stream_open: image decode failed");
+            break;
+        }
+        chunks = mtmd_input_chunks_init();
+        if (!chunks) {
+            eliza_set_error(out_error,
+                "[libelizainference] describe_image_stream_open: chunks allocation failed");
+            break;
+        }
+        mtmd_input_text text = { prompt_text.c_str(), true, true };
+        const mtmd_bitmap * bitmaps[] = { bitmap };
+        int32_t tok_rc = mtmd_tokenize(ctx->vision_mtmd, chunks, &text, bitmaps, 1);
+        if (tok_rc != 0) {
+            eliza_set_error(out_error,
+                "[libelizainference] describe_image_stream_open: mtmd_tokenize rc=" +
+                std::to_string(tok_rc));
+            break;
+        }
+
+        llama_memory_clear(llama_get_memory(lctx), true);
+        int32_t eval_rc = mtmd_helper_eval_chunks(
+            ctx->vision_mtmd, lctx, chunks, n_past, 0,
+            (int32_t) cparams.n_batch, true, &n_past);
+        if (eval_rc != 0) {
+            eliza_set_error(out_error,
+                "[libelizainference] describe_image_stream_open: mtmd_helper_eval_chunks rc=" +
+                std::to_string(eval_rc));
+            break;
+        }
+
+        llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
+        sampler = llama_sampler_chain_init(sparams);
+        if (!sampler) {
+            eliza_set_error(out_error,
+                "[libelizainference] describe_image_stream_open: failed to init sampler");
+            break;
+        }
+        llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
+        ok = true;
+    } while (false);
+
+    /* The bitmap + chunks are only needed for the prefill eval; the KV now holds
+     * the image + prompt, so release them (the lctx + sampler live on in the
+     * returned stream). */
+    if (chunks) mtmd_input_chunks_free(chunks);
+    if (bitmap) mtmd_bitmap_free(bitmap);
+
+    if (!ok) {
+        if (sampler) llama_sampler_free(sampler);
+        llama_free(lctx);
+        return nullptr;
+    }
+
+    EliLlmStream * stream = new (std::nothrow) EliLlmStream();
+    if (!stream) {
+        llama_sampler_free(sampler);
+        llama_free(lctx);
+        eliza_set_error(out_error,
+            "[libelizainference] describe_image_stream_open: out of memory");
+        return nullptr;
+    }
+    stream->ctx = ctx;
+    stream->lctx = lctx;
+    stream->sampler = sampler;
+    stream->n_past = (int) n_past;
+    stream->generated = 0;
+    stream->max_tokens = eliza_int_env_or_default("ELIZA_VISION_MAX_TOKENS", 256);
+    stream->eos = false;
+    /* mtp stays null — vision uses the plain fixed-KV decode path in
+     * _llm_stream_next, which samples from lctx (logits primed at -1 by
+     * mtmd_helper_eval_chunks above). */
+    return stream;
+#endif // ELIZA_ENABLE_VISION
+}
+
 /* ---- Tokenizer (ABI v9) ------------------------------------------- *
  *
  * llama_tokenize / llama_detokenize over the loaded text model's vocab, so the
