@@ -883,6 +883,10 @@ private:
                                             COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
             if (spec_mtp) {
                 cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                // gemma4-assistant-style MTP drafters read the target model's
+                // token embeddings and share its KV cache via ctx_other. Setting
+                // it for other draft arches is harmless (only that arch reads it).
+                cparams.ctx_other = ctx_tgt;
             }
 
             // note: for small models maybe we can set this to the maximum possible draft from all speculative types
@@ -900,8 +904,9 @@ private:
                     params_base.model.path.c_str());
 
             auto cparams_mtp = common_context_params_to_llama(params_base);
-            cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-            cparams_mtp.n_rs_seq = 0;
+            cparams_mtp.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
+            cparams_mtp.n_rs_seq  = 0;
+            cparams_mtp.ctx_other = ctx_tgt;
 
             ctx_dft.reset(llama_init_from_model(model_tgt, cparams_mtp));
             if (ctx_dft == nullptr) {
