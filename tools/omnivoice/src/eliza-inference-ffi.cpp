@@ -22,13 +22,16 @@
 // ABI guard: the TS loader (ffi-llm-streaming-abi.ts) marshals
 // eliza_llm_stream_config_t by hand-written field offsets, so any reorder /
 // insert / type change on the C side silently corrupts every streaming-LLM
-// call. Pin the on-the-wire layout (documented "sizeof config = 80" since v8):
-// 6×int32 + 5×ptr + 4-byte fields packed to 80 bytes on a 64-bit ABI. Adding a
-// field is an ABI bump — update this assert AND the TS marshaller together.
+// call. Pin the on-the-wire layout. ABI v9 appended `context_size` (int32 at
+// offset 80), so the packed size on a 64-bit ABI is 88 bytes (8×int32 + 5×ptr,
+// pointer-aligned). The TS marshaller (ffi-bindings.ts) already allocs 88 and
+// writes context_size at offset 80; this assert had simply not been bumped to
+// match. Adding a field is an ABI bump — update this assert AND the TS
+// marshaller together.
 static_assert(
-    sizeof(eliza_llm_stream_config_t) == 80,
+    sizeof(eliza_llm_stream_config_t) == 88,
     "eliza_llm_stream_config_t layout changed — bump ABI + update the TS "
-    "marshaller in ffi-llm-streaming-abi.ts, then update this assert.");
+    "marshaller in ffi-bindings.ts, then update this assert.");
 
 /* common/ — the same-file MTP speculative-decode engine wired into the
  * streaming-LLM text path (ABI v8) reuses the DRAFT_MTP implementation in
@@ -2922,7 +2925,9 @@ EliLlmStream * eliza_inference_llm_stream_open(
      * batch / threads / flash-attn / KV-quant). */
     llama_context_params cparams = llama_context_default_params();
     const int n_ctx_train = llama_model_n_ctx_train(model);
-    int n_ctx = eliza_int_env_or_default("ELIZA_LLM_N_CTX", 8192);
+    int n_ctx = cfg->context_size > 0
+        ? cfg->context_size
+        : eliza_int_env_or_default("ELIZA_LLM_N_CTX", 8192);
     if (n_ctx_train > 0 && n_ctx > n_ctx_train) n_ctx = n_ctx_train;
     cparams.n_ctx = (uint32_t) n_ctx;
     cparams.n_batch = (uint32_t) eliza_int_env_or_default("ELIZA_LLM_N_BATCH", 512);
