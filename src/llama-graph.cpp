@@ -1987,20 +1987,28 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
-        // Eliza fused-attn K/V cache types (QJL1_256, Q4_POLAR, TBQ3_TCQ) have
-        // no vec_dot in the CPU type-traits — they are stored cache types that
-        // require either the fused custom op (GGML_OP_FUSED_ATTN_QJL_TBQ) or a
-        // dequantize hop before ggml_flash_attn_ext. The graph builder does
-        // not yet route to the fused op, so dequantize via F32 -> F16 here.
-        // This is bit-exact w.r.t. the type's to_float (dequantize_row_*).
-        if (k->type == GGML_TYPE_QJL1_256 || k->type == GGML_TYPE_TBQ3_TCQ) {
-            ggml_tensor * k_f32 = ggml_cast(ctx0, k, GGML_TYPE_F32);
-            k = ggml_cast(ctx0, k_f32, GGML_TYPE_F16);
+        // Eliza custom cache types need either their fused attention op or a
+        // dequantize hop before stock flash attention. Keep this fallback
+        // explicit so manual cache-type overrides do not reach FA with a type
+        // its backend does not accept.
+        const auto needs_cache_dequant = [](ggml_type type) {
+            return type == GGML_TYPE_QJL1_256 ||
+                   type == GGML_TYPE_TBQ3_TCQ ||
+                   type == GGML_TYPE_TBQ3_0 ||
+                   type == GGML_TYPE_TBQ4_0 ||
+                   type == GGML_TYPE_Q4_POLAR;
+        };
+        const auto dequant_to_f16 = [&](ggml_tensor * t) {
+            ggml_tensor * t_f32 = ggml_cast(ctx0, t, GGML_TYPE_F32);
+            return ggml_cast(ctx0, t_f32, GGML_TYPE_F16);
+        };
+
+        if (needs_cache_dequant(k->type)) {
+            k = dequant_to_f16(k);
         }
 
-        if (v->type == GGML_TYPE_Q4_POLAR) {
-            ggml_tensor * v_f32 = ggml_cast(ctx0, v, GGML_TYPE_F32);
-            v = ggml_cast(ctx0, v_f32, GGML_TYPE_F16);
+        if (needs_cache_dequant(v->type)) {
+            v = dequant_to_f16(v);
         }
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
