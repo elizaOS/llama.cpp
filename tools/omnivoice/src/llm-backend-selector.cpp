@@ -20,7 +20,7 @@
 /* Gated backend factory accessors. Declared only when the matching backend is
  * compiled in; register_builtins() calls them under the same gate. Keeping the
  * declarations gated means the default build has no unresolved symbols. */
-#ifdef ELIZA_ENABLE_LITERT
+#ifdef ELIZA_ENABLE_LITERT_LM
 LlmBackendFactory * litert_backend_factory();
 #endif
 #if defined(ELIZA_ENABLE_MLX) && defined(__APPLE__)
@@ -70,7 +70,7 @@ void llm_backend_register(LlmBackendFactory * factory) {
 
 void llm_backend_register_builtins() {
     std::call_once(g_builtins_once, []() {
-#ifdef ELIZA_ENABLE_LITERT
+#ifdef ELIZA_ENABLE_LITERT_LM
         llm_backend_register(litert_backend_factory());
 #endif
 #if defined(ELIZA_ENABLE_MLX) && defined(__APPLE__)
