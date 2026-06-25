@@ -1691,6 +1691,13 @@ static ggml_cgraph* kokoro_build_graph_decoder_body(kokoro_context* c, int T_fra
         // but conv_1d wants (T, C). Transpose to (2T, 1).
         const int Tin = (int)x->ne[1];
         ggml_tensor* y = ggml_cont(ctx0, ggml_transpose(ctx0, x)); // (2T, 1)
+        // ggml_conv_1d routes through ggml_im2col with an F16 destination, whose
+        // CPU kernel asserts the conv weight is F16. Most Kokoro convs ship F16,
+        // but the decoder F0_conv/N_conv weights ship F32 in the mainline GGUF —
+        // cast them to F16 (the convention every other conv already uses) so they
+        // satisfy the im2col path instead of tripping GGML_ASSERT.
+        if (w->type != GGML_TYPE_F16)
+            w = ggml_cast(ctx0, w, GGML_TYPE_F16);
         y = ggml_conv_1d(ctx0, w, y, s, p, /*d*/ 1);               // (Tout, 1, 1)
         const int Cout = (int)w->ne[2];
         ggml_tensor* b3 = ggml_reshape_3d(ctx0, b, 1, b->ne[0], 1);
