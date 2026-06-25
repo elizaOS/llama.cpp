@@ -95,11 +95,23 @@ KOKORO_HPARAMS = {
 
 
 def _add_tensor(writer: gguf.GGUFWriter, name: str, data: np.ndarray) -> None:
-    """Add a tensor as fp32 (cast from fp64/fp16 if needed; ensure c-contig)."""
-    if data.dtype != np.float32:
+    """Add a tensor matching the dtype scheme the kokoro forward pass requires:
+    weight matrices (ndim>=2) as F16, 1-D tensors (biases/norms) as F32.
+
+    This is load-bearing, not cosmetic: the fused loader's forward pass expects
+    the >=2-D weights in F16. Emitting them as F32 (or quantizing them) produces
+    *inaudible noise*, not degraded speech — the model loads and synthesizes, but
+    the output is garbage. Mirrors the working CrispASR export's scheme exactly
+    (verified: an all-F32 GGUF speaks once its >=2-D weights are cast to F16). #9588
+    """
+    if data.dtype not in (np.float32, np.float16):
         data = data.astype(np.float32)
     if not data.flags["C_CONTIGUOUS"]:
         data = np.ascontiguousarray(data)
+    if data.ndim >= 2:
+        data = data.astype(np.float16)
+    elif data.dtype != np.float32:
+        data = data.astype(np.float32)
     writer.add_tensor(name, data)
 
 
