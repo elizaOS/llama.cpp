@@ -30,6 +30,7 @@
 #include "kokoro.h"
 #include "kokoro-istft.h"
 #include "kokoro-phonemes.h"
+#include "kokoro-tensor-names.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -164,6 +165,39 @@ static ggml_tensor * find_tensor(ggml_context * ctx, const std::string & name) {
     return ggml_get_tensor(ctx, name.c_str());
 }
 
+static bool has_tensor_alias(const char * name, void * user_data) {
+    return name && ggml_get_tensor((ggml_context *) user_data, name) != nullptr;
+}
+
+static ggml_tensor * find_tensor_any(ggml_context * ctx, const char * const * aliases) {
+    const char * name = kokoro_pick_tensor_name(aliases, has_tensor_alias, ctx);
+    return name ? ggml_get_tensor(ctx, name) : nullptr;
+}
+
+static std::string format_aliases(const char * const * aliases) {
+    std::string out;
+    for (const char * const * p = aliases; p && *p; ++p) {
+        if (!out.empty()) out += ", ";
+        out += "'";
+        out += *p;
+        out += "'";
+    }
+    return out;
+}
+
+static ggml_tensor * require_tensor_any(
+        ggml_context * ctx,
+        const char * const * aliases,
+        const char * label,
+        std::string & err_out) {
+    ggml_tensor * t = find_tensor_any(ctx, aliases);
+    if (!t) {
+        err_out = std::string("required tensor missing for ") + label
+                + " (accepted names: " + format_aliases(aliases) + ")";
+    }
+    return t;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -252,14 +286,38 @@ kokoro_model_ptr kokoro_load_model(
         }
     }
 
-    // Bind canonical tensors. Missing tensors are non-fatal during the J2
-    // ship phase — the synthesis path treats absent tensors as zero, which
-    // produces shape-correct but acoustically degraded output. See the
-    // J2-kokoro-port-notes.md gap log.
-    model->tok_embd   = find_tensor(model->ctx, "kokoro.token_embd.weight");
+    // Bind the published Kokoro GGUF schema, while accepting the older
+    // unprefixed dev names from pre-publication GGUFs. Missing required
+    // tensors are a hard load error: otherwise the synth path can appear to
+    // work while silently skipping the real model weights.
+    model->tok_embd = require_tensor_any(
+        model->ctx,
+        KOKORO_TENSOR_BERT_TOKEN_EMBD,
+        "BERT token embedding",
+        err_out);
+    if (!model->tok_embd) return {nullptr, kokoro_model_deleter{}};
+
+    if (!require_tensor_any(model->ctx, KOKORO_TENSOR_BERT_ATTN_Q, "BERT attention Q", err_out)) {
+        return {nullptr, kokoro_model_deleter{}};
+    }
+    if (!require_tensor_any(model->ctx, KOKORO_TENSOR_F0_PROJ, "F0 projection", err_out)) {
+        return {nullptr, kokoro_model_deleter{}};
+    }
+    if (!require_tensor_any(model->ctx, KOKORO_TENSOR_N_PROJ, "noise projection", err_out)) {
+        return {nullptr, kokoro_model_deleter{}};
+    }
+    if (!require_tensor_any(model->ctx, KOKORO_TENSOR_GEN_CONV_POST, "generator post convolution", err_out)) {
+        return {nullptr, kokoro_model_deleter{}};
+    }
+
     model->mel_proj   = find_tensor(model->ctx, "kokoro.decoder.mel_proj.weight");
     model->phase_proj = find_tensor(model->ctx, "kokoro.decoder.phase_proj.weight");
-    model->dur_proj   = find_tensor(model->ctx, "kokoro.predictor.duration.weight");
+    model->dur_proj   = require_tensor_any(
+        model->ctx,
+        KOKORO_TENSOR_DURATION_PROJ,
+        "duration projection",
+        err_out);
+    if (!model->dur_proj) return {nullptr, kokoro_model_deleter{}};
     model->style_proj = find_tensor(model->ctx, "kokoro.style.proj.weight");
     model->out_norm   = find_tensor(model->ctx, "kokoro.text.out_norm.weight");
 

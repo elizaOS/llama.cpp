@@ -17,6 +17,7 @@ set(KOKORO_PUBLIC_HEADERS
     include/kokoro-istft.h
     include/kokoro-phonemes.h
     include/kokoro-server-mount.h
+    include/kokoro-tensor-names.h
     include/kokoro-layers.h
     include/kokoro-predictor.h)
 
