@@ -15,46 +15,33 @@
  * the factory links in as a no-op: `available()` is false and `open()`
  * returns nullptr + sets `*out_error` "not compiled in".
  *
- * ── Targeted runtime API (researched 2026-06-22) ──────────────────────────
+ * ── Targeted runtime API (STABLE C API — engine.h) ────────────────────────
  * Repo:    https://github.com/google-ai-edge/LiteRT-LM  (`main`)
  * Docs:    https://developers.google.com/edge/litert-lm/cpp
  *          https://ai.google.dev/edge/litert/next/litert_lm_npu
- * Namespace: `litert::lm`
+ * Header:  <ELIZA_LITERT_SDK_DIR>/include/engine.h  (extern "C" — no `litert::lm`)
  *
- * Symbols this backend targets (verbatim from the headers above):
- *   - runtime/engine/engine.h
- *       using Engine = EngineT<SessionInterface>;
- *       static absl::StatusOr<std::unique_ptr<Engine>>
- *           Engine::CreateEngine(const EngineSettings&);
- *       absl::StatusOr<std::unique_ptr<SessionT>>
- *           EngineT::CreateSession(const SessionConfig&);
- *   - runtime/engine/engine.h  (SessionInterface)
- *       absl::Status        RunPrefill(const std::vector<InputData>&);
- *       absl::StatusOr<Responses> RunDecode();
- *       absl::StatusOr<Responses> RunDecode(const DecodeConfig&);
- *       absl::Status        GenerateContentStream(
- *                               const std::vector<InputData>&,
- *                               absl::AnyInvocable<void(absl::StatusOr<Responses>)>);
- *   - runtime/engine/engine_settings.h
- *       static absl::StatusOr<EngineSettings> EngineSettings::CreateDefault(
- *           ModelAssets, Backend backend = Backend::CPU,
- *           std::optional<Backend> vision_backend  = std::nullopt,
- *           std::optional<Backend> audio_backend   = std::nullopt,
- *           std::optional<Backend> sampler_backend = std::nullopt);
- *       static SessionConfig SessionConfig::CreateDefault();
- *       absl::StatusOr<ModelAssets> ModelAssets::Create(<path>);   // .litertlm
- *   - runtime/engine/io_types.h
- *       using InputData = std::variant<InputText, InputImage, InputAudio, ...>;
- *       class InputText { explicit InputText(std::variant<std::string, TensorBuffer>); };
- *       class Responses  { const std::vector<std::string>& GetTexts() const; };
- *   - runtime/proto/engine.pb.h
- *       enum Backend { ... CPU, GPU, NPU, ... };   // litert::lm::Backend
+ * The backend targets the C API ONLY — the ABI-stable `litert_lm_*` functions —
+ * so the fused libelizainference carries no libc++ C++-ABI dependency on the
+ * prebuilt liblitert-lm.so. Symbols this backend uses (verbatim from engine.h):
+ *   - litert_lm_engine_settings_create(model_path, backend_str, vision, audio)
+ *     + litert_lm_engine_settings_set_enable_speculative_decoding (MTP)
+ *   - litert_lm_engine_create / litert_lm_engine_delete
+ *   - litert_lm_engine_create_session / litert_lm_session_delete
+ *   - litert_lm_session_run_prefill(session, LiteRtLmInputData[], n)
+ *   - litert_lm_session_run_decode_async(session, LiteRtLmStreamCallback, data)
+ *     (one chunk per callback; mapped onto the FFI pull contract via a queue)
+ *   - litert_lm_session_cancel_process
+ *   - litert_lm_engine_tokenize / litert_lm_engine_detokenize (id↔text
+ *     round-trip against the .litertlm's own tokenizer)
  *
- * Accelerator ladder (Android NPU first): the factory tries NPU, then GPU,
- * then CPU at `open()` and records which one initialized. Every
+ * Accelerator ladder (Android NPU first): the factory tries the "npu", then
+ * "gpu", then "cpu" backend_str at `open()` (engine_create returns null when a
+ * rung's delegate is unavailable) and records which one initialized. Every
  * hardware-gated assumption is tagged `DEVICE-VERIFY` in the .cpp — the
- * accelerator ladder, the .litertlm graph fit, and tok/s can only be
- * confirmed on a real NPU device, which this scaffold does not have.
+ * accelerator ladder, the .litertlm graph fit, and tok/s can only be confirmed
+ * on a real NPU device. The C-API linkage itself is proven by
+ * `litert-capi-smoke.cpp` (loads the .litertlm, prefills, decodes "Paris").
  */
 
 #include "../llm-backend.h"

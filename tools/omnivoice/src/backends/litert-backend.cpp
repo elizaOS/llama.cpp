@@ -1,11 +1,15 @@
 /*
  * litert-backend.cpp — LiteRT-LM in-process streaming-LLM backend (M4).
  *
- * See litert-backend.h for the targeted LiteRT-LM C++ API (repo + commit
- * date cited there). The real implementation is gated behind
- * `ELIZA_ENABLE_LITERT`; the default (Linux/desktop) build compiles the stub
- * branch, which links zero LiteRT-LM SDK headers and reports
- * `available() == false` so the selector keeps the in-tree llama.cpp path.
+ * The real implementation (gated behind `ELIZA_ENABLE_LITERT`) targets the
+ * LiteRT-LM STABLE C API (`litert_lm_*`, engine.h) — NOT the C++ runtime
+ * (`litert::lm::Engine`). The C surface is ABI-stable, so the fused
+ * libelizainference links the prebuilt liblitert-lm.so with no libc++
+ * C++-ABI coupling. See litert-backend.h for the targeted symbols.
+ *
+ * The default (Linux/desktop CI) build compiles the stub branch, which links
+ * zero LiteRT-LM SDK headers and reports `available() == false` so the selector
+ * keeps the in-tree llama.cpp path.
  *
  * Error contract (native/AGENTS.md §3 + §9): never log, never return a
  * defaulted result on failure. Every failure path heap-allocates `*out_error`
@@ -74,32 +78,29 @@ std::string find_litertlm_artifact(const char *) { return std::string(); }
  * ════════════════════════════════════════════════════════════════════════ */
 #ifdef ELIZA_ENABLE_LITERT
 
+#include <condition_variable>
+#include <deque>
 #include <memory>
-#include <optional>
 #include <utility>
-#include <variant>
 #include <vector>
 
-/* LiteRT-LM cross-platform C++ runtime. Paths per the repo's bazel layout
- * (github.com/google-ai-edge/LiteRT-LM, `main`, researched 2026-06-22). */
-#include "runtime/engine/engine.h"          // litert::lm::Engine, SessionInterface
-#include "runtime/engine/engine_settings.h" // EngineSettings, SessionConfig, ModelAssets
-#include "runtime/engine/io_types.h"        // InputData, InputText, Responses
+/* LiteRT-LM STABLE C API (engine.h). C API only — NO `litert::lm::` C++
+ * symbols — so the fused libelizainference carries no libc++ C++-ABI
+ * dependency on the prebuilt liblitert-lm.so. The whole surface below maps the
+ * llm-backend.h FFI pull contract onto the litert_lm_* functions:
+ *
+ *   open()    -> litert_lm_engine_settings_create (+ speculative decoding for
+ *                MTP) -> litert_lm_engine_create -> litert_lm_engine_create_session
+ *   prefill() -> litert_lm_session_run_prefill (ids round-tripped to text via
+ *                the engine tokenizer; the .litertlm carries its own tokenizer)
+ *   next()    -> one chunk pulled from the async-decode callback queue, emitted
+ *                as a text delta + re-tokenized ids
+ *   cancel()  -> litert_lm_session_cancel_process
+ *   reset()   -> rebuild the session from the warm engine
+ */
+#include "engine.h"
 
 namespace {
-
-using litert::lm::Backend;
-using litert::lm::Engine;
-using litert::lm::EngineSettings;
-using litert::lm::InputData;
-using litert::lm::InputText;
-using litert::lm::ModelAssets;
-using litert::lm::Responses;
-using litert::lm::SessionConfig;
-
-/* The Session type the templated Engine hands back (Engine::Session is the
- * public alias EngineT<SessionT> exposes; for Engine it is SessionInterface). */
-using Session = Engine::Session;
 
 /* The accelerator the factory resolved at open(), recorded for diagnostics
  * and preference reporting. DEVICE-VERIFY: which rung actually initializes is
@@ -115,82 +116,116 @@ const char * accelerator_name(ResolvedAccelerator a) {
     }
 }
 
-/* Try to build an Engine for `artifact` on `backend`. Returns the Engine on
- * success; on failure returns nullptr (the ladder falls through to the next
- * rung). The error text is captured so the final rung can surface it. */
-std::unique_ptr<Engine> try_engine(const std::string & artifact,
-                                   Backend backend,
-                                   std::string & last_err) {
-    auto model_assets = ModelAssets::Create(artifact);
-    if (!model_assets.ok()) {
-        last_err = std::string(model_assets.status().message());
-        return nullptr;
+/* The backend_str the C API expects for each rung. */
+const char * backend_str(ResolvedAccelerator a) {
+    switch (a) {
+        case ResolvedAccelerator::kNpu: return "npu";
+        case ResolvedAccelerator::kGpu: return "gpu";
+        default:                        return "cpu";
     }
-    auto settings = EngineSettings::CreateDefault(*model_assets, backend);
-    if (!settings.ok()) {
-        last_err = std::string(settings.status().message());
-        return nullptr;
-    }
-    auto engine = Engine::CreateEngine(*settings);
-    if (!engine.ok()) {
-        last_err = std::string(engine.status().message());
-        return nullptr;
-    }
-    return std::move(*engine);
 }
 
-/* ── Session: mirrors the FFI streaming pull contract 1:1 ────────────────── */
+/* RAII for the C engine settings (the only place it lives is open()). */
+struct SettingsHandle {
+    LiteRtLmEngineSettings * p = nullptr;
+    ~SettingsHandle() { if (p) litert_lm_engine_settings_delete(p); }
+};
+
+/* Detokenize text-vocab ids → UTF-8 through the engine's own tokenizer. */
+std::string detokenize(LiteRtLmEngine * engine, const int32_t * ids,
+                       size_t num) {
+    if (!engine || num == 0) return std::string();
+    std::vector<int> tmp(ids, ids + num);
+    LiteRtLmDetokenizeResult * res =
+        litert_lm_engine_detokenize(engine, tmp.data(), tmp.size());
+    if (!res) return std::string();
+    const char * s = litert_lm_detokenize_result_get_string(res);
+    std::string out = s ? std::string(s) : std::string();
+    litert_lm_detokenize_result_delete(res);
+    return out;
+}
+
+/* Tokenize UTF-8 → text-vocab ids through the engine's own tokenizer. */
+std::vector<int> tokenize(LiteRtLmEngine * engine, const std::string & text) {
+    std::vector<int> out;
+    if (!engine || text.empty()) return out;
+    LiteRtLmTokenizeResult * res = litert_lm_engine_tokenize(engine, text.c_str());
+    if (!res) return out;
+    size_t n = litert_lm_tokenize_result_get_num_tokens(res);
+    const int * toks = litert_lm_tokenize_result_get_tokens(res);
+    if (toks) out.assign(toks, toks + n);
+    litert_lm_tokenize_result_delete(res);
+    return out;
+}
+
+/* ── Session: mirrors the FFI streaming pull contract 1:1 ────────────────── *
+ *
+ * Decode is driven through litert_lm_session_run_decode_async: prefill kicks
+ * off the async stream and each next() pops one chunk from a thread-safe
+ * queue. This maps the library's push-streaming surface onto the FFI's
+ * pull-one-step contract without buffering the whole response. The engine
+ * is owned and kept warm so reset() rebuilds only the per-generation session.
+ */
 class LiteRtBackendSession final : public LlmBackendSession {
 public:
-    LiteRtBackendSession(std::unique_ptr<Engine> engine,
-                         std::unique_ptr<Session> session,
+    LiteRtBackendSession(LiteRtLmEngine * engine, LiteRtLmSession * session,
                          const eliza_llm_stream_config_t & cfg,
                          ResolvedAccelerator accel)
-        : engine_(std::move(engine)),
-          session_(std::move(session)),
+        : engine_(engine),
+          session_(session),
           accel_(accel),
           max_tokens_(cfg.max_tokens > 0 ? cfg.max_tokens : 0) {}
 
-    /* prefill: copy the caller's tokens, detokenize through the engine's
-     * tokenizer, and run a LiteRT prefill pass. The FFI hands pre-tokenized
-     * ids (text-model vocab); LiteRT-LM's prefill consumes InputData (text),
-     * so we round-trip ids → text via the shared tokenizer rather than
-     * assuming vocab parity (the .litertlm graph carries its own tokenizer).
-     * DEVICE-VERIFY: id/text round-trip fidelity needs a real .litertlm. */
+    ~LiteRtBackendSession() override {
+        if (session_) litert_lm_session_delete(session_);
+        if (engine_)  litert_lm_engine_delete(engine_);
+    }
+
+    /* prefill: round-trip the caller's text-vocab ids to text through the
+     * engine tokenizer, feed it as a single text input, and start the async
+     * decode stream so next() can pull chunks. The FFI hands pre-tokenized ids;
+     * the .litertlm graph carries its own tokenizer, so we round-trip rather
+     * than assume vocab parity. DEVICE-VERIFY: round-trip fidelity needs a real
+     * device .litertlm. */
     int prefill(const int32_t * token_ids, size_t num_tokens,
                 char ** out_error) override {
         if (!session_) {
-            litert_set_error(out_error,
-                "[litert-lm] prefill: session is not open");
+            litert_set_error(out_error, "[litert-lm] prefill: session not open");
             return ELIZA_ERR_INVALID_ARG;
         }
         if (cancelled_.load(std::memory_order_acquire)) {
             return ELIZA_ERR_CANCELLED;
         }
-        std::vector<int> ids;
-        ids.reserve(num_tokens);
-        for (size_t i = 0; i < num_tokens; ++i) ids.push_back(token_ids[i]);
 
-        const std::string text = engine_->GetTokenizer().Detokenize(ids);
-        std::vector<InputData> contents;
-        contents.emplace_back(InputText(std::string(text)));
+        const std::string text = detokenize(engine_, token_ids, num_tokens);
 
-        absl::Status st = session_->RunPrefill(contents);
-        if (!st.ok()) {
+        LiteRtLmInputData input;
+        input.type = kLiteRtLmInputDataTypeText;
+        input.data = text.c_str();
+        input.size = text.size();
+
+        if (litert_lm_session_run_prefill(session_, &input, 1) != 0) {
+            litert_set_error(out_error, "[litert-lm] run_prefill failed");
+            return ELIZA_ERR_FFI_FAULT;
+        }
+
+        /* Kick off the streaming decode; chunks land on the queue via the
+         * static callback below. next() drains them one at a time. */
+        reset_stream_state();
+        if (litert_lm_session_run_decode_async(session_, &on_stream_chunk,
+                                               this) != 0) {
             litert_set_error(out_error,
-                std::string("[litert-lm] RunPrefill failed: ") +
-                std::string(st.message()));
+                "[litert-lm] run_decode_async failed to start");
             return ELIZA_ERR_FFI_FAULT;
         }
         prefilled_ = true;
         return ELIZA_OK;
     }
 
-    /* next: one decode step. LiteRT-LM's RunDecode() returns a Responses
-     * batch; we emit the newly-produced UTF-8 delta as detokenized text and
-     * its token ids. LiteRT-LM has no in-process MTP drafter exposed through
-     * this surface, so drafted/accepted are always 0. Returns 1 (final) at
-     * EOS or the max-token cap, 0 otherwise. */
+    /* next: pop one decode chunk from the async stream. Emits the chunk text as
+     * a delta and its re-tokenized ids. LiteRT-LM exposes no in-process MTP
+     * drafter on this surface, so drafted/accepted are always 0. Returns 1
+     * (final) at EOS, stream error, or the token cap, 0 otherwise. */
     int next(int32_t * tokens_out, size_t tokens_cap, size_t * num_tokens_out,
              char * text_out, size_t text_cap, int32_t * drafter_drafted_out,
              int32_t * drafter_accepted_out, char ** out_error) override {
@@ -212,25 +247,22 @@ public:
             return ELIZA_ERR_CANCELLED;
         }
 
-        auto responses = session_->RunDecode();
-        if (!responses.ok()) {
+        Chunk chunk;
+        {
+            std::unique_lock<std::mutex> lock(mu_);
+            cv_.wait(lock, [this] { return !queue_.empty(); });
+            chunk = std::move(queue_.front());
+            queue_.pop_front();
+        }
+
+        if (chunk.error) {
             litert_set_error(out_error,
-                std::string("[litert-lm] RunDecode failed: ") +
-                std::string(responses.status().message()));
+                std::string("[litert-lm] decode stream error: ") + chunk.text);
             return ELIZA_ERR_FFI_FAULT;
         }
 
-        /* RunDecode yields the running candidate texts; GetTexts()[0] is the
-         * cumulative decode for candidate 0. Emit only the suffix produced
-         * since the last step so the FFI streams a delta per pull. */
-        const std::vector<std::string> & texts = responses->GetTexts();
-        std::string cumulative = texts.empty() ? std::string() : texts.front();
-        std::string delta = compute_delta(cumulative);
-        emitted_chars_ = cumulative.size();
-
-        /* Re-tokenize the delta against the engine tokenizer so the FFI gets
-         * committed text-vocab ids (the same round-trip the prefill used). */
-        std::vector<int> delta_ids = engine_->GetTokenizer().Tokenize(delta);
+        const std::string & delta = chunk.text;
+        std::vector<int> delta_ids = tokenize(engine_, delta);
         size_t n_emit = delta_ids.size();
         if (n_emit > tokens_cap) n_emit = tokens_cap;
         if (tokens_out) {
@@ -239,52 +271,57 @@ public:
             }
         }
         if (num_tokens_out) *num_tokens_out = n_emit;
-        if (text_out && text_cap) {
-            const size_t copy = delta.size() < text_cap - 1
-                                    ? delta.size()
-                                    : text_cap - 1;
+        if (text_out && text_cap && !delta.empty()) {
+            const size_t copy =
+                delta.size() < text_cap - 1 ? delta.size() : text_cap - 1;
             std::memcpy(text_out, delta.data(), copy);
             text_out[copy] = '\0';
         }
 
         decoded_tokens_ += static_cast<int32_t>(delta_ids.size());
-        const bool hit_cap =
-            max_tokens_ > 0 && decoded_tokens_ >= max_tokens_;
-        /* DEVICE-VERIFY: the precise EOS signal LiteRT-LM exposes per step is
-         * runtime-version-dependent. A done decode yields no new delta; treat
-         * an empty delta or the token cap as the final step. */
-        const bool eos = delta_ids.empty();
-        return (hit_cap || eos) ? 1 : 0;
+        const bool hit_cap = max_tokens_ > 0 && decoded_tokens_ >= max_tokens_;
+        return (chunk.is_final || hit_cap) ? 1 : 0;
     }
 
-    /* cancel: publish a flag the next decode step observes. Thread-safe. */
+    /* cancel: signal the C runtime to stop the in-flight decode and wake any
+     * blocked next(). Thread-safe; idempotent. */
     int cancel() override {
         cancelled_.store(true, std::memory_order_release);
+        if (session_) litert_lm_session_cancel_process(session_);
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            queue_.push_back(Chunk{std::string(), true, false});
+        }
+        cv_.notify_all();
         return ELIZA_OK;
     }
 
-    /* reset: drop a fresh Session from the same Engine (clears KV + sampler).
-     * Reuses the warm Engine (model weights stay resident) — only the
-     * per-generation Session is rebuilt. */
+    /* reset: rebuild the per-generation session from the warm engine (clears
+     * KV + sampler). Model weights stay resident. */
     int reset() override {
-        auto cfg = SessionConfig::CreateDefault();
-        auto session = engine_->CreateSession(cfg);
-        if (!session.ok()) {
-            /* reset has no out_error param; a failed rebuild leaves the old
-             * session in place and surfaces on the next prefill/next. */
+        if (session_) {
+            litert_lm_session_cancel_process(session_);
+            litert_lm_session_delete(session_);
+            session_ = nullptr;
+        }
+        LiteRtLmSession * fresh =
+            litert_lm_engine_create_session(engine_, nullptr);
+        if (!fresh) {
+            /* reset has no out_error param; the failure surfaces on the next
+             * prefill/next when session_ is null. */
             return ELIZA_ERR_FFI_FAULT;
         }
-        session_ = std::move(*session);
+        session_ = fresh;
         cancelled_.store(false, std::memory_order_release);
         prefilled_ = false;
         decoded_tokens_ = 0;
-        emitted_chars_ = 0;
+        reset_stream_state();
         return ELIZA_OK;
     }
 
-    /* reset_keep: LiteRT-LM's Session does not expose prefix-preserving KV
-     * trimming through this surface, so fall back to a full reset and return 0
-     * (no prefix kept) — never an error (llm-backend.h contract). */
+    /* reset_keep: the C session surface exposes no prefix-preserving KV trim,
+     * so fall back to a full reset and return 0 (no prefix kept) — never an
+     * error (llm-backend.h contract). */
     int reset_keep(int32_t /*n_keep*/) override {
         reset();
         return 0;
@@ -293,36 +330,82 @@ public:
     const char * accelerator() const { return accelerator_name(accel_); }
 
 private:
-    /* The suffix of `cumulative` produced since the last emitted step. */
-    std::string compute_delta(const std::string & cumulative) const {
-        if (cumulative.size() <= emitted_chars_) return std::string();
-        return cumulative.substr(emitted_chars_);
+    struct Chunk {
+        std::string text;
+        bool is_final = false;
+        bool error = false;
+    };
+
+    void reset_stream_state() {
+        std::lock_guard<std::mutex> lock(mu_);
+        queue_.clear();
     }
 
-    std::unique_ptr<Engine>  engine_;
-    std::unique_ptr<Session> session_;
-    std::atomic<bool>        cancelled_{false};
-    bool                     prefilled_ = false;
-    int32_t                  decoded_tokens_ = 0;
-    size_t                   emitted_chars_ = 0;
-    ResolvedAccelerator      accel_ = ResolvedAccelerator::kNone;
-    int32_t                  max_tokens_ = 0;
+    /* C stream callback (litert_lm_session_run_decode_async). Runs on the C
+     * runtime's background thread; pushes each chunk onto the queue. The
+     * `callback_data` is the owning session. */
+    static void on_stream_chunk(void * callback_data, const char * chunk,
+                                bool is_final, const char * error_msg) {
+        auto * self = static_cast<LiteRtBackendSession *>(callback_data);
+        Chunk c;
+        if (error_msg) {
+            c.error = true;
+            c.is_final = true;
+            c.text = error_msg;
+        } else {
+            c.text = chunk ? std::string(chunk) : std::string();
+            c.is_final = is_final;
+        }
+        {
+            std::lock_guard<std::mutex> lock(self->mu_);
+            self->queue_.push_back(std::move(c));
+        }
+        self->cv_.notify_one();
+    }
+
+    LiteRtLmEngine *  engine_  = nullptr;  /* owned */
+    LiteRtLmSession * session_ = nullptr;  /* owned */
+    std::atomic<bool> cancelled_{false};
+    bool              prefilled_ = false;
+    int32_t           decoded_tokens_ = 0;
+    ResolvedAccelerator accel_ = ResolvedAccelerator::kNone;
+    int32_t           max_tokens_ = 0;
+
+    std::mutex                  mu_;
+    std::condition_variable     cv_;
+    std::deque<Chunk>           queue_;
 };
+
+/* Build a C engine for `artifact` on `accel`. Returns the engine on success;
+ * on failure returns nullptr (the ladder falls through to the next rung). */
+LiteRtLmEngine * try_engine(const std::string & artifact,
+                            ResolvedAccelerator accel) {
+    SettingsHandle settings;
+    settings.p = litert_lm_engine_settings_create(
+        artifact.c_str(), backend_str(accel),
+        /*vision_backend=*/nullptr, /*audio_backend=*/nullptr);
+    if (!settings.p) return nullptr;
+
+    /* MTP speculative decoding (§3 — mandatory). The .litertlm carries its own
+     * drafter; enabling speculative decoding turns it on. */
+    litert_lm_engine_settings_set_enable_speculative_decoding(settings.p, true);
+
+    return litert_lm_engine_create(settings.p);
+}
 
 /* ── Factory ─────────────────────────────────────────────────────────────── */
 class LiteRtBackendFactory final : public LlmBackendFactory {
 public:
     const char * name() const override { return LITERT_BACKEND_NAME; }
 
-    /* available(): compiled in AND an accelerator (NPU or GPU) initializes on
-     * THIS host. Cheap — must not load a model. We probe by building a minimal
-     * EngineSettings on NPU then GPU with NO model assets; a backend whose
-     * delegate is missing fails settings validation. CPU alone does NOT make
-     * this backend "available" (CPU is the in-tree llama.cpp path's job).
-     * DEVICE-VERIFY: real delegate presence is only knowable on-device. */
-    bool available() const override {
-        return probe_accelerator() != ResolvedAccelerator::kNone;
-    }
+    /* available(): compiled in AND a *.litertlm-servable accelerator exists.
+     * The C API offers no cheap no-model delegate probe, so availability here
+     * is "the SDK is linked in" — the real NPU/GPU delegate handshake happens
+     * at open() and falls back down the ladder. The selector still only picks
+     * this backend when can_serve() finds an artifact, so an available()==true
+     * with no .litertlm bundle never displaces the llama.cpp path.
+     * DEVICE-VERIFY: true delegate presence is only knowable on-device. */
+    bool available() const override { return true; }
 
     /* can_serve(): a *.litertlm exists under <bundle_dir>/text/. Cheap probe,
      * no caching — open() re-resolves the bundle from the context accessor. */
@@ -330,19 +413,17 @@ public:
         return !find_litertlm_artifact(bundle_dir).empty();
     }
 
-    /* preference_rank(): high on Android NPU (the whole reason this backend
-     * exists), modest on a GPU-only fallback, 0 otherwise so llama.cpp wins. */
-    int preference_rank() const override {
-        switch (probe_accelerator()) {
-            case ResolvedAccelerator::kNpu: return 100;
-            case ResolvedAccelerator::kGpu: return 20;
-            default:                        return 0;
-        }
-    }
+    /* preference_rank(): positive so an NPU/GPU device that ships a .litertlm
+     * bundle prefers this backend over llama.cpp. The accelerator the engine
+     * actually binds is resolved at open() via the ladder; this rank only
+     * orders candidates that can_serve the same bundle.
+     * DEVICE-VERIFY: the right rank vs the GPU llama.cpp path is device-tuned. */
+    int preference_rank() const override { return 50; }
 
-    /* open(): resolve the .litertlm under the cached bundle, then walk the
-     * accelerator ladder NPU → GPU → CPU, recording which rung built the
-     * Engine. Builds a default Session and returns the streaming session. */
+    /* open(): resolve the .litertlm under the cached bundle, walk the
+     * accelerator ladder NPU → GPU → CPU (the C API picks the delegate from
+     * backend_str; a missing delegate fails engine_create and we fall to the
+     * next rung), then create the streaming session. */
     LlmBackendSession * open(EliInferenceContext * ctx,
                              const eliza_llm_stream_config_t * cfg,
                              char ** out_error) override {
@@ -360,71 +441,44 @@ public:
             return nullptr;
         }
 
-        /* Accelerator ladder — NPU first (Qualcomm QNN / MediaTek NeuroPilot /
-         * Google Tensor), then GPU (OpenCL/Metal/WebGPU), then CPU (XNNPACK).
-         * Each rung's failure text is preserved for the final diagnostic.
+        /* NPU first (Qualcomm QNN / MediaTek NeuroPilot / Google Tensor), then
+         * GPU (OpenCL/Metal/WebGPU), then CPU (XNNPACK). engine_create returns
+         * null when the rung's delegate is unavailable; we fall through.
          * DEVICE-VERIFY: rung availability is hardware-specific. */
-        struct Rung { Backend backend; ResolvedAccelerator accel; };
-        const Rung ladder[] = {
-            {Backend::NPU, ResolvedAccelerator::kNpu},
-            {Backend::GPU, ResolvedAccelerator::kGpu},
-            {Backend::CPU, ResolvedAccelerator::kCpu},
+        const ResolvedAccelerator ladder[] = {
+            ResolvedAccelerator::kNpu,
+            ResolvedAccelerator::kGpu,
+            ResolvedAccelerator::kCpu,
         };
 
-        std::unique_ptr<Engine> engine;
+        LiteRtLmEngine * engine = nullptr;
         ResolvedAccelerator resolved = ResolvedAccelerator::kNone;
-        std::string last_err;
-        for (const Rung & rung : ladder) {
-            engine = try_engine(artifact, rung.backend, last_err);
+        for (ResolvedAccelerator accel : ladder) {
+            engine = try_engine(artifact, accel);
             if (engine) {
-                resolved = rung.accel;
+                resolved = accel;
                 break;
             }
         }
         if (!engine) {
             litert_set_error(out_error,
-                std::string("[litert-lm] open: no accelerator could build the "
-                            "engine (last error: ") + last_err + ")");
+                "[litert-lm] open: no accelerator (npu/gpu/cpu) could build the "
+                "engine for the bundle's .litertlm");
             return nullptr;
         }
 
-        auto session_cfg = SessionConfig::CreateDefault();
-        auto session = engine->CreateSession(session_cfg);
-        if (!session.ok()) {
+        LiteRtLmSession * session =
+            litert_lm_engine_create_session(engine, nullptr);
+        if (!session) {
+            litert_lm_engine_delete(engine);
             litert_set_error(out_error,
-                std::string("[litert-lm] open: CreateSession failed on ") +
-                accelerator_name(resolved) + ": " +
-                std::string(session.status().message()));
+                std::string("[litert-lm] open: create_session failed on ") +
+                accelerator_name(resolved));
             return nullptr;
         }
 
-        return new LiteRtBackendSession(std::move(engine), std::move(*session),
-                                        *cfg, resolved);
+        return new LiteRtBackendSession(engine, session, *cfg, resolved);
     }
-
-private:
-    /* Build a no-model EngineSettings on NPU then GPU; the first whose
-     * delegate validates marks that rung present. Result is memoized so the
-     * repeated available()/preference_rank() calls are cheap.
-     * DEVICE-VERIFY: settings-only validation is the cheapest honest probe;
-     * the true delegate handshake happens at open() on-device. */
-    ResolvedAccelerator probe_accelerator() const {
-        std::call_once(probe_once_, [this]() {
-            auto empty = ModelAssets::Create(std::string());
-            if (!empty.ok()) { probed_ = ResolvedAccelerator::kNone; return; }
-            if (EngineSettings::CreateDefault(*empty, Backend::NPU).ok()) {
-                probed_ = ResolvedAccelerator::kNpu;
-            } else if (EngineSettings::CreateDefault(*empty, Backend::GPU).ok()) {
-                probed_ = ResolvedAccelerator::kGpu;
-            } else {
-                probed_ = ResolvedAccelerator::kNone;
-            }
-        });
-        return probed_;
-    }
-
-    mutable std::once_flag      probe_once_;
-    mutable ResolvedAccelerator probed_ = ResolvedAccelerator::kNone;
 };
 
 }  // namespace
