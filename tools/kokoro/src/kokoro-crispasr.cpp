@@ -239,6 +239,111 @@ struct kokoro_context {
 
 namespace {
 
+// ---------------------------------------------------------------------------
+// Tensor-name normalization (issue #9588).
+//
+// Three naming conventions exist for the same Kokoro weights:
+//   1. The CrispASR/StyleTTS2 export this loader was authored against —
+//      un-prefixed canonical names: `bert.embd.tok.weight`,
+//      `pred.F0_proj.weight`, `dec.gen.conv_post.weight`, …
+//   2. The shipped bundle GGUF (elizaos/eliza-1 .../kokoro-82m-v1_0-Q4_K_M.gguf)
+//      and the in-tree converter (`convert_kokoro_pth_to_gguf.py`) use the
+//      mainline-llama.cpp Kokoro convention: a `kokoro.` prefix plus different
+//      sub-names (`kokoro.bert.layer.attn_q.weight`,
+//      `kokoro.bert.token_embd.weight`, `kokoro.predictor.de.lstm0.…`,
+//      `kokoro.gen.resblocks.0.convs1.0.weight`, …).
+//
+// `canonicalize_tensor_name` maps any mainline `kokoro.`-prefixed name onto
+// the canonical name the loader's `require()`/`try_get()` calls expect, so
+// BOTH conventions load with the same forward-pass code. Already-canonical
+// names (convention 1) are returned unchanged. The transform is a fixed set
+// of ordered structural rewrites — there is no fallback or guessing: an
+// unrecognized `kokoro.`-prefixed name is passed through with only the prefix
+// stripped, and the sanity check still fails loudly if a required tensor is
+// genuinely absent.
+std::string canonicalize_tensor_name(const std::string& raw) {
+    static const char kPrefix[] = "kokoro.";
+    if (raw.compare(0, sizeof(kPrefix) - 1, kPrefix) != 0)
+        return raw; // already-canonical CrispASR/StyleTTS2 export
+    std::string s = raw.substr(sizeof(kPrefix) - 1);
+
+    // Ordered prefix rewrites. `replace_prefix` swaps the leading `from`
+    // segment for `to`; `replace_substr` swaps the first occurrence of a
+    // fixed infix (used for the reverse-LSTM suffix and the AdaIN `.fc.`
+    // insert). Each rule is structural and non-overlapping.
+    auto replace_prefix = [](std::string& v, const char* from, const char* to) -> bool {
+        const size_t flen = std::strlen(from);
+        if (v.compare(0, flen, from) != 0)
+            return false;
+        v = std::string(to) + v.substr(flen);
+        return true;
+    };
+    auto replace_substr = [](std::string& v, const char* from, const char* to) {
+        const size_t pos = v.find(from);
+        if (pos != std::string::npos)
+            v.replace(pos, std::strlen(from), to);
+    };
+
+    // --- BERT (PL-BERT / ALBERT, parameter-shared single layer) ---
+    if (replace_prefix(s, "bert.token_embd.", "bert.embd.tok.")) {
+    } else if (replace_prefix(s, "bert.position_embd.", "bert.embd.pos.")) {
+    } else if (replace_prefix(s, "bert.tok_type_embd.", "bert.embd.tt.")) {
+    } else if (replace_prefix(s, "bert.embd_ln.", "bert.embd.ln.")) {
+    } else if (replace_prefix(s, "bert.layer.ffn_out.", "bert.ffn_down.")) {
+    } else if (replace_prefix(s, "bert.layer.ffn.", "bert.ffn_up.")) {
+    } else if (replace_prefix(s, "bert.layer.full_ln.", "bert.ffn_ln.")) {
+    } else if (replace_prefix(s, "bert.layer.", "bert.")) { // attn_q/k/v/o, attn_ln
+    } else if (replace_prefix(s, "bert_encoder.", "bert_proj.")) {
+        // --- TextEncoder ---
+    } else if (replace_prefix(s, "text_encoder.embd.", "text_enc.embd.")) {
+    } else if (replace_prefix(s, "text_encoder.cnn.", "text_enc.cnn.")) {
+        // text_enc.cnn.<i>.<weight|bias> → text_enc.cnn.<i>.conv.<weight|bias>
+        // (a name carries exactly one of weight/bias, so both rewrites are safe)
+        replace_substr(s, ".weight", ".conv.weight");
+        replace_substr(s, ".bias", ".conv.bias");
+    } else if (replace_prefix(s, "text_encoder.ln.", "text_enc.cnn.")) {
+        // The TextEncoder per-conv LayerNorm is `text_enc.cnn.<i>.ln.<gamma|beta>`
+        // to the loader. Upstream exports name the affine pair either
+        // gamma/beta (StyleTTS2 source) or weight/bias (the shipped bundle +
+        // converter) — normalize both onto gamma/beta.
+        replace_substr(s, ".gamma", ".ln.gamma");
+        replace_substr(s, ".weight", ".ln.gamma");
+        replace_substr(s, ".beta", ".ln.beta");
+        replace_substr(s, ".bias", ".ln.beta");
+    } else if (replace_prefix(s, "text_encoder.lstm.", "text_enc.lstm.")) {
+        // --- Predictor ---
+    } else if (replace_prefix(s, "predictor.de.lstm", "pred.dur_enc.")) {
+        // pred.dur_enc.<i>.<lstm-field> ; the `de.lstm<i>` digit became the
+        // dur_enc index, but the `.lstm.` segment must be reinserted.
+        const size_t dot = s.find('.', std::strlen("pred.dur_enc."));
+        if (dot != std::string::npos)
+            s.insert(dot, ".lstm");
+    } else if (replace_prefix(s, "predictor.de.adaln", "pred.dur_enc.")) {
+        // predictor.de.adaln<i>.fc.<field> → pred.dur_enc.<i>.adaln.<field>
+        replace_substr(s, ".fc.", ".adaln.");
+    } else if (replace_prefix(s, "predictor.duration_proj.", "pred.dur_proj.")) {
+    } else if (replace_prefix(s, "predictor.", "pred.")) { // lstm, shared, F0_proj, N_proj
+        // --- Decoder body ---
+    } else if (replace_prefix(s, "decoder.", "dec.")) {
+        // AdaIN norms in the decoder body are named norm1.fc/norm2.fc upstream.
+        replace_substr(s, ".norm1.fc.", ".adain1.");
+        replace_substr(s, ".norm2.fc.", ".adain2.");
+        // --- Generator ---
+    } else if (replace_prefix(s, "gen.m_source.l_linear.", "dec.gen.m_source.")) {
+    } else if (replace_prefix(s, "gen.", "dec.gen.")) {
+        // AdaIN fc weights inside the generator AdaINResBlock1 drop the `.fc`
+        // segment: `…adain1.<j>.fc.weight` → `…adain1.<j>.weight`. The `.fc`
+        // only ever appears in the adain sub-tensors of a generator resblock.
+        replace_substr(s, ".fc.weight", ".weight");
+        replace_substr(s, ".fc.bias", ".bias");
+    }
+
+    // Reverse-LSTM suffix: mainline uses `_l0_r`, the loader uses
+    // `_l0_reverse`. Applies across text_enc / predictor LSTM weights+biases.
+    replace_substr(s, "_l0_r", "_l0_reverse");
+    return s;
+}
+
 ggml_tensor* try_get(const kokoro_context* c, const char* name) {
     auto it = c->tensors.find(name);
     return it == c->tensors.end() ? nullptr : it->second;
@@ -279,10 +384,14 @@ std::vector<uint32_t> kv_u32_array(gguf_context* g, const char* key) {
 // subset rather than enumerating every tensor (the full list is 459
 // names; load_weights already provides the full map).
 bool sanity_check_weights(const kokoro_context* c) {
+    // `bert.pooler.*` is intentionally NOT required: the synthesis path reads
+    // the per-token last_hidden_state, never the pooled output (see
+    // kokoro_build_graph_bert), and the mainline/converter GGUFs do not ship a
+    // pooler. Requiring it would reject otherwise-valid bundles.
     const char* must_have[] = {
         "bert.embd.tok.weight",       "bert.embd_proj.weight",
         "bert.attn_q.weight",         "bert.attn_q.bias",
-        "bert.ffn_up.weight",         "bert.pooler.weight",
+        "bert.ffn_up.weight",         "bert.ffn_down.weight",
         "bert_proj.weight",           "bert_proj.bias",
         "text_enc.embd.weight",       "text_enc.cnn.0.conv.weight",
         "text_enc.lstm.weight_ih_l0", "text_enc.lstm.weight_ih_l0_reverse",
@@ -2687,7 +2796,28 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, 
     }
     c->ctx_w = wl.ctx;
     c->buf_w = wl.buf;
-    c->tensors = std::move(wl.tensors);
+
+    // Normalize tensor keys onto the loader's canonical names so the shipped
+    // mainline-named bundle GGUF (`kokoro.bert.layer.attn_q.weight`, …) and the
+    // in-tree converter output load through the same forward-pass code as the
+    // CrispASR/StyleTTS2 export. Already-canonical names pass through unchanged.
+    // See `canonicalize_tensor_name` (issue #9588). Collisions (a file carrying
+    // both naming conventions for the same weight) are a malformed GGUF and are
+    // surfaced as a hard error rather than silently picking one.
+    {
+        std::map<std::string, ggml_tensor*> normalized;
+        for (auto& kv : wl.tensors) {
+            std::string canon = canonicalize_tensor_name(kv.first);
+            auto [it, inserted] = normalized.emplace(std::move(canon), kv.second);
+            if (!inserted && it->second != kv.second) {
+                fprintf(stderr, "kokoro: tensor name collision after normalization: '%s' (from '%s')\n",
+                        it->first.c_str(), kv.first.c_str());
+                kokoro_free(c);
+                return nullptr;
+            }
+        }
+        c->tensors = std::move(normalized);
+    }
 
     if (!sanity_check_weights(c)) {
         fprintf(stderr, "kokoro: weight sanity check failed for '%s'\n", path_model);
