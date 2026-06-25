@@ -97,9 +97,15 @@ KOKORO_HPARAMS = {
 def _add_tensor(writer: gguf.GGUFWriter, name: str, data: np.ndarray) -> None:
     """Add tensors with the dtype layout the Kokoro forward pass expects.
 
-    Weight matrices and convolution kernels (ndim >= 2) are emitted as F16;
-    biases, norms, and other vectors stay F32. All-F32 GGUFs can load but
-    synthesize noise in the fused runtime path.
+    Weight matrices and convolution kernels (ndim >= 2) are emitted as F16
+    purely to halve the GGUF download size; biases, norms, and other vectors
+    stay F32. The GGUF dtype does not affect correctness: the loader
+    dequantizes every tensor to F32 at load time, so an all-F32 and an
+    F16-weights GGUF produce identical synthesis. (An earlier note here
+    claimed all-F32 GGUFs synthesized noise — that was a misdiagnosis: the
+    fused path was a stub that ignored the weights, and the real defect was
+    the loader reading non-F32 tensors as raw F32. Both are fixed; F16 is
+    kept only for bundle size.)
     """
     if data.dtype not in (np.float32, np.float16):
         data = data.astype(np.float32)

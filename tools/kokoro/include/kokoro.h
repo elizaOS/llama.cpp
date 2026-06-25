@@ -116,10 +116,12 @@ kokoro_status kokoro_load_voice_preset(
     kokoro_voice_preset & out,
     std::string & err_out) noexcept;
 
-// Phonemize an input text into Kokoro's int phoneme ids. The implementation
-// uses a deterministic ASCII grapheme→phoneme mapping (no espeak-ng
-// dependency). This is intentionally lossy vs the upstream phonemizer —
-// quality recovery is part of the gap documented in J2-kokoro-port-notes.md.
+// Phonemize an input text into Kokoro's int phoneme ids (the model input_ids,
+// wrapped as [PAD, *ids, PAD]). When the build links libespeak-ng this is the
+// real G2P path (text → en-us IPA → Kokoro vocab ids), reproducing the
+// upstream phonemizer's token sequence. Without libespeak-ng it falls back to
+// a deterministic (lossy) ASCII grapheme mapping; in that case the TS voice
+// layer should phonemize and pass IPA (see kokoro-phonemes.h ipa_to_token_ids).
 std::vector<int32_t> kokoro_phonemize(const std::string & text);
 
 // Synthesize a single utterance. `text` is the natural-language input,

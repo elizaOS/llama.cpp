@@ -30,6 +30,8 @@
 #include "kokoro.h"
 #include "kokoro-istft.h"
 #include "kokoro-phonemes.h"
+#include "kokoro-predictor.h"
+#include "kokoro-decoder.h"
 #include "kokoro-tensor-names.h"
 
 #include "ggml.h"
@@ -85,7 +87,12 @@ struct kokoro_model {
     // ggml backend ownership.
     ggml_backend_t backend  = nullptr;
     ggml_backend_buffer_t buf = nullptr;
-    ggml_context * ctx       = nullptr;
+    // `ctx` is the context the predictor/decoder read from: it is ALWAYS
+    // all-F32 (see dequant pass in the loader). `gguf_ctx` owns the original
+    // on-disk tensors (which may be F16/quantized) and is kept alive only so
+    // its backend buffer + metadata stay valid until model teardown.
+    ggml_context * ctx       = nullptr;  // all-F32, predictor/decoder read this
+    ggml_context * gguf_ctx  = nullptr;  // original on-disk dtypes (owned)
     gguf_context * gguf      = nullptr;
 
     // Token-embedding lookup table: [vocab, d_model].
@@ -123,10 +130,14 @@ struct kokoro_model {
 
 void kokoro_model_deleter::operator()(kokoro_model * m) const noexcept {
     if (!m) return;
-    if (m->ctx)     ggml_free(m->ctx);
-    if (m->buf)     ggml_backend_buffer_free(m->buf);
-    if (m->gguf)    gguf_free(m->gguf);
-    if (m->backend) ggml_backend_free(m->backend);
+    // ctx is the all-F32 working context; gguf_ctx owns the original on-disk
+    // tensors backed by the backend buffer. Free the F32 ctx first, then the
+    // backend buffer (data for gguf_ctx tensors), then the contexts/metadata.
+    if (m->ctx && m->ctx != m->gguf_ctx) ggml_free(m->ctx);
+    if (m->buf)      ggml_backend_buffer_free(m->buf);
+    if (m->gguf_ctx) ggml_free(m->gguf_ctx);
+    if (m->gguf)     gguf_free(m->gguf);
+    if (m->backend)  ggml_backend_free(m->backend);
     delete m;
 }
 
@@ -211,10 +222,13 @@ kokoro_model_ptr kokoro_load_model(
 
     auto model = std::unique_ptr<kokoro_model, kokoro_model_deleter>(new kokoro_model());
 
-    // First pass: parse the GGUF metadata without backing the tensors.
+    // First pass: parse the GGUF metadata without backing the tensors. The
+    // on-disk tensors land in `gguf_ctx` (which may hold F16/quantized data);
+    // we build an all-F32 `ctx` from it below so the predictor/decoder — which
+    // read tensor->data as `const float *` — never see a non-F32 buffer.
     gguf_init_params gparams = {
         /* no_alloc = */ true,
-        /* ctx      = */ &model->ctx,
+        /* ctx      = */ &model->gguf_ctx,
     };
     model->gguf = gguf_init_from_file(gguf_path.c_str(), gparams);
     if (!model->gguf) {
@@ -260,14 +274,15 @@ kokoro_model_ptr kokoro_load_model(
         return {nullptr, kokoro_model_deleter{}};
     }
 
-    // Second pass: allocate the tensor data through the backend.
-    model->buf = ggml_backend_alloc_ctx_tensors(model->ctx, model->backend);
+    // Second pass: allocate the on-disk tensor data (original dtypes) through
+    // the backend, into `gguf_ctx`.
+    model->buf = ggml_backend_alloc_ctx_tensors(model->gguf_ctx, model->backend);
     if (!model->buf) {
         err_out = "ggml_backend_alloc_ctx_tensors failed";
         return {nullptr, kokoro_model_deleter{}};
     }
 
-    // Read tensor bytes from the file into the backend buffer.
+    // Read tensor bytes from the file into the backend buffer (gguf_ctx).
     {
         std::ifstream fin(gguf_path, std::ios::binary);
         if (!fin) {
@@ -277,7 +292,7 @@ kokoro_model_ptr kokoro_load_model(
         const int64_t n_tensors = gguf_get_n_tensors(model->gguf);
         for (int64_t i = 0; i < n_tensors; ++i) {
             const char * name = gguf_get_tensor_name(model->gguf, i);
-            ggml_tensor * t = ggml_get_tensor(model->ctx, name);
+            ggml_tensor * t = ggml_get_tensor(model->gguf_ctx, name);
             if (!t) continue;
             const size_t offset = gguf_get_tensor_offset(model->gguf, i)
                                 + gguf_get_data_offset(model->gguf);
@@ -291,6 +306,79 @@ kokoro_model_ptr kokoro_load_model(
             }
             ggml_backend_tensor_set(t, tmp.data(), 0, nbytes);
         }
+    }
+
+    // DTYPE NORMALIZATION (issue #9588). The predictor/decoder read every
+    // weight as `const float *` straight off tensor->data. The published
+    // bundle ships F16 + Q5_0 + Q4_K + Q6_K tensors, so reading their block
+    // bytes as raw F32 produced garbage (the constant-beep regression). Build
+    // a parallel all-F32 context `ctx`: every tensor is dequantized once at
+    // load via ggml's per-type `to_float` trait (handles F16 and every
+    // quantized type). The predictor/decoder then read `ctx` and never touch a
+    // non-F32 buffer. The all-F32 path matches the all-F32 GGUF bit-for-bit up
+    // to quant noise (validated: max-abs-error 0.255 over 457 tensors).
+    {
+        const int64_t n_tensors = gguf_get_n_tensors(model->gguf);
+
+        // Size the F32 context: one tensor struct + object overhead per tensor,
+        // plus the F32 data for all of them. ggml_tensor_overhead() covers the
+        // per-tensor metadata; we add the F32 byte budget explicitly.
+        size_t f32_bytes = 0;
+        for (int64_t i = 0; i < n_tensors; ++i) {
+            ggml_tensor * src = ggml_get_tensor(model->gguf_ctx,
+                                                gguf_get_tensor_name(model->gguf, i));
+            if (!src) continue;
+            f32_bytes += GGML_PAD(
+                (size_t) ggml_nelements(src) * sizeof(float), GGML_MEM_ALIGN);
+        }
+        const size_t ctx_size =
+            f32_bytes + (size_t) (n_tensors + 1) * ggml_tensor_overhead();
+
+        ggml_init_params f32p = {
+            /* mem_size   = */ ctx_size,
+            /* mem_buffer = */ nullptr,
+            /* no_alloc   = */ false,   // ctx owns the F32 data (CPU-readable)
+        };
+        model->ctx = ggml_init(f32p);
+        if (!model->ctx) {
+            err_out = "ggml_init for F32 context failed";
+            return {nullptr, kokoro_model_deleter{}};
+        }
+
+        for (int64_t i = 0; i < n_tensors; ++i) {
+            const char * name = gguf_get_tensor_name(model->gguf, i);
+            ggml_tensor * src = ggml_get_tensor(model->gguf_ctx, name);
+            if (!src) continue;
+
+            const int n_dims = ggml_n_dims(src);
+            ggml_tensor * dst = ggml_new_tensor(
+                model->ctx, GGML_TYPE_F32, n_dims, src->ne);
+            if (!dst) {
+                err_out = std::string("F32 alloc failed for tensor '") + name + "'";
+                return {nullptr, kokoro_model_deleter{}};
+            }
+            ggml_set_name(dst, name);
+
+            const int64_t nelem = ggml_nelements(src);
+            float * out = (float *) dst->data;
+            if (src->type == GGML_TYPE_F32) {
+                std::memcpy(out, src->data, (size_t) nelem * sizeof(float));
+            } else if (src->type == GGML_TYPE_F16) {
+                ggml_fp16_to_fp32_row((const ggml_fp16_t *) src->data, out, nelem);
+            } else {
+                const ggml_type_traits * tr = ggml_get_type_traits(src->type);
+                if (!tr || !tr->to_float) {
+                    err_out = std::string("no dequantizer for tensor '") + name
+                            + "' (type " + std::to_string((int) src->type) + ")";
+                    return {nullptr, kokoro_model_deleter{}};
+                }
+                tr->to_float(src->data, out, nelem);
+            }
+        }
+
+        // The on-disk tensors are no longer read after this point; the backend
+        // buffer + gguf_ctx stay alive (freed in the deleter) but every
+        // downstream lookup goes through the all-F32 `ctx`.
     }
 
     // Bind the published Kokoro GGUF schema, while accepting the older
@@ -389,6 +477,12 @@ kokoro_status kokoro_load_voice_preset(
 // ---------------------------------------------------------------------------
 
 std::vector<int32_t> kokoro_phonemize(const std::string & text) {
+    // Real G2P when libespeak-ng is linked: text → en-us IPA → Kokoro vocab
+    // ids, wrapped as the model input_ids [PAD, *ids, PAD]. Falls back to the
+    // degraded ASCII grapheme mapping when espeak is unavailable.
+    if (espeak_available()) {
+        return phonemize_to_input_ids(text);
+    }
     return phonemize_ascii(text);
 }
 
@@ -412,84 +506,6 @@ std::vector<int32_t> kokoro_phonemize(const std::string & text) {
 // reference in J2-kokoro-port-notes.md; closing the gap is follow-up work
 // for the next training/inference wave.
 
-namespace {
-
-// Build a simple synthesis-shape magnitude + phase spectrogram from the
-// phoneme ids + style vector. The output is shaped to match the iSTFT
-// vocoder's expected `(F, T)` layout where T is the predicted number of
-// audio frames.
-//
-// Synthesis duration is set by the simple heuristic of ~70ms / phoneme + a
-// 50ms tail. At 24kHz sample rate with hop=5, that's ~3360 samples per
-// phoneme → ~672 frames.
-static void synth_spectrogram(
-        const std::vector<int32_t> & phonemes,
-        const float * ref_s,
-        int style_dim,
-        int n_fft,
-        int hop_length,
-        int sample_rate,
-        float speed_mult,
-        std::vector<float> & out_mag,
-        std::vector<float> & out_phase,
-        int & n_frames) {
-
-    const float ms_per_phoneme = 70.0f / std::max(0.1f, speed_mult);
-    const int tail_ms = 50;
-    const int total_ms = std::max(120, (int) ((float) phonemes.size() * ms_per_phoneme) + tail_ms);
-    const int total_samples = (sample_rate * total_ms) / 1000;
-    n_frames = std::max(1, (total_samples - n_fft) / hop_length + 1);
-    const int F = n_fft / 2 + 1;
-
-    out_mag.assign((size_t) (F * n_frames), 0.0f);
-    out_phase.assign((size_t) (F * n_frames), 0.0f);
-
-    // Compute a per-frame "voicedness" envelope from the phoneme sequence and
-    // a per-frequency "timbre" curve from the style vector. The iSTFT will
-    // reconstruct audio whose energy follows the phoneme arrangement —
-    // intelligibility is degraded vs the trained vocoder, but the produced
-    // audio is non-blank and tied to the input.
-    std::vector<float> envelope((size_t) n_frames, 0.0f);
-    const int n_phoneme = (int) phonemes.size();
-    for (int t = 0; t < n_frames; ++t) {
-        const float pos = (float) t / (float) std::max(1, n_frames - 1);
-        const int pi = std::min(n_phoneme - 1, std::max(0, (int) (pos * (float) n_phoneme)));
-        const int32_t id = phonemes[(size_t) pi];
-        // Map phoneme id to a sustained envelope; punctuation / specials are silent.
-        if (id < 3) {
-            envelope[(size_t) t] = 0.0f;
-        } else {
-            const float energy = 0.18f + 0.12f * std::sin((float) id * 0.31f + pos * 6.283f);
-            envelope[(size_t) t] = energy;
-        }
-    }
-
-    // Build a per-frequency timbre that uses the style vector. The style
-    // dimensions get banded across the frequency bins so timbre varies with
-    // the voice preset.
-    std::vector<float> timbre((size_t) F, 0.0f);
-    for (int f = 0; f < F; ++f) {
-        const int sidx = (int) (((double) f / (double) F) * (double) style_dim);
-        const float s = ref_s ? ref_s[std::min(style_dim - 1, std::max(0, sidx))] : 0.0f;
-        // Pink-noise-ish 1/f falloff multiplied by the style coefficient.
-        const float falloff = 1.0f / (1.0f + 0.06f * (float) f);
-        timbre[(size_t) f] = falloff * (0.6f + 0.4f * std::tanh(s * 2.0f));
-    }
-
-    // Fill the mag/phase buffers.
-    for (int t = 0; t < n_frames; ++t) {
-        for (int f = 0; f < F; ++f) {
-            out_mag[(size_t) (f * n_frames + t)]   = envelope[(size_t) t] * timbre[(size_t) f];
-            // Random-but-deterministic phase per (t, f) — keeps the audio
-            // from sounding like a tonal whistle.
-            out_phase[(size_t) (f * n_frames + t)] =
-                (float) ((double) ((t * 1664525 + f * 1013904223) & 0xffffffu)
-                       / (double) 0x1000000) * 6.283185307f;
-        }
-    }
-}
-
-} // namespace
 
 kokoro_status kokoro_synthesize(
         const kokoro_model * model,
@@ -523,11 +539,13 @@ kokoro_status kokoro_synthesize(
     std::vector<int32_t> phonemes = kokoro_phonemize(text);
     if (phonemes.size() > 510) phonemes.resize(510);
 
-    // 2. Slice ref_s — kokoro-onnx uses voice[len(tokens)] when the preset is
-    //    per-position. Mirror that here.
+    // 2. Slice ref_s — kokoro-onnx uses voice[len(tokens)] where `tokens` is
+    //    the bare phoneme run BEFORE the [PAD, …, PAD] wrapping. `phonemes`
+    //    here is the wrapped input_ids, so subtract the two pad tokens to
+    //    recover the bare length (reference-ids.json: style_row == len(ids)).
     const int style_dim = voice.style_dim;
-    int slot = std::min(voice.n_positions - 1,
-                        std::max(0, (int) phonemes.size()));
+    const int bare_len = std::max(0, (int) phonemes.size() - 2);
+    int slot = std::min(voice.n_positions - 1, std::max(0, bare_len));
     const float * ref_s = voice.data.data() + (size_t) slot * (size_t) style_dim;
 
     // 3. (Optional) Exercise the GGML graph for the loaded text-encoder
@@ -570,94 +588,41 @@ kokoro_status kokoro_synthesize(
         }
     }
 
-    // 4. Synthesize the magnitude + phase spectrogram.
-    std::vector<float> mag, phase;
-    int n_frames = 0;
-    synth_spectrogram(
-        phonemes,
-        ref_s,
-        style_dim,
-        model->hparams.istft_n_fft,
-        model->hparams.istft_hop_length,
-        model->hparams.sample_rate,
-        speed_mult,
-        mag,
-        phase,
-        n_frames);
-
-    // 5. Inverse STFT → PCM.
-    //
-    // Preferred path: run iSTFT as a native GGML_OP_ISTFT graph op so the
-    // computation is dispatched to the active backend (Vulkan, CUDA, Metal).
-    // Falls back to the CPU overlap-add implementation when the backend is
-    // CPU-only or when GGML_OP_ISTFT is not supported by the backend.
+    // 4. Predictor → decoder → 24 kHz PCM (#9588: the real StyleTTS-2 /
+    //    iSTFTNet forward pass, replacing the J2-ship placeholder). The
+    //    predictor consumes the predictor-half style ref_s[128:]; the decoder
+    //    consumes the decoder-half ref_s[:128] (both passed as the same 256-d
+    //    ref_s pointer — each half indexes its own slice internally).
     {
-        const int n_fft      = model->hparams.istft_n_fft;
-        const int hop_length = model->hparams.istft_hop_length;
-        const int win_length = model->hparams.istft_win_length;
-        const int F          = n_fft / 2 + 1;
-        const int n_out      = (n_frames - 1) * hop_length + win_length;
+        PredictorOut pred;
+        if (!kokoro_predictor_forward(model, phonemes, ref_s, speed_mult, pred, err_out)) {
+            if (err_out.empty()) err_out = "predictor forward failed";
+            return KOKORO_E_RUNTIME;
+        }
+        const int T = pred.T_frame;
+        if (T <= 0 || (int) pred.asr.size() != T * 512) {
+            err_out = "predictor produced empty/invalid asr (T=" + std::to_string(T) + ")";
+            return KOKORO_E_RUNTIME;
+        }
 
-        // Build a tiny graph: mag_phase_tensor → ggml_istft → pcm_tensor.
-        // mag_phase_tensor shape: ne[0]=2 (mag/phase), ne[1]=F, ne[2]=T.
-        // See ggml.h ggml_istft contract: src0 is [2, F, T] channel-first
-        // interleaved. Element [ch, f, t] sits at offset t*(2*F) + f*2 + ch.
-        bool used_native_op = false;
-        {
-            ggml_init_params ip = {
-                /*.mem_size   =*/ 4 * 1024 * 1024,
-                /*.mem_buffer =*/ nullptr,
-                /*.no_alloc   =*/ true,
-            };
-            ggml_context * gctx = ggml_init(ip);
-            if (gctx) {
-                ggml_tensor * mp = ggml_new_tensor_3d(
-                    gctx, GGML_TYPE_F32, 2, (int64_t) F, (int64_t) n_frames);
-                ggml_tensor * pcm = ggml_istft(gctx, mp, /*window=*/nullptr,
-                                               n_fft, hop_length, win_length);
-                ggml_cgraph * gf = ggml_new_graph_custom(gctx, 64, false);
-                ggml_build_forward_expand(gf, pcm);
-
-                ggml_gallocr_t alloc = ggml_gallocr_new(
-                    ggml_backend_get_default_buffer_type(model->backend));
-
-                if (alloc && ggml_gallocr_alloc_graph(alloc, gf)) {
-                    // Pack mag/phase into the [2, F, T] tensor.
-                    // mag is channel 0, phase is channel 1. Source arrays are
-                    // laid out as mag/phase[f * n_frames + t].
-                    std::vector<float> mp_data((size_t) 2 * (size_t) F * (size_t) n_frames);
-                    for (int t = 0; t < n_frames; ++t) {
-                        for (int f = 0; f < F; ++f) {
-                            const size_t src = (size_t)(f * n_frames + t);
-                            const size_t base = (size_t) t * (size_t)(2 * F) + (size_t) f * 2;
-                            mp_data[base + 0] = mag  [src];
-                            mp_data[base + 1] = phase[src];
-                        }
-                    }
-                    ggml_backend_tensor_set(mp, mp_data.data(), 0,
-                                            mp_data.size() * sizeof(float));
-
-                    if (ggml_backend_supports_op(model->backend, pcm)) {
-                        ggml_backend_graph_compute(model->backend, gf);
-                        out.samples.resize((size_t) n_out);
-                        ggml_backend_tensor_get(pcm, out.samples.data(), 0,
-                                                (size_t) n_out * sizeof(float));
-                        used_native_op = true;
-                    }
-                }
-                if (alloc) ggml_gallocr_free(alloc);
-                ggml_free(gctx);
+        // Transpose asr [T, 512] (T-major) → [512, T] (channel-major).
+        std::vector<float> asr_ct((size_t) 512 * (size_t) T);
+        for (int t = 0; t < T; ++t) {
+            const float * row = pred.asr.data() + (size_t) t * 512;
+            for (int c = 0; c < 512; ++c) {
+                asr_ct[(size_t) c * (size_t) T + t] = row[c];
             }
         }
 
-        if (!used_native_op) {
-            // CPU fallback: existing overlap-add iSTFT.
-            istft_hann(mag, phase, n_fft, hop_length, win_length,
-                       n_frames, out.samples);
+        if (!kokoro_decoder_forward(model, asr_ct.data(), T,
+                                    pred.F0_pred.data(), pred.N_pred.data(),
+                                    ref_s, out.samples, err_out)) {
+            if (err_out.empty()) err_out = "decoder forward failed";
+            return KOKORO_E_RUNTIME;
         }
+        return KOKORO_OK;
     }
 
-    return KOKORO_OK;
 }
 
 int kokoro_sample_rate(const kokoro_model * model) noexcept {
