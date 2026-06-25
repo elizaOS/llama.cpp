@@ -1,22 +1,26 @@
 // SPDX-License-Identifier: MIT
 //
-// kokoro-phonemes.h — minimal ASCII text → Kokoro phoneme-id mapping.
+// kokoro-phonemes.h — text → Kokoro phoneme-id mapping.
 //
-// Kokoro v1.0 uses espeak-ng's phoneme inventory + a small set of control
-// tokens (BOS, EOS, PAD, blanks). The training-time path passes text through
-// `phonemize` (Python wrapper around espeak-ng) before tokenizing.
+// Kokoro v1.0 tokenizes espeak-ng IPA against a small fixed vocab
+// (`tts/kokoro/tokenizer.json`, `model.vocab`). The reference Python path is:
 //
-// Adding an espeak-ng dependency to the fork is overkill for a TTS that
-// is being ported as a one-release deprecation runway. This header
-// implements a deterministic grapheme→phoneme mapping that:
+//   text → espeak-ng (en-us, --ipa) → IPA string → per-codepoint vocab lookup
+//        → ids → model input_ids = [0, *ids, 0]   (0 = the "$" pad symbol)
 //
-//   1. covers the basic Latin alphabet + common digraphs (sh, ch, th, ng);
-//   2. maps every other ASCII printable to PAD;
-//   3. returns ids in the same value range as kokoro-onnx's tokenizer
-//      (PAD=0, BOS=1, EOS=2, then phonemes from offset 3).
+// Every vocab key is a single Unicode codepoint, so the mapping is a pure
+// codepoint→id table lookup over the IPA string (no multi-char digraph
+// handling is needed — espeak already emits the canonical IPA codepoints,
+// e.g. eɪ is two codepoints 'e'+'ɪ', each with its own id).
 //
-// The synthesis quality this produces is noticeably worse than the
-// espeak-ng path — that is the documented gap in J2-kokoro-port-notes.md.
+// Two build modes:
+//   * KOKORO_USE_ESPEAK (default when libespeak-ng is linked) — the real G2P
+//     path: `phonemize_ipa()` drives espeak_TextToPhonemes() to get IPA, then
+//     maps to ids. This reproduces the kokoro reference ids exactly.
+//   * fallback — when espeak is unavailable the caller may pass pre-computed
+//     IPA from the TS layer (which already runs espeak) into
+//     `ipa_to_token_ids()`. `phonemize_ipa()` then returns an empty vector and
+//     the caller must supply IPA.
 
 #pragma once
 
@@ -26,12 +30,42 @@
 
 namespace eliza_kokoro {
 
-// Tokenize a UTF-8 / ASCII text string into a phoneme-id vector.
-// Always returns a sequence of length <= 510 (the BERT encoder cap in
-// Kokoro v1.0 — anything longer is split at the caller).
-std::vector<int32_t> phonemize_ascii(const std::string & text);
+// Kokoro pad/boundary token. model.vocab maps '$' → 0; the reference wraps the
+// phoneme ids as [PAD, *ids, PAD] to form the model input_ids.
+inline constexpr int32_t KOKORO_PAD_ID = 0;
 
-// Diagnostic — total phoneme vocab size (for hparams cross-check).
+// Map a single Unicode codepoint (an espeak IPA symbol) to its Kokoro vocab id.
+// Returns -1 if the codepoint is not in the vocab (caller drops it, matching
+// the reference which silently skips unmapped codepoints).
+int32_t kokoro_codepoint_to_id(char32_t cp) noexcept;
+
+// Map an espeak-ng IPA string (UTF-8) to the bare Kokoro phoneme-id sequence
+// (no pad wrapping). Codepoints absent from the vocab are dropped. This is the
+// `ids` array in reference-ids.json — its length is the style-row index.
+std::vector<int32_t> ipa_to_token_ids(const std::string & ipa);
+
+// Phonemize text to bare Kokoro phoneme ids via espeak-ng (en-us IPA).
+// Returns the same sequence as `ipa_to_token_ids(espeak_ipa(text))`.
+// When KOKORO_USE_ESPEAK is not compiled in, returns an empty vector — the
+// caller must supply IPA from the TS layer and call `ipa_to_token_ids()`.
+std::vector<int32_t> phonemize_ipa(const std::string & text);
+
+// Wrap a bare phoneme-id sequence as the model input_ids: [PAD, *ids, PAD].
+std::vector<int32_t> wrap_input_ids(const std::vector<int32_t> & ids);
+
+// Convenience: text → model input_ids [PAD, *ipa_ids, PAD] via espeak.
+// Equivalent to `wrap_input_ids(phonemize_ipa(text))`.
+std::vector<int32_t> phonemize_to_input_ids(const std::string & text);
+
+// True when this build links libespeak-ng (the real G2P path is available).
+bool espeak_available() noexcept;
+
+// Total Kokoro vocab size (highest id + 1 = 178 for v1.0).
 int phoneme_vocab_size() noexcept;
+
+// --- Legacy ASCII fallback (retained only for callers not yet migrated) ---
+// Deprecated: returns the degraded ASCII grapheme mapping. New code uses
+// phonemize_to_input_ids().
+std::vector<int32_t> phonemize_ascii(const std::string & text);
 
 } // namespace eliza_kokoro

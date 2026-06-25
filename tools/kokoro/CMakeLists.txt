@@ -25,7 +25,9 @@ set(KOKORO_CORE_SOURCES
     src/kokoro.cpp
     src/kokoro-istft.cpp
     src/kokoro-phonemes.cpp
-    src/kokoro-predictor.cpp)
+    src/kokoro-predictor.cpp
+    src/kokoro-generator.cpp
+    src/kokoro-decoder.cpp)
 
 add_library(kokoro_lib STATIC
     ${KOKORO_CORE_SOURCES}
@@ -46,6 +48,29 @@ endif()
 
 target_compile_features(kokoro_lib PUBLIC cxx_std_17)
 
+# Real G2P via libespeak-ng. When present, kokoro_phonemize() drives
+# espeak_TextToPhonemes() (en-us IPA) and maps codepoints to Kokoro vocab ids,
+# reproducing the reference token sequence. When absent, the build falls back
+# to the degraded ASCII grapheme mapping and the TS layer must supply IPA.
+# Override the search with -DKOKORO_ESPEAK_ROOT=<prefix> (e.g. Homebrew).
+option(KOKORO_ENABLE_ESPEAK "Link libespeak-ng for real Kokoro G2P" ON)
+if(KOKORO_ENABLE_ESPEAK)
+    find_path(ESPEAK_NG_INCLUDE_DIR espeak-ng/speak_lib.h
+        HINTS ${KOKORO_ESPEAK_ROOT} /opt/homebrew /usr/local /usr
+        PATH_SUFFIXES include)
+    find_library(ESPEAK_NG_LIBRARY NAMES espeak-ng
+        HINTS ${KOKORO_ESPEAK_ROOT} /opt/homebrew /usr/local /usr
+        PATH_SUFFIXES lib lib64)
+    if(ESPEAK_NG_INCLUDE_DIR AND ESPEAK_NG_LIBRARY)
+        target_include_directories(kokoro_lib PRIVATE ${ESPEAK_NG_INCLUDE_DIR})
+        target_link_libraries(kokoro_lib PRIVATE ${ESPEAK_NG_LIBRARY})
+        target_compile_definitions(kokoro_lib PRIVATE KOKORO_USE_ESPEAK)
+        message(STATUS "Kokoro G2P: libespeak-ng found (${ESPEAK_NG_LIBRARY}) — real IPA path enabled")
+    else()
+        message(STATUS "Kokoro G2P: libespeak-ng not found — falling back to ASCII grapheme mapping (TS layer must supply IPA)")
+    endif()
+endif()
+
 # Standalone CLI harness — host-only (required by J2 verification,
 # tools/voice-kokoro/). Skipped on iOS: there an executable is implicitly a
 # MACOSX_BUNDLE app, so `install(TARGETS ... RUNTIME)` fails configure with
@@ -55,6 +80,12 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     add_executable(kokoro-tts tools/kokoro-tts.cpp)
     target_link_libraries(kokoro-tts PRIVATE kokoro_lib)
     install(TARGETS kokoro-tts RUNTIME)
+
+    add_executable(kokoro-stage-dump tools/kokoro-stage-dump.cpp)
+    target_link_libraries(kokoro-stage-dump PRIVATE kokoro_lib)
+
+    add_executable(kokoro-decoder-test tools/kokoro-decoder-test.cpp)
+    target_link_libraries(kokoro-decoder-test PRIVATE kokoro_lib)
 endif()
 
 # Server-mount handler: compiled into kokoro_lib only when the server target
