@@ -95,11 +95,20 @@ KOKORO_HPARAMS = {
 
 
 def _add_tensor(writer: gguf.GGUFWriter, name: str, data: np.ndarray) -> None:
-    """Add a tensor as fp32 (cast from fp64/fp16 if needed; ensure c-contig)."""
-    if data.dtype != np.float32:
+    """Add tensors with the dtype layout the Kokoro forward pass expects.
+
+    Weight matrices and convolution kernels (ndim >= 2) are emitted as F16;
+    biases, norms, and other vectors stay F32. All-F32 GGUFs can load but
+    synthesize noise in the fused runtime path.
+    """
+    if data.dtype not in (np.float32, np.float16):
         data = data.astype(np.float32)
     if not data.flags["C_CONTIGUOUS"]:
         data = np.ascontiguousarray(data)
+    if data.ndim >= 2:
+        data = data.astype(np.float16)
+    elif data.dtype != np.float32:
+        data = data.astype(np.float32)
     writer.add_tensor(name, data)
 
 
@@ -281,6 +290,8 @@ def emit_stub(out_path: str, hp: dict) -> None:
     _add_tensor(writer, "kokoro.predictor.F0_proj.bias",   np.zeros((1,), dtype=np.float32))
     _add_tensor(writer, "kokoro.predictor.N_proj.weight",  rng.standard_normal((1, hid//2, 1), dtype=np.float32) * scale)
     _add_tensor(writer, "kokoro.predictor.N_proj.bias",    np.zeros((1,), dtype=np.float32))
+    _add_tensor(writer, "kokoro.gen.conv_post.weight", rng.standard_normal((22, 128, 7), dtype=np.float32) * scale)
+    _add_tensor(writer, "kokoro.gen.conv_post.bias",   np.zeros((22,), dtype=np.float32))
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
