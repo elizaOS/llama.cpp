@@ -679,6 +679,7 @@ static ggml_cgraph* kokoro_build_graph_text_enc(kokoro_context* c, int L) {
 
         // (D, L) → (L, D) for conv input layout.
         x = ggml_cont(ctx0, ggml_transpose(ctx0, x));                       // (L, D)
+        if (cw->type != GGML_TYPE_F16) cw = ggml_cast(ctx0, cw, GGML_TYPE_F16);
         x = ggml_conv_1d(ctx0, cw, x, /*s=*/1, /*p=*/(K - 1) / 2, /*d=*/1); // (L, D, 1)
         x = ggml_add(ctx0, x, bias_1d(cb));
         // Drop the trailing batch dim → (L, D).
@@ -1022,7 +1023,8 @@ static inline ggml_tensor* kokoro_adain_resblk(ggml_context* ctx, ggml_tensor* x
     auto conv_k3 = [&](ggml_tensor* in, ggml_tensor* w, ggml_tensor* b) -> ggml_tensor* {
         const int Tin = (int)in->ne[1];
         ggml_tensor* y = ggml_cont(ctx, ggml_transpose(ctx, in)); // (T, Cin)
-        y = ggml_conv_1d(ctx, w, y, /*s*/ 1, /*p*/ 1, /*d*/ 1);   // (T, Cout, 1)
+        ggml_tensor* wf16 = w->type != GGML_TYPE_F16 ? ggml_cast(ctx, w, GGML_TYPE_F16) : w;
+        y = ggml_conv_1d(ctx, wf16, y, /*s*/ 1, /*p*/ 1, /*d*/ 1);   // (T, Cout, 1)
         // Add bias broadcast: bias ne=(Cout,) → reshape (1, Cout, 1)
         ggml_tensor* b3 = ggml_reshape_3d(ctx, b, 1, b->ne[0], 1);
         y = ggml_add(ctx, y, b3);
@@ -1058,7 +1060,8 @@ static inline ggml_tensor* kokoro_adain_resblk(ggml_context* ctx, ggml_tensor* x
         // Conv1d k=1, no bias. (Cin, T') → transpose → (T', Cin) → conv → (T', Cout, 1) → reshape → transpose
         const int Tin = (int)sc->ne[1];
         ggml_tensor* sct = ggml_cont(ctx, ggml_transpose(ctx, sc));         // (T', Cin)
-        sct = ggml_conv_1d(ctx, conv1x1_w, sct, /*s*/ 1, /*p*/ 0, /*d*/ 1); // (T', Cout, 1)
+        ggml_tensor* c1x1 = conv1x1_w->type != GGML_TYPE_F16 ? ggml_cast(ctx, conv1x1_w, GGML_TYPE_F16) : conv1x1_w;
+        sct = ggml_conv_1d(ctx, c1x1, sct, /*s*/ 1, /*p*/ 0, /*d*/ 1); // (T', Cout, 1)
         const int Cout = (int)conv1x1_w->ne[2];
         sct = ggml_reshape_2d(ctx, sct, Tin, Cout);    // (T', Cout)
         sc = ggml_cont(ctx, ggml_transpose(ctx, sct)); // (Cout, T')
@@ -1516,6 +1519,7 @@ static ggml_cgraph* kokoro_build_graph_f0n(kokoro_context* c, int T_frames, int 
     {
         const int Tf = (int)F0->ne[1];
         ggml_tensor* y = ggml_cont(ctx0, ggml_transpose(ctx0, F0));  // (T, 256)
+        if (fp_w->type != GGML_TYPE_F16) fp_w = ggml_cast(ctx0, fp_w, GGML_TYPE_F16);
         y = ggml_conv_1d(ctx0, fp_w, y, /*s*/ 1, /*p*/ 0, /*d*/ 1);  // (T, 1, 1)
         y = ggml_add(ctx0, y, ggml_reshape_3d(ctx0, fp_b, 1, 1, 1)); // bias broadcast
         F0 = ggml_reshape_2d(ctx0, y, Tf, 1);                        // (T, 1)
@@ -1534,6 +1538,7 @@ static ggml_cgraph* kokoro_build_graph_f0n(kokoro_context* c, int T_frames, int 
     {
         const int Tf = (int)N->ne[1];
         ggml_tensor* y = ggml_cont(ctx0, ggml_transpose(ctx0, N));
+        if (np_w->type != GGML_TYPE_F16) np_w = ggml_cast(ctx0, np_w, GGML_TYPE_F16);
         y = ggml_conv_1d(ctx0, np_w, y, /*s*/ 1, /*p*/ 0, /*d*/ 1);
         y = ggml_add(ctx0, y, ggml_reshape_3d(ctx0, np_b, 1, 1, 1));
         N = ggml_reshape_2d(ctx0, y, Tf, 1);
@@ -1770,6 +1775,7 @@ static ggml_cgraph* kokoro_build_graph_decoder_body(kokoro_context* c, int T_fra
     {
         const int Tin = (int)asr_in->ne[1];
         ggml_tensor* y = ggml_cont(ctx0, ggml_transpose(ctx0, asr_in));  // (T, 512)
+        if (asr_res_w->type != GGML_TYPE_F16) asr_res_w = ggml_cast(ctx0, asr_res_w, GGML_TYPE_F16);
         y = ggml_conv_1d(ctx0, asr_res_w, y, /*s*/ 1, /*p*/ 0, /*d*/ 1); // (T, 64, 1)
         ggml_tensor* b3 = ggml_reshape_3d(ctx0, asr_res_b, 1, asr_res_b->ne[0], 1);
         y = ggml_add(ctx0, y, b3);
@@ -2010,6 +2016,10 @@ static void kokoro_load_resblock1(const kokoro_context* c, kokoro_resblock1_w& w
 // Returns (Cout, T) F32.
 static inline ggml_tensor* kokoro_conv1d_kd(ggml_context* ctx, ggml_tensor* in, ggml_tensor* w, ggml_tensor* b, int K,
                                             int d) {
+    // ggml_conv_1d routes through F16 im2col; cast an F32 conv kernel to F16 so
+    // an all-F32 GGUF (e.g. a fresh convert_kokoro_pth_to_gguf.py output) loads.
+    if (w->type != GGML_TYPE_F16)
+        w = ggml_cast(ctx, w, GGML_TYPE_F16);
     const int Tin = (int)in->ne[1];
     const int Cout = (int)w->ne[2];
     const int p = d * (K - 1) / 2;                            // same-padding for stride=1
@@ -2074,6 +2084,8 @@ static inline ggml_tensor* kokoro_convt1d_pad(ggml_context* ctx, ggml_tensor* in
 // padding param.
 static inline ggml_tensor* kokoro_conv1d_ks(ggml_context* ctx, ggml_tensor* in, ggml_tensor* w, ggml_tensor* b, int s,
                                             int p) {
+    if (w->type != GGML_TYPE_F16)
+        w = ggml_cast(ctx, w, GGML_TYPE_F16);
     const int Cout = (int)w->ne[2];
     ggml_tensor* y = ggml_cont(ctx, ggml_transpose(ctx, in)); // (T, Cin)
     y = ggml_conv_1d(ctx, w, y, s, p, /*d*/ 1);               // (T_out, Cout, 1)
