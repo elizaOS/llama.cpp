@@ -323,6 +323,14 @@ std::string canonicalize_tensor_name(const std::string& raw) {
         replace_substr(s, ".fc.", ".adaln.");
     } else if (replace_prefix(s, "predictor.duration_proj.", "pred.dur_proj.")) {
     } else if (replace_prefix(s, "predictor.", "pred.")) { // lstm, shared, F0_proj, N_proj
+        // The predictor F0/N AdainResBlk1d stacks carry the same AdaIN1d norms
+        // as the decoder body, named norm1.fc/norm2.fc upstream (e.g.
+        // `predictor.F0.0.norm1.fc.weight`). The loader's run_stack() requires
+        // them as `pred.F0.<i>.adain1.weight` — without this rewrite they stay
+        // `pred.F0.<i>.norm1.fc.weight`, miss the soft sanity check, and surface
+        // as a NULL-tensor segfault in kokoro_adain_resblk during synthesis.
+        replace_substr(s, ".norm1.fc.", ".adain1.");
+        replace_substr(s, ".norm2.fc.", ".adain2.");
         // --- Decoder body ---
     } else if (replace_prefix(s, "decoder.", "dec.")) {
         // AdaIN norms in the decoder body are named norm1.fc/norm2.fc upstream.
