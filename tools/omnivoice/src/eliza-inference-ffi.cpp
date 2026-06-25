@@ -108,10 +108,22 @@ struct EliInferenceContext {
     std::string bundle_dir;
     std::string tts_model_path;
     std::string codec_model_path;
+    /* ASR runs the Gemma audio mmproj (gemma4a USM-conformer projector) over
+     * the SHARED text model (ctx->llm_model), exactly like the vision describe
+     * path runs the vision mmproj over the same model — there is no separate
+     * ASR LM. asr_audio_mmproj_path is the resolved audio projector GGUF.
+     * asr_model_path is the LEGACY separate-LM path, populated only when a
+     * bundle still ships a standalone asr/eliza-1-asr.gguf with no shared text
+     * model + audio mmproj available (back-compat fallback). */
+    std::string asr_audio_mmproj_path;
     std::string asr_model_path;
     std::string asr_mmproj_path;
     ov_context * ov = nullptr;
+    /* Legacy separate-LM ASR weights — only populated on the back-compat path
+     * (eliza_load_asr_legacy). The primary path leaves asr_model null and
+     * decodes against ctx->llm_model. */
     llama_model * asr_model = nullptr;
+    bool asr_uses_shared_model = false;
     llama_context * asr_lctx = nullptr;
     mtmd_context * asr_mtmd = nullptr;
     llama_sampler * asr_sampler = nullptr;
@@ -474,6 +486,40 @@ static bool eliza_pick_voice_files(
     return true;
 }
 
+/* Resolve the Gemma audio mmproj GGUF that the primary (shared-model) ASR path
+ * runs over ctx->llm_model — mirroring how the vision describe path resolves a
+ * vision mmproj. Looks (in order) at the canonical audio-mmproj filename under
+ * asr/, then any "*mmproj*" GGUF under asr/, then the tier's vision/ mmproj
+ * (Gemma-4 ships a single combined mmproj carrying both has_vision + has_audio,
+ * so a vision/ mmproj doubles as the audio projector). Returns "" when none. */
+static std::string eliza_pick_asr_audio_mmproj(const std::filesystem::path & bundle_dir) {
+    const auto asr_dir = bundle_dir / "asr";
+    std::error_code ec;
+    for (const char * name : {"eliza-1-audio-mmproj.gguf", "eliza-1-asr-mmproj.gguf"}) {
+        const auto candidate = asr_dir / name;
+        if (std::filesystem::is_regular_file(candidate, ec)) {
+            return candidate.string();
+        }
+    }
+    for (const auto & candidate : eliza_find_ggufs(asr_dir)) {
+        const std::string filename = eliza_lower_ascii(std::filesystem::path(candidate).filename().string());
+        if (filename.find("mmproj") != std::string::npos) {
+            return candidate;
+        }
+    }
+    /* Combined vision+audio mmproj shipped under vision/. */
+    for (const auto & candidate : eliza_find_ggufs(bundle_dir / "vision")) {
+        const std::string filename = eliza_lower_ascii(std::filesystem::path(candidate).filename().string());
+        if (filename.find("mmproj") != std::string::npos) {
+            return candidate;
+        }
+    }
+    return std::string();
+}
+
+/* LEGACY back-compat: resolve a standalone ASR LM + its audio mmproj. Only used
+ * when a bundle still ships a separate asr/eliza-1-asr.gguf and the primary
+ * shared-model path is unavailable. New bundles do not ship a separate ASR LM. */
 static bool eliza_pick_asr_files(
     const std::filesystem::path & bundle_dir,
     std::string & asr_model,
@@ -745,20 +791,21 @@ static std::string eliza_asr_force_language() {
     return value;
 }
 
-static std::string eliza_format_asr_prompt(llama_model * model) {
-    (void) model;
-    // Mirrors Qwen3-ASR's chat-template structure: empty system context,
-    // one user audio turn, and a generation prompt. Appending
-    // "language X<asr_text>" follows the upstream text-only forcing path
-    // and avoids returning language metadata or role-token chatter.
-    std::string prompt = std::string("<|im_start|>system\n<|im_end|>\n<|im_start|>user\n") +
-        mtmd_default_marker() +
-        "<|im_end|>\n<|im_start|>assistant\n";
+static std::string eliza_format_asr_prompt() {
+    // Gemma-4 transcription prompt. The media marker expands (in mtmd) into the
+    // gemma4a audio scaffold "<|audio> ...(USM-conformer embeddings)... <audio|>"
+    // automatically — see init_audio()/PROJECTOR_TYPE_GEMMA4A in mtmd.cpp — so
+    // the only scaffold we add here is Gemma's own chat template
+    // (<start_of_turn>user … <end_of_turn>\n<start_of_turn>model\n), matching the
+    // llama-mtmd-cli --jinja path that was verified against the real Gemma-4 GGUFs.
+    // No Qwen <|im_start|>/<asr_text> tokens and no language-forcing suffix.
+    std::string instruction = "Transcribe this audio.";
     std::string language = eliza_asr_force_language();
     if (!language.empty()) {
-        prompt += "language " + language + "<asr_text>";
+        instruction = "Transcribe this audio in " + language + ".";
     }
-    return prompt;
+    return std::string("<start_of_turn>user\n") + mtmd_default_marker() + " " +
+        instruction + "<end_of_turn>\n<start_of_turn>model\n";
 }
 
 static std::string eliza_trim_ascii(std::string value) {
@@ -775,19 +822,14 @@ static std::string eliza_trim_ascii(std::string value) {
 }
 
 static std::string eliza_clean_asr_transcript(std::string transcript) {
-    const std::string asr_marker = "<asr_text>";
-    size_t marker = transcript.find(asr_marker);
-    if (marker != std::string::npos) {
-        transcript = transcript.substr(marker + asr_marker.size());
-    }
+    /* Gemma emits a plain transcript followed by <end_of_turn>/<eos>; cut at the
+     * first turn/audio control token and strip role chatter. */
     const char * sentinels[] = {
-        "<|im_start|>",
-        "<|im_end|>",
-        "<|endoftext|>",
-        "<|audio_start|>",
-        "<|audio_end|>",
-        "<|vision_start|>",
-        "<|vision_end|>",
+        "<end_of_turn>",
+        "<start_of_turn>",
+        "<eos>",
+        "<audio|>",
+        "<|audio>",
         "</s>",
     };
     for (const char * sentinel : sentinels) {
@@ -872,10 +914,13 @@ static void eliza_free_asr(EliInferenceContext * ctx) {
         llama_free(ctx->asr_lctx);
         ctx->asr_lctx = nullptr;
     }
+    /* Only the legacy standalone ASR LM is owned here; the primary path runs
+     * over the shared ctx->llm_model, which the llm path owns and frees. */
     if (ctx->asr_model) {
         llama_model_free(ctx->asr_model);
         ctx->asr_model = nullptr;
     }
+    ctx->asr_uses_shared_model = false;
     ctx->asr_sample_rate = 0;
 }
 
@@ -929,39 +974,21 @@ static int eliza_load_tts(EliInferenceContext * ctx, char ** out_error) {
     return ELIZA_OK;
 }
 
-static int eliza_load_asr(EliInferenceContext * ctx, char ** out_error) {
-    if (!ctx) {
-        eliza_set_error(out_error, "[libelizainference] load_asr: ctx is NULL");
-        return ELIZA_ERR_INVALID_ARG;
-    }
-    std::lock_guard<std::mutex> lock(ctx->asr_mutex);
-    if (ctx->asr_model && ctx->asr_lctx && ctx->asr_mtmd && ctx->asr_sampler) {
-        return ELIZA_OK;
-    }
-    if (ctx->asr_model_path.empty() || ctx->asr_mmproj_path.empty()) {
-        if (!eliza_pick_asr_files(std::filesystem::path(ctx->bundle_dir), ctx->asr_model_path, ctx->asr_mmproj_path)) {
-            eliza_set_error(out_error, std::string("[libelizainference] ASR requires both a text GGUF and mmproj GGUF under ") + (std::filesystem::path(ctx->bundle_dir) / "asr").string());
-            return ELIZA_ERR_BUNDLE_INVALID;
-        }
-    }
+static int eliza_load_llm_model_locked(
+    EliInferenceContext * ctx,
+    int32_t n_gpu_layers,
+    char ** out_error);
 
-    std::call_once(eliza_llama_backend_once, []() {
-        llama_backend_init();
-    });
-
-    llama_model_params mparams = llama_model_default_params();
-    mparams.n_gpu_layers = eliza_asr_use_gpu() ? 99 : 0;
-    mparams.use_mmap = eliza_asr_use_mmap();
-    mparams.use_extra_bufts = eliza_asr_use_extra_bufts();
-    eliza_asr_debug_log("loading ASR text model");
-    ctx->asr_model = llama_model_load_from_file(ctx->asr_model_path.c_str(), mparams);
-    if (!ctx->asr_model) {
-        eliza_free_asr(ctx);
-        eliza_set_error(out_error, std::string("[libelizainference] failed to load ASR model: ") + ctx->asr_model_path);
-        return ELIZA_ERR_BUNDLE_INVALID;
-    }
-    eliza_asr_debug_log("loaded ASR text model; initializing llama context");
-
+/* Build the ASR llama context (over the supplied model), the audio mmproj
+ * context, and the greedy sampler. `model` is either the shared text model
+ * (primary Gemma path) or the legacy standalone ASR LM. Caller holds asr_mutex
+ * and must NOT have already populated the ASR region. On any failure the ASR
+ * region is freed and a structured error is set. */
+static int eliza_build_asr_region(
+    EliInferenceContext * ctx,
+    llama_model * model,
+    const std::string & audio_mmproj_path,
+    char ** out_error) {
     llama_context_params cparams = llama_context_default_params();
     ctx->asr_n_batch = eliza_asr_batch_size();
     cparams.n_ctx = eliza_asr_context_size();
@@ -972,7 +999,7 @@ static int eliza_load_asr(EliInferenceContext * ctx, char ** out_error) {
     cparams.flash_attn_type = eliza_asr_android_cpu_profile()
         ? LLAMA_FLASH_ATTN_TYPE_DISABLED
         : LLAMA_FLASH_ATTN_TYPE_AUTO;
-    ctx->asr_lctx = llama_init_from_model(ctx->asr_model, cparams);
+    ctx->asr_lctx = llama_init_from_model(model, cparams);
     if (!ctx->asr_lctx) {
         eliza_free_asr(ctx);
         eliza_set_error(out_error, "[libelizainference] failed to initialize ASR llama context");
@@ -988,10 +1015,10 @@ static int eliza_load_asr(EliInferenceContext * ctx, char ** out_error) {
         ? LLAMA_FLASH_ATTN_TYPE_DISABLED
         : LLAMA_FLASH_ATTN_TYPE_AUTO;
     aparams.warmup = !eliza_asr_android_cpu_profile();
-    ctx->asr_mtmd = mtmd_init_from_file(ctx->asr_mmproj_path.c_str(), ctx->asr_model, aparams);
+    ctx->asr_mtmd = mtmd_init_from_file(audio_mmproj_path.c_str(), model, aparams);
     if (!ctx->asr_mtmd) {
         eliza_free_asr(ctx);
-        eliza_set_error(out_error, std::string("[libelizainference] failed to load ASR mmproj: ") + ctx->asr_mmproj_path);
+        eliza_set_error(out_error, std::string("[libelizainference] failed to load ASR audio mmproj: ") + audio_mmproj_path);
         return ELIZA_ERR_BUNDLE_INVALID;
     }
     eliza_asr_debug_log("loaded ASR audio mmproj; initializing sampler");
@@ -1017,6 +1044,70 @@ static int eliza_load_asr(EliInferenceContext * ctx, char ** out_error) {
     llama_sampler_chain_add(ctx->asr_sampler, llama_sampler_init_greedy());
     eliza_asr_debug_log("ASR region ready");
     return ELIZA_OK;
+}
+
+/* LEGACY back-compat: load a standalone ASR LM + its audio mmproj. Used only
+ * when a bundle ships a separate asr/eliza-1-asr.gguf and no shared text model
+ * + audio mmproj is available. Caller holds asr_mutex. */
+static int eliza_load_asr_legacy(EliInferenceContext * ctx, char ** out_error) {
+    if (ctx->asr_model_path.empty() || ctx->asr_mmproj_path.empty()) {
+        if (!eliza_pick_asr_files(std::filesystem::path(ctx->bundle_dir), ctx->asr_model_path, ctx->asr_mmproj_path)) {
+            eliza_set_error(out_error, std::string("[libelizainference] ASR requires an audio mmproj (shared text model) or a standalone ASR GGUF + mmproj under ") + (std::filesystem::path(ctx->bundle_dir) / "asr").string());
+            return ELIZA_ERR_BUNDLE_INVALID;
+        }
+    }
+
+    std::call_once(eliza_llama_backend_once, []() {
+        llama_backend_init();
+    });
+
+    llama_model_params mparams = llama_model_default_params();
+    mparams.n_gpu_layers = eliza_asr_use_gpu() ? 99 : 0;
+    mparams.use_mmap = eliza_asr_use_mmap();
+    mparams.use_extra_bufts = eliza_asr_use_extra_bufts();
+    eliza_asr_debug_log("loading legacy standalone ASR text model");
+    ctx->asr_model = llama_model_load_from_file(ctx->asr_model_path.c_str(), mparams);
+    if (!ctx->asr_model) {
+        eliza_free_asr(ctx);
+        eliza_set_error(out_error, std::string("[libelizainference] failed to load ASR model: ") + ctx->asr_model_path);
+        return ELIZA_ERR_BUNDLE_INVALID;
+    }
+    ctx->asr_uses_shared_model = false;
+    return eliza_build_asr_region(ctx, ctx->asr_model, ctx->asr_mmproj_path, out_error);
+}
+
+static int eliza_load_asr(EliInferenceContext * ctx, char ** out_error) {
+    if (!ctx) {
+        eliza_set_error(out_error, "[libelizainference] load_asr: ctx is NULL");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::mutex> lock(ctx->asr_mutex);
+    if (ctx->asr_lctx && ctx->asr_mtmd && ctx->asr_sampler) {
+        return ELIZA_OK;
+    }
+
+    std::call_once(eliza_llama_backend_once, []() {
+        llama_backend_init();
+    });
+
+    /* Primary path: run the Gemma audio mmproj over the SHARED text model — the
+     * same model the text + vision paths use — instead of loading a separate
+     * ASR LM. Mirrors eliza_inference_describe_image's vision mmproj. */
+    if (ctx->asr_audio_mmproj_path.empty()) {
+        ctx->asr_audio_mmproj_path =
+            eliza_pick_asr_audio_mmproj(std::filesystem::path(ctx->bundle_dir));
+    }
+    if (!ctx->asr_audio_mmproj_path.empty()) {
+        std::lock_guard<std::mutex> llm_lock(ctx->llm_mutex);
+        int rc = eliza_load_llm_model_locked(ctx, /* n_gpu_layers= */ -1, out_error);
+        if (rc != ELIZA_OK) return rc;
+        eliza_asr_debug_log("building ASR region over shared text model");
+        ctx->asr_uses_shared_model = true;
+        return eliza_build_asr_region(ctx, ctx->llm_model, ctx->asr_audio_mmproj_path, out_error);
+    }
+
+    /* Fallback: a bundle that still ships a standalone ASR LM. */
+    return eliza_load_asr_legacy(ctx, out_error);
 }
 
 /* ---- Streaming LLM (text generation) ------------------------------- *
@@ -1953,8 +2044,15 @@ static int eliza_asr_decode_core(
     }
 
     std::lock_guard<std::mutex> lock(ctx->asr_mutex);
-    if (!ctx->asr_model || !ctx->asr_lctx || !ctx->asr_mtmd || !ctx->asr_sampler) {
+    if (!ctx->asr_lctx || !ctx->asr_mtmd || !ctx->asr_sampler) {
         eliza_set_error(out_error, "[libelizainference] asr_transcribe: ASR region is not acquired; call mmap_acquire(\"asr\") after arming voice input");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    /* The model backing the ASR context: the shared text model on the primary
+     * Gemma path, or the legacy standalone ASR LM on the fallback path. */
+    llama_model * asr_decode_model = ctx->asr_uses_shared_model ? ctx->llm_model : ctx->asr_model;
+    if (!asr_decode_model) {
+        eliza_set_error(out_error, "[libelizainference] asr_transcribe: ASR region has no backing model");
         return ELIZA_ERR_INVALID_ARG;
     }
 
@@ -1967,7 +2065,7 @@ static int eliza_asr_decode_core(
         return ELIZA_ERR_FFI_FAULT;
     }
 
-    std::string prompt = eliza_format_asr_prompt(ctx->asr_model);
+    std::string prompt = eliza_format_asr_prompt();
     mtmd_input_text text = { prompt.c_str(), true, true };
     const mtmd_bitmap * bitmaps[] = { bitmap.get() };
     std::unique_ptr<mtmd_input_chunks, decltype(&mtmd_input_chunks_free)> chunks(
@@ -2001,7 +2099,7 @@ static int eliza_asr_decode_core(
         return ELIZA_ERR_FFI_FAULT;
     }
 
-    const llama_vocab * vocab = llama_model_get_vocab(ctx->asr_model);
+    const llama_vocab * vocab = llama_model_get_vocab(asr_decode_model);
     std::string transcript;
     transcript.reserve(std::min<size_t>(max_text_bytes, 256));
     const int max_decode_tokens = std::min<int>(
@@ -2029,12 +2127,11 @@ static int eliza_asr_decode_core(
                 // Stop only on a real end-of-turn marker — NOT on the first
                 // sentence-final '.'/'?'/'!'. Sentence-final early-stop truncated
                 // any multi-sentence utterance after its first clause (e.g.
-                // "Hello there. How are you?" -> "Hello there."). Qwen3-ASR emits
-                // an EOG / <|im_end|> at the true end of the transcript, which the
-                // EOG check above and the sentinels here already catch.
-                if (piece.find('\n') != std::string::npos ||
-                    transcript.find("<|im_end|>") != std::string::npos ||
-                    transcript.find("<|endoftext|>") != std::string::npos ||
+                // "Hello there. How are you?" -> "Hello there."). Gemma-4 emits an
+                // EOG (<end_of_turn>/<eos>) at the true end of the transcript,
+                // which the EOG check above and these sentinels already catch.
+                if (transcript.find("<end_of_turn>") != std::string::npos ||
+                    transcript.find("<eos>") != std::string::npos ||
                     transcript.find("</s>") != std::string::npos) {
                     completed = true;
                     break;
