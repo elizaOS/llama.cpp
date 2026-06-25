@@ -282,61 +282,17 @@ std::string extract_transcript(const std::string & json) {
     return out;
 }
 
-}  // namespace
-
-int litert_asr_transcribe(const char * litertlm_path, const float * pcm,
-                          size_t n_samples, int sample_rate_hz, char * out_text,
-                          size_t max_text_bytes, char ** out_error) {
-    if (!litertlm_path || litertlm_path[0] == '\0') {
-        litert_asr_set_error(out_error,
-            "[litert-asr] transcribe: litertlm_path is NULL/empty");
-        return ELIZA_ERR_INVALID_ARG;
-    }
-    if (!pcm || n_samples == 0) {
-        litert_asr_set_error(out_error,
-            "[litert-asr] transcribe: pcm is NULL or n_samples == 0");
-        return ELIZA_ERR_INVALID_ARG;
-    }
-    if (!out_text || max_text_bytes == 0) {
-        litert_asr_set_error(out_error,
-            "[litert-asr] transcribe: out_text buffer is NULL/zero");
-        return ELIZA_ERR_INVALID_ARG;
-    }
-    if (sample_rate_hz <= 0) {
-        litert_asr_set_error(out_error,
-            "[litert-asr] transcribe: sample_rate_hz must be positive");
-        return ELIZA_ERR_INVALID_ARG;
-    }
-
-    /* Quiet the library except for true errors (0=VERBOSE..4=ERROR..5=FATAL). */
-    litert_lm_set_min_log_level(4 /* ERROR */);
-
-    /* 1. Engine settings — CPU text + CPU audio backend. The audio backend is
-     *    REQUIRED for an audio attachment (the CLI errors out without it). */
-    SettingsHandle settings;
-    settings.p = litert_lm_engine_settings_create(
-        litertlm_path, /*backend=*/"cpu", /*vision_backend=*/nullptr,
-        /*audio_backend=*/"cpu");
-    if (!settings.p) {
-        litert_asr_set_error(out_error,
-            std::string("[litert-asr] engine_settings_create failed for ") +
-            litertlm_path);
-        return ELIZA_ERR_BUNDLE_INVALID;
-    }
-
-    /* 2. Build the engine (loads the model + USM audio encoder). */
-    EngineHandle engine;
-    engine.p = litert_lm_engine_create(settings.p);
-    if (!engine.p) {
-        litert_asr_set_error(out_error,
-            "[litert-asr] engine_create failed (no CPU audio delegate or "
-            "incompatible .litertlm)");
-        return ELIZA_ERR_FFI_FAULT;
-    }
-
-    /* 3. Conversation config (default session). The conversation API applies the
-     *    model's chat template and handles the multimodal content blocks — the
-     *    same path the proven CLI uses for --attachment audio. */
+/* ── One transcription on an already-built warm engine ────────────────────── *
+ * Opens a fresh conversation on `engine`, sends the audio+prompt message, and
+ * writes the decoded transcript into out_text. The expensive model + USM audio
+ * encoder load happened at engine_create time and is NOT repeated here. */
+int litert_asr_transcribe_on_engine(LiteRtLmEngine * engine, const float * pcm,
+                                    size_t n_samples, int sample_rate_hz,
+                                    char * out_text, size_t max_text_bytes,
+                                    char ** out_error) {
+    /* Conversation config (default session). The conversation API applies the
+     * model's chat template and handles the multimodal content blocks — the
+     * same path the proven CLI uses for --attachment audio. */
     ConvConfigHandle conv_cfg;
     conv_cfg.p = litert_lm_conversation_config_create();
     if (!conv_cfg.p) {
@@ -354,15 +310,15 @@ int litert_asr_transcribe(const char * litertlm_path, const float * pcm,
     }
 
     ConversationHandle conv;
-    conv.p = litert_lm_conversation_create(engine.p, conv_cfg.p);
+    conv.p = litert_lm_conversation_create(engine, conv_cfg.p);
     if (!conv.p) {
         litert_asr_set_error(out_error,
             "[litert-asr] conversation_create failed");
         return ELIZA_ERR_FFI_FAULT;
     }
 
-    /* 4. Build the multimodal user message: audio blob (WAV) + transcribe text.
-     *    Mirrors litert_lm AudioBytes ({"type":"audio","blob":"<base64>"}). */
+    /* Build the multimodal user message: audio blob (WAV) + transcribe text.
+     * Mirrors litert_lm AudioBytes ({"type":"audio","blob":"<base64>"}). */
     const std::vector<uint8_t> wav =
         build_wav_pcm16(pcm, n_samples, sample_rate_hz);
     const std::string blob = base64_encode(wav.data(), wav.size());
@@ -377,7 +333,7 @@ int litert_asr_transcribe(const char * litertlm_path, const float * pcm,
     msg_json += json_escape(LITERT_ASR_TRANSCRIBE_PROMPT);
     msg_json += "\"}]}";
 
-    /* 5. Send (blocking) and read the JSON response. */
+    /* Send (blocking) and read the JSON response. */
     JsonResponseHandle resp;
     resp.p = litert_lm_conversation_send_message(
         conv.p, msg_json.c_str(), /*extra_context=*/"{}",
@@ -404,14 +360,114 @@ int litert_asr_transcribe(const char * litertlm_path, const float * pcm,
         return ELIZA_ERR_FFI_FAULT;
     }
 
-    /* 6. Copy out, NUL-terminate, and report bytes written (matching the
-     *    eliza_inference_asr_transcribe contract). */
+    /* Copy out, NUL-terminate, and report bytes written (matching the
+     * eliza_inference_asr_transcribe contract). */
     const size_t copy = transcript.size() < max_text_bytes - 1
                             ? transcript.size()
                             : max_text_bytes - 1;
     std::memcpy(out_text, transcript.data(), copy);
     out_text[copy] = '\0';
     return static_cast<int>(copy);
+}
+
+}  // namespace
+
+/* The opaque warm-engine handle: the loaded model + USM audio encoder, held
+ * across transcriptions. Owns the settings (the C API requires they outlive the
+ * engine) and the engine; conversations are per-call. */
+struct LitertAsrEngine {
+    LiteRtLmEngineSettings * settings = nullptr;
+    LiteRtLmEngine * engine = nullptr;
+    ~LitertAsrEngine() {
+        if (engine) litert_lm_engine_delete(engine);
+        if (settings) litert_lm_engine_settings_delete(settings);
+    }
+};
+
+LitertAsrEngine * litert_asr_engine_open(const char * litertlm_path,
+                                         char ** out_error) {
+    if (!litertlm_path || litertlm_path[0] == '\0') {
+        litert_asr_set_error(out_error,
+            "[litert-asr] engine_open: litertlm_path is NULL/empty");
+        return nullptr;
+    }
+
+    /* Quiet the library except for true errors (0=VERBOSE..4=ERROR..5=FATAL). */
+    litert_lm_set_min_log_level(4 /* ERROR */);
+
+    std::unique_ptr<LitertAsrEngine> h(new LitertAsrEngine());
+
+    /* Engine settings — CPU text + CPU audio backend. The audio backend is
+     * REQUIRED for an audio attachment (the CLI errors out without it). The
+     * settings must outlive the engine, so the handle owns them. */
+    h->settings = litert_lm_engine_settings_create(
+        litertlm_path, /*backend=*/"cpu", /*vision_backend=*/nullptr,
+        /*audio_backend=*/"cpu");
+    if (!h->settings) {
+        litert_asr_set_error(out_error,
+            std::string("[litert-asr] engine_settings_create failed for ") +
+            litertlm_path);
+        return nullptr;
+    }
+
+    /* Build the engine (loads the model + USM audio encoder). */
+    h->engine = litert_lm_engine_create(h->settings);
+    if (!h->engine) {
+        litert_asr_set_error(out_error,
+            "[litert-asr] engine_create failed (no CPU audio delegate or "
+            "incompatible .litertlm)");
+        return nullptr;
+    }
+
+    return h.release();
+}
+
+int litert_asr_engine_transcribe(LitertAsrEngine * engine, const float * pcm,
+                                 size_t n_samples, int sample_rate_hz,
+                                 char * out_text, size_t max_text_bytes,
+                                 char ** out_error) {
+    if (!engine || !engine->engine) {
+        litert_asr_set_error(out_error,
+            "[litert-asr] engine_transcribe: engine handle is NULL");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    if (!pcm || n_samples == 0) {
+        litert_asr_set_error(out_error,
+            "[litert-asr] engine_transcribe: pcm is NULL or n_samples == 0");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    if (!out_text || max_text_bytes == 0) {
+        litert_asr_set_error(out_error,
+            "[litert-asr] engine_transcribe: out_text buffer is NULL/zero");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    if (sample_rate_hz <= 0) {
+        litert_asr_set_error(out_error,
+            "[litert-asr] engine_transcribe: sample_rate_hz must be positive");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    return litert_asr_transcribe_on_engine(engine->engine, pcm, n_samples,
+                                           sample_rate_hz, out_text,
+                                           max_text_bytes, out_error);
+}
+
+void litert_asr_engine_close(LitertAsrEngine * engine) { delete engine; }
+
+int litert_asr_transcribe(const char * litertlm_path, const float * pcm,
+                          size_t n_samples, int sample_rate_hz, char * out_text,
+                          size_t max_text_bytes, char ** out_error) {
+    /* One-shot: open a warm engine, transcribe once, tear it down. The runtime
+     * FFI uses the engine-cache (litert_asr_engine_*) instead; this stays for
+     * the smoke harness and any caller that transcribes a single clip. */
+    LitertAsrEngine * engine = litert_asr_engine_open(litertlm_path, out_error);
+    if (!engine) {
+        return ELIZA_ERR_FFI_FAULT;
+    }
+    const int rc = litert_asr_engine_transcribe(
+        engine, pcm, n_samples, sample_rate_hz, out_text, max_text_bytes,
+        out_error);
+    litert_asr_engine_close(engine);
+    return rc;
 }
 
 int litert_asr_supported(void) { return 1; }
@@ -432,6 +488,26 @@ int litert_asr_transcribe(const char * /*litertlm_path*/, const float * /*pcm*/,
         "(build with -DELIZA_ENABLE_LITERT to enable the LiteRT-LM ASR path)");
     return ELIZA_ERR_NOT_IMPLEMENTED;
 }
+
+LitertAsrEngine * litert_asr_engine_open(const char * /*litertlm_path*/,
+                                         char ** out_error) {
+    litert_asr_set_error(out_error,
+        "[litert-asr] backend not compiled in "
+        "(build with -DELIZA_ENABLE_LITERT to enable the LiteRT-LM ASR path)");
+    return nullptr;
+}
+
+int litert_asr_engine_transcribe(LitertAsrEngine * /*engine*/,
+                                 const float * /*pcm*/, size_t /*n_samples*/,
+                                 int /*sample_rate_hz*/, char * /*out_text*/,
+                                 size_t /*max_text_bytes*/, char ** out_error) {
+    litert_asr_set_error(out_error,
+        "[litert-asr] backend not compiled in "
+        "(build with -DELIZA_ENABLE_LITERT to enable the LiteRT-LM ASR path)");
+    return ELIZA_ERR_NOT_IMPLEMENTED;
+}
+
+void litert_asr_engine_close(LitertAsrEngine * /*engine*/) {}
 
 int litert_asr_supported(void) { return 0; }
 

@@ -73,6 +73,45 @@ int litert_asr_transcribe(const char * litertlm_path, const float * pcm,
                           size_t n_samples, int sample_rate_hz, char * out_text,
                           size_t max_text_bytes, char ** out_error);
 
+/* ── Warm reusable engine handle ──────────────────────────────────────────── *
+ *
+ * `litert_asr_transcribe` above builds + tears down the whole LiteRT-LM engine
+ * (model + USM audio encoder load) per call, which is fine for the one-shot
+ * smoke harness but far too costly for the runtime ASR FFI, where the same
+ * .litertlm bundle transcribes many utterances. The engine handle below lets the
+ * caller open the engine ONCE and reuse it across transcriptions:
+ *
+ *   LitertAsrEngine * eng = litert_asr_engine_open(litertlm_path, &err);
+ *   litert_asr_engine_transcribe(eng, pcm, n, sr, out, cap, &err);   // repeat
+ *   litert_asr_engine_close(eng);
+ *
+ * Each transcribe opens + tears down only a conversation on the warm engine, so
+ * the expensive model/encoder load happens once. The handle is opaque; its
+ * concrete type is defined only in the real (ELIZA_ENABLE_LITERT) translation
+ * unit. The stub build returns nullptr from open() and sets `*out_error`.
+ *
+ * Thread-safety: a handle is NOT internally synchronized — the caller serializes
+ * transcribe/close (the FFI already holds ctx->asr_mutex around the ASR path).
+ */
+struct LitertAsrEngine;
+
+/* Open a warm engine for `litertlm_path` (loads the model + USM audio encoder).
+ * Returns an owned handle to free with litert_asr_engine_close, or nullptr +
+ * heap-allocated `*out_error` on failure / in the stub build. */
+LitertAsrEngine * litert_asr_engine_open(const char * litertlm_path,
+                                         char ** out_error);
+
+/* Transcribe `n_samples` of 16 kHz mono fp32 PCM on a warm engine. Same
+ * argument + return contract as litert_asr_transcribe (bytes written, or a
+ * negative ELIZA_* code with heap-allocated `*out_error`). */
+int litert_asr_engine_transcribe(LitertAsrEngine * engine, const float * pcm,
+                                 size_t n_samples, int sample_rate_hz,
+                                 char * out_text, size_t max_text_bytes,
+                                 char ** out_error);
+
+/* Free a handle returned by litert_asr_engine_open. NULL-safe. */
+void litert_asr_engine_close(LitertAsrEngine * engine);
+
 /* Capability probe: 1 when this build was compiled with ELIZA_ENABLE_LITERT
  * (the LiteRT-LM SDK is linked in), 0 for the stub build. Mirrors the
  * `eliza_inference_asr_stream_supported()` probe style so the loader can choose

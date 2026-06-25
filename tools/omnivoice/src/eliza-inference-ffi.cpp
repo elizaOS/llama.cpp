@@ -15,6 +15,12 @@
 
 #include "eliza-inference-ffi.h"
 #include "llm-backend.h"
+/* LiteRT-LM ASR (Gemma USM audio encoder) — compiled in only with
+ * -DELIZA_ENABLE_LITERT. The header is gate-safe: with the gate off it pulls in
+ * no SDK headers and litert_asr_supported() returns 0, so the include is inert
+ * on the default build. The runtime ASR path delegates to it when a .litertlm
+ * is present in the bundle (see eliza_inference_asr_transcribe). */
+#include "backends/litert-asr.h"
 #include "omnivoice.h"
 #include "llama.h"
 #include "mtmd.h"
@@ -183,6 +189,15 @@ struct EliInferenceContext {
     std::string kokoro_gguf_path;
     std::string kokoro_voice_path;
     std::mutex kokoro_mutex;
+#endif
+#ifdef ELIZA_ENABLE_LITERT
+    /* Warm LiteRT-LM ASR engine (Gemma USM audio path), lazily opened on the
+     * first transcription when a *.litertlm is present in the bundle and reused
+     * across transcriptions so the model + audio-encoder load happens once.
+     * Keyed on the resolved .litertlm path so a bundle swap reopens. Protected
+     * by asr_mutex (the ASR decode path already holds it). */
+    LitertAsrEngine * litert_asr_engine = nullptr;
+    std::string litert_asr_path;
 #endif
 };
 
@@ -1755,6 +1770,13 @@ void eliza_inference_destroy(EliInferenceContext * ctx) {
     {
         std::lock_guard<std::mutex> lock(ctx->asr_mutex);
         eliza_free_asr(ctx);
+#ifdef ELIZA_ENABLE_LITERT
+        if (ctx->litert_asr_engine) {
+            litert_asr_engine_close(ctx->litert_asr_engine);
+            ctx->litert_asr_engine = nullptr;
+            ctx->litert_asr_path.clear();
+        }
+#endif
     }
     {
         std::lock_guard<std::mutex> lock(ctx->llm_mutex);
@@ -2026,6 +2048,28 @@ int eliza_inference_tts_synthesize(
     return written;
 }
 
+#ifdef ELIZA_ENABLE_LITERT
+/* Probe <bundle_dir>/text/ for a *.litertlm artifact — the same location +
+ * pattern litert-backend.cpp's find_litertlm_artifact uses for the text LLM
+ * path, reused here for the ASR (Gemma USM audio encoder) delegation. Returns
+ * the absolute path of the first match, or an empty string when none exists (or
+ * the bundle dir is unset). Cheap directory walk, no model load. */
+static std::string eliza_find_litertlm_artifact(const std::string & bundle_dir) {
+    if (bundle_dir.empty()) return std::string();
+    std::error_code ec;
+    std::filesystem::path text_dir = std::filesystem::path(bundle_dir) / "text";
+    if (!std::filesystem::is_directory(text_dir, ec)) return std::string();
+    for (std::filesystem::directory_iterator it(text_dir, ec), end;
+         !ec && it != end; it.increment(ec)) {
+        if (!it->is_regular_file(ec)) continue;
+        if (it->path().extension() == ".litertlm") {
+            return it->path().string();
+        }
+    }
+    return std::string();
+}
+#endif
+
 /* Shared ASR decode core. Takes the asr_mutex, runs the audio-in/text-out
  * decode, and yields the cleaned transcript. Both eliza_inference_asr_transcribe
  * and eliza_inference_asr_transcribe_timed call this so the decode lives in
@@ -2178,6 +2222,39 @@ int eliza_inference_asr_transcribe(
         eliza_set_error(out_error, "[libelizainference] asr_transcribe: invalid arguments");
         return ELIZA_ERR_INVALID_ARG;
     }
+#ifdef ELIZA_ENABLE_LITERT
+    /* LiteRT-LM (Gemma USM) ASR delegation: when this build is compiled with the
+     * LiteRT backend AND the bundle ships a *.litertlm under text/, transcribe
+     * through the LiteRT-LM audio path instead of the fused Qwen3-ASR decoder.
+     * The warm engine is opened once (model + USM audio encoder load) and cached
+     * on the ctx, keyed on the .litertlm path, so repeated transcriptions reuse
+     * it. Default build (gate off) or a bundle with no .litertlm falls through to
+     * the existing fused path below, byte-for-byte unchanged. */
+    if (litert_asr_supported() && n_samples > 0) {
+        const std::string litertlm_path =
+            eliza_find_litertlm_artifact(ctx->bundle_dir);
+        if (!litertlm_path.empty()) {
+            std::lock_guard<std::mutex> lock(ctx->asr_mutex);
+            if (ctx->litert_asr_engine && ctx->litert_asr_path != litertlm_path) {
+                litert_asr_engine_close(ctx->litert_asr_engine);
+                ctx->litert_asr_engine = nullptr;
+                ctx->litert_asr_path.clear();
+            }
+            if (!ctx->litert_asr_engine) {
+                ctx->litert_asr_engine =
+                    litert_asr_engine_open(litertlm_path.c_str(), out_error);
+                if (!ctx->litert_asr_engine) {
+                    return ELIZA_ERR_FFI_FAULT;
+                }
+                ctx->litert_asr_path = litertlm_path;
+            }
+            return litert_asr_engine_transcribe(ctx->litert_asr_engine, pcm,
+                                                n_samples, sample_rate_hz,
+                                                out_text, max_text_bytes,
+                                                out_error);
+        }
+    }
+#endif
     std::string transcript;
     int rc = eliza_asr_decode_core(ctx, pcm, n_samples, sample_rate_hz, max_text_bytes, transcript, out_error);
     if (rc < 0) {

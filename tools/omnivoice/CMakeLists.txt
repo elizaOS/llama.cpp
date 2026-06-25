@@ -298,7 +298,11 @@ if(TARGET mtmd)
     # default desktop/CI build is byte-for-byte the pre-seam behavior.
     if(ELIZA_ENABLE_LITERT)
         target_sources(elizainference PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/litert-backend.cpp)
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/litert-backend.cpp
+            # litert-asr.cpp — the LiteRT-LM (Gemma USM) in-process ASR backend.
+            # The FFI's eliza_inference_asr_transcribe delegates to it when a
+            # *.litertlm is present in the bundle (warm engine cached on the ctx).
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/litert-asr.cpp)
         target_compile_definitions(elizainference PRIVATE ELIZA_ENABLE_LITERT)
         # LiteRT-LM SDK (github.com/google-ai-edge/LiteRT-LM). Point at a built
         # SDK with -DELIZA_LITERT_SDK_DIR=<dir>; the device/host cross-build
