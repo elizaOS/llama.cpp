@@ -105,7 +105,9 @@ int main(int argc, char ** argv) {
     const auto * hp = eliza_kokoro::kokoro_get_hparams(model.get());
 
     eliza_kokoro::kokoro_voice_preset voice;
-    const auto vst = eliza_kokoro::kokoro_load_voice_preset(voice_path, hp->style_dim, voice, err);
+    // Kokoro v1.0 voice packs are 2*style_dim wide (256 = decoder-half 128 +
+    // predictor-half 128); the model's hparam style_dim is the per-half value.
+    const auto vst = eliza_kokoro::kokoro_load_voice_preset(voice_path, 2 * hp->style_dim, voice, err);
     if (vst != eliza_kokoro::KOKORO_OK) {
         std::fprintf(stderr, "kokoro_load_voice_preset failed: %s (status=%s)\n",
                      err.c_str(), eliza_kokoro::kokoro_status_str(vst));
