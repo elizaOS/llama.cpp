@@ -70,6 +70,22 @@ int main() {
     expect_pick(KOKORO_TENSOR_N_PROJ, legacy_schema, "pred.N_proj.weight");
     expect_pick(KOKORO_TENSOR_GEN_CONV_POST, legacy_schema, "dec.gen.conv_post.weight");
 
+    const std::set<std::string> published_legacy_schema = {
+        "bert.embd.tok.weight",
+        "bert.attn_q.weight",
+        "pred.dur_proj.weight",
+        "pred.F0_proj.weight",
+        "pred.N_proj.weight",
+        "dec.gen.conv_post.weight",
+    };
+
+    expect_pick(KOKORO_TENSOR_BERT_TOKEN_EMBD, published_legacy_schema, "bert.embd.tok.weight");
+    expect_pick(KOKORO_TENSOR_BERT_ATTN_Q, published_legacy_schema, "bert.attn_q.weight");
+    expect_pick(KOKORO_TENSOR_DURATION_PROJ, published_legacy_schema, "pred.dur_proj.weight");
+    expect_pick(KOKORO_TENSOR_F0_PROJ, published_legacy_schema, "pred.F0_proj.weight");
+    expect_pick(KOKORO_TENSOR_N_PROJ, published_legacy_schema, "pred.N_proj.weight");
+    expect_pick(KOKORO_TENSOR_GEN_CONV_POST, published_legacy_schema, "dec.gen.conv_post.weight");
+
     const std::set<std::string> empty_schema;
     assert(kokoro_pick_tensor_name(KOKORO_TENSOR_BERT_TOKEN_EMBD, has_name, (void *) &empty_schema) == nullptr);
 
