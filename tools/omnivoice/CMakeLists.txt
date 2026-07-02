@@ -396,6 +396,26 @@ target_include_directories(omnivoice-test-abi-c PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(omnivoice-test-abi-c PRIVATE omnivoice_lib)
 
+# omnivoice-test-diarizer-metadata : metadata-only GGUF contract test for the
+# vendored diarizer reader. It writes tiny GGUF files, so it does not need the
+# pyannote model artifact.
+add_executable(omnivoice-test-diarizer-metadata tests/diarizer-metadata.c)
+set_target_properties(omnivoice-test-diarizer-metadata PROPERTIES
+    C_STANDARD 99
+    C_STANDARD_REQUIRED ON
+    C_EXTENSIONS ON)
+if(MSVC)
+    target_compile_options(omnivoice-test-diarizer-metadata PRIVATE /W4 /WX)
+else()
+    target_compile_options(omnivoice-test-diarizer-metadata PRIVATE -Wall -Werror -pedantic)
+endif()
+target_include_directories(omnivoice-test-diarizer-metadata PRIVATE
+    ${OMNIVOICE_VOICE_CLASSIFIER_INCLUDE_DIRS})
+target_link_libraries(omnivoice-test-diarizer-metadata PRIVATE eliza_voice_classifiers)
+if(BUILD_TESTING)
+    add_test(NAME omnivoice-test-diarizer-metadata COMMAND omnivoice-test-diarizer-metadata)
+endif()
+
 # omnivoice-dac-parity : focused CPU numerical parity harness for
 # dac_conv_t1d's ggml_conv_transpose_1d migration (elizaOS/eliza#7660).
 # The default run uses deterministic synthetic DAC block shapes; pass
