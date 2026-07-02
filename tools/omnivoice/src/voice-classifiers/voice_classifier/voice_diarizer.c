@@ -70,6 +70,7 @@
 #define DIAR_LINEAR0_OUT 128
 #define DIAR_LINEAR1_OUT 128
 #define DIAR_LEAKY_ALPHA 0.01f
+#define DIAR_LSTM_GATE_ORDER "IOFC"
 
 /* Cached pointers + buffer struct for one diarizer session. */
 struct voice_diarizer_session {
@@ -196,8 +197,8 @@ static inline float sigmoidf(float x) {
     }
 }
 
-/* One-direction LSTM step. Gates packed in I, F, G, O order
- * (matches the converter's reorder). `x_dot_W` is the
+/* One-direction LSTM step. Gates packed in I, O, F, C order (matches the
+ * published diarizer GGUF this fork currently ships). `x_dot_W` is the
  * pre-computed x @ W_ih^T + b_ih, shape [T, 4H]. */
 static void lstm_run_dir(const float *x_dot_W,
                          int T, int H,
@@ -393,6 +394,26 @@ int voice_diarizer_open(const char *gguf, voice_diarizer_handle *out) {
         meta.sample_rate != VOICE_CLASSIFIER_SAMPLE_RATE_HZ) return -EINVAL;
     if (meta.num_classes != 0 &&
         meta.num_classes != VOICE_DIARIZER_NUM_CLASSES) return -EINVAL;
+    if (meta.window_samples != 0 &&
+        meta.window_samples != DIAR_WINDOW_SAMPLES) return -EINVAL;
+    if (meta.frames_per_window != 0 &&
+        meta.frames_per_window != DIAR_FRAMES_PER_WINDOW) return -EINVAL;
+    if (meta.lstm_layers != 0 &&
+        meta.lstm_layers != DIAR_LSTM_LAYERS) return -EINVAL;
+    if (meta.lstm_hidden != 0 &&
+        meta.lstm_hidden != DIAR_LSTM_HIDDEN) return -EINVAL;
+    if (meta.linear0_out != 0 &&
+        meta.linear0_out != DIAR_LINEAR0_OUT) return -EINVAL;
+    if (meta.linear1_out != 0 &&
+        meta.linear1_out != DIAR_LINEAR1_OUT) return -EINVAL;
+    if (meta.lstm_gate_order[0] != '\0' &&
+        strcmp(meta.lstm_gate_order, DIAR_LSTM_GATE_ORDER) != 0) {
+        fprintf(stderr,
+                "[voice_diarizer] unsupported LSTM gate order '%s'; this fused reader expects %s\n",
+                meta.lstm_gate_order,
+                DIAR_LSTM_GATE_ORDER);
+        return -EINVAL;
+    }
 
     struct voice_diarizer_session *s =
         (struct voice_diarizer_session *)calloc(1, sizeof(*s));
