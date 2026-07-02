@@ -1034,6 +1034,22 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
     }
 
     int res = ggml_metal_op_encode_impl(ctx, idx);
+
+    // a nil compute pipeline latches encode_failed on the encoder (the op body
+    // becomes a no-op instead of dispatching). abort the graph encode here so
+    // ggml_metal_graph_compute returns GGML_STATUS_FAILED and llama_decode
+    // surfaces an error instead of the process crashing (issue #11612)
+    if (ggml_metal_encoder_encode_failed(ctx->enc)) {
+        GGML_LOG_ERROR("%s: error: node %d (op = %s, name = '%s') requires a Metal pipeline that failed to compile - failing graph\n",
+                __func__, idx, ggml_op_desc(ctx->node(idx)), ctx->node(idx)->name);
+
+        if (ctx->use_capture) {
+            ggml_metal_encoder_debug_group_pop(ctx->enc);
+        }
+
+        return 0;
+    }
+
     if (idx + res > ctx->n_nodes()) {
         GGML_ABORT("fusion error: nodes spanning multiple encoders have been fused. this indicates a bug in the fusion logic %s",
                 "https://github.com/ggml-org/llama.cpp/pull/14849");

@@ -98,7 +98,35 @@ void ggml_metal_pipeline_free(ggml_metal_pipeline_t pipeline) {
     free(pipeline);
 }
 
+// GGML_METAL_ABORT_ON_NIL_PIPELINE=1 restores the legacy hard-abort so a
+// debugger stops at the first nil compute pipeline. The default is the
+// recoverable path: the failure is latched on the encoder and the graph
+// returns GGML_STATUS_FAILED instead of crashing the process (issue #11612 —
+// A18 devices can fail to compile individual mul_mat pipelines at runtime).
+static bool ggml_metal_abort_on_nil_pipeline(void) {
+    static atomic_int state = 0; // 0 = unchecked, 1 = abort, -1 = recover
+
+    int cur = atomic_load_explicit(&state, memory_order_relaxed);
+    if (cur == 0) {
+        const char * env = getenv("GGML_METAL_ABORT_ON_NIL_PIPELINE");
+        cur = (env != NULL && env[0] != '\0' && env[0] != '0') ? 1 : -1;
+        atomic_store_explicit(&state, cur, memory_order_relaxed);
+    }
+
+    return cur == 1;
+}
+
 int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_with_params pipeline) {
+    if (!pipeline.pipeline || !pipeline.pipeline->obj) {
+        GGML_LOG_ERROR("%s: error: Metal compute pipeline is nil\n", __func__);
+        if (ggml_metal_abort_on_nil_pipeline()) {
+            GGML_ABORT("nil Metal compute pipeline");
+        }
+        // safe placeholder: the op will latch the failure on its encoder via
+        // ggml_metal_encoder_set_pipeline before anything is dispatched
+        return 1;
+    }
+
     return pipeline.pipeline->obj.maxTotalThreadsPerThreadgroup;
 }
 
@@ -477,6 +505,12 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 
 struct ggml_metal_encoder {
     id<MTLComputeCommandEncoder> obj;
+
+    // latched when a required compute pipeline is nil. once set, every encode
+    // call on this encoder becomes a no-op (never dispatch with unset/stale
+    // pipeline state) and ggml_metal_op_encode aborts the graph so it fails
+    // with GGML_STATUS_FAILED instead of crashing (issue #11612)
+    bool encode_failed;
 };
 
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
@@ -509,26 +543,65 @@ void ggml_metal_encoder_debug_group_pop (ggml_metal_encoder_t encoder) {
 }
 
 void ggml_metal_encoder_set_pipeline(ggml_metal_encoder_t encoder, struct ggml_metal_pipeline_with_params pipeline) {
+    if (encoder->encode_failed) {
+        return;
+    }
+
+    if (!pipeline.pipeline || !pipeline.pipeline->obj) {
+        GGML_LOG_ERROR("%s: error: Metal compute pipeline is nil - failing this graph instead of dispatching\n", __func__);
+        if (ggml_metal_abort_on_nil_pipeline()) {
+            GGML_ABORT("nil Metal compute pipeline");
+        }
+
+        encoder->encode_failed = true;
+
+        return;
+    }
+
     [encoder->obj setComputePipelineState:pipeline.pipeline->obj];
 }
 
+bool ggml_metal_encoder_encode_failed(ggml_metal_encoder_t encoder) {
+    return encoder->encode_failed;
+}
+
 void ggml_metal_encoder_set_bytes(ggml_metal_encoder_t encoder, void * data, size_t size, int idx) {
+    if (encoder->encode_failed) {
+        return;
+    }
+
     [encoder->obj setBytes:data length:size atIndex:idx];
 }
 
 void ggml_metal_encoder_set_buffer(ggml_metal_encoder_t encoder, struct ggml_metal_buffer_id buffer, int idx) {
+    if (encoder->encode_failed) {
+        return;
+    }
+
     [encoder->obj setBuffer:buffer.metal offset:buffer.offs atIndex:idx];
 }
 
 void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder, size_t size, int idx) {
+    if (encoder->encode_failed) {
+        return;
+    }
+
     [encoder->obj setThreadgroupMemoryLength:size atIndex:idx];
 }
 
 void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int tg0, int tg1, int tg2, int tptg0, int tptg1, int tptg2) {
+    if (encoder->encode_failed) {
+        return;
+    }
+
     [encoder->obj dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
 }
 
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
+    if (encoder->encode_failed) {
+        return;
+    }
+
     [encoder->obj memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
