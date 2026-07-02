@@ -1,10 +1,17 @@
 // SPDX-License-Identifier: MIT
 //
 // kokoro-layers.h — small neural-net layer primitives used by the Kokoro
-// predictor + decoder forwards. Plain CPU/scalar implementations — no GGML
-// graph, no backend dispatch. The forward pass is line-for-line matched to
-// the upstream `kokoro` Python package (modules.py + istftnet.py) so the
-// trained weights produce numerically equivalent output.
+// predictor + decoder forwards. No GGML graph / backend dispatch: the forward
+// pass is line-for-line matched to the upstream `kokoro` Python package
+// (modules.py + istftnet.py) so the trained weights produce numerically
+// equivalent output.
+//
+// On Apple platforms the O(C^2*K*T) hot loops (Conv1d, ConvTranspose1d,
+// Linear, LSTM gate matvecs) are routed through the Accelerate BLAS
+// (im2col + sgemm / sgemv, AMX-backed) — same math, same fp32 accumulation,
+// ~2 orders of magnitude faster than the scalar loops on M-series. Every
+// function keeps the portable scalar path as the non-Apple fallback and as
+// the readable reference.
 //
 // Tensor convention (matches PyTorch Conv1d / Linear):
 //   - 1D feature maps: `[C, T]` (channel-major, time-minor).
@@ -21,6 +28,14 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+
+#if defined(__APPLE__)
+#define KOKORO_USE_ACCELERATE 1
+#if !defined(ACCELERATE_NEW_LAPACK)
+#define ACCELERATE_NEW_LAPACK
+#endif
+#include <Accelerate/Accelerate.h>
+#endif
 
 namespace eliza_kokoro {
 
@@ -50,12 +65,22 @@ inline void linear_forward(
         const float * x, int in_dim,
         const float * W, const float * b, int out_dim,
         float * y) {
+#if defined(KOKORO_USE_ACCELERATE)
+    float beta = 0.0f;
+    if (b) {
+        std::memcpy(y, b, sizeof(float) * (size_t) out_dim);
+        beta = 1.0f;
+    }
+    cblas_sgemv(CblasRowMajor, CblasNoTrans, out_dim, in_dim,
+                1.0f, W, in_dim, x, 1, beta, y, 1);
+#else
     for (int i = 0; i < out_dim; ++i) {
         float acc = b ? b[i] : 0.0f;
         const float * w = W + i * in_dim;
         for (int j = 0; j < in_dim; ++j) acc += w[j] * x[j];
         y[i] = acc;
     }
+#endif
 }
 
 // =================================================================
@@ -70,6 +95,46 @@ inline void conv1d_forward(
         const float * W, const float * b, int Cout, int K,
         int stride, int pad, int dilation,
         float * y, int T_out) {
+#if defined(KOKORO_USE_ACCELERATE)
+    // im2col + one SGEMM. The PyTorch weight layout [Cout, Cin, K] is already
+    // a row-major [Cout, Cin*K] GEMM operand; the column matrix is
+    // [Cin*K, T_out] with zero padding baked in, so
+    //   y[Cout, T_out] = W · cols (+ bias).
+    std::vector<float> cols((size_t) Cin * K * T_out, 0.0f);
+    for (int ci = 0; ci < Cin; ++ci) {
+        const float * xi = x + (size_t) ci * T;
+        for (int k = 0; k < K; ++k) {
+            float * col = cols.data() + ((size_t) ci * K + k) * T_out;
+            const int t_off = k * dilation - pad;  // ti = to*stride + t_off
+            // valid `to` range keeping ti within [0, T)
+            int to_lo = 0;
+            if (t_off < 0) to_lo = (-t_off + stride - 1) / stride;
+            int to_hi = (T - 1 - t_off) / stride;  // inclusive
+            if (to_hi > T_out - 1) to_hi = T_out - 1;
+            if (to_lo > to_hi) continue;
+            if (stride == 1) {
+                std::memcpy(col + to_lo, xi + (to_lo + t_off),
+                            sizeof(float) * (size_t) (to_hi - to_lo + 1));
+            } else {
+                for (int to = to_lo; to <= to_hi; ++to) {
+                    col[to] = xi[to * stride + t_off];
+                }
+            }
+        }
+    }
+    float beta = 0.0f;
+    if (b) {
+        for (int co = 0; co < Cout; ++co) {
+            float * yc = y + (size_t) co * T_out;
+            for (int to = 0; to < T_out; ++to) yc[to] = b[co];
+        }
+        beta = 1.0f;
+    }
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                Cout, T_out, Cin * K,
+                1.0f, W, Cin * K, cols.data(), T_out,
+                beta, y, T_out);
+#else
     for (int co = 0; co < Cout; ++co) {
         const float bias_v = b ? b[co] : 0.0f;
         for (int to = 0; to < T_out; ++to) {
@@ -86,6 +151,7 @@ inline void conv1d_forward(
             y[(size_t)co * T_out + to] = acc;
         }
     }
+#endif
 }
 
 // =================================================================
@@ -158,6 +224,28 @@ inline void convtranspose1d_forward(
             for (int to = 0; to < T_out; ++to) yc[to] += b[co];
         }
     }
+#if defined(KOKORO_USE_ACCELERATE)
+    // One SGEMM + col2im scatter. Viewing W [Cin, Cout, K] as a row-major
+    // [Cin, Cout*K] operand:
+    //   tmp[Cout*K, T] = W^T · x[Cin, T]
+    // then tmp[co*K + k, t_in] scatters into y[co, t_in*stride - pad + k].
+    std::vector<float> tmp((size_t) Cout * K * T);
+    cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                Cout * K, T, Cin,
+                1.0f, W, Cout * K, x, T,
+                0.0f, tmp.data(), T);
+    for (int co = 0; co < Cout; ++co) {
+        float * yc = y + (size_t) co * T_out;
+        for (int k = 0; k < K; ++k) {
+            const float * row = tmp.data() + ((size_t) co * K + k) * T;
+            const int t_off = k - pad;  // to = t_in*stride + t_off
+            for (int t_in = 0; t_in < T; ++t_in) {
+                const int to = t_in * stride + t_off;
+                if (to >= 0 && to < T_out) yc[to] += row[t_in];
+            }
+        }
+    }
+#else
     for (int ci = 0; ci < Cin; ++ci) {
         const float * xi = x + (size_t)ci * T;
         for (int t_in = 0; t_in < T; ++t_in) {
@@ -173,6 +261,7 @@ inline void convtranspose1d_forward(
             }
         }
     }
+#endif
 }
 
 // Depthwise transpose (groups == Cin == Cout). Used by AdainResBlk1d pool.
@@ -263,6 +352,15 @@ inline void lstm_cell_step(
         float * h_out, float * c_out,
         float * gates_scratch /* [4H] */ ) {
     // gates = W_ih @ x + b_ih + W_hh @ h_prev + b_hh
+#if defined(KOKORO_USE_ACCELERATE)
+    for (int g = 0; g < 4 * H; ++g) {
+        gates_scratch[g] = (b_ih ? b_ih[g] : 0.0f) + (b_hh ? b_hh[g] : 0.0f);
+    }
+    cblas_sgemv(CblasRowMajor, CblasNoTrans, 4 * H, I,
+                1.0f, W_ih, I, x, 1, 1.0f, gates_scratch, 1);
+    cblas_sgemv(CblasRowMajor, CblasNoTrans, 4 * H, H,
+                1.0f, W_hh, H, h_prev, 1, 1.0f, gates_scratch, 1);
+#else
     for (int g = 0; g < 4 * H; ++g) {
         float acc = (b_ih ? b_ih[g] : 0.0f) + (b_hh ? b_hh[g] : 0.0f);
         const float * w_ih_row = W_ih + (size_t)g * I;
@@ -271,6 +369,7 @@ inline void lstm_cell_step(
         for (int j = 0; j < H; ++j) acc += w_hh_row[j] * h_prev[j];
         gates_scratch[g] = acc;
     }
+#endif
     // Split into i, f, g, o; apply sigmoid/tanh.
     auto sigmoid = [](float v){ return 1.0f / (1.0f + std::exp(-v)); };
     for (int j = 0; j < H; ++j) {

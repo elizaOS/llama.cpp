@@ -48,6 +48,14 @@ endif()
 
 target_compile_features(kokoro_lib PUBLIC cxx_std_17)
 
+# kokoro-layers.h routes the Conv1d/ConvTranspose1d/Linear/LSTM hot loops
+# through the Accelerate BLAS (im2col + sgemm/sgemv) on Apple platforms —
+# the scalar loops are ~2 orders of magnitude too slow for real-time TTS.
+if(APPLE)
+    find_library(KOKORO_ACCELERATE_FRAMEWORK Accelerate REQUIRED)
+    target_link_libraries(kokoro_lib PUBLIC ${KOKORO_ACCELERATE_FRAMEWORK})
+endif()
+
 # Real G2P via libespeak-ng. When present, kokoro_phonemize() drives
 # espeak_TextToPhonemes() (en-us IPA) and maps codepoints to Kokoro vocab ids,
 # reproducing the reference token sequence. When absent, the build falls back
