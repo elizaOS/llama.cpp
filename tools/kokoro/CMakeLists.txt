@@ -51,9 +51,14 @@ target_compile_features(kokoro_lib PUBLIC cxx_std_17)
 # kokoro-layers.h routes the Conv1d/ConvTranspose1d/Linear/LSTM hot loops
 # through the Accelerate BLAS (im2col + sgemm/sgemv) on Apple platforms —
 # the scalar loops are ~2 orders of magnitude too slow for real-time TTS.
+# On every other platform the header's portable-fast path (internal
+# std::thread pool + NEON on aarch64) is used, so it needs the threads lib.
 if(APPLE)
     find_library(KOKORO_ACCELERATE_FRAMEWORK Accelerate REQUIRED)
     target_link_libraries(kokoro_lib PUBLIC ${KOKORO_ACCELERATE_FRAMEWORK})
+else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(kokoro_lib PUBLIC Threads::Threads)
 endif()
 
 # Real G2P via libespeak-ng. When present, kokoro_phonemize() drives
