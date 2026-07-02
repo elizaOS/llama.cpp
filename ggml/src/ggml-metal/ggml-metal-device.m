@@ -99,6 +99,11 @@ void ggml_metal_pipeline_free(ggml_metal_pipeline_t pipeline) {
 }
 
 int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_with_params pipeline) {
+    if (!pipeline.pipeline || !pipeline.pipeline->obj) {
+        GGML_LOG_ERROR("%s: error: Metal compute pipeline is nil\n", __func__);
+        GGML_ABORT("nil Metal compute pipeline");
+    }
+
     return pipeline.pipeline->obj.maxTotalThreadsPerThreadgroup;
 }
 
@@ -509,6 +514,11 @@ void ggml_metal_encoder_debug_group_pop (ggml_metal_encoder_t encoder) {
 }
 
 void ggml_metal_encoder_set_pipeline(ggml_metal_encoder_t encoder, struct ggml_metal_pipeline_with_params pipeline) {
+    if (!pipeline.pipeline || !pipeline.pipeline->obj) {
+        GGML_LOG_ERROR("%s: error: Metal compute pipeline is nil\n", __func__);
+        GGML_ABORT("nil Metal compute pipeline");
+    }
+
     [encoder->obj setComputePipelineState:pipeline.pipeline->obj];
 }
 
