@@ -223,11 +223,12 @@ static void lstm_run_dir(const float *x_dot_W,
             gate_buf[g] = acc;
         }
 
-        /* Apply nonlinearities. Gate order I, F, G, O. */
+        /* Apply nonlinearities. Gate order I, O, F, C (ONNX IOFC layout —
+         * pyannote-3 segmentation GGUF, #9460). */
         const float *gi = gate_buf + 0 * H;
-        const float *gf = gate_buf + 1 * H;
-        const float *gg = gate_buf + 2 * H;
-        const float *go = gate_buf + 3 * H;
+        const float *go = gate_buf + 1 * H;
+        const float *gf = gate_buf + 2 * H;
+        const float *gg = gate_buf + 3 * H;
         for (int j = 0; j < H; ++j) {
             const float i_t = sigmoidf(gi[j]);
             const float f_t = sigmoidf(gf[j]);

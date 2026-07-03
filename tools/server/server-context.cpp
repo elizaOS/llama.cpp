@@ -866,23 +866,34 @@ private:
                 return false;
             }
 
+            const bool spec_mtp = std::find(params_base.speculative.types.begin(),
+                                            params_base.speculative.types.end(),
+                                            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+
             // Upstream PR #22660: for SWA draft models, force swa_full on the
             // draft context so prefix reuse (seq_rm + seq_add) works beyond
             // the SWA window during speculation. Without this, the draft has
             // to re-decode from the window edge on every long-context request
             // and acceptance length degrades sharply.
-            if (llama_model_n_swa(model_dft.get()) > 0 && !params_dft.swa_full) {
+            //
+            // Exception: an MTP drafter that shares the target's KV cache (e.g.
+            // gemma4-assistant via ctx_other) must size its SWA cache to match
+            // the target's exactly. Forcing swa_full here would make the drafter
+            // expect a full-size SWA cache while the shared target tensor is
+            // small-SWA-sized, overflowing the view in get_k/get_v.
+            if (!spec_mtp && llama_model_n_swa(model_dft.get()) > 0 && !params_dft.swa_full) {
                 SRV_INF("%s", "draft model uses SWA - enabling swa_full for the draft context\n");
                 params_dft.swa_full = true;
             }
 
             auto cparams = common_context_params_to_llama(params_dft);
 
-            const bool spec_mtp = std::find(params_base.speculative.types.begin(),
-                                            params_base.speculative.types.end(),
-                                            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
             if (spec_mtp) {
                 cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                // gemma4-assistant-style MTP drafters read the target model's
+                // token embeddings and share its KV cache via ctx_other. Setting
+                // it for other draft arches is harmless (only that arch reads it).
+                cparams.ctx_other = ctx_tgt;
             }
 
             // note: for small models maybe we can set this to the maximum possible draft from all speculative types
@@ -900,8 +911,9 @@ private:
                     params_base.model.path.c_str());
 
             auto cparams_mtp = common_context_params_to_llama(params_base);
-            cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-            cparams_mtp.n_rs_seq = 0;
+            cparams_mtp.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
+            cparams_mtp.n_rs_seq  = 0;
+            cparams_mtp.ctx_other = ctx_tgt;
 
             ctx_dft.reset(llama_init_from_model(model_tgt, cparams_mtp));
             if (ctx_dft == nullptr) {

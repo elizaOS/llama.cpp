@@ -46,6 +46,11 @@ struct llama_cparams {
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;
 
+    // sibling context whose model provides shared inputs/KV (gemma4-assistant MTP
+    // drafter reads the target model's token embeddings + shares its KV cache).
+    // null for all other arches.
+    struct llama_context * ctx_other;
+
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
 };

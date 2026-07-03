@@ -188,6 +188,10 @@ struct llama_hparams {
     // output embedding dimension (0 = use n_embd)
     uint32_t n_embd_out_impl = 0;
 
+    // input/backbone embedding dimension (0 = derive from n_embd; gemma4-assistant
+    // sets this to the target hidden size so the MTP drafter projects to/from it)
+    uint32_t n_embd_inp_impl = 0;
+
     // llama4 smallthinker
     uint32_t n_moe_layer_step        = 0;
     uint32_t n_no_rope_layer_step    = 4;

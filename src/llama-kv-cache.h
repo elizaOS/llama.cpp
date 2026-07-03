@@ -105,8 +105,10 @@ public:
                      uint32_t   n_pad,
                      uint32_t   n_swa,
                llama_swa_type   swa_type,
+               llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
+        const  layer_share_cb & share,
                      uint32_t   kv_size_max = 0);
 
     ~llama_kv_cache() = default;
@@ -275,6 +277,10 @@ private:
     stream_copy_info sc_info;
 
     std::vector<kv_layer> layers;
+
+    // sibling KV cache to share K/V tensors with (gemma4-assistant MTP drafter
+    // shares KV with the target). null for all other arches.
+    llama_kv_cache * other = nullptr;
 
     // dynamic resize state
     uint32_t kv_size_cur     = 0;

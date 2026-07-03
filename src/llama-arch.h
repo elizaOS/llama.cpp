@@ -63,6 +63,7 @@ enum llm_arch {
     LLM_ARCH_GEMMA3,
     LLM_ARCH_GEMMA3N,
     LLM_ARCH_GEMMA4,
+    LLM_ARCH_GEMMA4_ASSISTANT,
     LLM_ARCH_GEMMA_EMBEDDING,
     LLM_ARCH_STARCODER2,
     LLM_ARCH_MAMBA,
@@ -569,6 +570,11 @@ enum llm_tensor {
     // EAGLE3 draft-model tensors (upstream PR #18039)
     LLM_TENSOR_EAGLE3_TARGET_FEATURES,
     LLM_TENSOR_EAGLE3_TARGET_TOK_EMBD,
+    // gemma4-assistant (MTP next-token drafter) tensors
+    LLM_TENSOR_NEXTN_PROJ_PRE,
+    LLM_TENSOR_NEXTN_PROJ_POST,
+    LLM_TENSOR_MASKED_EMBD_CENTROIDS,
+    LLM_TENSOR_MASKED_EMBD_ORDERING,
 };
 
 enum llm_tensor_layer {

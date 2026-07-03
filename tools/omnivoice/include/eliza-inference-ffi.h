@@ -863,7 +863,10 @@ int eliza_inference_llm_kv_quant_supported(void);
  * `cache_type_k` / `cache_type_v` (ABI v8): KV-cache quantization type names
  * (e.g. "f16", "q8_0", "qjl1_256", "q4_polar"). NULL leaves the llama.cpp
  * default (f16). Mapped to ggml_type and applied to cparams.type_k/type_v.
- * Mirrors desktop-llama-adapter.ts's GGML_KV_CACHE_TYPES pass-through. */
+ * Mirrors desktop-llama-adapter.ts's GGML_KV_CACHE_TYPES pass-through.
+ *
+ * `context_size` (ABI v9): runtime context window in tokens. <=0 falls back
+ * to ELIZA_LLM_N_CTX or the native default. */
 typedef struct {
     int32_t      max_tokens;
     float        temperature;
@@ -880,6 +883,7 @@ typedef struct {
     int32_t      n_gpu_layers;       /* -1 = default (all), 0 = CPU (ABI v8) */
     const char * cache_type_k;       /* KV K-cache quant name; NULL = f16 (ABI v8) */
     const char * cache_type_v;       /* KV V-cache quant name; NULL = f16 (ABI v8) */
+    int32_t      context_size;       /* Runtime context tokens; <=0 = env/default (ABI v9) */
 } eliza_llm_stream_config_t;
 
 /* Opaque streaming-LLM session. One per active generation. */

@@ -387,6 +387,46 @@ if(TARGET mtmd)
             "LINKER:-reexport_library,$<TARGET_FILE:llama>")
     endif()
     add_dependencies(elizainference omnivoice-version)
+
+    # Static variant for the mobile / iOS XCFramework slice. The mtp build
+    # (build-llama-cpp-mtp.mjs) builds BUILD_SHARED_LIBS=OFF and links the slice
+    # statically into LlamaCpp.xcframework — it builds `elizainference_static`
+    # BY NAME and collects libelizainference.a alongside the separately-built
+    # libllama.a / libmtmd.a / libkokoro_lib.a. A static archive carries only the
+    # FFI + core OBJECTS; the dependency archives' objects merge at the app's
+    # final link, so we record usage requirements (include dirs, ELIZA_ENABLE_*
+    # defines, the `if(TARGET kokoro_lib)` Kokoro fold) but do NOT reexport a
+    # library (that is a SHARED-only link option).
+    add_library(elizainference_static STATIC
+        ${OMNIVOICE_CORE_SOURCES}
+        ${OMNIVOICE_FFI_SOURCES})
+    target_compile_features(elizainference_static PUBLIC cxx_std_17)
+    target_compile_definitions(elizainference_static
+        PRIVATE OMNIVOICE_BUILD ${OMNIVOICE_COMPILE_DEFINITIONS})
+    if(ELIZA_ENABLE_VISION)
+        target_compile_definitions(elizainference_static PRIVATE ELIZA_ENABLE_VISION)
+    endif()
+    target_include_directories(elizainference_static PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_BINARY_DIR}
+        ${OMNIVOICE_LLAMA_PRIVATE_INCLUDE_DIRS})
+    target_include_directories(elizainference_static PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../mtmd
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../common)
+    target_link_libraries(elizainference_static PUBLIC llama mtmd)
+    target_link_libraries(elizainference_static PRIVATE eliza_voice_classifiers llama-common)
+    if(TARGET kokoro_lib)
+        target_link_libraries(elizainference_static PRIVATE kokoro_lib)
+        target_include_directories(elizainference_static PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../kokoro/include)
+        target_compile_definitions(elizainference_static PRIVATE ELIZA_ENABLE_KOKORO)
+    endif()
+    set_target_properties(elizainference_static PROPERTIES
+        OUTPUT_NAME              elizainference
+        POSITION_INDEPENDENT_CODE ON)
+    add_dependencies(elizainference_static omnivoice-version)
 endif()
 
 # llama-server wiring — mount the OmniVoice POST /v1/audio/speech route

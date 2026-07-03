@@ -434,7 +434,14 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
         GGML_ASSERT(ctx_tgt && ctx_dft && "MTP requires ctx_tgt and ctx_dft to be set");
 
-        n_embd = llama_model_n_embd(llama_get_model(ctx_dft));
+        // The MTP hidden-state I/O width is the *backbone* width, which can differ
+        // from the drafter's internal embedding width (gemma4-assistant: internal
+        // n_embd=256, but it reads/writes target hidden states of width
+        // n_embd_out=1536). Size every embd row against the output width and assert
+        // it matches the target's hidden width that we feed in.
+        n_embd = llama_model_n_embd_out(llama_get_model(ctx_dft));
+        GGML_ASSERT(n_embd == llama_model_n_embd(llama_get_model(ctx_tgt)) &&
+                "MTP input row width must match the target hidden width");
 
         const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
         batch = llama_batch_init(/*n_tokens=*/ n_b, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
