@@ -70,7 +70,8 @@
 #define DIAR_LINEAR0_OUT 128
 #define DIAR_LINEAR1_OUT 128
 #define DIAR_LEAKY_ALPHA 0.01f
-#define DIAR_LSTM_GATE_ORDER "IOFC"
+#define DIAR_GGUF_CONVERTER_EPOCH 2
+#define DIAR_LSTM_GATE_ORDER "IFGO"
 
 /* Cached pointers + buffer struct for one diarizer session. */
 struct voice_diarizer_session {
@@ -197,8 +198,8 @@ static inline float sigmoidf(float x) {
     }
 }
 
-/* One-direction LSTM step. Gates packed in I, O, F, C order (matches the
- * published diarizer GGUF this fork currently ships). `x_dot_W` is the
+/* One-direction LSTM step. Gates packed in I, F, G, O order
+ * (matches the converter's reorder). `x_dot_W` is the
  * pre-computed x @ W_ih^T + b_ih, shape [T, 4H]. */
 static void lstm_run_dir(const float *x_dot_W,
                          int T, int H,
@@ -224,12 +225,11 @@ static void lstm_run_dir(const float *x_dot_W,
             gate_buf[g] = acc;
         }
 
-        /* Apply nonlinearities. Gate order I, O, F, C (ONNX IOFC layout —
-         * pyannote-3 segmentation GGUF, #9460). */
+        /* Apply nonlinearities. Gate order I, F, G, O. */
         const float *gi = gate_buf + 0 * H;
-        const float *go = gate_buf + 1 * H;
-        const float *gf = gate_buf + 2 * H;
-        const float *gg = gate_buf + 3 * H;
+        const float *gf = gate_buf + 1 * H;
+        const float *gg = gate_buf + 2 * H;
+        const float *go = gate_buf + 3 * H;
         for (int j = 0; j < H; ++j) {
             const float i_t = sigmoidf(gi[j]);
             const float f_t = sigmoidf(gf[j]);
@@ -406,11 +406,18 @@ int voice_diarizer_open(const char *gguf, voice_diarizer_handle *out) {
         meta.linear0_out != DIAR_LINEAR0_OUT) return -EINVAL;
     if (meta.linear1_out != 0 &&
         meta.linear1_out != DIAR_LINEAR1_OUT) return -EINVAL;
-    if (meta.lstm_gate_order[0] != '\0' &&
-        strcmp(meta.lstm_gate_order, DIAR_LSTM_GATE_ORDER) != 0) {
+    if (meta.converter_epoch < DIAR_GGUF_CONVERTER_EPOCH) {
         fprintf(stderr,
-                "[voice_diarizer] unsupported LSTM gate order '%s'; this fused reader expects %s\n",
-                meta.lstm_gate_order,
+                "[voice_diarizer] stale GGUF converter epoch %d; need >= %d with LSTM gates packed as %s\n",
+                meta.converter_epoch,
+                DIAR_GGUF_CONVERTER_EPOCH,
+                DIAR_LSTM_GATE_ORDER);
+        return -EINVAL;
+    }
+    if (strcmp(meta.lstm_gate_order, DIAR_LSTM_GATE_ORDER) != 0) {
+        fprintf(stderr,
+                "[voice_diarizer] unsupported LSTM gate order '%s'; expected %s\n",
+                meta.lstm_gate_order[0] ? meta.lstm_gate_order : "<missing>",
                 DIAR_LSTM_GATE_ORDER);
         return -EINVAL;
     }
