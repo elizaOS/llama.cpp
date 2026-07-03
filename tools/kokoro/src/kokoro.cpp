@@ -480,6 +480,10 @@ std::vector<int32_t> kokoro_phonemize(const std::string & text) {
     return phonemize_ascii(text);
 }
 
+kokoro_g2p_kind kokoro_g2p_kind_of_build() noexcept {
+    return espeak_available() ? KOKORO_G2P_ESPEAK : KOKORO_G2P_ASCII;
+}
+
 // ---------------------------------------------------------------------------
 // Synthesis path
 // ---------------------------------------------------------------------------
@@ -501,36 +505,23 @@ std::vector<int32_t> kokoro_phonemize(const std::string & text) {
 // for the next training/inference wave.
 
 
-kokoro_status kokoro_synthesize(
+// Shared synthesis core: takes an already-phonemized, wrapped input-id run
+// ([PAD, *ids, PAD]) and runs the predictor → decoder → 24 kHz PCM path. Both
+// public entries (`kokoro_synthesize` = raw text via kokoro_phonemize,
+// `kokoro_synthesize_ipa` = precomputed espeak IPA via ipa_to_token_ids) funnel
+// here so the two G2P front-ends share one identical back-end. `model`/`voice`
+// are already validated by the caller; this takes the model lock.
+static kokoro_status kokoro_synthesize_from_input_ids(
         const kokoro_model * model,
         const kokoro_voice_preset & voice,
-        const std::string & text,
+        std::vector<int32_t> phonemes,
         float speed_mult,
         kokoro_audio & out,
         std::string & err_out) noexcept {
-    err_out.clear();
-    out.samples.clear();
-    out.sample_rate = 24000;
-
-    if (!model) {
-        err_out = "null model";
-        return KOKORO_E_INVALID_ARG;
-    }
-    if (voice.data.empty() || voice.style_dim <= 0) {
-        err_out = "empty / malformed voice preset";
-        return KOKORO_E_INVALID_ARG;
-    }
-    if (text.empty()) {
-        err_out = "empty text";
-        return KOKORO_E_INVALID_ARG;
-    }
-
     std::lock_guard<std::mutex> lk(const_cast<kokoro_model *>(model)->mu);
 
     out.sample_rate = model->hparams.sample_rate;
 
-    // 1. Phonemize.
-    std::vector<int32_t> phonemes = kokoro_phonemize(text);
     if (phonemes.size() > 510) phonemes.resize(510);
 
     // 2. Slice ref_s — kokoro-onnx uses voice[len(tokens)] where `tokens` is
@@ -624,6 +615,70 @@ kokoro_status kokoro_synthesize(
         return KOKORO_OK;
     }
 
+}
+
+// Shared model/voice validation for both public synthesis entries.
+static kokoro_status kokoro_validate_synth_args(
+        const kokoro_model * model,
+        const kokoro_voice_preset & voice,
+        std::string & err_out) noexcept {
+    if (!model) {
+        err_out = "null model";
+        return KOKORO_E_INVALID_ARG;
+    }
+    if (voice.data.empty() || voice.style_dim <= 0) {
+        err_out = "empty / malformed voice preset";
+        return KOKORO_E_INVALID_ARG;
+    }
+    return KOKORO_OK;
+}
+
+kokoro_status kokoro_synthesize(
+        const kokoro_model * model,
+        const kokoro_voice_preset & voice,
+        const std::string & text,
+        float speed_mult,
+        kokoro_audio & out,
+        std::string & err_out) noexcept {
+    err_out.clear();
+    out.samples.clear();
+    out.sample_rate = 24000;
+
+    kokoro_status vst = kokoro_validate_synth_args(model, voice, err_out);
+    if (vst != KOKORO_OK) return vst;
+    if (text.empty()) {
+        err_out = "empty text";
+        return KOKORO_E_INVALID_ARG;
+    }
+
+    // 1. Phonemize (espeak-ng IPA when linked, else lossy ASCII grapheme map).
+    return kokoro_synthesize_from_input_ids(
+        model, voice, kokoro_phonemize(text), speed_mult, out, err_out);
+}
+
+kokoro_status kokoro_synthesize_ipa(
+        const kokoro_model * model,
+        const kokoro_voice_preset & voice,
+        const std::string & ipa,
+        float speed_mult,
+        kokoro_audio & out,
+        std::string & err_out) noexcept {
+    err_out.clear();
+    out.samples.clear();
+    out.sample_rate = 24000;
+
+    kokoro_status vst = kokoro_validate_synth_args(model, voice, err_out);
+    if (vst != KOKORO_OK) return vst;
+    if (ipa.empty()) {
+        err_out = "empty ipa";
+        return KOKORO_E_INVALID_ARG;
+    }
+
+    // 1. Map the caller-supplied espeak-ng IPA straight to Kokoro vocab ids,
+    //    wrapped as the model input_ids [PAD, *ids, PAD] — no internal G2P.
+    return kokoro_synthesize_from_input_ids(
+        model, voice, wrap_input_ids(ipa_to_token_ids(ipa)), speed_mult, out,
+        err_out);
 }
 
 int kokoro_sample_rate(const kokoro_model * model) noexcept {

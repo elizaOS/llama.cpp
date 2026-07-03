@@ -63,9 +63,12 @@ endif()
 
 # Real G2P via libespeak-ng. When present, kokoro_phonemize() drives
 # espeak_TextToPhonemes() (en-us IPA) and maps codepoints to Kokoro vocab ids,
-# reproducing the reference token sequence. When absent, the build falls back
-# to the degraded ASCII grapheme mapping and the TS layer must supply IPA.
-# Override the search with -DKOKORO_ESPEAK_ROOT=<prefix> (e.g. Homebrew).
+# reproducing the reference token sequence. When absent, the text path falls
+# back to the degraded ASCII grapheme mapping — so an espeak-less build reports
+# `eliza_inference_kokoro_g2p_kind() == ELIZA_KOKORO_G2P_ASCII` and the TS voice
+# layer supplies espeak-ng (WASM) IPA through
+# `eliza_inference_kokoro_synthesize_ipa()` (ABI v14, #11776) to stay
+# intelligible. Override the search with -DKOKORO_ESPEAK_ROOT=<prefix> (Homebrew).
 option(KOKORO_ENABLE_ESPEAK "Link libespeak-ng for real Kokoro G2P" ON)
 if(KOKORO_ENABLE_ESPEAK)
     find_path(ESPEAK_NG_INCLUDE_DIR espeak-ng/speak_lib.h
@@ -80,7 +83,7 @@ if(KOKORO_ENABLE_ESPEAK)
         target_compile_definitions(kokoro_lib PRIVATE KOKORO_USE_ESPEAK)
         message(STATUS "Kokoro G2P: libespeak-ng found (${ESPEAK_NG_LIBRARY}) — real IPA path enabled")
     else()
-        message(STATUS "Kokoro G2P: libespeak-ng not found — falling back to ASCII grapheme mapping (TS layer must supply IPA)")
+        message(STATUS "Kokoro G2P: libespeak-ng not found — ASCII grapheme fallback; g2p_kind() reports ASCII so the TS layer feeds IPA via kokoro_synthesize_ipa (#11776)")
     endif()
 endif()
 
