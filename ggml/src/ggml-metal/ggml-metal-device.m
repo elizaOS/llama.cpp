@@ -922,6 +922,28 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
                 GGML_LOG_ERROR("%s: error: failed to create library\n", __func__);
             }
 
+            // // ELIZA-METAL-BF16-LIBRARY-GATE (#11612)
+            // has_bfloat reflects GPU-family capability, but a precompiled
+            // (embedded) metallib built with MSL < 3.1 has every bf16 kernel
+            // #if'd out (ggml-metal.metal undefs GGML_METAL_HAS_BF16 when
+            // __METAL_VERSION__ < 310). Selecting a bf16 kernel that is not in
+            // the library fails pipeline creation at graph time and the whole
+            // decode fails. Gate has_bfloat on the library actually containing
+            // the bf16 mul_mm kernel so bf16 ops fall back to the CPU backend
+            // via supports_op instead of failing generation.
+            if (dev->props.has_bfloat && dev->library) {
+                id<MTLFunction> bf16_probe = [dev->library->obj newFunctionWithName:@"kernel_mul_mm_bf16_f32"];
+                if (bf16_probe == nil) {
+                    GGML_LOG_WARN("%s: the Metal library does not contain bf16 kernels (compiled with MSL < 3.1?) - disabling bfloat support\n", __func__);
+                    dev->props.has_bfloat = false;
+                } else {
+#if !__has_feature(objc_arc)
+                    [bf16_probe release];
+#endif
+                    bf16_probe = nil;
+                }
+            }
+
             if (dev->props.use_residency_sets) {
                 dev->rsets = ggml_metal_rsets_init();
             } else {
