@@ -121,16 +121,45 @@ kokoro_status kokoro_load_voice_preset(
 // real G2P path (text → en-us IPA → Kokoro vocab ids), reproducing the
 // upstream phonemizer's token sequence. Without libespeak-ng it falls back to
 // a deterministic (lossy) ASCII grapheme mapping; in that case the TS voice
-// layer should phonemize and pass IPA (see kokoro-phonemes.h ipa_to_token_ids).
+// layer should phonemize and pass IPA (see kokoro-phonemes.h ipa_to_token_ids)
+// via `kokoro_synthesize_ipa()`.
 std::vector<int32_t> kokoro_phonemize(const std::string & text);
+
+// Which grapheme→phoneme path this build uses, decided at compile time by
+// whether libespeak-ng was linked (KOKORO_USE_ESPEAK). The caller queries this
+// to decide whether it must supply its own IPA: an ESPEAK build phonemizes raw
+// text correctly inside `kokoro_synthesize`, while an ASCII build only has the
+// lossy grapheme fallback and needs `kokoro_synthesize_ipa` fed with real
+// espeak-ng IPA from the TS layer.
+enum kokoro_g2p_kind {
+    KOKORO_G2P_ASCII  = 0,  // no espeak — text path is lossy; use kokoro_synthesize_ipa
+    KOKORO_G2P_ESPEAK = 1,  // real espeak-ng G2P — kokoro_synthesize(text) is correct
+};
+kokoro_g2p_kind kokoro_g2p_kind_of_build() noexcept;
 
 // Synthesize a single utterance. `text` is the natural-language input,
 // `voice` is the loaded ref_s preset. Output PCM lands in `out`. The
 // `speed_mult` parameter scales the predicted durations (1.0 = native rate).
+// On an ASCII (espeak-less) build the internal grapheme fallback yields
+// speech-shaped but unintelligible audio — use `kokoro_synthesize_ipa` there.
 kokoro_status kokoro_synthesize(
     const kokoro_model * model,
     const kokoro_voice_preset & voice,
     const std::string & text,
+    float speed_mult,
+    kokoro_audio & out,
+    std::string & err_out) noexcept;
+
+// Synthesize from a precomputed espeak-ng IPA string (UTF-8) instead of raw
+// text. The IPA is mapped straight to Kokoro vocab ids via `ipa_to_token_ids`
+// and wrapped as [PAD, *ids, PAD] — bypassing `kokoro_phonemize` entirely, so
+// this is the intelligible path on ASCII (espeak-less) builds where the TS
+// layer runs its own espeak-ng (WASM) phonemizer and passes the IPA in.
+// Identical synthesis contract to `kokoro_synthesize` otherwise.
+kokoro_status kokoro_synthesize_ipa(
+    const kokoro_model * model,
+    const kokoro_voice_preset & voice,
+    const std::string & ipa,
     float speed_mult,
     kokoro_audio & out,
     std::string & err_out) noexcept;

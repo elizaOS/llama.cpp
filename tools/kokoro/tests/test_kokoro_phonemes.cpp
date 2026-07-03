@@ -9,6 +9,7 @@
 // dependency-free.
 
 #include "kokoro-phonemes.h"
+#include "kokoro.h"
 
 #include <cassert>
 #include <cstdio>
@@ -73,6 +74,24 @@ int main() {
         // [PAD, 'h'(50), 'i'(51), PAD]
         const std::vector<int32_t> exp = {KOKORO_PAD_ID, 50, 51, KOKORO_PAD_ID};
         assert(ids == exp);
+    }
+    {
+        // G2P-kind capability query mirrors espeak_available() (ABI v14, #11776).
+        // A build without libespeak-ng must report ASCII so the TS layer knows it
+        // has to feed IPA through kokoro_synthesize_ipa.
+        const kokoro_g2p_kind kind = kokoro_g2p_kind_of_build();
+        assert(kind == (espeak_available() ? KOKORO_G2P_ESPEAK : KOKORO_G2P_ASCII));
+    }
+    {
+        // The IPA-input synthesis path derives its model input_ids as
+        // wrap_input_ids(ipa_to_token_ids(ipa)) — assert the exact wrapped run
+        // the native kokoro_synthesize_ipa entry would feed the model for
+        // "həlˈoʊ".
+        const std::string ipa = "h\xC9\x99l\xCB\x88o\xCA\x8A";
+        std::vector<int32_t> input = wrap_input_ids(ipa_to_token_ids(ipa));
+        const std::vector<int32_t> exp = {
+            KOKORO_PAD_ID, 50, 83, 54, 156, 57, 135, KOKORO_PAD_ID};
+        assert(input == exp);
     }
 
     std::printf("test_kokoro_phonemes: OK\n");
