@@ -43,6 +43,7 @@
 
 #include "kokoro-generator.h"
 #include "kokoro-layers.h"
+#include "kokoro-profile.h"
 
 #include <algorithm>
 #include <cmath>
@@ -245,6 +246,18 @@ void kokoro_generator_forward(
     const float voiced_threshold = 10.0f;
     const float sr = 24000.0f;
 
+    // Phase checkpoints (KOKORO_PROFILE=1): logs the delta since the previous
+    // mark, attributing generator time to source/stft, the two upsample
+    // stages, and conv_post+iSTFT.
+    auto prof_last = std::chrono::steady_clock::now();
+    auto prof_mark = [&prof_last](const char * label) {
+        if (!kokoro_profile_enabled()) return;
+        const auto now = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(now - prof_last).count();
+        std::fprintf(stderr, "[kokoro-profile] %-28s %10.1f ms\n", label, ms);
+        prof_last = now;
+    };
+
     // ------------------------------------------------------------------
     // 1. Harmonic source.  f0_up = nearest-upsample(f0_curve) x300.
     // ------------------------------------------------------------------
@@ -323,6 +336,8 @@ void kokoro_generator_forward(
         if (hf) { hf.read((char *) har.data(), sizeof(float) * har.size()); }
     }
 #endif
+
+    prof_mark("  gen: source+stft");
 
     // ------------------------------------------------------------------
     // 3. Upsample stages.

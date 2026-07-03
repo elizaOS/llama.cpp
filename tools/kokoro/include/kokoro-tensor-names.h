@@ -32,6 +32,7 @@ inline constexpr const char * KOKORO_TENSOR_DURATION_PROJ[] = {
     "kokoro.predictor.duration.weight",
     "predictor.duration_proj.weight",
     "pred.duration_proj.weight",
+    "pred.dur_proj.weight",
     "pred.duration.weight",
     nullptr,
 };

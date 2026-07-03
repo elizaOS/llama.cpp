@@ -1,10 +1,27 @@
 // SPDX-License-Identifier: MIT
 //
 // kokoro-layers.h — small neural-net layer primitives used by the Kokoro
-// predictor + decoder forwards. Plain CPU/scalar implementations — no GGML
-// graph, no backend dispatch. The forward pass is line-for-line matched to
-// the upstream `kokoro` Python package (modules.py + istftnet.py) so the
-// trained weights produce numerically equivalent output.
+// predictor + decoder forwards. No GGML graph / backend dispatch: the forward
+// pass is line-for-line matched to the upstream `kokoro` Python package
+// (modules.py + istftnet.py) so the trained weights produce numerically
+// equivalent output.
+//
+// The O(C^2*K*T) hot loops (Conv1d, ConvTranspose1d, Linear, LSTM gate
+// matvecs) have three implementations, selected at compile time:
+//
+//   1. KOKORO_USE_ACCELERATE (Apple): Accelerate BLAS (im2col + sgemm /
+//      sgemv, AMX-backed) — same math, same fp32 accumulation, ~2 orders
+//      of magnitude faster than the scalar loops on M-series.
+//   2. KOKORO_USE_PORTABLE_FAST (everything else): a small internal
+//      std::thread pool parallelizes over output channels / gate rows, and
+//      the innermost MAC loops run branch-free AXPY/dot kernels — NEON
+//      (vfmaq_f32) on aarch64, plain auto-vectorizable loops elsewhere.
+//      Thread count: min(hardware_concurrency, 16), override with
+//      KOKORO_NUM_THREADS.
+//   3. Pure scalar reference: define KOKORO_FORCE_SCALAR to compile only
+//      the readable single-threaded loops (the numerical reference the
+//      other two paths are validated against). Define KOKORO_NO_ACCELERATE
+//      to take path 2 on Apple (used by the layer parity test).
 //
 // Tensor convention (matches PyTorch Conv1d / Linear):
 //   - 1D feature maps: `[C, T]` (channel-major, time-minor).
@@ -22,7 +39,179 @@
 #include <cstring>
 #include <vector>
 
+#if defined(__APPLE__) && !defined(KOKORO_NO_ACCELERATE) && !defined(KOKORO_FORCE_SCALAR)
+#define KOKORO_USE_ACCELERATE 1
+#if !defined(ACCELERATE_NEW_LAPACK)
+#define ACCELERATE_NEW_LAPACK
+#endif
+#include <Accelerate/Accelerate.h>
+#elif !defined(KOKORO_FORCE_SCALAR)
+#define KOKORO_USE_PORTABLE_FAST 1
+#include <atomic>
+#include <condition_variable>
+#include <cstdlib>
+#include <functional>
+#include <mutex>
+#include <thread>
+#if defined(__aarch64__) || defined(_M_ARM64)
+#define KOKORO_USE_NEON 1
+#include <arm_neon.h>
+#endif
+#endif
+
 namespace eliza_kokoro {
+
+#if defined(KOKORO_USE_PORTABLE_FAST)
+namespace detail {
+
+inline int kokoro_thread_count() {
+    static const int n = [] {
+        if (const char * e = std::getenv("KOKORO_NUM_THREADS")) {
+            const int v = std::atoi(e);
+            if (v >= 1) return v < 64 ? v : 64;
+        }
+        const unsigned hc = std::thread::hardware_concurrency();
+        const unsigned capped = hc == 0 ? 4u : (hc > 16u ? 16u : hc);
+        return (int) capped;
+    }();
+    return n;
+}
+
+// Tiny persistent thread pool. One pool per process (lazy singleton), no
+// nested parallelism (callers below are all top-level layer forwards).
+// Work items are claimed with an atomic counter; the calling thread
+// participates, so a 1-thread pool degrades to the serial loop.
+class KokoroThreadPool {
+public:
+    static KokoroThreadPool & instance() {
+        static KokoroThreadPool pool(kokoro_thread_count() - 1);
+        return pool;
+    }
+
+    // Runs fn(i) for every i in [0, n). Blocks until all items are done.
+    void parallel_for(int n, const std::function<void(int)> & fn) {
+        if (n <= 0) return;
+        if (workers_.empty() || n == 1) {
+            for (int i = 0; i < n; ++i) fn(i);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            task_ = &fn;
+            n_ = n;
+            next_.store(0, std::memory_order_relaxed);
+            pending_ = (int) workers_.size();
+            ++generation_;
+        }
+        cv_.notify_all();
+        run_chunks();
+        std::unique_lock<std::mutex> lock(m_);
+        done_cv_.wait(lock, [&] { return pending_ == 0; });
+        task_ = nullptr;
+    }
+
+private:
+    explicit KokoroThreadPool(int n_workers) {
+        for (int i = 0; i < n_workers; ++i) {
+            workers_.emplace_back([this] { worker_loop(); });
+        }
+    }
+    ~KokoroThreadPool() {
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            stop_ = true;
+            ++generation_;
+        }
+        cv_.notify_all();
+        for (auto & t : workers_) t.join();
+    }
+
+    void run_chunks() {
+        const std::function<void(int)> * task = task_;
+        const int n = n_;
+        for (;;) {
+            const int i = next_.fetch_add(1, std::memory_order_relaxed);
+            if (i >= n) break;
+            (*task)(i);
+        }
+    }
+
+    void worker_loop() {
+        uint64_t seen = 0;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lock(m_);
+                cv_.wait(lock, [&] { return stop_ || generation_ != seen; });
+                if (stop_) return;
+                seen = generation_;
+            }
+            run_chunks();
+            {
+                std::lock_guard<std::mutex> lock(m_);
+                if (--pending_ == 0) done_cv_.notify_one();
+            }
+        }
+    }
+
+    std::vector<std::thread> workers_;
+    std::mutex m_;
+    std::condition_variable cv_, done_cv_;
+    const std::function<void(int)> * task_ = nullptr;
+    std::atomic<int> next_{0};
+    int n_ = 0;
+    int pending_ = 0;
+    uint64_t generation_ = 0;
+    bool stop_ = false;
+};
+
+// Below this many MACs the pool dispatch overhead outweighs the win.
+constexpr size_t KOKORO_PARALLEL_MIN_MACS = 1u << 18;  // 256k
+
+inline void kokoro_parallel_for(size_t total_macs, int n, const std::function<void(int)> & fn) {
+    if (total_macs < KOKORO_PARALLEL_MIN_MACS) {
+        for (int i = 0; i < n; ++i) fn(i);
+        return;
+    }
+    KokoroThreadPool::instance().parallel_for(n, fn);
+}
+
+// dot(a, b, n) — innermost MAC of Linear / LSTM gate rows.
+inline float kokoro_dot_f32(const float * a, const float * b, int n) {
+#if defined(KOKORO_USE_NEON)
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        acc0 = vfmaq_f32(acc0, vld1q_f32(a + i),     vld1q_f32(b + i));
+        acc1 = vfmaq_f32(acc1, vld1q_f32(a + i + 4), vld1q_f32(b + i + 4));
+    }
+    float acc = vaddvq_f32(vaddq_f32(acc0, acc1));
+    for (; i < n; ++i) acc += a[i] * b[i];
+    return acc;
+#else
+    float acc = 0.0f;
+    for (int i = 0; i < n; ++i) acc += a[i] * b[i];
+    return acc;
+#endif
+}
+
+// y[i] += a * x[i] — innermost MAC of the (transposed) conv time loops.
+inline void kokoro_axpy_f32(float a, const float * x, float * y, int n) {
+#if defined(KOKORO_USE_NEON)
+    const float32x4_t av = vdupq_n_f32(a);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        vst1q_f32(y + i,     vfmaq_f32(vld1q_f32(y + i),     av, vld1q_f32(x + i)));
+        vst1q_f32(y + i + 4, vfmaq_f32(vld1q_f32(y + i + 4), av, vld1q_f32(x + i + 4)));
+    }
+    for (; i < n; ++i) y[i] += a * x[i];
+#else
+    for (int i = 0; i < n; ++i) y[i] += a * x[i];
+#endif
+}
+
+} // namespace detail
+#endif // KOKORO_USE_PORTABLE_FAST
 
 // =================================================================
 // Tensor (lightweight host tensor — view or owned)
@@ -50,12 +239,27 @@ inline void linear_forward(
         const float * x, int in_dim,
         const float * W, const float * b, int out_dim,
         float * y) {
+#if defined(KOKORO_USE_ACCELERATE)
+    float beta = 0.0f;
+    if (b) {
+        std::memcpy(y, b, sizeof(float) * (size_t) out_dim);
+        beta = 1.0f;
+    }
+    cblas_sgemv(CblasRowMajor, CblasNoTrans, out_dim, in_dim,
+                1.0f, W, in_dim, x, 1, beta, y, 1);
+#elif defined(KOKORO_USE_PORTABLE_FAST)
+    detail::kokoro_parallel_for((size_t) out_dim * in_dim, out_dim, [&](int i) {
+        y[i] = (b ? b[i] : 0.0f) +
+               detail::kokoro_dot_f32(W + (size_t) i * in_dim, x, in_dim);
+    });
+#else
     for (int i = 0; i < out_dim; ++i) {
         float acc = b ? b[i] : 0.0f;
         const float * w = W + i * in_dim;
         for (int j = 0; j < in_dim; ++j) acc += w[j] * x[j];
         y[i] = acc;
     }
+#endif
 }
 
 // =================================================================
@@ -70,6 +274,78 @@ inline void conv1d_forward(
         const float * W, const float * b, int Cout, int K,
         int stride, int pad, int dilation,
         float * y, int T_out) {
+#if defined(KOKORO_USE_ACCELERATE)
+    // im2col + one SGEMM. The PyTorch weight layout [Cout, Cin, K] is already
+    // a row-major [Cout, Cin*K] GEMM operand; the column matrix is
+    // [Cin*K, T_out] with zero padding baked in, so
+    //   y[Cout, T_out] = W · cols (+ bias).
+    std::vector<float> cols((size_t) Cin * K * T_out, 0.0f);
+    for (int ci = 0; ci < Cin; ++ci) {
+        const float * xi = x + (size_t) ci * T;
+        for (int k = 0; k < K; ++k) {
+            float * col = cols.data() + ((size_t) ci * K + k) * T_out;
+            const int t_off = k * dilation - pad;  // ti = to*stride + t_off
+            // valid `to` range keeping ti within [0, T)
+            int to_lo = 0;
+            if (t_off < 0) to_lo = (-t_off + stride - 1) / stride;
+            int to_hi = (T - 1 - t_off) / stride;  // inclusive
+            if (to_hi > T_out - 1) to_hi = T_out - 1;
+            if (to_lo > to_hi) continue;
+            if (stride == 1) {
+                std::memcpy(col + to_lo, xi + (to_lo + t_off),
+                            sizeof(float) * (size_t) (to_hi - to_lo + 1));
+            } else {
+                for (int to = to_lo; to <= to_hi; ++to) {
+                    col[to] = xi[to * stride + t_off];
+                }
+            }
+        }
+    }
+    float beta = 0.0f;
+    if (b) {
+        for (int co = 0; co < Cout; ++co) {
+            float * yc = y + (size_t) co * T_out;
+            for (int to = 0; to < T_out; ++to) yc[to] = b[co];
+        }
+        beta = 1.0f;
+    }
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                Cout, T_out, Cin * K,
+                1.0f, W, Cin * K, cols.data(), T_out,
+                beta, y, T_out);
+#elif defined(KOKORO_USE_PORTABLE_FAST)
+    // Parallel over output channels (each thread owns disjoint y rows), and
+    // per (ci, k) tap a branch-free AXPY over the valid `to` range — the
+    // per-element bounds check of the reference loop is hoisted into the
+    // range computation (same trick as the Accelerate im2col above).
+    const size_t total_macs = (size_t) Cout * T_out * Cin * K;
+    detail::kokoro_parallel_for(total_macs, Cout, [&](int co) {
+        float * yc = y + (size_t) co * T_out;
+        const float bias_v = b ? b[co] : 0.0f;
+        for (int to = 0; to < T_out; ++to) yc[to] = bias_v;
+        for (int ci = 0; ci < Cin; ++ci) {
+            const float * w  = W + (((size_t) co) * Cin + ci) * K;
+            const float * xi = x + (size_t) ci * T;
+            for (int k = 0; k < K; ++k) {
+                const int t_off = k * dilation - pad;  // ti = to*stride + t_off
+                int to_lo = 0;
+                if (t_off < 0) to_lo = (-t_off + stride - 1) / stride;
+                int to_hi = (T - 1 - t_off) / stride;  // inclusive
+                if (to_hi > T_out - 1) to_hi = T_out - 1;
+                if (to_lo > to_hi) continue;
+                if (stride == 1) {
+                    detail::kokoro_axpy_f32(w[k], xi + (to_lo + t_off),
+                                            yc + to_lo, to_hi - to_lo + 1);
+                } else {
+                    const float wv = w[k];
+                    for (int to = to_lo; to <= to_hi; ++to) {
+                        yc[to] += wv * xi[to * stride + t_off];
+                    }
+                }
+            }
+        }
+    });
+#else
     for (int co = 0; co < Cout; ++co) {
         const float bias_v = b ? b[co] : 0.0f;
         for (int to = 0; to < T_out; ++to) {
@@ -86,6 +362,7 @@ inline void conv1d_forward(
             y[(size_t)co * T_out + to] = acc;
         }
     }
+#endif
 }
 
 // =================================================================
@@ -158,6 +435,67 @@ inline void convtranspose1d_forward(
             for (int to = 0; to < T_out; ++to) yc[to] += b[co];
         }
     }
+#if defined(KOKORO_USE_ACCELERATE)
+    // One SGEMM + col2im scatter. Viewing W [Cin, Cout, K] as a row-major
+    // [Cin, Cout*K] operand:
+    //   tmp[Cout*K, T] = W^T · x[Cin, T]
+    // then tmp[co*K + k, t_in] scatters into y[co, t_in*stride - pad + k].
+    std::vector<float> tmp((size_t) Cout * K * T);
+    cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                Cout * K, T, Cin,
+                1.0f, W, Cout * K, x, T,
+                0.0f, tmp.data(), T);
+    for (int co = 0; co < Cout; ++co) {
+        float * yc = y + (size_t) co * T_out;
+        for (int k = 0; k < K; ++k) {
+            const float * row = tmp.data() + ((size_t) co * K + k) * T;
+            const int t_off = k - pad;  // to = t_in*stride + t_off
+            for (int t_in = 0; t_in < T; ++t_in) {
+                const int to = t_in * stride + t_off;
+                if (to >= 0 && to < T_out) yc[to] += row[t_in];
+            }
+        }
+    }
+#elif defined(KOKORO_USE_PORTABLE_FAST)
+    // Parallel over output channels (each thread scatters into disjoint y
+    // rows — no races). Two branch-free AXPY shapes, valid ranges hoisted
+    // out of the inner loop:
+    //   stride == 1: per (ci, k) tap, AXPY over the contiguous `to` run.
+    //   stride  > 1: per (ci, t_in) sample, AXPY over the contiguous K taps
+    //                (y[t_in*stride - pad ..] and w[0..K) are both contiguous).
+    const size_t total_macs = (size_t) Cin * T * Cout * K;
+    detail::kokoro_parallel_for(total_macs, Cout, [&](int co) {
+        float * yc = y + (size_t) co * T_out;
+        for (int ci = 0; ci < Cin; ++ci) {
+            const float * w  = W + (((size_t) ci) * Cout + co) * K;
+            const float * xi = x + (size_t) ci * T;
+            if (stride == 1) {
+                for (int k = 0; k < K; ++k) {
+                    const int t_off = k - pad;  // to = t_in + t_off
+                    int t_in_lo = t_off < 0 ? -t_off : 0;
+                    int t_in_hi = T_out - 1 - t_off;  // inclusive
+                    if (t_in_hi > T - 1) t_in_hi = T - 1;
+                    if (t_in_lo > t_in_hi) continue;
+                    detail::kokoro_axpy_f32(w[k], xi + t_in_lo,
+                                            yc + (t_in_lo + t_off),
+                                            t_in_hi - t_in_lo + 1);
+                }
+            } else {
+                for (int t_in = 0; t_in < T; ++t_in) {
+                    const float xv = xi[t_in];
+                    if (xv == 0.0f) continue;
+                    const int base = t_in * stride - pad;  // to = base + k
+                    int k_lo = base < 0 ? -base : 0;
+                    int k_hi = K - 1;  // inclusive
+                    if (k_hi > T_out - 1 - base) k_hi = T_out - 1 - base;
+                    if (k_lo > k_hi) continue;
+                    detail::kokoro_axpy_f32(xv, w + k_lo, yc + (base + k_lo),
+                                            k_hi - k_lo + 1);
+                }
+            }
+        }
+    });
+#else
     for (int ci = 0; ci < Cin; ++ci) {
         const float * xi = x + (size_t)ci * T;
         for (int t_in = 0; t_in < T; ++t_in) {
@@ -173,6 +511,7 @@ inline void convtranspose1d_forward(
             }
         }
     }
+#endif
 }
 
 // Depthwise transpose (groups == Cin == Cout). Used by AdainResBlk1d pool.
@@ -263,6 +602,25 @@ inline void lstm_cell_step(
         float * h_out, float * c_out,
         float * gates_scratch /* [4H] */ ) {
     // gates = W_ih @ x + b_ih + W_hh @ h_prev + b_hh
+#if defined(KOKORO_USE_ACCELERATE)
+    for (int g = 0; g < 4 * H; ++g) {
+        gates_scratch[g] = (b_ih ? b_ih[g] : 0.0f) + (b_hh ? b_hh[g] : 0.0f);
+    }
+    cblas_sgemv(CblasRowMajor, CblasNoTrans, 4 * H, I,
+                1.0f, W_ih, I, x, 1, 1.0f, gates_scratch, 1);
+    cblas_sgemv(CblasRowMajor, CblasNoTrans, 4 * H, H,
+                1.0f, W_hh, H, h_prev, 1, 1.0f, gates_scratch, 1);
+#elif defined(KOKORO_USE_PORTABLE_FAST)
+    // Parallel over gate rows; each row is two NEON/scalar dots. The MAC
+    // threshold keeps small cells (per-step sequential LSTM) off the pool.
+    const size_t total_macs = (size_t) 4 * H * (I + H);
+    detail::kokoro_parallel_for(total_macs, 4 * H, [&](int g) {
+        gates_scratch[g] =
+            (b_ih ? b_ih[g] : 0.0f) + (b_hh ? b_hh[g] : 0.0f) +
+            detail::kokoro_dot_f32(W_ih + (size_t) g * I, x, I) +
+            detail::kokoro_dot_f32(W_hh + (size_t) g * H, h_prev, H);
+    });
+#else
     for (int g = 0; g < 4 * H; ++g) {
         float acc = (b_ih ? b_ih[g] : 0.0f) + (b_hh ? b_hh[g] : 0.0f);
         const float * w_ih_row = W_ih + (size_t)g * I;
@@ -271,6 +629,7 @@ inline void lstm_cell_step(
         for (int j = 0; j < H; ++j) acc += w_hh_row[j] * h_prev[j];
         gates_scratch[g] = acc;
     }
+#endif
     // Split into i, f, g, o; apply sigmoid/tanh.
     auto sigmoid = [](float v){ return 1.0f / (1.0f + std::exp(-v)); };
     for (int j = 0; j < H; ++j) {

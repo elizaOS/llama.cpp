@@ -23,6 +23,10 @@ struct llama_memory_params {
     bool swa_full;
 
     llama_context_type ctx_type;
+
+    // sibling memory whose KV cache is shared per-layer (gemma4-assistant MTP
+    // drafter shares KV with the target). null for all other arches.
+    llama_memory_t mem_other;
 };
 
 enum llama_memory_status {
@@ -75,6 +79,10 @@ struct llama_memory_i {
     // this callback is used to specify which layers should reuse memory from other layers
     // return negative value to indicate that the layer il should not reuse memory
     using layer_reuse_cb = std::function<int32_t(int32_t il)>;
+
+    // this callback is used to specify which layer of the sibling (mem_other) cache
+    // a given layer should share its KV with. return negative to indicate no sharing.
+    using layer_share_cb = std::function<int32_t(int32_t il)>;
 
     virtual ~llama_memory_i() = default;
 

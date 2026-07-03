@@ -8,6 +8,7 @@
 #include "kokoro-decoder.h"
 #include "kokoro-decoder-front.h"   // DecoderFrontWeights, DecAdainResBlk, decoder_front
 #include "kokoro-generator.h"       // GeneratorWeights, kokoro_generator_forward
+#include "kokoro-profile.h"
 
 #include "ggml.h"
 
@@ -127,14 +128,20 @@ bool kokoro_decoder_forward(
 
     // --- run: decoder_front -> generator ---
     std::vector<float> x, F0_down, N_down;
-    decoder_front(W, asr_ct, /*Cin_asr*/512, T_frame, F0, N, ref_s_dec, x, F0_down, N_down);
+    {
+        kokoro_phase_timer t("decoder front");
+        decoder_front(W, asr_ct, /*Cin_asr*/512, T_frame, F0, N, ref_s_dec, x, F0_down, N_down);
+    }
 
     const int T0 = 2 * T_frame;  // decoder_front upsamples T_frame -> 2*T_frame
     if ((int) (x.size() / 512) != T0) {
         err = "decoder_front output width mismatch";
         return false;
     }
-    kokoro_generator_forward(x.data(), T0, ref_s_dec, F0, G, audio);
+    {
+        kokoro_phase_timer t("generator (iSTFTNet)");
+        kokoro_generator_forward(x.data(), T0, ref_s_dec, F0, G, audio);
+    }
     return true;
 }
 

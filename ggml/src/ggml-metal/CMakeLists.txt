@@ -69,8 +69,14 @@ if (GGML_METAL_EMBED_LIBRARY)
         # bfloat-typed kernels (e.g. kernel_get_rows_bf16, kernel_mul_mv_bf16_*,
         # kernel_flash_attn_ext_bf16_*) are emitted into default.metallib. The
         # runtime gates kernel lookup on the device's actual has_bfloat property
-        # via supports_op, and ggml-metal.metal auto-undefs the macro when
-        # __METAL_VERSION__ < 310, so this is safe for older Metal targets too.
+        # via supports_op. CAUTION (#11612): ggml-metal.metal auto-undefs the
+        # macro when __METAL_VERSION__ < 310, so a GGML_METAL_STD below metal3.1
+        # silently drops every bf16 kernel from the metallib while bf16-capable
+        # GPUs still select them — pass -std=metal3.1 (or newer) for any device
+        # target that can report has_bfloat. The runtime additionally probes the
+        # loaded library for kernel_mul_mm_bf16_f32 (ggml-metal-device.m,
+        # ELIZA-METAL-BF16-LIBRARY-GATE) and downgrades has_bfloat to a CPU
+        # fallback if the kernels are absent.
         COMMAND xcrun -sdk ${METAL_SDK} metal ${XC_FLAGS} -DGGML_METAL_EMBED_LIBRARY=1 -DGGML_METAL_HAS_BF16=1 -c "${METALLIB_SOURCE_EMBED}" -o "${METALLIB_EMBED_AIR}"
         COMMAND xcrun -sdk ${METAL_SDK} metal ${XC_FLAGS} -c ${CMAKE_CURRENT_SOURCE_DIR}/eliza-shipped/turbo3.metal -o ${CMAKE_CURRENT_BINARY_DIR}/turbo3.air
         COMMAND xcrun -sdk ${METAL_SDK} metal ${XC_FLAGS} -c ${CMAKE_CURRENT_SOURCE_DIR}/eliza-shipped/turbo4.metal -o ${CMAKE_CURRENT_BINARY_DIR}/turbo4.air

@@ -89,11 +89,15 @@ llama_kv_cache::llama_kv_cache(
                  uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
+           llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
+    const  layer_share_cb & share,
                  uint32_t   kv_size_max) :
     model(model), hparams(model.hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
+
+    other = static_cast<llama_kv_cache *>(mem_other);
 
     // save construction parameters for dynamic resize
     saved_type_k     = type_k;
@@ -192,6 +196,23 @@ llama_kv_cache::llama_kv_cache(
         if (filter && !filter(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: filtered\n", __func__, il);
             continue;
+        }
+
+        if (share && other) {
+            const int32_t il_share = share(il);
+
+            if (il_share >= 0) {
+                const auto & layer_share = other->layers[other->map_layer_ids[il_share]];
+
+                LLAMA_LOG_DEBUG("%s: layer %3d: sharing with sibling layer %d\n", __func__, il, il_share);
+
+                map_layer_ids[il] = layers.size();
+
+                layers.push_back(layer_share);
+                layers.back().il = il;
+
+                continue;
+            }
         }
 
         if (n_embd_head_k_all == 0) {
@@ -1196,7 +1217,8 @@ bool llama_kv_cache::try_resize() {
     // NOTE: pass kv_size_max=0 so the constructor does NOT apply
     //       the dynamic start logic (which would shrink back to 256)
     llama_kv_cache tmp(model, saved_type_k, saved_type_v, saved_v_trans, saved_offload, saved_unified, new_size,
-                       saved_n_seq_max, saved_n_pad, saved_n_swa, saved_swa_type, saved_filter, saved_reuse,
+                       saved_n_seq_max, saved_n_pad, saved_n_swa, saved_swa_type,
+                       /*mem_other=*/nullptr, saved_filter, saved_reuse, /*share=*/nullptr,
                        /*kv_size_max=*/0);
 
     // copy existing data

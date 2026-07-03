@@ -32,6 +32,7 @@
 #include "kokoro-phonemes.h"
 #include "kokoro-predictor.h"
 #include "kokoro-decoder.h"
+#include "kokoro-profile.h"
 #include "kokoro-tensor-names.h"
 
 #include "ggml.h"
@@ -594,10 +595,14 @@ kokoro_status kokoro_synthesize(
     //    consumes the decoder-half ref_s[:128] (both passed as the same 256-d
     //    ref_s pointer — each half indexes its own slice internally).
     {
+        kokoro_phase_timer synth_timer("synthesize total");
         PredictorOut pred;
-        if (!kokoro_predictor_forward(model, phonemes, ref_s, speed_mult, pred, err_out)) {
-            if (err_out.empty()) err_out = "predictor forward failed";
-            return KOKORO_E_RUNTIME;
+        {
+            kokoro_phase_timer t("predictor forward");
+            if (!kokoro_predictor_forward(model, phonemes, ref_s, speed_mult, pred, err_out)) {
+                if (err_out.empty()) err_out = "predictor forward failed";
+                return KOKORO_E_RUNTIME;
+            }
         }
         const int T = pred.T_frame;
         if (T <= 0 || (int) pred.asr.size() != T * 512) {
@@ -614,11 +619,14 @@ kokoro_status kokoro_synthesize(
             }
         }
 
-        if (!kokoro_decoder_forward(model, asr_ct.data(), T,
-                                    pred.F0_pred.data(), pred.N_pred.data(),
-                                    ref_s, out.samples, err_out)) {
-            if (err_out.empty()) err_out = "decoder forward failed";
-            return KOKORO_E_RUNTIME;
+        {
+            kokoro_phase_timer t("decoder forward");
+            if (!kokoro_decoder_forward(model, asr_ct.data(), T,
+                                        pred.F0_pred.data(), pred.N_pred.data(),
+                                        ref_s, out.samples, err_out)) {
+                if (err_out.empty()) err_out = "decoder forward failed";
+                return KOKORO_E_RUNTIME;
+            }
         }
         return KOKORO_OK;
     }

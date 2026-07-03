@@ -8102,6 +8102,42 @@ class Gemma4Model(Gemma3Model):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
+@ModelBase.register("Gemma4AssistantForCausalLM")
+class Gemma4AssistantModel(Gemma4Model):
+    """Gemma-4 assistant MTP drafter head (HF model_type "gemma4_assistant").
+
+    A small Q-only drafter (4 layers for E2B) that at runtime shares the target
+    Gemma-4 backbone's KV cache and token embeddings via ctx_other (llama.cpp
+    arch "gemma4-assistant"). Its internal width is text_config.hidden_size
+    (256 for E2B) while the pre/post projections read and write target hidden
+    states of width backbone_hidden_size (1536 for E2B), which is recorded as
+    embedding_length_out.
+    """
+    model_arch = gguf.MODEL_ARCH.GEMMA4_ASSISTANT
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        # llama.cpp requires embedding_length_out to carry the target backbone
+        # hidden size (must differ from the drafter's own embedding_length)
+        self.gguf_writer.add_embedding_length_out(self.hparams["backbone_hidden_size"])
+
+        # the whole model is a single MTP block; llama_init_from_model rejects
+        # LLAMA_CONTEXT_TYPE_MTP when nextn_predict_layers == 0
+        self.gguf_writer.add_nextn_predict_layers(1)
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, _ = item
+
+        # centroid/ordering tables for the HF ordered-embedding lookup;
+        # unused by the llama.cpp gemma4-assistant graph
+        if name.startswith("masked_embedding."):
+            return None
+
+        return super().filter_tensors(item)
+
+
 @ModelBase.register("Gemma4ForConditionalGeneration")
 class Gemma4VisionAudioModel(MmprojModel):
     has_audio_encoder = True

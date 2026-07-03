@@ -392,6 +392,12 @@ extern "C" {
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
         struct llama_sampler_seq_config * samplers;
         size_t                            n_samplers;
+
+        // sibling context whose model supplies shared inputs / KV cache.
+        // required for arches that read from another model (gemma4-assistant MTP
+        // drafter reads the target model's token embeddings and shares its KV).
+        // null for all other arches. (the caller keeps this context alive.)
+        struct llama_context * ctx_other;
     };
 
     struct llama_model_tensor_override {
@@ -551,7 +557,8 @@ extern "C" {
 
     DEPRECATED(LLAMA_API int32_t llama_n_vocab    (const struct llama_vocab * vocab), "use llama_vocab_n_tokens instead");
 
-    LLAMA_API const struct llama_model * llama_get_model   (const struct llama_context * ctx);
+    LLAMA_API const struct llama_model * llama_get_model    (const struct llama_context * ctx);
+    LLAMA_API       struct llama_context * llama_get_ctx_other(struct llama_context * ctx);
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
 

@@ -387,6 +387,46 @@ if(TARGET mtmd)
             "LINKER:-reexport_library,$<TARGET_FILE:llama>")
     endif()
     add_dependencies(elizainference omnivoice-version)
+
+    # Static variant for the mobile / iOS XCFramework slice. The mtp build
+    # (build-llama-cpp-mtp.mjs) builds BUILD_SHARED_LIBS=OFF and links the slice
+    # statically into LlamaCpp.xcframework — it builds `elizainference_static`
+    # BY NAME and collects libelizainference.a alongside the separately-built
+    # libllama.a / libmtmd.a / libkokoro_lib.a. A static archive carries only the
+    # FFI + core OBJECTS; the dependency archives' objects merge at the app's
+    # final link, so we record usage requirements (include dirs, ELIZA_ENABLE_*
+    # defines, the `if(TARGET kokoro_lib)` Kokoro fold) but do NOT reexport a
+    # library (that is a SHARED-only link option).
+    add_library(elizainference_static STATIC
+        ${OMNIVOICE_CORE_SOURCES}
+        ${OMNIVOICE_FFI_SOURCES})
+    target_compile_features(elizainference_static PUBLIC cxx_std_17)
+    target_compile_definitions(elizainference_static
+        PRIVATE OMNIVOICE_BUILD ${OMNIVOICE_COMPILE_DEFINITIONS})
+    if(ELIZA_ENABLE_VISION)
+        target_compile_definitions(elizainference_static PRIVATE ELIZA_ENABLE_VISION)
+    endif()
+    target_include_directories(elizainference_static PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_BINARY_DIR}
+        ${OMNIVOICE_LLAMA_PRIVATE_INCLUDE_DIRS})
+    target_include_directories(elizainference_static PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../mtmd
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../common)
+    target_link_libraries(elizainference_static PUBLIC llama mtmd)
+    target_link_libraries(elizainference_static PRIVATE eliza_voice_classifiers llama-common)
+    if(TARGET kokoro_lib)
+        target_link_libraries(elizainference_static PRIVATE kokoro_lib)
+        target_include_directories(elizainference_static PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../kokoro/include)
+        target_compile_definitions(elizainference_static PRIVATE ELIZA_ENABLE_KOKORO)
+    endif()
+    set_target_properties(elizainference_static PROPERTIES
+        OUTPUT_NAME              elizainference
+        POSITION_INDEPENDENT_CODE ON)
+    add_dependencies(elizainference_static omnivoice-version)
 endif()
 
 # llama-server wiring — mount the OmniVoice POST /v1/audio/speech route
@@ -445,6 +485,26 @@ target_include_directories(omnivoice-test-abi-c PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(omnivoice-test-abi-c PRIVATE omnivoice_lib)
+
+# omnivoice-test-diarizer-metadata : metadata-only GGUF contract test for the
+# vendored diarizer reader. It writes tiny GGUF files, so it does not need the
+# pyannote model artifact.
+add_executable(omnivoice-test-diarizer-metadata tests/diarizer-metadata.c)
+set_target_properties(omnivoice-test-diarizer-metadata PROPERTIES
+    C_STANDARD 99
+    C_STANDARD_REQUIRED ON
+    C_EXTENSIONS ON)
+if(MSVC)
+    target_compile_options(omnivoice-test-diarizer-metadata PRIVATE /W4 /WX)
+else()
+    target_compile_options(omnivoice-test-diarizer-metadata PRIVATE -Wall -Werror -pedantic)
+endif()
+target_include_directories(omnivoice-test-diarizer-metadata PRIVATE
+    ${OMNIVOICE_VOICE_CLASSIFIER_INCLUDE_DIRS})
+target_link_libraries(omnivoice-test-diarizer-metadata PRIVATE eliza_voice_classifiers)
+if(BUILD_TESTING)
+    add_test(NAME omnivoice-test-diarizer-metadata COMMAND omnivoice-test-diarizer-metadata)
+endif()
 
 # omnivoice-dac-parity : focused CPU numerical parity harness for
 # dac_conv_t1d's ggml_conv_transpose_1d migration (elizaOS/eliza#7660).
