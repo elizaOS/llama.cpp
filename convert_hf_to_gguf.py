@@ -8102,6 +8102,25 @@ class Gemma4Model(Gemma3Model):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
+@ModelBase.register("Gemma4UnifiedForConditionalGeneration")
+class Gemma4UnifiedModel(Gemma4Model):
+    """Gemma-4 "unified" dense text backbone (HF model_type "gemma4_unified",
+    text sub-config "gemma4_unified_text"; classes E2B/E4B ship as
+    Gemma4ForConditionalGeneration while the dense 12B/31B tiers ship as
+    Gemma4UnifiedForConditionalGeneration).
+
+    The unified text tower is the SAME dense graph as Gemma4Model: SWA/full
+    5:1 layer pattern, dual head dims (global 512 / swa 256), proportional
+    RoPE on the full layers, shared-KV/PLE both disabled (num_kv_shared_layers
+    == 0, hidden_size_per_layer_input == 0), no MoE (enable_moe_block False).
+    ModelBase merges `text_config` to the root hparams (see load_hparams), so
+    Gemma4Model.set_gguf_parameters/generate_extra_tensors read the right
+    values unchanged. Only the HF architecture name differs, hence this thin
+    registration."""
+
+    model_arch = gguf.MODEL_ARCH.GEMMA4
+
+
 @ModelBase.register("Gemma4AssistantForCausalLM")
 class Gemma4AssistantModel(Gemma4Model):
     """Gemma-4 assistant MTP drafter head (HF model_type "gemma4_assistant").
