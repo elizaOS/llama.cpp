@@ -1,5 +1,5 @@
 /*
- * libelizainference FFI ABI v12.
+ * libelizainference FFI ABI v14.
  *
  * (Banner tracks ELIZA_INFERENCE_ABI_VERSION below; the per-version history is
  * at the end of this header preamble, newest first.)
@@ -134,6 +134,24 @@ extern "C" {
  * load and refuses to bind if they disagree.
  *
  * Changelog:
+ *   v14: Kokoro IPA input + G2P-kind capability query.
+ *        `eliza_inference_kokoro_g2p_kind()` reports whether the linked
+ *        kokoro_lib phonemizes raw text with real espeak-ng
+ *        (ELIZA_KOKORO_G2P_ESPEAK) or only the lossy per-byte ASCII fallback
+ *        (ELIZA_KOKORO_G2P_ASCII). `eliza_inference_kokoro_synthesize_ipa()`
+ *        takes precomputed espeak-ng IPA and routes it through the fixed Kokoro
+ *        vocab (`ipa_to_token_ids`), bypassing the in-lib phonemizer — the
+ *        intelligible path for espeak-less Android / iOS / host builds, fed by
+ *        the TS espeak-ng-WASM phonemizer (#11776). Before this, an espeak-less
+ *        fused build phonemized raw text with the ASCII grapheme fallback and
+ *        produced speech-shaped but unintelligible audio on every mobile build
+ *        and any host without libespeak-ng. Additive symbols — a v12/v13 caller
+ *        is unaffected; a library that predates this surface reports the symbols
+ *        absent and the loader falls back to the raw-text path.
+ *        NOTE ON NUMBERING: v13 (token-by-token vision describe) is the
+ *        main-lineage vision surface. This develop-pinned lineage (fork-sync
+ *        #11386) advances 12 -> 14 for the Kokoro IPA surface so the two
+ *        independent bumps stay collision-free through reconciliation.
  *   v12: ASR word timestamps folded into the fused ASR.
  *        `eliza_inference_asr_timestamps_supported()` + `_asr_transcribe_timed`
  *        run the SAME audio-in/text-out decode as `_asr_transcribe` and
@@ -203,9 +221,9 @@ extern "C" {
  *   v7: real Silero VAD (same symbol surface as v6).
  *   v6: fused wake-word, speaker, diarizer.
  */
-#define ELIZA_INFERENCE_ABI_VERSION 12
+#define ELIZA_INFERENCE_ABI_VERSION 14
 
-/* Returns a static, NUL-terminated string of the form "12" matching
+/* Returns a static, NUL-terminated string of the form "14" matching
  * ELIZA_INFERENCE_ABI_VERSION at the time the library was built. The
  * pointer is owned by the library — do NOT free. */
 const char * eliza_inference_abi_version(void);
@@ -390,6 +408,37 @@ int eliza_inference_kokoro_synthesize(
 /* The loaded Kokoro model's audio sample rate (24000 for v1.0), or a
  * negative ELIZA_* code if no Kokoro model is loaded. */
 int eliza_inference_kokoro_sample_rate(EliInferenceContext * ctx);
+
+/* ---- Kokoro G2P kind + IPA synthesis (ABI v14) -------------------- *
+ *
+ * Which grapheme->phoneme path the linked kokoro_lib uses, so the TS voice
+ * layer can decide whether it must pre-phonemize:
+ *   ELIZA_KOKORO_G2P_ESPEAK (1): the lib links libespeak-ng and phonemizes raw
+ *       text correctly inside `eliza_inference_kokoro_synthesize` — pass text.
+ *   ELIZA_KOKORO_G2P_ASCII (0): the lib has NO espeak; the text path uses the
+ *       lossy per-byte ASCII grapheme fallback (unintelligible). The caller MUST
+ *       run its own espeak-ng G2P and call
+ *       `eliza_inference_kokoro_synthesize_ipa` with the IPA instead.
+ * This is a build property (independent of any loaded model); `ctx` is accepted
+ * for API symmetry. Returns a negative ELIZA_* code on a non-Kokoro build. */
+#define ELIZA_KOKORO_G2P_ASCII  0
+#define ELIZA_KOKORO_G2P_ESPEAK 1
+int eliza_inference_kokoro_g2p_kind(EliInferenceContext * ctx);
+
+/* Synthesize from precomputed espeak-ng IPA (UTF-8) instead of raw text: the
+ * IPA is mapped straight to Kokoro vocab ids (`ipa_to_token_ids`), bypassing the
+ * in-lib phonemizer. This is the intelligible path on espeak-less builds
+ * (Android / iOS / host-without-libespeak) — the TS layer runs the espeak-ng
+ * WASM phonemizer and passes the IPA here. Same return contract as
+ * `eliza_inference_kokoro_synthesize`. */
+int eliza_inference_kokoro_synthesize_ipa(
+    EliInferenceContext * ctx,
+    const char * ipa,
+    size_t ipa_len,
+    float speed,
+    float * out_pcm,
+    size_t max_samples,
+    char ** out_error);
 
 /* ---- OmniVoice reference encode (ABI v4) -------------------------- *
  *

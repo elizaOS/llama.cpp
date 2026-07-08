@@ -6,6 +6,7 @@
 //     -L /opt/homebrew/lib -lespeak-ng -o /tmp/t && /tmp/t
 
 #include "kokoro-phonemes.h"
+#include "kokoro.h"
 
 #include <cstdio>
 #include <string>
@@ -30,6 +31,21 @@ int main() {
     printf("phoneme_vocab_size: %d\n\n", phoneme_vocab_size());
 
     int fails = 0;
+
+    // G2P-kind capability (ABI v14, #11776): a build that links libespeak-ng
+    // must report ESPEAK so the TS layer keeps sending raw text; without it the
+    // build reports ASCII and the TS layer feeds IPA via kokoro_synthesize_ipa.
+    {
+        const kokoro_g2p_kind kind = kokoro_g2p_kind_of_build();
+        const kokoro_g2p_kind want =
+            espeak_available() ? KOKORO_G2P_ESPEAK : KOKORO_G2P_ASCII;
+        const bool ok = kind == want;
+        printf("g2p_kind_of_build: %s (want %s): %s\n",
+               kind == KOKORO_G2P_ESPEAK ? "espeak" : "ascii",
+               want == KOKORO_G2P_ESPEAK ? "espeak" : "ascii",
+               ok ? "PASS" : "FAIL");
+        if (!ok) ++fails;
+    }
 
     // Reference case (from reference-ids.json).
     {
