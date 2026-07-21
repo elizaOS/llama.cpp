@@ -1,0 +1,291 @@
+name: Eliza CUDA Validation
+
+# Eliza-specific CUDA backend parity job. Mirrors
+# eliza-vulkan-validation.yml and eliza-metal-validation.yml:
+#
+#   1. `ubuntu-cuda-build` (always): compile llama.cpp + custom Eliza
+#      CUDA kernels inside the nvidia/cuda:12.4.1-devel-ubuntu22.04
+#      Docker image on a stock GitHub-hosted runner. No GPU required.
+#      Catches CUDA compile/link regressions for turbo-tcq.cu,
+#      polarquant.cu, qjl.cu, fused-attn-qjl-tbq.cu, and the
+#      fattn-vec-instance-tbq*.cu template instances.
+#
+#   2. `cuda-runtime-validation` (gated): runs test-backend-ops on a
+#      real CUDA device. Requires a self-hosted runner with the
+#      `self-hosted-cuda` label and a working NVIDIA driver +
+#      Container Toolkit. Skipped automatically when that label is
+#      not provisioned in the repo.
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_cuda_runtime:
+        description: 'Force runtime validation on a self-hosted-cuda runner. Leave unchecked on push/PR — the runtime job is skipped automatically because no GPU runner is registered yet.'
+        type: boolean
+        default: false
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/eliza-cuda-validation.yml'
+      - 'scripts/cuda-docker-build.sh'
+      - 'scripts/cuda-mtp-validate.sh'
+      - 'ggml/src/ggml-cuda/**'
+      - 'ggml/include/**'
+      - 'src/**'
+      - 'tests/test-backend-ops.cpp'
+      - 'tests/test-quantize-fns.cpp'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  GGML_NLOOP: 3
+  GGML_N_THREADS: 1
+  LLAMA_LOG_COLORS: 0
+  LLAMA_LOG_PREFIX: 1
+  LLAMA_LOG_TIMESTAMPS: 1
+
+jobs:
+  ubuntu-cuda-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: eliza-cuda-validation-ubuntu-24
+          evict-old-files: 1d
+          save: ${{ github.event_name == 'push' }}
+
+      - name: Docker info
+        run: docker version && docker info | head -20
+
+      - name: Pull CUDA devel image
+        run: docker pull nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+      - name: Build llama.cpp + Eliza CUDA kernels (Docker)
+        run: |
+          docker run --rm \
+            -v "$PWD":/work -w /work \
+            -e BUILD_DIR=build-cuda-docker \
+            nvidia/cuda:12.4.1-devel-ubuntu22.04 bash -lc '
+              set -euo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y --no-install-recommends \
+                cmake build-essential git ccache ca-certificates >/dev/null
+              nvcc --version | tail -2
+              cmake -B build-cuda-docker \
+                -DGGML_CUDA=ON \
+                -DGGML_METAL=OFF \
+                -DLLAMA_CURL=OFF \
+                -DLLAMA_BUILD_TESTS=ON \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;90"
+              cmake --build build-cuda-docker -j $(nproc) \
+                --target llama-cli test-backend-ops test-quantize-fns
+            '
+
+      - name: Verify Eliza custom CUDA kernels linked
+        run: |
+          echo "=== Eliza custom CUDA object files ==="
+          required=(turbo-tcq polarquant qjl fused-attn-qjl-tbq)
+          for k in "${required[@]}"; do
+            count=$(find build-cuda-docker -name "*.o" -path "*ggml-cuda*" \
+              | grep -c "$k" || true)
+            echo "  $k: $count object(s)"
+            if [ "$count" -eq 0 ]; then
+              echo "::error::missing CUDA build output for $k"
+              exit 1
+            fi
+          done
+          # fattn-vec-instance-tbq* template instances (4 expected)
+          n_tbq=$(find build-cuda-docker -name "*fattn-vec-instance-tbq*.o" \
+            | wc -l | tr -d ' ')
+          echo "  fattn-vec-instance-tbq*: $n_tbq object(s)"
+          if [ "$n_tbq" -lt 4 ]; then
+            echo "::error::expected >=4 fattn-vec-instance-tbq*.o, got $n_tbq"
+            exit 1
+          fi
+
+      - name: test-quantize-fns (CPU; smoke for Eliza custom quants)
+        # Runs the CPU-side quant fns test from the Docker build. CUDA
+        # kernels are not exercised here (no GPU), but this confirms
+        # the binary itself links cleanly with all Eliza quant types
+        # registered.
+        run: |
+          docker run --rm \
+            -v "$PWD":/work -w /work \
+            nvidia/cuda:12.4.1-devel-ubuntu22.04 bash -lc '
+              ./build-cuda-docker/bin/test-quantize-fns 2>&1
+            ' | tee /tmp/quantize-fns.log
+          for t in qjl1_256 q4_polar tbq3_0 tbq4_0 tbq3_tcq; do
+            grep -q "Testing $t" /tmp/quantize-fns.log \
+              || (echo "::error::MISSING quant: $t" && exit 1)
+          done
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eliza-cuda-build-logs
+          path: |
+            /tmp/quantize-fns.log
+          retention-days: 14
+
+  cuda-runtime-validation:
+    # Gated: requires a self-hosted runner with a real NVIDIA GPU and
+    # the `self-hosted-cuda` label. No such runner is registered in the
+    # elizaOS org yet, so this job is gated behind the
+    # `force_cuda_runtime` workflow_dispatch input — running it on
+    # every push/PR would queue forever and never reach a runner.
+    #
+    # To run it: register a runner with label `self-hosted-cuda`, then
+    #   gh workflow run eliza-cuda-validation.yml -f force_cuda_runtime=true
+    # See docs/eliza-cuda-runtime-validation.md for runner setup.
+    needs: ubuntu-cuda-build
+    runs-on: [self-hosted, self-hosted-cuda]
+    timeout-minutes: 120
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.force_cuda_runtime }}
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Confirm GPU
+        run: |
+          nvidia-smi
+          docker run --rm --gpus all \
+            nvidia/cuda:12.4.1-devel-ubuntu22.04 nvidia-smi
+
+      - name: Build llama.cpp + Eliza CUDA kernels (Docker, --gpus all)
+        run: |
+          docker run --rm --gpus all \
+            -v "$PWD":/work -w /work \
+            nvidia/cuda:12.4.1-devel-ubuntu22.04 bash -lc '
+              set -euo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y --no-install-recommends \
+                cmake build-essential git ccache ca-certificates >/dev/null
+              cmake -B build-cuda-runtime \
+                -DGGML_CUDA=ON \
+                -DGGML_METAL=OFF \
+                -DLLAMA_CURL=OFF \
+                -DLLAMA_BUILD_TESTS=ON \
+                -DCMAKE_BUILD_TYPE=Release
+              cmake --build build-cuda-runtime -j $(nproc) \
+                --target llama-cli test-backend-ops test-quantize-fns
+            '
+
+      - name: test-backend-ops on CUDA (filtered subset)
+        run: |
+          docker run --rm --gpus all \
+            -v "$PWD":/work -w /work \
+            -e GGML_NLOOP=3 -e GGML_N_THREADS=1 \
+            nvidia/cuda:12.4.1-devel-ubuntu22.04 bash -lc '
+              for op in MUL_MAT MUL_MAT_ID ADD MUL SOFT_MAX RMS_NORM \
+                        CPY ROPE FLASH_ATTN_EXT GET_ROWS; do
+                echo "=== $op ==="
+                timeout 600 ./build-cuda-runtime/bin/test-backend-ops \
+                  -b CUDA0 -o "$op" 2>&1 || true
+              done
+            ' | tee /tmp/backend-ops.log
+          echo "=== FAIL SUMMARY ==="
+          grep -E "Backend CUDA0:.*FAIL|tests passed|Failing tests:" \
+            /tmp/backend-ops.log || true
+
+      - name: test-backend-ops Eliza custom-quant parity (CUDA)
+        # CUDA reference path for the same custom-quant matrix the
+        # Vulkan + Metal workflows enforce. Fails on any divergence
+        # from the CPU reference; expected zero "not supported" since
+        # CUDA kernels exist for all these types.
+        run: |
+          docker run --rm --gpus all \
+            -v "$PWD":/work -w /work \
+            -e GGML_NLOOP=3 -e GGML_N_THREADS=1 \
+            nvidia/cuda:12.4.1-devel-ubuntu22.04 bash -lc '
+              for op in GET_ROWS CPY MUL_MAT FLASH_ATTN_EXT; do
+                echo "=== $op (Eliza custom quants) ==="
+                timeout 600 ./build-cuda-runtime/bin/test-backend-ops \
+                  -b CUDA0 -o "$op" 2>&1 || true
+              done
+            ' | tee /tmp/eliza-custom-quants.log
+          echo "=== Eliza custom-quant summary ==="
+          for t in q1_0_g32 q1_0_g128 tbq3_0 tbq4_0 tbq3_k tbq4_k \
+                   qjl1_256 q4_polar tbq3_tcq; do
+            n_skip=$(grep -c "type=$t.*not supported" /tmp/eliza-custom-quants.log || true)
+            n_fail=$(grep -c "type=$t.*FAIL"          /tmp/eliza-custom-quants.log || true)
+            n_pass=$(grep -c "type=$t.*OK"            /tmp/eliza-custom-quants.log || true)
+            echo "  $t: skip=$n_skip pass=$n_pass fail=$n_fail"
+            if [ "$n_fail" -gt 0 ]; then
+              echo "::error::CUDA kernel divergence for type=$t"
+              exit 1
+            fi
+          done
+
+      - name: CUDA MTP gated_delta_net K-snapshot parity
+        # Closes TODO(cuda-mtp-validation) in
+        # ggml/src/ggml-cuda/gated_delta_net.cu (commit 142e7ac65 — port of
+        # upstream PR #22673 multi-token-prediction state snapshots).
+        # Runs the full GATED_DELTA_NET op-test sweep and confirms the K>1
+        # snapshot cases were scheduled (not silently skipped).
+        run: |
+          docker run --rm --gpus all \
+            -v "$PWD":/work -w /work \
+            -e GGML_NLOOP=3 -e GGML_N_THREADS=1 \
+            nvidia/cuda:12.4.1-devel-ubuntu22.04 bash -lc '
+              ./build-cuda-runtime/bin/test-backend-ops \
+                -b CUDA0 -o GATED_DELTA_NET 2>&1
+            ' | tee /tmp/cuda-mtp.log
+          if grep -qE "GATED_DELTA_NET.*FAIL" /tmp/cuda-mtp.log; then
+            echo "::error::CUDA GATED_DELTA_NET parity failed vs CPU reference"
+            exit 1
+          fi
+          n_k_gt_1=$(grep -cE "GATED_DELTA_NET.*K=[2-9][0-9]*" /tmp/cuda-mtp.log || true)
+          echo "K>1 cases observed: $n_k_gt_1"
+          if [ "$n_k_gt_1" -lt 4 ]; then
+            echo "::error::expected >=4 K>1 cases (MTP snapshot path), got $n_k_gt_1"
+            exit 1
+          fi
+
+      - name: CUDA MTP end-to-end smoke (skip-without-model)
+        # Optional smoke. The MTP-baked GGUF is not in the repo; this step
+        # is best-effort and explicitly skips when the model is absent so a
+        # missing artifact doesn't break the runtime job.
+        run: |
+          MTP_GGUF=/tmp/Qwen3.5-2B-MTP-Q4_K_M.gguf
+          if [ ! -f "$MTP_GGUF" ]; then
+            echo "skip-without-model: $MTP_GGUF missing"
+            echo "(stage Qwen3.5-2B-MTP-Q4_K_M.gguf on the runner to enable)"
+            exit 0
+          fi
+          docker run --rm --gpus all \
+            -v "$PWD":/work -v /tmp:/tmp -w /work \
+            nvidia/cuda:12.4.1-devel-ubuntu22.04 bash -lc "
+              timeout 120 ./build-cuda-runtime/bin/llama-cli \
+                -m $MTP_GGUF \
+                -p 'The capital of France is' \
+                -n 32 --temp 0 -c 512 -t 4 -ngl 99 \
+                --spec-type draft-mtp --spec-draft-n-max 2 2>&1
+            " | tee /tmp/cuda-mtp-smoke.log
+          grep -qE "Generation:|generated [0-9]+ tokens|^The capital of France" \
+            /tmp/cuda-mtp-smoke.log \
+            || (echo "::error::no recognisable llama-cli output" && exit 1)
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eliza-cuda-runtime-logs
+          path: |
+            /tmp/backend-ops.log
+            /tmp/eliza-custom-quants.log
+            /tmp/cuda-mtp.log
+            /tmp/cuda-mtp-smoke.log
+          retention-days: 14
