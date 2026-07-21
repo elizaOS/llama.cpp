@@ -419,13 +419,6 @@ static bool arch_supported(const llm_arch arch) {
         return false;
     }
 
-    // FIXME some models are segfaulting with WebGPU:
-#ifdef GGML_USE_WEBGPU
-    if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_KIMI_LINEAR) {
-        return false;
-    }
-#endif // GGML_USE_WEBGPU
-
     return true;
 }
 
