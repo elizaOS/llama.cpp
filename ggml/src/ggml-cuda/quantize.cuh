@@ -21,17 +21,6 @@ void quantize_row_q8_1_cuda(
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
-template<int q8_1_layout_block_size>
-void quantize_row_q8_1_layout_cuda(
-        const float * x, const int32_t * ids, void * vy,
-        ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
-        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
-
-extern template void quantize_row_q8_1_layout_cuda<4 * QK8_1>(
-        const float * x, const int32_t * ids, void * vy,
-        ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
-        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
-
 void quantize_mmq_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy,
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
@@ -50,3 +39,28 @@ void quantize_mmq_fp4_cuda(const float *   x,
                              int64_t         ne2,
                              int64_t         ne3,
                              cudaStream_t    stream);
+
+// quantize each token once and scatter the block to its compact rows (via the inverse map)
+void quantize_scatter_mmq_fp4_cuda(const float *   x,
+                                   const int32_t * ids_src1_inv,
+                                   void *          vy,
+                                   ggml_type       type_src0,
+                                   int64_t         ne00,
+                                   int64_t         stride_token,
+                                   int64_t         ne0,
+                                   int64_t         n_tokens,
+                                   int64_t         nrows_dst,
+                                   int             n_expert_used,
+                                   cudaStream_t    stream);
+
+void quantize_scatter_mmq_q8_1_cuda(const float *   x,
+                                    const int32_t * ids_src1_inv,
+                                    void *          vy,
+                                    ggml_type       type_src0,
+                                    int64_t         ne00,
+                                    int64_t         stride_token,
+                                    int64_t         ne0,
+                                    int64_t         n_tokens,
+                                    int64_t         nrows_dst,
+                                    int             n_expert_used,
+                                    cudaStream_t    stream);

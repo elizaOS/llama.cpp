@@ -45,43 +45,7 @@ void quantize_row_q8_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
 
     block_q8_0 * GGML_RESTRICT y = vy;
 
-#if defined(__ARM_FEATURE_SVE)
-    const int sve_register_length = svcntb() * 8;
-    const int ggml_f32_epr = sve_register_length / 32;
-    const svfloat32_t inactive1 = svdup_n_f32(0.0f);
-    const svbool_t pg = svptrue_b32();
-    svfloat32_t zero = svdup_f32(0.0f);
-    svfloat32_t half = svdup_f32(0.5f);
-
-    for (int i = 0; i < nb; i+=1) {
-        svfloat32_t srcv1, asrcv1;
-        svfloat32_t sv_max = svdup_n_f32(0.0f);
-        float32_t amax = 0.0;
-
-        for (int j = 0; j < QK8_0; j+=ggml_f32_epr) {
-            srcv1  = svld1_f32(pg, x + i*32 + j);
-            asrcv1 = svabs_f32_m(inactive1, pg, srcv1);
-            sv_max = svmax_f32_m(pg, sv_max, asrcv1);
-        }
-        amax = svmaxv_f32(pg, sv_max);
-        float32_t d = amax / ((1 << 7) - 1);
-        float32_t id = d ? 1.0f/d : 0.0f;
-        y[i].d = GGML_FP32_TO_FP16(d);
-        for (int j = 0; j < QK8_0; j+=ggml_f32_epr) {
-            srcv1  = svld1_f32(pg, x + i*32 + j);
-            const svfloat32_t v1  = svmul_n_f32_m(pg, srcv1, id);
-
-            svbool_t ge_zero = svcmpge_f32(pg, v1, zero);
-            svfloat32_t v_pos = svadd_f32_m(pg, v1, half);
-            svfloat32_t v_neg = svsub_f32_m(pg, v1, half);
-
-            svfloat32_t v_rounded = svsel_f32(ge_zero, v_pos, v_neg);
-            svint32_t result = svcvt_s32_f32_x(pg, v_rounded);
-            svst1b_s32(pg, &y[i].qs[j], result);
-        }
-    }
-
-#elif defined(__ARM_NEON)
+#if defined(__ARM_NEON)
     for (int i = 0; i < nb; i++) {
         float32x4_t srcv [8];
         float32x4_t asrcv[8];
@@ -255,9 +219,8 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
-// milady Q1_0_g32: 32-element blocks (enum=200) — ARM NEON version
-void ggml_vec_dot_q1_0_g32_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
-    const int qk = QK1_0_g32;  // 32
+void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK2_0;
     const int nb = n / qk;
 
     assert(n % qk == 0);
@@ -267,124 +230,69 @@ void ggml_vec_dot_q1_0_g32_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const
     UNUSED(by);
     UNUSED(bs);
 
-    const block_q1_0_g32 * GGML_RESTRICT x = vx;
+    const block_q2_0 * GGML_RESTRICT x = vx;
     const block_q8_0 * GGML_RESTRICT y = vy;
 
-#if defined(__ARM_NEON)
-    float32x4_t sumv = vdupq_n_f32(0.0f);
-
-    for (int i = 0; i < nb; i++) {
-        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
-        const float d1 = GGML_CPU_FP16_TO_FP32(y[i].d);
-
-        const uint8_t * bits = x[i].qs;
-
-        const int8x16_t y0 = vld1q_s8(y[i].qs);
-        const int8x16_t y1 = vld1q_s8(y[i].qs + 16);
-
-        const uint64_t expand0 = table_b2b_0[bits[0]];
-        const uint64_t expand1 = table_b2b_0[bits[1]];
-        const uint64_t expand2 = table_b2b_0[bits[2]];
-        const uint64_t expand3 = table_b2b_0[bits[3]];
-
-        uint8x8_t e0 = vcreate_u8(expand0);
-        uint8x8_t e1 = vcreate_u8(expand1);
-        uint8x8_t e2 = vcreate_u8(expand2);
-        uint8x8_t e3 = vcreate_u8(expand3);
-
-        int8x8_t s0 = vreinterpret_s8_u8(vshr_n_u8(e0, 4));
-        int8x8_t s1 = vreinterpret_s8_u8(vshr_n_u8(e1, 4));
-        int8x8_t s2 = vreinterpret_s8_u8(vshr_n_u8(e2, 4));
-        int8x8_t s3 = vreinterpret_s8_u8(vshr_n_u8(e3, 4));
-
-        int8x8_t one = vdup_n_s8(1);
-        s0 = vsub_s8(vadd_s8(s0, s0), one);
-        s1 = vsub_s8(vadd_s8(s1, s1), one);
-        s2 = vsub_s8(vadd_s8(s2, s2), one);
-        s3 = vsub_s8(vadd_s8(s3, s3), one);
-
-        int8x16_t signs0 = vcombine_s8(s0, s1);
-        int8x16_t signs1 = vcombine_s8(s2, s3);
-
-        int32x4_t p0 = ggml_vdotq_s32(vdupq_n_s32(0), signs0, y0);
-        int32x4_t p1 = ggml_vdotq_s32(p0, signs1, y1);
-
-        sumv = vmlaq_n_f32(sumv, vcvtq_f32_s32(p1), d0 * d1);
-    }
-
-    *s = vaddvq_f32(sumv);
-#else
-    ggml_vec_dot_q1_0_g32_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
-#endif
-}
-
-// milady Q1_0_g128: 128-element blocks (enum=201) — ARM NEON version
-void ggml_vec_dot_q1_0_g128_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
-    const int qk = QK1_0_g128;  // 128
-    const int nb = n / qk;
-
-    assert(n % qk == 0);
-    assert(nrc == 1);
-    UNUSED(nrc);
-    UNUSED(bx);
-    UNUSED(by);
-    UNUSED(bs);
-
-    const block_q1_0_g128 * GGML_RESTRICT x = vx;
-    const block_q8_0 * GGML_RESTRICT y = vy;
+    float sumf = 0.0f;
 
 #if defined(__ARM_NEON)
+    // Replicate pattern: each byte repeated 4 times
+    static const uint8_t tbl_idx_lo[16] = {0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3};
+    static const uint8_t tbl_idx_hi[16] = {4,4,4,4, 5,5,5,5, 6,6,6,6, 7,7,7,7};
+    // Right-shift amounts: 0,2,4,6 repeated for each group of 4
+    static const int8_t shift_vals[16] = {0,-2,-4,-6, 0,-2,-4,-6, 0,-2,-4,-6, 0,-2,-4,-6};
+
+    const uint8x16_t idx_lo  = vld1q_u8(tbl_idx_lo);
+    const uint8x16_t idx_hi  = vld1q_u8(tbl_idx_hi);
+    const int8x16_t  shifts  = vld1q_s8(shift_vals);
+    const uint8x16_t mask2   = vdupq_n_u8(0x03);
+    const int8x16_t  one     = vdupq_n_s8(1);
+
     float32x4_t sumv = vdupq_n_f32(0.0f);
 
     for (int i = 0; i < nb; i++) {
         const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
 
-        for (int k = 0; k < 4; k++) {
-            const block_q8_0 * GGML_RESTRICT yb = &y[i * 4 + k];
+        // group 64: one Q2_0 block (64 weights) maps to two Q8_0 blocks (2 * 32 = 64)
+        for (int k = 0; k < 2; k++) {
+            const block_q8_0 * GGML_RESTRICT yb = &y[i * 2 + k];
             const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
 
-            const uint8_t * bits = &x[i].qs[k * 4];
+            // Load 8 bytes of packed 2-bit values
+            const uint8x8_t raw = vld1_u8(&x[i].qs[k * 8]);
+            const uint8x16_t raw16 = vcombine_u8(raw, raw);
 
+            // First 16 elements: replicate bytes 0-3, shift, mask, subtract 1
+            uint8x16_t bytes0 = ggml_vqtbl1q_u8(raw16, idx_lo);
+            int8x16_t qv0 = vsubq_s8(
+                vreinterpretq_s8_u8(vandq_u8(vshlq_u8(bytes0, shifts), mask2)),
+                one);
+
+            // Second 16 elements: replicate bytes 4-7, shift, mask, subtract 1
+            uint8x16_t bytes1 = ggml_vqtbl1q_u8(raw16, idx_hi);
+            int8x16_t qv1 = vsubq_s8(
+                vreinterpretq_s8_u8(vandq_u8(vshlq_u8(bytes1, shifts), mask2)),
+                one);
+
+            // Load Q8_0 values and dot product
             const int8x16_t y0 = vld1q_s8(yb->qs);
             const int8x16_t y1 = vld1q_s8(yb->qs + 16);
 
-            const uint64_t expand0 = table_b2b_0[bits[0]];
-            const uint64_t expand1 = table_b2b_0[bits[1]];
-            const uint64_t expand2 = table_b2b_0[bits[2]];
-            const uint64_t expand3 = table_b2b_0[bits[3]];
-
-            uint8x8_t e0 = vcreate_u8(expand0);
-            uint8x8_t e1 = vcreate_u8(expand1);
-            uint8x8_t e2 = vcreate_u8(expand2);
-            uint8x8_t e3 = vcreate_u8(expand3);
-
-            int8x8_t s0 = vreinterpret_s8_u8(vshr_n_u8(e0, 4));
-            int8x8_t s1 = vreinterpret_s8_u8(vshr_n_u8(e1, 4));
-            int8x8_t s2 = vreinterpret_s8_u8(vshr_n_u8(e2, 4));
-            int8x8_t s3 = vreinterpret_s8_u8(vshr_n_u8(e3, 4));
-
-            int8x8_t one = vdup_n_s8(1);
-            s0 = vsub_s8(vadd_s8(s0, s0), one);
-            s1 = vsub_s8(vadd_s8(s1, s1), one);
-            s2 = vsub_s8(vadd_s8(s2, s2), one);
-            s3 = vsub_s8(vadd_s8(s3, s3), one);
-
-            int8x16_t signs0 = vcombine_s8(s0, s1);
-            int8x16_t signs1 = vcombine_s8(s2, s3);
-
-            int32x4_t p0 = ggml_vdotq_s32(vdupq_n_s32(0), signs0, y0);
-            int32x4_t p1 = ggml_vdotq_s32(p0, signs1, y1);
+            int32x4_t p0 = ggml_vdotq_s32(vdupq_n_s32(0), qv0, y0);
+            int32x4_t p1 = ggml_vdotq_s32(p0, qv1, y1);
 
             sumv = vmlaq_n_f32(sumv, vcvtq_f32_s32(p1), d0 * d1);
         }
     }
 
-    *s = vaddvq_f32(sumv);
+    sumf = vaddvq_f32(sumv);
 #else
-    ggml_vec_dot_q1_0_g128_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+    ggml_vec_dot_q2_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+    return;
 #endif
-}
 
+    *s = sumf;
+}
 
 void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
@@ -855,111 +763,7 @@ void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     int ib = 0;
     float sumf = 0;
 
-#if defined(__ARM_FEATURE_SVE)
-    svfloat32_t sumv0 = svdup_n_f32(0.0f);
-    svfloat32_t sumv1 = svdup_n_f32(0.0f);
-
-    const int vector_length = ggml_cpu_get_sve_cnt() * 8;
-    const svbool_t ph16 = svptrue_pat_b8(SV_VL16);
-    // load LUT
-    svint8_t lut = svld1_s8(ph16, kvalues_mxfp4);
-
-    switch (vector_length) {
-        case 128:
-            {
-                const svbool_t ph4 = svptrue_pat_b32(SV_VL4);
-
-                for (; ib + 1 < nb; ib += 2) {
-                    const block_mxfp4 * GGML_RESTRICT x0 = &x[ib + 0];
-                    const block_mxfp4 * GGML_RESTRICT x1 = &x[ib + 1];
-                    const block_q8_0  * GGML_RESTRICT y0 = &y[ib + 0];
-                    const block_q8_0  * GGML_RESTRICT y1 = &y[ib + 1];
-
-                    // load x
-                    const svuint8_t qx0r = svld1rq_u8(ph16, x0->qs);
-                    const svuint8_t qx1r = svld1rq_u8(ph16, x1->qs);
-
-                    // extract nibble
-                    const svuint8_t idx0l = svand_n_u8_m(ph16, qx0r, 0x0F);
-                    const svuint8_t idx0h = svlsr_n_u8_m(ph16, qx0r, 0x04);
-                    const svuint8_t idx1l = svand_n_u8_m(ph16, qx1r, 0x0F);
-                    const svuint8_t idx1h = svlsr_n_u8_m(ph16, qx1r, 0x04);
-
-                    // 4-bit -> 8-bit
-                    const svint8_t qx0l = svtbl_s8(lut, idx0l);
-                    const svint8_t qx0h = svtbl_s8(lut, idx0h);
-                    const svint8_t qx1l = svtbl_s8(lut, idx1l);
-                    const svint8_t qx1h = svtbl_s8(lut, idx1h);
-
-                    // load y
-                    const svint8_t qy0h = svld1_s8(ph16, (const int8_t *) (y0->qs));
-                    const svint8_t qy0l = svld1_s8(ph16, (const int8_t *) (y0->qs + 16));
-                    const svint8_t qy1h = svld1_s8(ph16, (const int8_t *) (y1->qs));
-                    const svint8_t qy1l = svld1_s8(ph16, (const int8_t *) (y1->qs + 16));
-
-                    // dot product
-                    const svint32_t dot0 = svdot_s32(
-                        svdot_s32(svdup_n_s32(0), qx0l, qy0h),
-                        qx0h, qy0l
-                    );
-                    const svint32_t dot1 = svdot_s32(
-                        svdot_s32(svdup_n_s32(0), qx1l, qy1h),
-                        qx1h, qy1l
-                    );
-
-                    sumv0 = svmla_n_f32_x(ph4, sumv0,
-                        svcvt_f32_s32_x(ph4, dot0), GGML_CPU_FP16_TO_FP32(y0->d) * GGML_E8M0_TO_FP32_HALF(x0->e));
-                    sumv1 = svmla_n_f32_x(ph4, sumv1,
-                        svcvt_f32_s32_x(ph4, dot1), GGML_CPU_FP16_TO_FP32(y1->d) * GGML_E8M0_TO_FP32_HALF(x1->e));
-                }
-                sumf = svaddv_f32(svptrue_b32(), svadd_f32_x(svptrue_b32(), sumv0, sumv1));
-            } break;
-        case 256:
-        case 512:
-            {
-                const svbool_t ph32 = svptrue_pat_b8(SV_VL32);
-                const svbool_t pl16 = svnot_b_z(ph32, ph16);
-
-                for (; ib + 1 < nb; ib += 2) {
-                    const block_mxfp4 * GGML_RESTRICT x0 = &x[ib + 0];
-                    const block_mxfp4 * GGML_RESTRICT x1 = &x[ib + 1];
-                    const block_q8_0  * GGML_RESTRICT y0 = &y[ib + 0];
-                    const block_q8_0  * GGML_RESTRICT y1 = &y[ib + 1];
-
-                    // load x
-                    const svuint8_t qx0r = svld1rq_u8(ph32, x0->qs);
-                    const svuint8_t qx1r = svld1rq_u8(ph32, x1->qs);
-
-                    // extract nibble
-                    const svuint8_t idx0 = svlsr_n_u8_m(pl16, svand_n_u8_m(ph16, qx0r, 0x0F), 0x04);
-                    const svuint8_t idx1 = svlsr_n_u8_m(pl16, svand_n_u8_m(ph16, qx1r, 0x0F), 0x04);
-
-                    // 4-bit -> 8-bit
-                    const svint8_t qx0 = svtbl_s8(lut, idx0);
-                    const svint8_t qx1 = svtbl_s8(lut, idx1);
-
-                    // load y
-                    const svint8_t qy0 = svld1_s8(ph32, y0->qs);
-                    const svint8_t qy1 = svld1_s8(ph32, y1->qs);
-
-                    // dot product
-                    const svint32_t dot0 = svdot_s32(svdup_n_s32(0), qx0, qy0);
-                    const svint32_t dot1 = svdot_s32(svdup_n_s32(0), qx1, qy1);
-
-                    sumv0 = svmla_n_f32_x(ph32, sumv0,
-                        svcvt_f32_s32_x(ph32, dot0), GGML_CPU_FP16_TO_FP32(y0->d) * GGML_E8M0_TO_FP32_HALF(x0->e));
-                    sumv1 = svmla_n_f32_x(ph32, sumv1,
-                        svcvt_f32_s32_x(ph32, dot1), GGML_CPU_FP16_TO_FP32(y1->d) * GGML_E8M0_TO_FP32_HALF(x1->e));
-                }
-                sumf = svaddv_f32(ph32, svadd_f32_x(ph32, sumv0, sumv1));
-            } break;
-
-        default:
-            assert(false && "Unsupported vector length");
-            break;
-    }
-
-#elif defined (__ARM_NEON)
+#if defined __ARM_NEON
     const int8x16_t values = vld1q_s8(kvalues_mxfp4);
     const uint8x16_t m4b = vdupq_n_u8(0x0f);
     uint8x16x2_t q4bits;
@@ -1082,10 +886,10 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
         const float dy0 = GGML_CPU_FP16_TO_FP32(y[2*ib].d);
         const float dy1 = GGML_CPU_FP16_TO_FP32(y[2*ib+1].d);
         const float32x4_t nvsc = {
-            ggml_ue4m3_to_fp32(x[ib].d[0]),
-            ggml_ue4m3_to_fp32(x[ib].d[1]),
-            ggml_ue4m3_to_fp32(x[ib].d[2]),
-            ggml_ue4m3_to_fp32(x[ib].d[3])
+            GGML_CPU_UE4M3_TO_FP32(x[ib].d[0]),
+            GGML_CPU_UE4M3_TO_FP32(x[ib].d[1]),
+            GGML_CPU_UE4M3_TO_FP32(x[ib].d[2]),
+            GGML_CPU_UE4M3_TO_FP32(x[ib].d[3])
         };
         const float32x4_t scales = vmulq_f32(nvsc, (float32x4_t){dy0, dy0, dy1, dy1});
 

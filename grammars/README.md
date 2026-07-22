@@ -69,71 +69,15 @@ Parentheses `()` can be used to group sequences, which allows for embedding alte
 
 ## Tokens
 
-The terminals described so far (`"abc"`, `[a-z]`, `.`) match **character sequences** in the model's output. A *token* terminal instead matches **a single tokenizer token by id**, regardless of what bytes that token decodes to.
+Tokens allow grammars to match specific tokenizer tokens rather than character sequences. This is useful for constraining outputs based on special tokens (like `<think>` or `</think>`).
 
-This is useful when you want to constrain the model's output in terms of its own vocabulary — for example, requiring it to emit a specific control token like `<think>`, or forbidding a particular token mid-sequence.
+Tokens can be specified in two ways:
 
-There are three ways to write a token terminal:
+1. **Token ID**: Use angle brackets with the token ID in square brackets: `<[token-id]>`. For example, `<[1000]>` matches the token with ID 1000.
 
-### 1. By token id — `<[N]>`
+2. **Token string**: Use angle brackets with the token text directly: `<token>`. For example, `<think>` will match the token whose text is exactly `<think>`. This only works if the string tokenizes to exactly one token in the vocabulary, otherwise the grammar will fail to parse.
 
-`<[N]>` matches the token whose id is `N`.
-
-```
-root ::= <[1000]>     # matches token id 1000
-```
-
-This is the most explicit form and works without a tokenizer being present.
-
-### 2. By literal text including the brackets — `<text>`
-
-`<text>` looks up the token whose vocabulary text is **literally** `<text>` — angle brackets included. This is the form to use for special tokens that store the brackets as part of their name (most chat-template control tokens do):
-
-```
-root ::= <think> .* </think>     # matches the special tokens <think> and </think>
-```
-
-Internally the grammar parser passes the full slice — angle brackets and all — to the model's tokenizer and requires it to resolve to exactly one token. If it doesn't, grammar parsing fails.
-
-### 3. By literal text without the brackets — `<{text}>`
-
-`<{text}>` looks up the token whose text is exactly `text` (no brackets). Use this for ordinary tokens, or for special tokens whose vocabulary name does not contain angle brackets:
-
-```
-root ::= <{Hello}> <{ world}>    # matches the tokens "Hello" and " world"
-```
-
-Inside `<{...}>`, the standard GBNF string escapes are accepted (`\\`, `\"`, `\[`, `\]`, `\t`, `\r`, `\n`, `\xXX`, `\uXXXX`, `\UXXXXXXXX`), plus `\}` for a literal closing brace.
-
-As with form 2, the inner text must tokenize to exactly one token or grammar parsing fails.
-
-### Negation — `!`
-
-Prefix any of the three forms with `!` to match *any token except* the specified one:
-
-```
-thinking  ::= !</think>*         # any tokens except the </think> special token
-not-hello ::= !<{Hello}>         # any single token that is not "Hello"
-not-1000  ::= !<[1000]>          # any single token whose id is not 1000
-```
-
-### Requirements and caveats
-
-- Forms 2 and 3 require a tokenizer to be available at grammar build time (i.e. the grammar must be loaded against a model). Form 1 does not.
-- All three forms match exactly one token at a time. Use sequencing or repetition to match multiple.
-- Token terminals and character terminals can be freely mixed in the same rule.
-
-### Choosing between the forms
-
-| You want to match…                                        | Use         |
-| --------------------------------------------------------- | ----------- |
-| A specific token id you already know                      | `<[N]>`     |
-| A special token whose vocab text contains angle brackets  | `<text>`    |
-| Any other token, by its literal text                      | `<{text}>`  |
-
-Behind the scenes all three forms compile to the same internal representation (a token-id match), so they are interchangeable wherever they resolve to the same id.
-
-### Example
+You can negate token matches using the `!` prefix: `!<[1000]>` or `!<think>` matches any token *except* the specified one.
 
 ```
 # Match a thinking block: <think>...</think>
@@ -289,7 +233,7 @@ And a non-exhaustive list of other unsupported features that are unlikely to be 
 > [!WARNING]
 > The JSON schemas spec states `object`s accept [additional properties](https://json-schema.org/understanding-json-schema/reference/object#additionalproperties) by default.
 > Since this is slow and seems prone to hallucinations, we default to no additional properties.
-> You can set `"additionalProperties": true` in the the schema of any object to explicitly allow additional properties.
+> You can set `"additionalProperties": true` in the schema of any object to explicitly allow additional properties.
 
 If you're using [Pydantic](https://pydantic.dev/) to generate schemas, you can enable additional properties with the `extra` config on each model class:
 

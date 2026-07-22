@@ -29,12 +29,11 @@ llama_memory_hybrid::llama_memory_hybrid(
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr,
-                            /* dynamic resize */
-                 uint32_t   kv_size_max) :
+    const layer_filter_cb & filter_recr) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
+        model.hparams,
         type_k,
         type_v,
         v_trans,
@@ -45,13 +44,12 @@ llama_memory_hybrid::llama_memory_hybrid(
         n_pad,
         n_swa,
         swa_type,
-        nullptr, // mem_other
+        nullptr,
         filter_attn == nullptr ?
-            [&](int32_t il) { return !hparams.is_recurrent(il); }
+            [&](int32_t il) { return !hparams.is_recr(il); }
             : filter_attn,
-        nullptr, // reuse
-        nullptr, // share
-        kv_size_max
+        nullptr,
+        nullptr
     )),
     mem_recr(new llama_memory_recurrent(
         model,
@@ -62,7 +60,7 @@ llama_memory_hybrid::llama_memory_hybrid(
         n_seq_max,
         n_rs_seq,
         filter_recr == nullptr ?
-            [&](int32_t il) { return hparams.is_recurrent(il); }
+            [&](int32_t il) { return hparams.is_recr(il); }
             : filter_recr
     )) {}
 
@@ -82,7 +80,13 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
             } else {
                 // Use non-sequential split when KV cache is unified (needed for hellaswag/winogrande/multiple-choice)
                 const bool unified = (mem_attn->get_n_stream() == 1);
-                ubatch = balloc.split_equal(n_ubatch, !unified);
+
+                // [TAG_RECURRENT_ROLLBACK_SPLITS]
+                // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
+                //   so that the rollback snapshots remain valid
+                const uint32_t n_rs_seq = mem_recr->n_rs_seq;
+
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
             }
 
             if (ubatch.n_tokens == 0) {
@@ -99,20 +103,15 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
 
         // prepare the recurrent batches first
         if (!mem_recr->prepare(ubatches)) {
-            LLAMA_LOG_DEBUG("%s: failed to prepare recurrent ubatches\n", __func__);
+            // TODO: will the recurrent cache be in an undefined context at this point?
+            LLAMA_LOG_ERROR("%s: failed to prepare recurrent ubatches\n", __func__);
             return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
 
         // prepare the attention cache
         auto heads_attn = mem_attn->prepare(ubatches);
-        while (heads_attn.empty()) {
-            if (!mem_attn->try_resize()) {
-                break;
-            }
-            heads_attn = mem_attn->prepare(ubatches);
-        }
         if (heads_attn.empty()) {
-            LLAMA_LOG_DEBUG("%s: failed to prepare attention ubatches\n", __func__);
+            LLAMA_LOG_ERROR("%s: failed to prepare attention ubatches\n", __func__);
             return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
 

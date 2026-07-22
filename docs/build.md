@@ -22,6 +22,7 @@ The following sections describe how to build with different backends and options
 * [HIP](#hip)
 * [Vulkan](#vulkan)
 * [CANN](#cann)
+* [ZenDNN](#zendnn)
 * [Arm® KleidiAI™](#arm-kleidiai)
 * [OpenCL](#opencl)
 * [Android](#android-1)
@@ -269,13 +270,10 @@ The environment variable [`CUDA_SCALE_LAUNCH_QUEUES`](https://docs.nvidia.com/cu
 
 Consider setting `CUDA_SCALE_LAUNCH_QUEUES=4x`, which increases the CUDA command buffer to 4 times its default size. This optimization is particularly beneficial for **Multi-GPU setups with pipeline parallelism**, where it significantly improves prompt processing throughput by allowing more operations to be enqueued across GPUs.
 
-#### GGML_CUDA_FORCE_CUBLAS_COMPUTE_32F
+#### GGML_CUDA_CUBLAS_COMPUTE_TYPE
 
-Use `GGML_CUDA_FORCE_CUBLAS_COMPUTE_32F` environment variable to use FP32 compute type on all GPUs in FP16 cuBLAS for preventing possible numerical overflows in exchange for slower prompt processing (small impact on RTX PRO/Datacenter products and significant on GeForce products).
-
-#### GGML_CUDA_FORCE_CUBLAS_COMPUTE_16F
-
-Use `GGML_CUDA_FORCE_CUBLAS_COMPUTE_16F` environment variable to force use FP16 compute type (instead of default FP32) in FP16 cuBLAS for V100, CDNA and RDNA4.
+Override default, speed-optimized compute types for cuBLAS matrix multiplications.
+Legal values: `auto`, `f16`, `fp16`, `bf16`, `f32`, `fp32`.
 
 ### Unified Memory
 
@@ -390,29 +388,9 @@ You can download it from your Linux distro's package manager or from here: [ROCm
   cmake -S . -B build -G Ninja -DGPU_TARGETS=gfx1100 -DGGML_HIP=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release
   cmake --build build
   ```
-  TheRock (The HIP Environment and ROCm Kit) has been released on https://github.com/ROCm/TheRock/, which is a lightweight open source build platform for HIP and ROCm.
-  Below is step for building llama.cpp for HIP backend for Windows. 
-
-  Download from https://github.com/ROCm/TheRock/releases and uncompress it to %HIP_PATH%. 
-
-  Also Set RC COMPILER with https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/ installation, like C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/rc.exe
-
-  Assuming a gfx1151-compatible AMD GPU from https://github.com/ROCm/TheRock/blob/main/RELEASES.md
-
-  ```bash
-  set HIP_PATH_70=%HIP_PATH%
-  set LLVM_PATH=%HIP_PATH%
-  set HIP_PLATFORM=amd
-  set CMAKE_C_COMPILER=%HIP_PATH%\lib\llvm\bin\amdclang.exe
-  set CMAKE_CXX_COMPILER=%HIP_PATH%\lib\llvm\bin\amdclang++.exe
-  set CMAKE_RC_COMPILER="C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/rc.exe"
-  set PATH=%HIP_PATH%\bin;%PATH%
-  cmake -S . -B build -G Ninja -DGPU_TARGETS=gfx1151 -DGGML_HIP=ON -DCMAKE_C_COMPILER=%CMAKE_C_COMPILER% -DCMAKE_CXX_COMPILER=%CMAKE_CXX_COMPILER% -DCMAKE_BUILD_TYPE=Release  -DCMAKE_RC_COMPILER=%CMAKE_RC_COMPILER%
-  cmake --build build
-  ```
-
   If necessary, adapt `GPU_TARGETS` to the GPU arch you want to compile for. The above example uses `gfx1100` that corresponds to Radeon RX 7900XTX/XT/GRE. You can find a list of targets [here](https://llvm.org/docs/AMDGPUUsage.html#processors)
   Find your gpu version string by matching the most significant version information from `rocminfo | grep gfx | head -1 | awk '{print $2}'` with the list of processors, e.g. `gfx1035` maps to `gfx1030`.
+
 
 The environment variable [`HIP_VISIBLE_DEVICES`](https://rocm.docs.amd.com/en/latest/understand/gpu_isolation.html#hip-visible-devices) can be used to specify which GPU(s) will be used.
 If your GPU is not officially supported you can use the environment variable [`HSA_OVERRIDE_GFX_VERSION`] set to a similar GPU, for example 10.3.0 on RDNA2 (e.g. gfx1030, gfx1031, or gfx1035) or 11.0.0 on RDNA3. Note that [`HSA_OVERRIDE_GFX_VERSION`] is [not supported on Windows](https://github.com/ROCm/ROCm/issues/2654)
@@ -543,11 +521,6 @@ Finally, after finishing your build, you should be able to do something like thi
 
 # You should see in the output, ggml_vulkan detected your GPU. For example:
 # ggml_vulkan: Using Intel(R) Graphics (ADL GT2) | uma: 1 | fp16: 1 | warp size: 32
-```
-
-Note: With Intel's Mesa implementation the maximum amount of memory that Vulkan can allocate is limited as a percentage of system RAM, by default 75%. You can increase this with the environment variable `ANV_SYS_MEM_LIMIT`, for example:
-```bash
-ANV_SYS_MEM_LIMIT=90 llama-cpp -m model.gguf
 ```
 
 ### For Mac users:
@@ -760,7 +733,7 @@ ninja
 
 To read documentation for how to build on Android, [click here](./android.md)
 
-## WebGPU [In Progress]
+## WebGPU
 
 The WebGPU backend relies on [Dawn](https://dawn.googlesource.com/dawn). Follow the instructions [here](https://dawn.googlesource.com/dawn/+/refs/heads/main/docs/quickstart-cmake.md) to install Dawn locally so that llama.cpp can find it using CMake. The current implementation is up-to-date with Dawn commit `18eb229`.
 

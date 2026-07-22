@@ -7,6 +7,8 @@ VISIONOS_MIN_OS_VERSION=1.0
 TVOS_MIN_OS_VERSION=16.4
 
 BUILD_SHARED_LIBS=OFF
+LLAMA_BUILD_APP=OFF
+LLAMA_BUILD_COMMON=OFF
 LLAMA_BUILD_EXAMPLES=OFF
 LLAMA_BUILD_TOOLS=OFF
 LLAMA_BUILD_TESTS=OFF
@@ -32,6 +34,8 @@ COMMON_CMAKE_ARGS=(
     -DCMAKE_XCODE_ATTRIBUTE_STRIP_INSTALLED_PRODUCT=NO
     -DCMAKE_XCODE_ATTRIBUTE_DEVELOPMENT_TEAM=ggml
     -DBUILD_SHARED_LIBS=${BUILD_SHARED_LIBS}
+    -DLLAMA_BUILD_APP=${LLAMA_BUILD_APP}
+    -DLLAMA_BUILD_COMMON=${LLAMA_BUILD_COMMON}
     -DLLAMA_BUILD_EXAMPLES=${LLAMA_BUILD_EXAMPLES}
     -DLLAMA_BUILD_TOOLS=${LLAMA_BUILD_TOOLS}
     -DLLAMA_BUILD_TESTS=${LLAMA_BUILD_TESTS}
@@ -130,16 +134,7 @@ setup_framework_structure() {
     # Create module map (common for all platforms)
     cat > ${module_path}module.modulemap << EOF
 framework module llama {
-    header "llama.h"
-    header "ggml.h"
-    header "ggml-alloc.h"
-    header "ggml-backend.h"
-    header "ggml-metal.h"
-    header "ggml-cpu.h"
-    header "ggml-blas.h"
-    header "gguf.h"
-    header "mtmd.h"
-    header "mtmd-helper.h"
+    umbrella "Headers"
 
     link "c++"
     link framework "Accelerate"
@@ -420,8 +415,9 @@ cmake -B build-ios-sim -G Xcode \
     -DCMAKE_C_FLAGS="${COMMON_C_FLAGS}" \
     -DCMAKE_CXX_FLAGS="${COMMON_CXX_FLAGS}" \
     -DLLAMA_OPENSSL=OFF \
+    -DMTMD_VIDEO=OFF \
     -S .
-cmake --build build-ios-sim --config Release -- -quiet
+cmake --build build-ios-sim --config Release -j $(sysctl -n hw.logicalcpu) -- -quiet
 
 echo "Building for iOS devices..."
 cmake -B build-ios-device -G Xcode \
@@ -434,8 +430,9 @@ cmake -B build-ios-device -G Xcode \
     -DCMAKE_C_FLAGS="${COMMON_C_FLAGS}" \
     -DCMAKE_CXX_FLAGS="${COMMON_CXX_FLAGS}" \
     -DLLAMA_OPENSSL=OFF \
+    -DMTMD_VIDEO=OFF \
     -S .
-cmake --build build-ios-device --config Release -- -quiet
+cmake --build build-ios-device --config Release -j $(sysctl -n hw.logicalcpu) -- -quiet
 
 echo "Building for macOS..."
 cmake -B build-macos -G Xcode \
@@ -446,7 +443,7 @@ cmake -B build-macos -G Xcode \
     -DCMAKE_CXX_FLAGS="${COMMON_CXX_FLAGS}" \
     -DLLAMA_OPENSSL=OFF \
     -S .
-cmake --build build-macos --config Release -- -quiet
+cmake --build build-macos --config Release -j $(sysctl -n hw.logicalcpu) -- -quiet
 
 echo "Building for visionOS..."
 cmake -B build-visionos -G Xcode \
@@ -460,8 +457,9 @@ cmake -B build-visionos -G Xcode \
     -DCMAKE_CXX_FLAGS="${COMMON_CXX_FLAGS}" \
     -DLLAMA_OPENSSL=OFF \
     -DLLAMA_BUILD_SERVER=OFF \
+    -DMTMD_VIDEO=OFF \
     -S .
-cmake --build build-visionos --config Release -- -quiet
+cmake --build build-visionos --config Release -j $(sysctl -n hw.logicalcpu) -- -quiet
 
 echo "Building for visionOS simulator..."
 cmake -B build-visionos-sim -G Xcode \
@@ -475,8 +473,9 @@ cmake -B build-visionos-sim -G Xcode \
     -DCMAKE_CXX_FLAGS="${COMMON_CXX_FLAGS}" \
     -DLLAMA_OPENSSL=OFF \
     -DLLAMA_BUILD_SERVER=OFF \
+    -DMTMD_VIDEO=OFF \
     -S .
-cmake --build build-visionos-sim --config Release -- -quiet
+cmake --build build-visionos-sim --config Release -j $(sysctl -n hw.logicalcpu) -- -quiet
 
 # Add tvOS builds (might need the same u_int definitions as watchOS and visionOS)
 echo "Building for tvOS simulator..."
@@ -491,8 +490,9 @@ cmake -B build-tvos-sim -G Xcode \
     -DCMAKE_C_FLAGS="${COMMON_C_FLAGS}" \
     -DCMAKE_CXX_FLAGS="${COMMON_CXX_FLAGS}" \
     -DLLAMA_OPENSSL=OFF \
+    -DMTMD_VIDEO=OFF \
     -S .
-cmake --build build-tvos-sim --config Release -- -quiet
+cmake --build build-tvos-sim --config Release -j $(sysctl -n hw.logicalcpu) -- -quiet
 
 echo "Building for tvOS devices..."
 cmake -B build-tvos-device -G Xcode \
@@ -506,8 +506,9 @@ cmake -B build-tvos-device -G Xcode \
     -DCMAKE_C_FLAGS="${COMMON_C_FLAGS}" \
     -DCMAKE_CXX_FLAGS="${COMMON_CXX_FLAGS}" \
     -DLLAMA_OPENSSL=OFF \
+    -DMTMD_VIDEO=OFF \
     -S .
-cmake --build build-tvos-device --config Release -- -quiet
+cmake --build build-tvos-device --config Release -j $(sysctl -n hw.logicalcpu) -- -quiet
 
 # Setup frameworks and copy binaries and headers
 echo "Setting up framework structures..."

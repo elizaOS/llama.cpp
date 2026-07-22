@@ -148,6 +148,8 @@ if (LLAMA_LLGUIDANCE)
     llama_build_and_test(test-grammar-llguidance.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 endif ()
 
+llama_build(test-recurrent-state-rollback.cpp get-model.cpp)
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-sampling.cpp)
@@ -155,7 +157,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-grammar-parser.cpp)
     llama_build_and_test(test-grammar-integration.cpp)
     llama_build_and_test(test-llama-grammar.cpp)
-    llama_build(test-grammar-perf.cpp)
+    llama_build_and_test(test-batch-alloc.cpp)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
@@ -193,6 +195,28 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
     llama_build_and_test(test-llama-archs.cpp)
+
+    set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
+    file(MAKE_DIRECTORY "${MODEL_DIR}")
+
+    llama_test(
+        test-llama-archs
+        NAME test-generate-models
+        LABEL main
+        ARGS -o "${MODEL_DIR}"
+    )
+    set_tests_properties(test-generate-models PROPERTIES
+        FIXTURES_SETUP generate-models
+    )
+
+    llama_test(
+        test-recurrent-state-rollback
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
+    )
+    set_tests_properties(test-recurrent-state-rollback PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
@@ -200,7 +224,6 @@ llama_build_and_test(test-jinja.cpp)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
 llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-chat-template.cpp)
-llama_build_and_test(test-json-partial.cpp)
 llama_build_and_test(test-log.cpp)
 llama_build_and_test(
     test-peg-parser.cpp
@@ -213,7 +236,6 @@ llama_build_and_test(
     peg-parser/test-unicode.cpp
     peg-parser/tests.h
 )
-llama_build_and_test(test-regex-partial.cpp)
 
 if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "s390x")
     set(MODEL_NAME "tinyllamas/stories15M-q4_0.gguf")
@@ -241,22 +263,9 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)
 endif()
-llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
-llama_build_and_test(test-vulkan-uma.cpp)
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
-
-if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
-    # test-model-load-buffer uses llama_model::memory_breakdown() directly,
-    # which is an internal C++ method not exported with LLAMA_API. On Windows
-    # shared-lib builds (e.g. CI sycl), the symbol is not visible to consumers
-    # of llama.dll → LNK2019. Match the gate used by other internal-symbol
-    # tests above (test-sampling, test-grammar-*, etc).
-    llama_build_and_test(test-model-load-buffer.cpp LABEL "model" ARGS "${MODEL_DEST}")
-    set_tests_properties(test-model-load-buffer PROPERTIES FIXTURES_REQUIRED test-download-model)
-endif()
-
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 
@@ -265,8 +274,9 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
 
-llama_build_and_test(test-recurrent-state-rollback.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
-set_tests_properties(test-recurrent-state-rollback PROPERTIES FIXTURES_REQUIRED test-download-model)
+# Test state save/load functionality
+llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 if (NOT GGML_BACKEND_DL)
     # these tests use the backends directly and cannot be built with dynamic loading
@@ -274,44 +284,7 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-quantize-fns.cpp)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)
-    # Eliza CPU smoke tests for QJL + the W3-B fused kernels. These
-    # call into ggml-cpu directly via the type-traits table and the
-    # GGML_OP_FUSED_ATTN_QJL_TBQ op, so they require static-linked
-    # backends just like the standard quant tests above.
-    llama_build_and_test(test-qjl-cache.cpp)
-    if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
-        # test-fused-kernels and bench-fused-kernels call directly into the
-        # internal fused-kernel entry points (ggml_vec_dot_q4_polar_q8_0,
-        # ggml_vec_dot_q4_polar_q8_0_fused,
-        # ggml_vec_dot_q4_polar_q8_0_fused_hadamard) which live in
-        # ggml-cpu but are not exported with GGML_BACKEND_API. On Windows
-        # shared-lib builds (e.g. CI sycl), those symbols are not visible
-        # to consumers of ggml-cpu.dll → LNK2019. Match the gate used by
-        # test-model-load-buffer above and the other internal-symbol tests.
-        llama_build_and_test(test-fused-kernels.cpp)
-        # Standalone bench: not part of `ctest` (no LABEL "main") since it
-        # records perf numbers rather than asserting correctness.
-        llama_build(bench-fused-kernels.cpp)
-    endif()
-    # W4-B compile-only validation that the new CUDA host wrappers for
-    # QJL / PolarQuant Q4 / TBQ3_TCQ are linkable. Skipped entirely when
-    # the CUDA backend is not built; otherwise the matching feature
-    # macros (set on the ggml-cuda target) decide which symbol blocks
-    # the test references.
-    if (GGML_CUDA)
-        llama_build_and_test(test-cuda-extra-kernels.cpp)
-        target_compile_definitions(test-cuda-extra-kernels PRIVATE GGML_USE_CUDA)
-        if (GGML_CUDA_QJL)
-            target_compile_definitions(test-cuda-extra-kernels PRIVATE GGML_CUDA_QJL)
-        endif()
-        if (GGML_CUDA_POLARQUANT)
-            target_compile_definitions(test-cuda-extra-kernels PRIVATE GGML_CUDA_POLARQUANT)
-        endif()
-        if (GGML_CUDA_TBQ3_TCQ)
-            target_compile_definitions(test-cuda-extra-kernels PRIVATE GGML_CUDA_TBQ3_TCQ)
-        endif()
-        target_link_libraries(test-cuda-extra-kernels PRIVATE ggml-cuda)
-    endif()
+    llama_build_and_test(test-col2im-1d.cpp)
 endif()
 
 # libmtmd
@@ -346,15 +319,16 @@ get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
 target_link_libraries(${TEST_TARGET} PRIVATE llama)
 
-llama_build_and_test(test-alloc.cpp)
-target_include_directories(test-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+if (NOT LLAMA_USE_SYSTEM_GGML)
+    # Needs non-public ggml-impl.h
+    llama_build_and_test(test-gguf.cpp)
 
-llama_build(export-graph-ops.cpp)
-target_include_directories(export-graph-ops PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
-if (TARGET gguf-model-data)
-    target_link_libraries(export-graph-ops PRIVATE gguf-model-data)
-    target_compile_definitions(export-graph-ops PRIVATE LLAMA_HF_FETCH)
+    # Needs non-public ggml{,-backend}-impl.h
+    llama_build_and_test(test-alloc.cpp)
 endif()
 
-# test-shared-kv-quant-imatrix: regression test for shared-KV models + imatrix-dependent quant
-llama_build_and_test(test-shared-kv-quant-imatrix.cpp)
+llama_build(test-export-graph-ops.cpp)
+if (TARGET gguf-model-data)
+    target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
+    target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
+endif()

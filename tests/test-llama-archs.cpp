@@ -12,6 +12,7 @@
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
@@ -39,8 +40,10 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
 }
 
 static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
+    size_t seed = *(const size_t *) userdata;
     std::hash<std::string> hasher;
-    std::mt19937 gen(hasher(tensor->name) + *(const size_t *) userdata);
+    seed ^= hasher(tensor->name);
+    std::mt19937 gen(seed);
     std::normal_distribution<float> dis(0.0f, 1.0e-2f);
 
     const int64_t ne = ggml_nelements(tensor);
@@ -99,6 +102,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_ff   = 96;
         n_layer = 22; // hparams.n_layer_kv_from_start = 20 is hardcoded
     } else if (arch == LLM_ARCH_DEEPSEEK2
+            || arch == LLM_ARCH_DEEPSEEK32
             || arch == LLM_ARCH_GLM_DSA
             || arch == LLM_ARCH_KIMI_LINEAR
             || arch == LLM_ARCH_MISTRAL4) {
@@ -155,6 +159,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
 
     ms.add_kv(LLM_KV_ATTENTION_MAX_ALIBI_BIAS, 8.0f);
     if (arch == LLM_ARCH_DEEPSEEK2
+            || arch == LLM_ARCH_DEEPSEEK32
             || arch == LLM_ARCH_GLM_DSA
             || arch == LLM_ARCH_KIMI_LINEAR
             || arch == LLM_ARCH_MISTRAL4) {
@@ -182,7 +187,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ROPE_FREQ_BASE_SWA,              10000.0f);
         // SWA pattern: every 5th layer is full attention (matches E2B layer_types)
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(5));
-    } else if (arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35) {
+    } else if (arch == LLM_ARCH_COHERE2MOE || arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35) {
         std::vector<uint32_t> pattern;
         pattern.reserve(n_layer);
         for (uint32_t il = 0; il < n_layer; il++) {
@@ -319,6 +324,7 @@ static std::vector<float> get_logits(
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_LLAMA4:
+        case LLM_ARCH_COHERE2MOE:
         case LLM_ARCH_GROK:
         case LLM_ARCH_QWEN2MOE:
         case LLM_ARCH_QWEN3MOE:
@@ -331,6 +337,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_ARCTIC:
         case LLM_ARCH_DEEPSEEK:
         case LLM_ARCH_DEEPSEEK2:
+        case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_GLM4_MOE:
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_EXAONE_MOE:
@@ -341,6 +348,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_ERNIE4_5:
         case LLM_ARCH_ERNIE4_5_MOE:
         case LLM_ARCH_HUNYUAN_MOE:
+        case LLM_ARCH_HY_V3:
         case LLM_ARCH_OPENAI_MOE:
         case LLM_ARCH_LFM2MOE:
         case LLM_ARCH_SMALLTHINKER:
@@ -353,6 +361,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_STEP35:
         case LLM_ARCH_MISTRAL4:
+        case LLM_ARCH_MELLUM:
             return true;
         default:
             return false;
@@ -387,7 +396,7 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_WAVTOKENIZER_DEC) {
         return false; // FIXME CUDA backend crashes.
     }
-    if (arch == LLM_ARCH_GEMMA4) {
+    if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
         return false; // FIXME @ngxson
     }
     if (arch == LLM_ARCH_LLAMA_EMBED || arch == LLM_ARCH_GEMMA_EMBEDDING || arch == LLM_ARCH_T5ENCODER) {
@@ -406,81 +415,7 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_DEEPSEEK2OCR) {
         return false;
     }
-
-    // FIXME some models are segfaulting with WebGPU:
-#ifdef GGML_USE_WEBGPU
-    if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_KIMI_LINEAR) {
-        return false;
-    }
-#endif // GGML_USE_WEBGPU
-
-    // FIXME numerical drift on Vulkan llvmpipe for gemma2 / gemma3n.
-    // Observed on `CI (vulkan)/ubuntu-24-vulkan-llvmpipe` (run 25917370432,
-    // SHA `5fbb7991b`): NMSE-vs-CPU `FAIL (2.45e-02)` for `gemma2 / Dense`
-    // and `FAIL (1.34e-01)` for `gemma3n / Dense`, exceeding the
-    // test threshold. CPU and Meta paths pass cleanly for both archs, and
-    // sibling Eliza arch `gemma3` PASSES on Vulkan in the same run
-    // (`OK (9.66e-14)`), so this is a real correctness drift in the Vulkan
-    // backend kernels specific to these two gemma family configurations,
-    // NOT a crash and NOT a generic gemma issue. Fixing the underlying
-    // Vulkan kernel(s) is out of test-llama-archs scope — tracked in the
-    // backlog. Narrow gate under `#ifdef GGML_USE_VULKAN` so CPU/Meta
-    // coverage is preserved, mirroring the existing `GGML_USE_WEBGPU` block.
-#ifdef GGML_USE_VULKAN
-    if (arch == LLM_ARCH_GEMMA2 || arch == LLM_ARCH_GEMMA3N) {
-        return false;
-    }
-#endif // GGML_USE_VULKAN
-
-    // FIXME hybrid-memory archs whose `inp_rs->s_copy` graph input ends up
-    // without a backend-allocated buffer, causing
-    // `llm_graph_input_mem_hybrid::set_input` to hit a
-    // `GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer))`
-    // failure inside `llama_decode`. Originally observed on Vulkan
-    // (CI vulkan-llvmpipe run 25905414293) and then also on ARM64 CPU
-    // cross-build (CI 3rd-party ubuntu-24-llguidance run 25914303467).
-    // Same arch family is already gated under WebGPU above. Tracked
-    // separately from the test harness — re-enable once the graph
-    // allocator places s_copy correctly across backends.
-    if (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) {
-        return false;
-    }
-
-    // Eliza-specific speculative draft arch. After wave-9/10 (Z `8c1885b6c` +
-    // DD `0f2998990`), the model loader no longer synthesizes zero-placeholder
-    // tensors on the `files.empty() && tid == -1 && !no_alloc` path for
-    // required tensors. `LLM_ARCH_DFLASH_DRAFT` registers `dflash_fc.weight`
-    // and `dflash_hidden_norm` as required (src/llama-arch.cpp:560-561), but
-    // the test fixture's sparse gguf only lists 8 wavtokenizer-shaped
-    // placeholders, so model load aborts with
-    // `error loading model: missing tensor 'dflash_fc.weight'`. The arch is
-    // an Eliza-specific draft head for speculative decoding (see
-    // src/models/dflash-draft.cpp) and is not the test's primary subject;
-    // skip it here using the same pattern as QWEN35/QWEN35MOE above.
-    if (arch == LLM_ARCH_DFLASH_DRAFT) {
-        return false;
-    }
-
-    // LLM_ARCH_KOKORO has no native graph inference path — the arch tag
-    // exists purely so the K-quant publish pipeline (R8 §3.1) can route a
-    // Kokoro-82M GGUF through the standard llama-quantize tool. Inference
-    // happens in the standalone `tools/kokoro/` runtime (kokoro.cpp), which
-    // does not go through `llama_init_from_model`. The test-llama-archs
-    // fixture path would abort with "native graph inference not yet
-    // implemented", so skip it here just like DFLASH_DRAFT above.
-    if (arch == LLM_ARCH_KOKORO) {
-        return false;
-    }
-
-    // LLM_ARCH_EAGLE3 is a fail-fast scaffolding stub from upstream PR #18039
-    // (wired in commit 8b5574cd3 "spec: wire EAGLE3/MTP enum stubs"). The arch
-    // exists in the enum and tensor-name tables but has no `llama_model_*`
-    // constructor and no graph builder, so `llama_model::create` falls through
-    // its switch and throws `unsupported model architecture: 'eagle3'` during
-    // the test fixture's model-load step. Same skip pattern as DFLASH_DRAFT
-    // above (commit 5311271ca) — fail-fast stub archs that aren't loadable
-    // models. Drop this gate once EAGLE3 has a real model class + graph.
-    if (arch == LLM_ARCH_EAGLE3) {
+    if (arch == LLM_ARCH_DEEPSEEK4) {
         return false;
     }
 
@@ -512,8 +447,11 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
         if (target_arch != LLM_ARCH_UNKNOWN && arch != target_arch) {
             continue;
         }
-        if (arch == LLM_ARCH_GEMMA4) {
+        if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
             continue; // FIXME: ISWA KV cache initialization needs more fixture params
+        }
+        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {
+            continue;
         }
         for (bool moe : {false, true}) {
             if (moe && !moe_implemented(arch)) {
@@ -522,7 +460,7 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
             if (!moe && moe_mandatory(arch)) {
                 continue;
             }
-            if (!llama_model_saver_supports_arch(arch)) {
+            if (!llama_model_saver_supports_arch(arch) || !arch_supported(arch)) {
                 LOG_INF("%s: %s model (%s) is unsupported, skipping\n", __func__, llm_arch_name(arch), moe ? "MoE" : "dense");
                 continue;
             }
@@ -567,6 +505,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
     };
 
     std::vector<device_config> dev_configs;
+    size_t max_device_label_length = 4;
     {
         std::vector<ggml_backend_dev_t> devices_meta;
         {
@@ -574,6 +513,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
             for (size_t i = 0; i < device_count; i++) {
                 ggml_backend_dev_t dev = ggml_backend_dev_get(i);
                 dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{dev}, ggml_backend_dev_description(dev), LLAMA_SPLIT_MODE_LAYER);
+                max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
 
                 // cpu-based devices cannot be used in tensor split mode
                 if (ggml_backend_dev_buffer_type(dev) != ggml_backend_cpu_buffer_type()) {
@@ -585,10 +525,27 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         dev_configs.emplace_back(devices_meta, "Meta", LLAMA_SPLIT_MODE_TENSOR);
     }
 
+    size_t max_arch_name_length = 0;
+    for (const llm_arch & arch : llm_arch_all()) {
+        max_arch_name_length = std::max(max_arch_name_length, strlen(llm_arch_name(arch)));
+    }
+
+    const std::string template_header  = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|%15s|%9s|\n";
+    const std::string template_row_cfg = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|";
+    const std::string template_row_res = "%15s %10s|%20s|\n";
+
     bool all_ok = true;
     common_log_flush(common_log_main());
-    printf("|%16s|%30s|%6s|%15s|%9s|\n", "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip");
-    printf("|----------------|------------------------------|------|---------------|---------|\n");
+    printf(template_header.c_str(), "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip");
+    printf("|");
+    for (size_t i = 0; i < max_arch_name_length; i++) {
+        printf("-");
+    }
+    printf("|");
+    for (size_t i = 0; i < max_device_label_length; i++) {
+        printf("-");
+    }
+    printf("|------|---------------|---------|\n");
     for (const llm_arch & arch : llm_arch_all()) {
         if (arch == LLM_ARCH_UNKNOWN) {
             continue;
@@ -596,8 +553,11 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         if (target_arch != LLM_ARCH_UNKNOWN && arch != target_arch) {
             continue;
         }
-        if (arch == LLM_ARCH_GEMMA4) {
+        if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
             continue; // FIXME: ISWA KV cache initialization needs more fixture params
+        }
+        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {
+            continue;
         }
 
         const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1;
@@ -613,6 +573,11 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
             std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_cpu;
             std::vector<float> logits_cpu;
             for (device_config & dc : dev_configs) {
+                // print test config first; should anything fail during model loading or inference, at least we know which test case caused it
+                printf(template_row_cfg.c_str(),
+                    llm_arch_name(arch), dc.label.c_str(), config_name.c_str());
+                fflush(stdout);
+
                 std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_dev;
                 std::vector<float> logits_dev;
                 std::string status_nmse      = "\033[1;33mSKIP\033[0m";
@@ -665,8 +630,9 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                     }
                 }
 
-                printf("|%16s|%30s|%6s|%15s %10s|%20s|\n", llm_arch_name(arch), dc.label.c_str(),
-                    config_name.c_str(), status_nmse.c_str(), nmse_str, status_roundtrip.c_str());
+                // log the results for this test case
+                printf(template_row_res.c_str(),
+                    status_nmse.c_str(), nmse_str, status_roundtrip.c_str());
             }
         }
     }

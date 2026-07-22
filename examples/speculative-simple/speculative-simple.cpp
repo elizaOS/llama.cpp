@@ -29,13 +29,6 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (params.speculative.draft.mparams.path.empty()) {
-        LOG_ERR("%s: --model-draft is required for draft-model speculative decoding; "
-                "use --spec-type=dflash -md <path> or --spec-type=mtp -md <path> "
-                "to use the draft-model fallback.\n", __func__);
-        return 1;
-    }
-
     // init llama.cpp
     llama_backend_init();
     llama_numa_init(params.numa);
@@ -136,12 +129,9 @@ int main(int argc, char ** argv) {
     // target model sampling context
     common_sampler_ptr smpl(common_sampler_init(model_tgt, params.sampling));
 
-    // eval the prompt prefix; keep the final token separate as the boundary
-    // token used to start the first speculative verification batch.
-    if (inp.size() > 1) {
-        llama_decode(ctx_tgt,       llama_batch_get_one(inp.data(), inp.size() - 1));
-        llama_decode(ctx_dft.get(), llama_batch_get_one(inp.data(), inp.size() - 1));
-    }
+    // eval the prompt
+    llama_decode(ctx_tgt,       llama_batch_get_one(inp.data(), inp.size() - 1));
+    llama_decode(ctx_dft.get(), llama_batch_get_one(inp.data(), inp.size() - 1));
 
     // note: keep the last token separate!
     llama_token id_last = inp.back();
@@ -185,7 +175,7 @@ int main(int argc, char ** argv) {
                     llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), seq_id));
 
             if (use_ckpt_dft) {
-                ckpt.update_dft(ctx_dft.get(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                ckpt.update_dft(ctx_dft.get(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
             }
 
             // generate a new draft
@@ -206,12 +196,12 @@ int main(int argc, char ** argv) {
             // this allows us to restore the state if partial draft acceptance occurs
             if (!draft.empty()) {
                 if (use_ckpt_tgt) {
-                    ckpt.update_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                    ckpt.update_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
             }
 
             {
-                ckpt.load_dft(ctx_dft.get(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                ckpt.load_dft(ctx_dft.get(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                 llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), seq_id, ckpt.pos_max + 1, -1);
             }
@@ -271,13 +261,13 @@ int main(int argc, char ** argv) {
             draft = std::move(ids);
 
             {
-                ckpt.load_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                ckpt.load_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                 llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, ckpt.pos_max + 1, -1);
             }
 
             {
-                ckpt.load_dft(ctx_dft.get(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                ckpt.load_dft(ctx_dft.get(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                 llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), seq_id, ckpt.pos_max + 1, -1);
             }

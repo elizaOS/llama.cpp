@@ -76,8 +76,7 @@ struct ggml_metal {
     ggml_abort_callback abort_callback;
     void *              abort_callback_data;
 
-    // error state - set when a command buffer fails during synchronize or when
-    // graph encoding fails (e.g. a required compute pipeline is nil, #11612)
+    // error state - set when a command buffer fails during synchronize
     // once set, graph_compute will return GGML_STATUS_FAILED until the backend is recreated
     bool has_error;
 };
@@ -134,16 +133,8 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
     res->d_queue = dispatch_queue_create("ggml-metal", DISPATCH_QUEUE_CONCURRENT);
 
-    res->use_fusion = getenv("GGML_METAL_FUSION_DISABLE") == nil;
-
-    // Auto-disable concurrent dispatch on non-Apple GPUs (AMD/Intel)
-    // MTLDispatchTypeConcurrent has broken memory barriers on these GPUs
-    bool is_apple_gpu = props_dev->supports_gpu_family_apple7;
-    res->use_concurrency = is_apple_gpu && (getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil);
-
-    if (!is_apple_gpu && getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil) {
-        GGML_LOG_INFO("%s: disabling concurrent dispatch (non-Apple GPU detected)\n", __func__);
-    }
+    res->use_fusion      = getenv("GGML_METAL_FUSION_DISABLE") == nil;
+    res->use_concurrency = getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil;
 
     {
         const char * val = getenv("GGML_METAL_GRAPH_DEBUG");
@@ -620,13 +611,6 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
     }
 
-    // encoding runs synchronously above (main-thread encode_async + the
-    // dispatch_apply barrier), so an encode failure is visible here
-    if (ctx->has_error) {
-        GGML_LOG_ERROR("%s: graph encode failed (nil compute pipeline or encoder error) - returning GGML_STATUS_FAILED\n", __func__);
-        return GGML_STATUS_FAILED;
-    }
-
     return GGML_STATUS_SUCCESS;
 }
 
@@ -723,10 +707,6 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
         for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
             const int res = ggml_metal_op_encode(ctx_op, idx);
             if (res == 0) {
-                // encode failure (e.g. nil compute pipeline, issue #11612) -
-                // latch the backend error state so graph_compute reports
-                // GGML_STATUS_FAILED instead of consuming a partial graph
-                ctx->has_error = true;
                 break;
             }
 
