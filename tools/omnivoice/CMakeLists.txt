@@ -268,6 +268,13 @@ if(TARGET mtmd)
     # common/sampling.cpp, and common/common.cpp. PRIVATE so the common ABI
     # is not re-exported from the fused .so (only eliza_inference_* + llama).
     target_link_libraries(elizainference PRIVATE eliza_voice_classifiers llama-common)
+    # Static objects folded into the Android/Linux shared library call libm
+    # directly. The dependency must live on the final shared target; relying on
+    # a private transitive edge from ggml-base can leave symbols such as powf
+    # unresolved and produces a .so that links but fails at dlopen().
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(elizainference PRIVATE m)
+    endif()
     # Kokoro-82M TTS (ABI v10): fold kokoro_lib into the fused .so so the
     # mobile Kokoro path synthesizes in-process (iOS / Google Play forbid the
     # local-TCP `llama-server /v1/audio/speech` route). kokoro_lib carries its
