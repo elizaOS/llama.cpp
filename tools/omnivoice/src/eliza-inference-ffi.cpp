@@ -1788,8 +1788,14 @@ int eliza_inference_kokoro_synthesize(
     const std::string in(text, text_len ? text_len : std::strlen(text));
     eliza_kokoro::kokoro_audio audio;
     std::string err;
+    ctx->tts_cancel.store(false, std::memory_order_release);
     eliza_kokoro::kokoro_status st = eliza_kokoro::kokoro_synthesize(
-        ctx->kokoro_model.get(), ctx->kokoro_voice, in, speed, audio, err);
+        ctx->kokoro_model.get(), ctx->kokoro_voice, in, speed, audio, err,
+        eliza_tts_cancel_requested, ctx);
+    if (st == eliza_kokoro::KOKORO_E_CANCELLED) {
+        eliza_set_error(out_error, "[libelizainference] kokoro_synthesize cancelled");
+        return ELIZA_ERR_CANCELLED;
+    }
     if (st != eliza_kokoro::KOKORO_OK) {
         eliza_set_error(out_error,
             std::string("[libelizainference] kokoro_synthesize failed: ") + err);
@@ -1862,8 +1868,14 @@ int eliza_inference_kokoro_synthesize_ipa(
     const std::string in(ipa, ipa_len ? ipa_len : std::strlen(ipa));
     eliza_kokoro::kokoro_audio audio;
     std::string err;
+    ctx->tts_cancel.store(false, std::memory_order_release);
     eliza_kokoro::kokoro_status st = eliza_kokoro::kokoro_synthesize_ipa(
-        ctx->kokoro_model.get(), ctx->kokoro_voice, in, speed, audio, err);
+        ctx->kokoro_model.get(), ctx->kokoro_voice, in, speed, audio, err,
+        eliza_tts_cancel_requested, ctx);
+    if (st == eliza_kokoro::KOKORO_E_CANCELLED) {
+        eliza_set_error(out_error, "[libelizainference] kokoro_synthesize_ipa cancelled");
+        return ELIZA_ERR_CANCELLED;
+    }
     if (st != eliza_kokoro::KOKORO_OK) {
         eliza_set_error(out_error,
             std::string("[libelizainference] kokoro_synthesize_ipa failed: ") + err);
