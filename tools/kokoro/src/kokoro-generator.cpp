@@ -254,7 +254,7 @@ void kokoro_generator_forward(
         if (!kokoro_profile_enabled()) return;
         const auto now = std::chrono::steady_clock::now();
         const double ms = std::chrono::duration<double, std::milli>(now - prof_last).count();
-        std::fprintf(stderr, "[kokoro-profile] %-28s %10.1f ms\n", label, ms);
+        kokoro_profile_emit(label, ms);
         prof_last = now;
     };
 
@@ -381,6 +381,7 @@ void kokoro_generator_forward(
         const int nr_k = (i == 0) ? 7 : 11;
         adain_resblock1(w.noise_res[i], x_source.data(), outC, xsT, s, Sdim, nr_k, dil135);
         if (i == 0) DBG("noise_res0", x_source.data(), x_source.size());
+        prof_mark(i == 0 ? "  gen: stage0 noise" : "  gen: stage1 noise");
 
         // x = ups[i](x). ConvTranspose1d(curC -> outC, k, stride=u, pad=(k-u)/2).
         const int tpad = (k - u) / 2;
@@ -408,6 +409,7 @@ void kokoro_generator_forward(
         // x = x + x_source  (shapes match: xT == xsT).
         std::vector<float> xs((size_t) outC * xT);
         for (size_t j = 0; j < (size_t) outC * xT; ++j) xs[j] = xptr[j] + x_source[j];
+        prof_mark(i == 0 ? "  gen: stage0 upsample" : "  gen: stage1 upsample");
 
         // resblocks: xs_sum = sum_j resblock[i*3+j](x, s) / 3.
         std::vector<float> accum((size_t) outC * xT, 0.0f);
@@ -423,6 +425,7 @@ void kokoro_generator_forward(
         curC = outC; curT = xT;
         if (i == 0) DBG("stage0_x", x.data(), x.size());
         if (i == 1) DBG("stage1_x", x.data(), x.size());
+        prof_mark(i == 0 ? "  gen: stage0 resblocks" : "  gen: stage1 resblocks");
     }
 
     // ------------------------------------------------------------------
@@ -445,6 +448,7 @@ void kokoro_generator_forward(
         }
     }
     istft_center(spec.data(), phase.data(), n_fft, hop, win, curT, audio);
+    prof_mark("  gen: post+istft");
 }
 
 } // namespace eliza_kokoro

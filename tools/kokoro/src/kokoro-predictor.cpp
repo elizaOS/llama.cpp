@@ -8,13 +8,14 @@
 // loaded by `kokoro_load_model` (see kokoro.cpp); see
 // `convert_kokoro_pth_to_gguf.py` for the canonical names.
 //
-// All compute runs on the host with plain C++ scalar loops. The
-// implementation is verified against reference activations produced by
-// `tools/dump_reference_activations.py` (run on the actual Python kokoro
-// package) using `tests/test_kokoro_predictor.cpp`.
+// Dense, convolution, and recurrent kernels route through kokoro-layers'
+// platform backend; ordering-sensitive normalization and activation steps stay
+// in direct C++. Reference activations from the Python Kokoro package verify
+// the complete predictor in `tests/test_kokoro_predictor.cpp`.
 
 #include "kokoro-predictor.h"
 #include "kokoro.h"
+#include "kokoro-model-internal.h"
 
 #include "ggml.h"
 #include "gguf.h"
@@ -35,7 +36,6 @@ namespace eliza_kokoro {
 // To access the loaded ggml_context we need to forward-declare a getter or
 // include the loader's internal layout. We expose a small private accessor.
 
-extern ggml_context * kokoro_model_ggml_ctx(const kokoro_model * model);
 extern const kokoro_hparams * kokoro_get_hparams(const kokoro_model * model) noexcept;
 
 namespace {
@@ -44,7 +44,7 @@ namespace {
 struct TLookup {
     ggml_context * ctx = nullptr;
     const float * get(const std::string & name, std::string * err = nullptr) const {
-        ggml_tensor * t = ggml_get_tensor(ctx, name.c_str());
+        ggml_tensor * t = kokoro_find_tensor_compat(ctx, name);
         if (!t) {
             if (err) *err = "missing tensor '" + name + "'";
             return nullptr;
@@ -52,11 +52,11 @@ struct TLookup {
         return (const float *) t->data;
     }
     const float * get_or_null(const std::string & name) const {
-        ggml_tensor * t = ggml_get_tensor(ctx, name.c_str());
+        ggml_tensor * t = kokoro_find_tensor_compat(ctx, name);
         return t ? (const float *) t->data : nullptr;
     }
     bool has(const std::string & name) const {
-        return ggml_get_tensor(ctx, name.c_str()) != nullptr;
+        return kokoro_find_tensor_compat(ctx, name) != nullptr;
     }
 };
 

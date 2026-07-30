@@ -1765,6 +1765,91 @@ int eliza_inference_kokoro_load(
 #endif
 }
 
+#ifdef ELIZA_ENABLE_KOKORO
+static int eliza_kokoro_synthesize_audio(
+    EliInferenceContext * ctx,
+    const char * input,
+    size_t input_len,
+    float speed,
+    bool ipa_input,
+    eliza_kokoro::kokoro_audio & audio,
+    char ** out_error) {
+    const char * operation = ipa_input
+        ? "kokoro_synthesize_ipa"
+        : "kokoro_synthesize";
+    if (!ctx || !input) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] ") + operation + ": null argument");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::mutex> lock(ctx->kokoro_mutex);
+    if (!ctx->kokoro_loaded || !ctx->kokoro_model) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] ") + operation +
+            ": no model loaded (call kokoro_load first)");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    if (speed <= 0.0f) speed = 1.0f;
+    const std::string in(input, input_len ? input_len : std::strlen(input));
+    std::string err;
+    const eliza_kokoro::kokoro_status st = ipa_input
+        ? eliza_kokoro::kokoro_synthesize_ipa(
+              ctx->kokoro_model.get(), ctx->kokoro_voice, in, speed, audio, err)
+        : eliza_kokoro::kokoro_synthesize(
+              ctx->kokoro_model.get(), ctx->kokoro_voice, in, speed, audio, err);
+    if (st != eliza_kokoro::KOKORO_OK) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] ") + operation + " failed: " + err);
+        return ELIZA_ERR_FFI_FAULT;
+    }
+    return ELIZA_OK;
+}
+
+static int eliza_copy_kokoro_audio(
+    const eliza_kokoro::kokoro_audio & audio,
+    const char * operation,
+    float * out_pcm,
+    size_t max_samples,
+    char ** out_error) {
+    if (audio.samples.size() > max_samples) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] ") + operation +
+            ": out_pcm too small; required samples=" +
+            std::to_string(audio.samples.size()));
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    std::memcpy(out_pcm, audio.samples.data(), audio.samples.size() * sizeof(float));
+    return (int) audio.samples.size();
+}
+
+static int eliza_transfer_kokoro_audio(
+    const eliza_kokoro::kokoro_audio & audio,
+    float ** out_pcm,
+    size_t * out_samples,
+    char ** out_error) {
+    if (!out_pcm || !out_samples) {
+        eliza_set_error(out_error,
+            "[libelizainference] kokoro owned PCM: null output argument");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    *out_pcm = nullptr;
+    *out_samples = 0;
+    if (audio.samples.empty()) return ELIZA_OK;
+
+    const size_t bytes = audio.samples.size() * sizeof(float);
+    float * pcm = static_cast<float *>(std::malloc(bytes));
+    if (!pcm) {
+        eliza_set_error(out_error,
+            "[libelizainference] kokoro owned PCM allocation failed");
+        return ELIZA_ERR_OOM;
+    }
+    std::memcpy(pcm, audio.samples.data(), bytes);
+    *out_pcm = pcm;
+    *out_samples = audio.samples.size();
+    return ELIZA_OK;
+}
+#endif
+
 int eliza_inference_kokoro_synthesize(
     EliInferenceContext * ctx,
     const char * text,
@@ -1774,35 +1859,16 @@ int eliza_inference_kokoro_synthesize(
     size_t max_samples,
     char ** out_error) {
 #ifdef ELIZA_ENABLE_KOKORO
-    if (!ctx || !text || !out_pcm) {
-        eliza_set_error(out_error, "[libelizainference] kokoro_synthesize: null argument");
+    if (!out_pcm) {
+        eliza_set_error(out_error, "[libelizainference] kokoro_synthesize: null output buffer");
         return ELIZA_ERR_INVALID_ARG;
     }
-    std::lock_guard<std::mutex> lock(ctx->kokoro_mutex);
-    if (!ctx->kokoro_loaded || !ctx->kokoro_model) {
-        eliza_set_error(out_error,
-            "[libelizainference] kokoro_synthesize: no model loaded (call kokoro_load first)");
-        return ELIZA_ERR_INVALID_ARG;
-    }
-    if (speed <= 0.0f) speed = 1.0f;
-    const std::string in(text, text_len ? text_len : std::strlen(text));
     eliza_kokoro::kokoro_audio audio;
-    std::string err;
-    eliza_kokoro::kokoro_status st = eliza_kokoro::kokoro_synthesize(
-        ctx->kokoro_model.get(), ctx->kokoro_voice, in, speed, audio, err);
-    if (st != eliza_kokoro::KOKORO_OK) {
-        eliza_set_error(out_error,
-            std::string("[libelizainference] kokoro_synthesize failed: ") + err);
-        return ELIZA_ERR_FFI_FAULT;
-    }
-    if (audio.samples.size() > max_samples) {
-        eliza_set_error(out_error,
-            "[libelizainference] kokoro_synthesize: out_pcm too small; required samples=" +
-            std::to_string(audio.samples.size()));
-        return ELIZA_ERR_INVALID_ARG;
-    }
-    std::memcpy(out_pcm, audio.samples.data(), audio.samples.size() * sizeof(float));
-    return (int) audio.samples.size();
+    const int rc = eliza_kokoro_synthesize_audio(
+        ctx, text, text_len, speed, false, audio, out_error);
+    if (rc != ELIZA_OK) return rc;
+    return eliza_copy_kokoro_audio(
+        audio, "kokoro_synthesize", out_pcm, max_samples, out_error);
 #else
     (void) ctx; (void) text; (void) text_len; (void) speed;
     (void) out_pcm; (void) max_samples;
@@ -1848,35 +1914,16 @@ int eliza_inference_kokoro_synthesize_ipa(
     size_t max_samples,
     char ** out_error) {
 #ifdef ELIZA_ENABLE_KOKORO
-    if (!ctx || !ipa || !out_pcm) {
-        eliza_set_error(out_error, "[libelizainference] kokoro_synthesize_ipa: null argument");
+    if (!out_pcm) {
+        eliza_set_error(out_error, "[libelizainference] kokoro_synthesize_ipa: null output buffer");
         return ELIZA_ERR_INVALID_ARG;
     }
-    std::lock_guard<std::mutex> lock(ctx->kokoro_mutex);
-    if (!ctx->kokoro_loaded || !ctx->kokoro_model) {
-        eliza_set_error(out_error,
-            "[libelizainference] kokoro_synthesize_ipa: no model loaded (call kokoro_load first)");
-        return ELIZA_ERR_INVALID_ARG;
-    }
-    if (speed <= 0.0f) speed = 1.0f;
-    const std::string in(ipa, ipa_len ? ipa_len : std::strlen(ipa));
     eliza_kokoro::kokoro_audio audio;
-    std::string err;
-    eliza_kokoro::kokoro_status st = eliza_kokoro::kokoro_synthesize_ipa(
-        ctx->kokoro_model.get(), ctx->kokoro_voice, in, speed, audio, err);
-    if (st != eliza_kokoro::KOKORO_OK) {
-        eliza_set_error(out_error,
-            std::string("[libelizainference] kokoro_synthesize_ipa failed: ") + err);
-        return ELIZA_ERR_FFI_FAULT;
-    }
-    if (audio.samples.size() > max_samples) {
-        eliza_set_error(out_error,
-            "[libelizainference] kokoro_synthesize_ipa: out_pcm too small; required samples=" +
-            std::to_string(audio.samples.size()));
-        return ELIZA_ERR_INVALID_ARG;
-    }
-    std::memcpy(out_pcm, audio.samples.data(), audio.samples.size() * sizeof(float));
-    return (int) audio.samples.size();
+    const int rc = eliza_kokoro_synthesize_audio(
+        ctx, ipa, ipa_len, speed, true, audio, out_error);
+    if (rc != ELIZA_OK) return rc;
+    return eliza_copy_kokoro_audio(
+        audio, "kokoro_synthesize_ipa", out_pcm, max_samples, out_error);
 #else
     (void) ctx; (void) ipa; (void) ipa_len; (void) speed;
     (void) out_pcm; (void) max_samples;
@@ -1884,6 +1931,70 @@ int eliza_inference_kokoro_synthesize_ipa(
         "[libelizainference] kokoro not built (ELIZA_ENABLE_KOKORO off)");
     return ELIZA_ERR_NOT_IMPLEMENTED;
 #endif
+}
+
+int eliza_inference_kokoro_synthesize_alloc(
+    EliInferenceContext * ctx,
+    const char * text,
+    size_t text_len,
+    float speed,
+    float ** out_pcm,
+    size_t * out_samples,
+    char ** out_error) {
+#ifdef ELIZA_ENABLE_KOKORO
+    if (!out_pcm || !out_samples) {
+        eliza_set_error(out_error,
+            "[libelizainference] kokoro_synthesize_alloc: null output argument");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    *out_pcm = nullptr;
+    *out_samples = 0;
+    eliza_kokoro::kokoro_audio audio;
+    const int rc = eliza_kokoro_synthesize_audio(
+        ctx, text, text_len, speed, false, audio, out_error);
+    if (rc != ELIZA_OK) return rc;
+    return eliza_transfer_kokoro_audio(audio, out_pcm, out_samples, out_error);
+#else
+    (void) ctx; (void) text; (void) text_len; (void) speed;
+    (void) out_pcm; (void) out_samples;
+    eliza_set_error(out_error,
+        "[libelizainference] kokoro not built (ELIZA_ENABLE_KOKORO off)");
+    return ELIZA_ERR_NOT_IMPLEMENTED;
+#endif
+}
+
+int eliza_inference_kokoro_synthesize_ipa_alloc(
+    EliInferenceContext * ctx,
+    const char * ipa,
+    size_t ipa_len,
+    float speed,
+    float ** out_pcm,
+    size_t * out_samples,
+    char ** out_error) {
+#ifdef ELIZA_ENABLE_KOKORO
+    if (!out_pcm || !out_samples) {
+        eliza_set_error(out_error,
+            "[libelizainference] kokoro_synthesize_ipa_alloc: null output argument");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    *out_pcm = nullptr;
+    *out_samples = 0;
+    eliza_kokoro::kokoro_audio audio;
+    const int rc = eliza_kokoro_synthesize_audio(
+        ctx, ipa, ipa_len, speed, true, audio, out_error);
+    if (rc != ELIZA_OK) return rc;
+    return eliza_transfer_kokoro_audio(audio, out_pcm, out_samples, out_error);
+#else
+    (void) ctx; (void) ipa; (void) ipa_len; (void) speed;
+    (void) out_pcm; (void) out_samples;
+    eliza_set_error(out_error,
+        "[libelizainference] kokoro not built (ELIZA_ENABLE_KOKORO off)");
+    return ELIZA_ERR_NOT_IMPLEMENTED;
+#endif
+}
+
+void eliza_inference_free_pcm(float * pcm) {
+    std::free(pcm);
 }
 
 int eliza_inference_mmap_acquire(

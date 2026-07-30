@@ -19,6 +19,7 @@ set(KOKORO_PUBLIC_HEADERS
     include/kokoro-server-mount.h
     include/kokoro-tensor-names.h
     include/kokoro-layers.h
+    include/kokoro-model-internal.h
     include/kokoro-predictor.h)
 
 set(KOKORO_CORE_SOURCES
@@ -47,6 +48,7 @@ if(TARGET ggml-cpu)
 endif()
 
 target_compile_features(kokoro_lib PUBLIC cxx_std_17)
+target_compile_definitions(kokoro_lib PRIVATE KOKORO_USE_GGML_BACKEND)
 
 # kokoro-layers.h routes the Conv1d/ConvTranspose1d/Linear/LSTM hot loops
 # through the Accelerate BLAS (im2col + sgemm/sgemv) on Apple platforms —
@@ -59,6 +61,9 @@ if(APPLE)
 else()
     find_package(Threads REQUIRED)
     target_link_libraries(kokoro_lib PUBLIC Threads::Threads)
+endif()
+if(ANDROID)
+    target_link_libraries(kokoro_lib PUBLIC log)
 endif()
 
 # Real G2P via libespeak-ng. When present, kokoro_phonemize() drives

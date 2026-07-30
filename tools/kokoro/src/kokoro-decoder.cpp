@@ -8,6 +8,7 @@
 #include "kokoro-decoder.h"
 #include "kokoro-decoder-front.h"   // DecoderFrontWeights, DecAdainResBlk, decoder_front
 #include "kokoro-generator.h"       // GeneratorWeights, kokoro_generator_forward
+#include "kokoro-model-internal.h"
 #include "kokoro-profile.h"
 
 #include "ggml.h"
@@ -16,15 +17,12 @@
 
 namespace eliza_kokoro {
 
-// Defined in kokoro.cpp — the all-F32 working context the predictor reads.
-ggml_context * kokoro_model_ggml_ctx(const kokoro_model * model);
-
 namespace {
 
 struct Lk {
     ggml_context * ctx;
     const float * get(const std::string & name) const {
-        ggml_tensor * t = ggml_get_tensor(ctx, name.c_str());
+        ggml_tensor * t = kokoro_find_tensor_compat(ctx, name);
         return t ? (const float *) t->data : nullptr;
     }
 };

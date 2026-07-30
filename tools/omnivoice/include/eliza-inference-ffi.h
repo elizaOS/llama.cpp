@@ -134,6 +134,11 @@ extern "C" {
  * load and refuses to bind if they disagree.
  *
  * Changelog:
+ *   v15: Kokoro synthesis can return an exact-size, library-owned PCM buffer
+ *       through `eliza_inference_kokoro_synthesize_alloc` and
+ *       `eliza_inference_kokoro_synthesize_ipa_alloc`; callers release it with
+ *       `eliza_inference_free_pcm`. This removes guessed duration ceilings and
+ *       avoids running the model twice to discover an output size.
  *   v14: Kokoro IPA input + G2P-kind capability query.
  *        `eliza_inference_kokoro_g2p_kind()` reports whether the linked
  *        kokoro_lib phonemizes raw text with real espeak-ng
@@ -221,9 +226,9 @@ extern "C" {
  *   v7: real Silero VAD (same symbol surface as v6).
  *   v6: fused wake-word, speaker, diarizer.
  */
-#define ELIZA_INFERENCE_ABI_VERSION 14
+#define ELIZA_INFERENCE_ABI_VERSION 15
 
-/* Returns a static, NUL-terminated string of the form "14" matching
+/* Returns a static, NUL-terminated string of the form "15" matching
  * ELIZA_INFERENCE_ABI_VERSION at the time the library was built. The
  * pointer is owned by the library — do NOT free. */
 const char * eliza_inference_abi_version(void);
@@ -439,6 +444,36 @@ int eliza_inference_kokoro_synthesize_ipa(
     float * out_pcm,
     size_t max_samples,
     char ** out_error);
+
+/* ---- Exact-size Kokoro PCM ownership (ABI v15) ------------------- *
+ *
+ * These entries run the same raw-text / IPA synthesis as the caller-buffer
+ * forms above, then transfer an exact-size malloc-owned PCM buffer to the
+ * caller. On success `*out_pcm` is NULL only when `*out_samples == 0`.
+ * Release every non-NULL result with `eliza_inference_free_pcm`.
+ *
+ * The allocation is owned by the library so callers do not guess an utterance
+ * duration, truncate valid audio, or repeat an expensive model forward merely
+ * to learn the required sample count. */
+int eliza_inference_kokoro_synthesize_alloc(
+    EliInferenceContext * ctx,
+    const char * text,
+    size_t text_len,
+    float speed,
+    float ** out_pcm,
+    size_t * out_samples,
+    char ** out_error);
+
+int eliza_inference_kokoro_synthesize_ipa_alloc(
+    EliInferenceContext * ctx,
+    const char * ipa,
+    size_t ipa_len,
+    float speed,
+    float ** out_pcm,
+    size_t * out_samples,
+    char ** out_error);
+
+void eliza_inference_free_pcm(float * pcm);
 
 /* ---- OmniVoice reference encode (ABI v4) -------------------------- *
  *

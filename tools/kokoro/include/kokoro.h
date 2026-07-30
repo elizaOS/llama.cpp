@@ -14,18 +14,12 @@
 //         |--> decoder (HiFi-GAN-style upsampling + ResBlock + iSTFT)
 //         |--> 24kHz PCM
 //
-// The arch tag `LLM_ARCH_KOKORO` (src/models/kokoro.cpp) exists for the
-// K-quant publish pipeline (R8 §3.1). This header sits next to that scaffold
-// and exposes a *standalone* inference entry point used by the kokoro-tts CLI
-// and the `/v1/audio/speech` route. It does NOT route through llama.cpp's
-// generic `llm_graph_context` — TTS does not fit that LM abstraction (no KV
-// cache, no autoregressive token gen, no logit head).
+// The arch tag `LLM_ARCH_KOKORO` is only a GGUF format discriminator. Generic
+// llama model loading rejects it because TTS has no KV cache, autoregressive
+// token generation, or logit head. This standalone API is the only supported
+// inference path and is consumed by the kokoro-tts CLI, the fused Eliza
+// inference ABI, and the `/v1/audio/speech` route.
 //
-// Quality note (J2): the from-scratch GGML port does not match the PyTorch /
-// ONNX reference numerically. Production keeps the ONNX path during the
-// one-release deprecation runway; this fork path is the new default once the
-// quality gap closes. See `.swarm/impl/J2-kokoro-port-notes.md`.
-
 #pragma once
 
 #include <cstdint>

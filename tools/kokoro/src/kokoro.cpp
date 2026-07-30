@@ -14,13 +14,10 @@
 //   decoder              : HiFi-GAN-style upsampling + ResBlock + iSTFTNet
 //                          vocoder head. Output: 24kHz PCM.
 //
-// The from-scratch port runs at low quality vs the PyTorch / ONNX reference
-// because (a) the phoneme mapper is ASCII-only (espeak-ng would be required
-// for parity) and (b) the predictor convolutions and ResBlock dilations need
-// careful per-layer weight-mapping that this initial port approximates with
-// a single-residual-branch generator. The pipeline does still produce
-// non-blank audio shaped by the phoneme sequence + style vector — which is
-// what the J2 brief requires shipping.
+// Published tensor names are normalized at the lookup boundary so both the
+// canonical converter output and the upstream flat GGUF run the same complete
+// predictor, decoder, and iSTFTNet graph. Android supplies IPA from the staged
+// phonemizer because the fused bionic library intentionally omits espeak-ng.
 //
 // The gguf-loader part is wired to the standard fork's `gguf_*` API (no
 // llama.cpp/llama-model.cpp dependency — we load tensor-by-tensor and own
@@ -29,6 +26,8 @@
 
 #include "kokoro.h"
 #include "kokoro-istft.h"
+#include "kokoro-layers.h"
+#include "kokoro-model-internal.h"
 #include "kokoro-phonemes.h"
 #include "kokoro-predictor.h"
 #include "kokoro-decoder.h"
@@ -45,12 +44,14 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -88,6 +89,7 @@ struct kokoro_model {
     // ggml backend ownership.
     ggml_backend_t backend  = nullptr;
     ggml_backend_buffer_t buf = nullptr;
+    detail::KokoroComputeState compute;
     // `ctx` is the context the predictor/decoder read from: it is ALWAYS
     // all-F32 (see dequant pass in the loader). `gguf_ctx` owns the original
     // on-disk tensors (which may be F16/quantized) and is kept alive only so
@@ -95,35 +97,6 @@ struct kokoro_model {
     ggml_context * ctx       = nullptr;  // all-F32, predictor/decoder read this
     ggml_context * gguf_ctx  = nullptr;  // original on-disk dtypes (owned)
     gguf_context * gguf      = nullptr;
-
-    // Token-embedding lookup table: [vocab, d_model].
-    ggml_tensor * tok_embd   = nullptr;
-    // Final projection from decoder hidden → mel-spec slice: [d_hidden, F]
-    ggml_tensor * mel_proj   = nullptr;
-    // Decoder phase projection: [d_hidden, F]
-    ggml_tensor * phase_proj = nullptr;
-    // Duration predictor head: [d_model, 1]
-    ggml_tensor * dur_proj   = nullptr;
-    // Style projection (mixes ref_s into the encoder hidden): [256, d_model]
-    ggml_tensor * style_proj = nullptr;
-
-    // Text encoder, single fused layer (Q/K/V/O + FFN). Multi-layer support is
-    // a follow-up — each layer's weights are stored in the GGUF under
-    // `text_encoder.layers.<il>.*`. We currently use the first layer only for
-    // forward-pass shape verification; downstream layers fall through.
-    struct text_layer {
-        ggml_tensor * attn_norm = nullptr;
-        ggml_tensor * wq = nullptr;
-        ggml_tensor * wk = nullptr;
-        ggml_tensor * wv = nullptr;
-        ggml_tensor * wo = nullptr;
-        ggml_tensor * ffn_norm = nullptr;
-        ggml_tensor * ffn_gate = nullptr;  // SwiGLU
-        ggml_tensor * ffn_up   = nullptr;
-        ggml_tensor * ffn_down = nullptr;
-    };
-    std::vector<text_layer> text_layers;
-    ggml_tensor * out_norm = nullptr;
 
     // Synthesis mutex.
     std::mutex mu;
@@ -177,6 +150,146 @@ static ggml_tensor * find_tensor(ggml_context * ctx, const std::string & name) {
     return ggml_get_tensor(ctx, name.c_str());
 }
 
+static bool replace_once(std::string & value, const std::string & from, const std::string & to) {
+    const size_t pos = value.find(from);
+    if (pos == std::string::npos) return false;
+    value.replace(pos, from.size(), to);
+    return true;
+}
+
+static void replace_all(std::string & value, const std::string & from, const std::string & to) {
+    size_t pos = 0;
+    while ((pos = value.find(from, pos)) != std::string::npos) {
+        value.replace(pos, from.size(), to);
+        pos += to.size();
+    }
+}
+
+// The first published Kokoro bundle predates the canonical tensor namespace
+// emitted by the in-tree converter. Its schema is regular but not a simple
+// prefix change: BERT, AdaIN, BiLSTM reverse directions, and the generator all
+// renamed structural segments. Resolve that complete schema here so every
+// forward pass uses one lookup policy; validating six representative tensors
+// at load time is insufficient if the predictor later performs exact-name
+// lookups for the remaining hundreds.
+static std::string published_legacy_tensor_name(const std::string & canonical) {
+    if (canonical == "kokoro.bert.token_embd.weight") return "bert.embd.tok.weight";
+    if (canonical == "kokoro.bert.position_embd.weight") return "bert.embd.pos.weight";
+    if (canonical == "kokoro.bert.tok_type_embd.weight") return "bert.embd.tt.weight";
+    if (canonical == "kokoro.bert.embd_ln.weight") return "bert.embd.ln.weight";
+    if (canonical == "kokoro.bert.embd_ln.bias") return "bert.embd.ln.bias";
+    if (canonical == "kokoro.bert.embd_proj.weight") return "bert.embd_proj.weight";
+    if (canonical == "kokoro.bert.embd_proj.bias") return "bert.embd_proj.bias";
+    if (canonical == "kokoro.bert_encoder.weight") return "bert_proj.weight";
+    if (canonical == "kokoro.bert_encoder.bias") return "bert_proj.bias";
+
+    if (canonical.rfind("kokoro.bert.layer.", 0) == 0) {
+        std::string tail = canonical.substr(std::string("kokoro.bert.layer.").size());
+        if (tail.rfind("ffn_out.", 0) == 0) {
+            return "bert.ffn_down." + tail.substr(std::string("ffn_out.").size());
+        }
+        if (tail.rfind("ffn.", 0) == 0) {
+            return "bert.ffn_up." + tail.substr(std::string("ffn.").size());
+        }
+        if (tail.rfind("full_ln.", 0) == 0) {
+            return "bert.ffn_ln." + tail.substr(std::string("full_ln.").size());
+        }
+        return "bert." + tail;
+    }
+
+    if (canonical.rfind("kokoro.predictor.", 0) == 0) {
+        std::string tail = canonical.substr(std::string("kokoro.predictor.").size());
+        if (tail.rfind("duration_proj.", 0) == 0) {
+            tail.replace(0, std::string("duration_proj").size(), "dur_proj");
+        }
+        if (tail.rfind("de.lstm", 0) == 0) {
+            const size_t dot = tail.find('.', std::string("de.lstm").size());
+            if (dot != std::string::npos) {
+                const std::string layer = tail.substr(std::string("de.lstm").size(),
+                                                      dot - std::string("de.lstm").size());
+                tail = "dur_enc." + layer + ".lstm." + tail.substr(dot + 1);
+            }
+        } else if (tail.rfind("de.adaln", 0) == 0) {
+            const size_t dot = tail.find('.', std::string("de.adaln").size());
+            if (dot != std::string::npos) {
+                const std::string layer = tail.substr(std::string("de.adaln").size(),
+                                                      dot - std::string("de.adaln").size());
+                tail = "dur_enc." + layer + ".adaln." + tail.substr(dot + 1);
+                replace_once(tail, ".fc.", ".");
+            }
+        }
+        replace_all(tail, ".norm1.fc.", ".adain1.");
+        replace_all(tail, ".norm2.fc.", ".adain2.");
+        replace_all(tail, "_l0_r", "_l0_reverse");
+        return "pred." + tail;
+    }
+
+    if (canonical.rfind("kokoro.text_encoder.", 0) == 0) {
+        std::string tail = canonical.substr(std::string("kokoro.text_encoder.").size());
+        if (tail.rfind("cnn.", 0) == 0) {
+            const size_t field = tail.find('.', std::string("cnn.").size());
+            if (field != std::string::npos) {
+                tail.insert(field + 1, "conv.");
+            }
+        } else if (tail.rfind("ln.", 0) == 0) {
+            const size_t field = tail.find('.', std::string("ln.").size());
+            if (field != std::string::npos) {
+                const std::string layer = tail.substr(std::string("ln.").size(),
+                                                      field - std::string("ln.").size());
+                std::string parameter = tail.substr(field + 1);
+                if (parameter == "weight") parameter = "gamma";
+                if (parameter == "bias") parameter = "beta";
+                tail = "cnn." + layer + ".ln." + parameter;
+            }
+        }
+        replace_all(tail, "_l0_r", "_l0_reverse");
+        return "text_enc." + tail;
+    }
+
+    if (canonical.rfind("kokoro.decoder.", 0) == 0) {
+        std::string tail = canonical.substr(std::string("kokoro.decoder.").size());
+        replace_all(tail, ".norm1.fc.", ".adain1.");
+        replace_all(tail, ".norm2.fc.", ".adain2.");
+        return "dec." + tail;
+    }
+
+    if (canonical.rfind("kokoro.gen.", 0) == 0) {
+        std::string tail = canonical.substr(std::string("kokoro.gen.").size());
+        replace_once(tail, "m_source.l_linear.", "m_source.");
+        replace_all(tail, ".fc.", ".");
+        return "dec.gen." + tail;
+    }
+
+    return {};
+}
+
+static ggml_tensor * find_tensor_compat_impl(ggml_context * ctx, const std::string & name) {
+    if (!ctx) return nullptr;
+    if (ggml_tensor * exact = ggml_get_tensor(ctx, name.c_str())) return exact;
+
+    // The converter uses LayerNorm's conventional weight/bias names while the
+    // portable predictor retains the upstream gamma/beta terminology.
+    std::string canonical_alias = name;
+    if (replace_once(canonical_alias, ".gamma", ".weight") ||
+        replace_once(canonical_alias, ".beta", ".bias")) {
+        if (ggml_tensor * alias = ggml_get_tensor(ctx, canonical_alias.c_str())) return alias;
+    } else {
+        canonical_alias.clear();
+    }
+
+    const std::string legacy = published_legacy_tensor_name(name);
+    if (!legacy.empty()) {
+        if (ggml_tensor * alias = ggml_get_tensor(ctx, legacy.c_str())) return alias;
+    }
+    if (!canonical_alias.empty()) {
+        const std::string legacy_alias = published_legacy_tensor_name(canonical_alias);
+        if (!legacy_alias.empty()) {
+            if (ggml_tensor * alias = ggml_get_tensor(ctx, legacy_alias.c_str())) return alias;
+        }
+    }
+    return nullptr;
+}
+
 static bool has_tensor_alias(const char * name, void * user_data) {
     return name && ggml_get_tensor((ggml_context *) user_data, name) != nullptr;
 }
@@ -211,6 +324,10 @@ static ggml_tensor * require_tensor_any(
 }
 
 } // namespace
+
+ggml_tensor * kokoro_find_tensor_compat(ggml_context * ctx, const std::string & name) {
+    return find_tensor_compat_impl(ctx, name);
+}
 
 // ---------------------------------------------------------------------------
 // Loader
@@ -267,6 +384,16 @@ kokoro_model_ptr kokoro_load_model(
         err_out = "ggml_backend_cpu_init failed";
         return {nullptr, kokoro_model_deleter{}};
     }
+    int backend_threads = 0;
+    if (const char * configured = std::getenv("KOKORO_NUM_THREADS")) {
+        backend_threads = std::atoi(configured);
+    }
+    if (backend_threads < 1) {
+        const unsigned available = std::thread::hardware_concurrency();
+        backend_threads = (int) std::min(available == 0 ? 4u : available, 16u);
+    }
+    ggml_backend_cpu_set_n_threads(model->backend, backend_threads);
+    model->compute.backend = model->backend;
 
     // Second pass: allocate the on-disk tensor data (original dtypes) through
     // the backend, into `gguf_ctx`.
@@ -379,12 +506,13 @@ kokoro_model_ptr kokoro_load_model(
     // unprefixed dev names from pre-publication GGUFs. Missing required
     // tensors are a hard load error: otherwise the synth path can appear to
     // work while silently skipping the real model weights.
-    model->tok_embd = require_tensor_any(
+    if (!require_tensor_any(
         model->ctx,
         KOKORO_TENSOR_BERT_TOKEN_EMBD,
         "BERT token embedding",
-        err_out);
-    if (!model->tok_embd) return {nullptr, kokoro_model_deleter{}};
+        err_out)) {
+        return {nullptr, kokoro_model_deleter{}};
+    }
 
     if (!require_tensor_any(model->ctx, KOKORO_TENSOR_BERT_ATTN_Q, "BERT attention Q", err_out)) {
         return {nullptr, kokoro_model_deleter{}};
@@ -399,30 +527,12 @@ kokoro_model_ptr kokoro_load_model(
         return {nullptr, kokoro_model_deleter{}};
     }
 
-    model->mel_proj   = find_tensor(model->ctx, "kokoro.decoder.mel_proj.weight");
-    model->phase_proj = find_tensor(model->ctx, "kokoro.decoder.phase_proj.weight");
-    model->dur_proj   = require_tensor_any(
+    if (!require_tensor_any(
         model->ctx,
         KOKORO_TENSOR_DURATION_PROJ,
         "duration projection",
-        err_out);
-    if (!model->dur_proj) return {nullptr, kokoro_model_deleter{}};
-    model->style_proj = find_tensor(model->ctx, "kokoro.style.proj.weight");
-    model->out_norm   = find_tensor(model->ctx, "kokoro.text.out_norm.weight");
-
-    model->text_layers.resize((size_t) h.text_n_layer);
-    for (int il = 0; il < h.text_n_layer; ++il) {
-        auto & L = model->text_layers[(size_t) il];
-        const std::string pfx = "kokoro.text.layers." + std::to_string(il) + ".";
-        L.attn_norm = find_tensor(model->ctx, pfx + "attn_norm.weight");
-        L.wq        = find_tensor(model->ctx, pfx + "attn_q.weight");
-        L.wk        = find_tensor(model->ctx, pfx + "attn_k.weight");
-        L.wv        = find_tensor(model->ctx, pfx + "attn_v.weight");
-        L.wo        = find_tensor(model->ctx, pfx + "attn_o.weight");
-        L.ffn_norm  = find_tensor(model->ctx, pfx + "ffn_norm.weight");
-        L.ffn_gate  = find_tensor(model->ctx, pfx + "ffn_gate.weight");
-        L.ffn_up    = find_tensor(model->ctx, pfx + "ffn_up.weight");
-        L.ffn_down  = find_tensor(model->ctx, pfx + "ffn_down.weight");
+        err_out)) {
+        return {nullptr, kokoro_model_deleter{}};
     }
 
     return kokoro_model_ptr(model.release(), kokoro_model_deleter{});
@@ -484,27 +594,6 @@ kokoro_g2p_kind kokoro_g2p_kind_of_build() noexcept {
     return espeak_available() ? KOKORO_G2P_ESPEAK : KOKORO_G2P_ASCII;
 }
 
-// ---------------------------------------------------------------------------
-// Synthesis path
-// ---------------------------------------------------------------------------
-//
-// This is the simplified pipeline:
-//
-//   1. Phonemize → int32 ids (length T <= 510).
-//   2. Slice ref_s from the voice preset (per-position style vector at idx T).
-//   3. Compute a per-phoneme "energy" curve as a deterministic function of
-//      (phoneme_id, position, style_vector). The curve drives the iSTFT
-//      vocoder's magnitude spectrogram.
-//   4. iSTFT → 24kHz PCM.
-//
-// Step 3 is where the GGML graph would dispatch the BERT encoder + predictors
-// + decoder. The current port runs the GGML graph (so the backend is
-// exercised + verified to load) and then computes the synthesis-shape curve
-// in plain C++. The synthesis quality is documented as degraded vs the ONNX
-// reference in J2-kokoro-port-notes.md; closing the gap is follow-up work
-// for the next training/inference wave.
-
-
 // Shared synthesis core: takes an already-phonemized, wrapped input-id run
 // ([PAD, *ids, PAD]) and runs the predictor → decoder → 24 kHz PCM path. Both
 // public entries (`kokoro_synthesize` = raw text via kokoro_phonemize,
@@ -533,52 +622,25 @@ static kokoro_status kokoro_synthesize_from_input_ids(
     int slot = std::min(voice.n_positions - 1, std::max(0, bare_len));
     const float * ref_s = voice.data.data() + (size_t) slot * (size_t) style_dim;
 
-    // 3. (Optional) Exercise the GGML graph for the loaded text-encoder
-    //    tensors — this verifies the backend can dispatch matmul + norm on
-    //    the GGUF-loaded weights without touching the synthesis spectrogram
-    //    (which uses the deterministic shape function below for the J2 ship).
-    //
-    //    A real graph build (text_encoder → predictor → decoder) lands in a
-    //    follow-up. The shape verification confirms the GGUF is internally
-    //    consistent and the backend boots.
-    if (model->tok_embd) {
-        ggml_init_params ip = {
-            /*.mem_size   =*/ 32 * 1024 * 1024,
-            /*.mem_buffer =*/ nullptr,
-            /*.no_alloc   =*/ true,
-        };
-        ggml_context * gctx = ggml_init(ip);
-        if (gctx) {
-            // input ids tensor.
-            ggml_tensor * ids = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, (int64_t) phonemes.size());
-            // lookup → [d, T]
-            ggml_tensor * h = ggml_get_rows(gctx, model->tok_embd, ids);
-            // optional final norm
-            if (model->out_norm) {
-                h = ggml_rms_norm(gctx, h, 1e-5f);
-                h = ggml_mul(gctx, h, model->out_norm);
-            }
-            ggml_cgraph * gf = ggml_new_graph_custom(gctx, 1024, false);
-            ggml_build_forward_expand(gf, h);
-
-            ggml_gallocr_t alloc = ggml_gallocr_new(
-                ggml_backend_get_default_buffer_type(model->backend));
-            if (alloc && ggml_gallocr_alloc_graph(alloc, gf)) {
-                ggml_backend_tensor_set(ids, phonemes.data(), 0,
-                                        sizeof(int32_t) * phonemes.size());
-                ggml_backend_graph_compute(model->backend, gf);
-            }
-            if (alloc) ggml_gallocr_free(alloc);
-            ggml_free(gctx);
-        }
-    }
-
-    // 4. Predictor → decoder → 24 kHz PCM (#9588: the real StyleTTS-2 /
-    //    iSTFTNet forward pass, replacing the J2-ship placeholder). The
+    // Predictor → decoder → 24 kHz PCM. The
     //    predictor consumes the predictor-half style ref_s[128:]; the decoder
     //    consumes the decoder-half ref_s[:128] (both passed as the same 256-d
     //    ref_s pointer — each half indexes its own slice internally).
     {
+#if defined(__APPLE__)
+        // Accelerate's AMX-backed SGEMM remains faster than GGML's CPU graph on
+        // Apple Silicon. Android and other non-Apple targets use GGML so their
+        // hot convolutions reach the optimized backend instead of scalar glue.
+        detail::KokoroComputeBackendScope compute_scope(
+            std::getenv("KOKORO_FORCE_GGML")
+                ? &const_cast<kokoro_model *>(model)->compute
+                : nullptr);
+#else
+        detail::KokoroComputeBackendScope compute_scope(
+            std::getenv("KOKORO_DISABLE_GGML")
+                ? nullptr
+                : &const_cast<kokoro_model *>(model)->compute);
+#endif
         kokoro_phase_timer synth_timer("synthesize total");
         PredictorOut pred;
         {
@@ -695,7 +757,6 @@ const kokoro_hparams * kokoro_get_hparams(const kokoro_model * model) noexcept {
 // surface while giving the sibling TUs a stable handle.
 // Forward-declare here so -Wmissing-declarations sees a prior declaration
 // at the definition site (the matching extern lives in the sibling TUs).
-ggml_context * kokoro_model_ggml_ctx(const kokoro_model * model);
 ggml_context * kokoro_model_ggml_ctx(const kokoro_model * model) {
     return model ? model->ctx : nullptr;
 }

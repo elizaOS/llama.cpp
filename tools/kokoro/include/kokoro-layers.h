@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 //
-// kokoro-layers.h — small neural-net layer primitives used by the Kokoro
-// predictor + decoder forwards. No GGML graph / backend dispatch: the forward
-// pass is line-for-line matched to the upstream `kokoro` Python package
-// (modules.py + istftnet.py) so the trained weights produce numerically
-// equivalent output.
+// Neural-network primitives for the Kokoro predictor and decoder. Production
+// convolution layers dispatch through GGML while the portable and scalar
+// implementations remain numerical references for parity testing. The forward
+// equations match the upstream `kokoro` Python package (modules.py +
+// istftnet.py), so backend selection cannot change the trained model contract.
 //
 // The O(C^2*K*T) hot loops (Conv1d, ConvTranspose1d, Linear, LSTM gate
 // matvecs) have three implementations, selected at compile time:
@@ -36,8 +36,16 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 #include <vector>
+
+#if defined(KOKORO_USE_GGML_BACKEND)
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "ggml.h"
+#endif
 
 #if defined(__APPLE__) && !defined(KOKORO_NO_ACCELERATE) && !defined(KOKORO_FORCE_SCALAR)
 #define KOKORO_USE_ACCELERATE 1
@@ -49,7 +57,6 @@
 #define KOKORO_USE_PORTABLE_FAST 1
 #include <atomic>
 #include <condition_variable>
-#include <cstdlib>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -60,6 +67,170 @@
 #endif
 
 namespace eliza_kokoro {
+
+#if defined(KOKORO_USE_GGML_BACKEND)
+namespace detail {
+
+struct CachedF16Weight {
+    size_t elements = 0;
+    std::vector<uint8_t> storage;
+
+    ggml_fp16_t * data() {
+        const uintptr_t address = reinterpret_cast<uintptr_t>(storage.data());
+        const uintptr_t aligned =
+            (address + GGML_MEM_ALIGN - 1) & ~(uintptr_t) (GGML_MEM_ALIGN - 1);
+        return reinterpret_cast<ggml_fp16_t *>(aligned);
+    }
+};
+
+struct KokoroComputeState {
+    ggml_backend_t backend = nullptr;
+    std::unordered_map<const float *, CachedF16Weight> f16_weights;
+};
+
+inline thread_local KokoroComputeState * kokoro_compute_state = nullptr;
+
+class KokoroComputeBackendScope {
+public:
+    explicit KokoroComputeBackendScope(KokoroComputeState * state)
+        : previous_(kokoro_compute_state) {
+        kokoro_compute_state = state;
+    }
+
+    ~KokoroComputeBackendScope() {
+        kokoro_compute_state = previous_;
+    }
+
+    KokoroComputeBackendScope(const KokoroComputeBackendScope &) = delete;
+    KokoroComputeBackendScope & operator=(const KokoroComputeBackendScope &) = delete;
+
+private:
+    KokoroComputeState * previous_;
+};
+
+inline bool ggml_compute_graph_and_copy(
+        ggml_backend_t backend, ggml_context * ctx, ggml_tensor * output,
+        float * destination, size_t elements) {
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 256, false);
+    ggml_build_forward_expand(graph, output);
+    ggml_gallocr_t allocator = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(backend));
+    if (!allocator) return false;
+    const bool allocated = ggml_gallocr_alloc_graph(allocator, graph);
+    const enum ggml_status status = allocated
+        ? ggml_backend_graph_compute(backend, graph)
+        : GGML_STATUS_ALLOC_FAILED;
+    if (status == GGML_STATUS_SUCCESS) {
+        ggml_backend_tensor_get(
+            output, destination, 0, sizeof(float) * elements);
+    }
+    ggml_gallocr_free(allocator);
+    return status == GGML_STATUS_SUCCESS;
+}
+
+inline const ggml_fp16_t * cached_f16_weight(
+        KokoroComputeState & state, const float * weight, size_t elements) {
+    auto & cached = state.f16_weights[weight];
+    if (cached.elements != elements) {
+        cached.elements = elements;
+        cached.storage.resize(
+            elements * sizeof(ggml_fp16_t) + GGML_MEM_ALIGN - 1);
+        ggml_fp32_to_fp16_row(weight, cached.data(), elements);
+    }
+    return cached.data();
+}
+
+inline bool ggml_conv1d_f32(
+        const float * x, int Cin, int T,
+        const float * W, const float * b, int Cout, int K,
+        int stride, int pad, int dilation,
+        float * y, int T_out) {
+    KokoroComputeState * state = kokoro_compute_state;
+    if (!state || !state->backend) return false;
+    ggml_backend_t backend = state->backend;
+
+    ggml_init_params params = {
+        /* mem_size   = */ 2 * 1024 * 1024,
+        /* mem_buffer = */ nullptr,
+        /* no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return false;
+
+    ggml_tensor * weight =
+        ggml_new_tensor_3d(ctx, GGML_TYPE_F16, K, Cin, Cout);
+    ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, T, Cin, 1);
+    weight->data = const_cast<ggml_fp16_t *>(cached_f16_weight(
+        *state, W, (size_t) K * Cin * Cout));
+    input->data = const_cast<float *>(x);
+
+    ggml_tensor * output = ggml_conv_1d(
+        ctx, weight, input, stride, pad, dilation);
+    if (b) {
+        ggml_tensor * bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, Cout);
+        bias->data = const_cast<float *>(b);
+        output = ggml_add(ctx, output, bias);
+    }
+
+    const bool ok =
+        output->ne[0] == T_out &&
+        output->ne[1] == Cout &&
+        ggml_compute_graph_and_copy(
+            backend, ctx, output, y, (size_t) Cout * T_out);
+    ggml_free(ctx);
+    return ok;
+}
+
+inline bool ggml_convtranspose1d_f32(
+        const float * x, int Cin, int T,
+        const float * W, const float * b, int Cout, int K,
+        int stride, int pad, int output_pad,
+        float * y, int T_out) {
+    KokoroComputeState * state = kokoro_compute_state;
+    if (!state || !state->backend) return false;
+    ggml_backend_t backend = state->backend;
+
+    ggml_init_params params = {
+        /* mem_size   = */ 2 * 1024 * 1024,
+        /* mem_buffer = */ nullptr,
+        /* no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return false;
+
+    ggml_tensor * weight = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, Cout, Cin);
+    ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T, Cin);
+    weight->data = const_cast<float *>(W);
+    input->data = const_cast<float *>(x);
+
+    ggml_tensor * output = ggml_conv_transpose_1d(ctx, weight, input, stride, 0, 1);
+    if (pad > 0) {
+        const int64_t cropped = output->ne[0] - 2 * (int64_t) pad;
+        output = ggml_view_2d(
+            ctx, output, cropped, output->ne[1], output->nb[1],
+            (size_t) pad * output->nb[0]);
+        output = ggml_cont(ctx, output);
+    }
+    if (output_pad > 0) {
+        output = ggml_pad(ctx, output, output_pad, 0, 0, 0);
+    }
+    if (b) {
+        ggml_tensor * bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, Cout);
+        bias->data = const_cast<float *>(b);
+        output = ggml_add(ctx, output, bias);
+    }
+
+    const bool ok =
+        output->ne[0] == T_out &&
+        output->ne[1] == Cout &&
+        ggml_compute_graph_and_copy(
+            backend, ctx, output, y, (size_t) Cout * T_out);
+    ggml_free(ctx);
+    return ok;
+}
+
+} // namespace detail
+#endif
 
 #if defined(KOKORO_USE_PORTABLE_FAST)
 namespace detail {
@@ -274,6 +445,12 @@ inline void conv1d_forward(
         const float * W, const float * b, int Cout, int K,
         int stride, int pad, int dilation,
         float * y, int T_out) {
+#if defined(KOKORO_USE_GGML_BACKEND)
+    if (detail::ggml_conv1d_f32(
+            x, Cin, T, W, b, Cout, K, stride, pad, dilation, y, T_out)) {
+        return;
+    }
+#endif
 #if defined(KOKORO_USE_ACCELERATE)
     // im2col + one SGEMM. The PyTorch weight layout [Cout, Cin, K] is already
     // a row-major [Cout, Cin*K] GEMM operand; the column matrix is
@@ -424,6 +601,12 @@ inline void convtranspose1d_forward(
         const float * W, const float * b, int Cout, int K,
         int stride, int pad, int output_pad,
         float * y, int T_out) {
+#if defined(KOKORO_USE_GGML_BACKEND)
+    if (detail::ggml_convtranspose1d_f32(
+            x, Cin, T, W, b, Cout, K, stride, pad, output_pad, y, T_out)) {
+        return;
+    }
+#endif
     // output_pad affects T_out (computed by caller) but does not change
     // the per-element formula here.
     (void)output_pad;
