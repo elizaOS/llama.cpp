@@ -1223,7 +1223,13 @@ static int eliza_load_llm_model_locked(
         n_gpu_layers >= 0
             ? n_gpu_layers
             : (eliza_bool_env_or_default("ELIZA_LLM_USE_GPU", true) ? 99 : 0);
-    mparams.use_mmap = true;
+    /* Android's packaged asset is copied into app-private storage before
+     * load, but the platform may still reclaim or invalidate file-backed
+     * pages under sustained native-memory pressure. ASR already uses this
+     * conservative Android profile. Keep text weights resident too, while
+     * preserving mmap on desktop and allowing an explicit device override. */
+    mparams.use_mmap = eliza_bool_env_or_default(
+        "ELIZA_LLM_USE_MMAP", !eliza_running_on_android());
     ctx->llm_model =
         llama_model_load_from_file(ctx->llm_model_path.c_str(), mparams);
     if (!ctx->llm_model) {
