@@ -5801,7 +5801,13 @@ static vk_device ggml_vk_get_device(size_t idx) {
             throw std::runtime_error("Unsupported device");
         }
 
-        device_extensions.push_back("VK_KHR_16bit_storage");
+        // 16-bit storage is core in Vulkan 1.1. Drivers can expose the core
+        // feature without advertising the promoted extension name.
+        if (fp16_storage) {
+            device_extensions.push_back("VK_KHR_16bit_storage");
+        } else if (device->properties.apiVersion < VK_API_VERSION_1_1) {
+            throw std::runtime_error("16-bit storage requires Vulkan 1.1 or VK_KHR_16bit_storage");
+        }
 
 #ifdef GGML_VULKAN_VALIDATE
         device_extensions.push_back("VK_KHR_shader_non_semantic_info");
