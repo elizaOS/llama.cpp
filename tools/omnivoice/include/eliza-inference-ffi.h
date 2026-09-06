@@ -1,5 +1,5 @@
 /*
- * libelizainference FFI ABI v14.
+ * libelizainference FFI ABI v16.
  *
  * (Banner tracks ELIZA_INFERENCE_ABI_VERSION below; the per-version history is
  * at the end of this header preamble, newest first.)
@@ -134,6 +134,8 @@ extern "C" {
  * load and refuses to bind if they disagree.
  *
  * Changelog:
+ *   v16: complete structured text messages can be formatted by the loaded
+ *       model's declared Jinja template, including its thinking setting.
  *   v15: Kokoro synthesis can return an exact-size, library-owned PCM buffer
  *       through `eliza_inference_kokoro_synthesize_alloc` and
  *       `eliza_inference_kokoro_synthesize_ipa_alloc`; callers release it with
@@ -226,9 +228,9 @@ extern "C" {
  *   v7: real Silero VAD (same symbol surface as v6).
  *   v6: fused wake-word, speaker, diarizer.
  */
-#define ELIZA_INFERENCE_ABI_VERSION 15
+#define ELIZA_INFERENCE_ABI_VERSION 16
 
-/* Returns a static, NUL-terminated string of the form "15" matching
+/* Returns a static, NUL-terminated string of the form "16" matching
  * ELIZA_INFERENCE_ABI_VERSION at the time the library was built. The
  * pointer is owned by the library — do NOT free. */
 const char * eliza_inference_abi_version(void);
@@ -1172,6 +1174,24 @@ int eliza_inference_describe_image(
     const char * prompt,
     char * out_text,
     size_t max_text_bytes,
+    char ** out_error);
+
+/**
+ * Formats complete text messages with the loaded model's declared Jinja chat
+ * template. The messages_json buffer contains a nonempty JSON array of exact
+ * {role, content} string pairs; system, user, and assistant roles are supported.
+ * Other shapes and missing templates fail explicitly. enable_thinking is 0 or 1.
+ * The model is loaded lazily and shared with generation. On success, the
+ * allocated UTF-8 JSON contains prompt and additionalStops; free it with
+ * eliza_inference_free_string. No caller-sized output buffer can clip the prompt.
+ * This additive ABI v16 function leaves earlier generation entry points intact.
+ */
+int eliza_inference_format_chat(
+    EliInferenceContext * ctx,
+    const char * messages_json,
+    size_t messages_len,
+    int enable_thinking,
+    char ** out_formatted_json,
     char ** out_error);
 
 /* ---- Tokenizer (ABI v9, additive) --------------------------------- *

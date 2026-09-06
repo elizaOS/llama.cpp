@@ -41,6 +41,8 @@ static_assert(
  * matches it exactly. NOTE: do not pull in httplib.h here — networking stays
  * out of the in-process FFI path. */
 #include "common.h"
+#include "chat.h"
+#include "nlohmann/json.hpp"
 #include "speculative.h"
 #include "sampling.h"
 
@@ -1233,6 +1235,78 @@ static int eliza_load_llm_model_locked(
         return ELIZA_ERR_BUNDLE_INVALID;
     }
     return ELIZA_OK;
+}
+
+int eliza_inference_format_chat(
+    EliInferenceContext * ctx,
+    const char * messages_json,
+    size_t messages_len,
+    int enable_thinking,
+    char ** out_formatted_json,
+    char ** out_error) {
+    if (out_formatted_json) *out_formatted_json = nullptr;
+    if (!ctx || !messages_json || !out_formatted_json ||
+        (enable_thinking != 0 && enable_thinking != 1)) {
+        eliza_set_error(out_error, "[libelizainference] format_chat: invalid arguments");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    try {
+        const auto messages = nlohmann::ordered_json::parse(
+            messages_json, messages_json + messages_len);
+        if (!messages.is_array() || messages.empty()) {
+            throw std::invalid_argument("messages must be a nonempty array");
+        }
+        for (const auto & message : messages) {
+            if (!message.is_object() || message.size() != 2 ||
+                !message.contains("role") || !message["role"].is_string() ||
+                !message.contains("content") || !message["content"].is_string()) {
+                throw std::invalid_argument("each text message requires exactly role and content strings");
+            }
+            const auto role = message["role"].get<std::string>();
+            if (role != "system" && role != "user" && role != "assistant") {
+                throw std::invalid_argument("unsupported text message role: " + role);
+            }
+        }
+        std::lock_guard<std::mutex> lock(ctx->llm_mutex);
+        const int rc = eliza_load_llm_model_locked(ctx, -1, out_error);
+        if (rc != ELIZA_OK) return rc;
+        const char * source = llama_model_chat_template(ctx->llm_model, nullptr);
+        if (!source || !*source) {
+            throw std::invalid_argument("loaded model has no tokenizer.chat_template");
+        }
+        auto templates = common_chat_templates_init(ctx->llm_model, "");
+        common_chat_templates_inputs inputs;
+        inputs.messages = common_chat_msgs_parse_oaicompat(messages);
+        inputs.enable_thinking = enable_thinking != 0;
+        inputs.add_generation_prompt = true;
+        inputs.use_jinja = true;
+        const auto formatted = common_chat_templates_apply(templates.get(), inputs);
+        size_t content_offset = 0;
+        for (const auto & message : messages) {
+            const auto content = message["content"].get<std::string>();
+            if (content.empty()) continue;
+            const auto position = formatted.prompt.find(content, content_offset);
+            if (position == std::string::npos) {
+                throw std::invalid_argument(
+                    "loaded chat template modifies or omits message content; "
+                    "use a model template that preserves complete ordered text");
+            }
+            content_offset = position + content.size();
+        }
+        const auto result = nlohmann::ordered_json{
+            {"prompt", formatted.prompt},
+            {"additionalStops", formatted.additional_stops},
+        }.dump();
+        *out_formatted_json = eliza_strdup(result);
+        if (!*out_formatted_json) {
+            throw std::runtime_error("could not allocate complete formatted chat");
+        }
+        return ELIZA_OK;
+    } catch (const std::exception & error) {
+        // error-policy:J1 Translate template and input failures at the C ABI boundary.
+        eliza_set_error(out_error, std::string("[libelizainference] format_chat: ") + error.what());
+        return ELIZA_ERR_INVALID_ARG;
+    }
 }
 
 /* Map a KV-cache quant type NAME (e.g. "f16", "q8_0", "qjl1_256",
