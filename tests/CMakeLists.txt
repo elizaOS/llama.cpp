@@ -341,6 +341,14 @@ if (TARGET cpp-httplib)
     endif()
 endif()
 
+if (TARGET ggml-metal)
+    add_executable(test-metal-library-layout test-metal-library-layout.cpp)
+    target_include_directories(test-metal-library-layout PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
+    target_link_libraries(test-metal-library-layout PRIVATE ggml-metal ggml-base)
+    llama_test(test-metal-library-layout)
+    set_tests_properties(test-metal-library-layout PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
