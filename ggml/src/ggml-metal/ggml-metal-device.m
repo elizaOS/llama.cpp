@@ -1,3 +1,6 @@
+/** Owns Metal devices and buffer allocation, storage, and tensor transfers. */
+#include <unistd.h>
+
 #import "ggml-metal-device.h"
 
 #import "ggml-impl.h"
@@ -2036,6 +2039,9 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
 }
 
 void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    if (size == 0) {
+        return;
+    }
     if (buf->is_shared) {
 #if GGML_METAL_HAS_MANAGED_BUFFERS
         // For Managed buffers (discrete GPU), sync GPU→CPU via blit encoder
@@ -2066,10 +2072,14 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
         bid_src.offs += offset;
 
         // dst
-        id<MTLBuffer> buf_dst = [buf->dev->mtl_device newBufferWithBytesNoCopy:data
-                                                               length:size
-                                                              options:MTLResourceStorageModeShared
-                                                          deallocator:nil];
+        // Pooled outputs may be smaller than a page and use ordinary heap storage.
+        // Metal's no-copy API requires both pointer and length to be page aligned.
+        const size_t page_size = (size_t) sysconf(_SC_PAGESIZE);
+        const bool direct = (uintptr_t) data % page_size == 0 && size % page_size == 0;
+        id<MTLBuffer> buf_dst = direct
+            ? [buf->dev->mtl_device newBufferWithBytesNoCopy:data length:size
+                                             options:MTLResourceStorageModeShared deallocator:nil]
+            : [buf->dev->mtl_device newBufferWithLength:size options:MTLResourceStorageModeShared];
 
         GGML_ASSERT(buf_dst);
 
@@ -2089,6 +2099,19 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
 
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
+        if (!direct) {
+            // The void buffer interface has no backend error channel; never publish
+            // invalid staging bytes when the GPU copy fails.
+            if (cmd_buf.status == MTLCommandBufferStatusCompleted) {
+                memcpy(data, buf_dst.contents, size);
+            } else {
+                GGML_LOG_ERROR("%s: readback failed with status %d\n", __func__, (int) cmd_buf.status);
+                if (cmd_buf.status == MTLCommandBufferStatusError) {
+                    GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
+                }
+            }
+        }
+        [buf_dst release];
     }
 }
 

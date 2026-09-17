@@ -1,3 +1,6 @@
+/** Submits Metal tensor operations and synchronizes GPU transfers with caller-owned memory. */
+#include <unistd.h>
+
 #import "ggml-metal-context.h"
 
 #import "ggml-impl.h"
@@ -358,12 +361,19 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
 }
 
 void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    if (size == 0) {
+        return;
+    }
     @autoreleasepool {
         id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
-        id<MTLBuffer> buf_dst = [device newBufferWithBytesNoCopy:data
-                                                          length:size
-                                                         options:MTLResourceStorageModeShared
-                                                     deallocator:nil];
+        // Pooled outputs may be smaller than a page and use ordinary heap storage.
+        // Metal's no-copy API requires both pointer and length to be page aligned.
+        const size_t page_size = (size_t) sysconf(_SC_PAGESIZE);
+        const bool direct = (uintptr_t) data % page_size == 0 && size % page_size == 0;
+        id<MTLBuffer> buf_dst = direct
+            ? [device newBufferWithBytesNoCopy:data length:size
+                                             options:MTLResourceStorageModeShared deallocator:nil]
+            : [device newBufferWithLength:size options:MTLResourceStorageModeShared];
 
         GGML_ASSERT(buf_dst);
 
@@ -388,12 +398,17 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
 
         [encoder endEncoding];
         [cmd_buf commit];
+        if (!direct) {
+            // Finish the staging copy before exposing bytes to the caller or freeing it.
+            [cmd_buf waitUntilCompleted];
+            if (cmd_buf.status == MTLCommandBufferStatusCompleted) {
+                memcpy(data, buf_dst.contents, size);
+            }
+            // Failed commands remain registered below for synchronize's error state.
+        }
         [buf_dst release];
 
-        // do not wait here for completion
-        //[cmd_buf waitUntilCompleted];
-
-        // instead, remember a reference to the command buffer and wait for it later if needed
+        // Aligned direct copies finish at backend synchronization.
         [ctx->cmd_bufs_ext addObject:cmd_buf];
         ctx->cmd_buf_last = cmd_buf;
 
