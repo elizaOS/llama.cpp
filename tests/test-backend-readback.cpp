@@ -41,6 +41,13 @@ int main(int argc, char ** argv) {
             source[j] = float(j) / 8.0f;
         }
         ggml_backend_tensor_set(tensor, source.data(), 0, source.size() * sizeof(float));
+        std::vector<float> partial_upload(386, -456.0f);
+        for (size_t j = 0; j < 384; ++j) {
+            partial_upload[j + 1] = -float(j + 1) / 16.0f;
+            source[j + 17] = partial_upload[j + 1];
+        }
+        ggml_backend_tensor_set(tensor, partial_upload.data() + 1, 17 * sizeof(float), 384 * sizeof(float));
+        ggml_backend_tensor_set(tensor, partial_upload.data() + 1, 17 * sizeof(float), 0);
         for (bool asynchronous : {false, true}) {
             for (size_t count : {size_t(1), size_t(384)}) {
                 for (size_t offset : {size_t(0), size_t(17)}) {
@@ -82,6 +89,11 @@ int main(int argc, char ** argv) {
         uintptr_t address = (uintptr_t) aligned_storage.data() + page_size;
         address -= address % page_size;
         uint8_t * aligned = (uint8_t *) address;
+        for (size_t j = 0; j < page_size / sizeof(float); ++j) {
+            source[j] = 1000.0f + float(j) / 4.0f;
+        }
+        std::memcpy(aligned, source.data(), page_size);
+        ggml_backend_tensor_set(tensor, aligned, 0, page_size);
         for (bool asynchronous : {false, true}) {
             std::fill(aligned_storage.begin(), aligned_storage.end(), 0xA5);
             if (asynchronous) {

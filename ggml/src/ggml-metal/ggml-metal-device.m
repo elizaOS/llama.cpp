@@ -1979,6 +1979,9 @@ void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor
 }
 
 void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    if (size == 0) {
+        return;
+    }
     if (buf->is_shared) {
         memcpy((char *) tensor->data + offset, data, size);
 
@@ -1994,12 +1997,14 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
     }
 
     @autoreleasepool {
-        // src
-        void * data_ptr = (void *)(uintptr_t) data; // "const cast" the src data
-        id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithBytesNoCopy:data_ptr
-                                                               length:size
-                                                              options:MTLResourceStorageModeShared
-                                                          deallocator:nil];
+        // Arbitrary tensor sources need a copying buffer unless the no-copy
+        // pointer and region satisfy Metal's page alignment contract.
+        const size_t page_size = (size_t) sysconf(_SC_PAGESIZE);
+        const bool direct = (uintptr_t) data % page_size == 0 && size % page_size == 0;
+        id<MTLBuffer> buf_src = direct
+            ? [buf->dev->mtl_device newBufferWithBytesNoCopy:(void *) data length:size
+                                                   options:MTLResourceStorageModeShared deallocator:nil]
+            : [buf->dev->mtl_device newBufferWithBytes:data length:size options:MTLResourceStorageModeShared];
 
         GGML_ASSERT(buf_src);
 
@@ -2033,6 +2038,7 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
 
         dispatch_semaphore_wait(completion_semaphore, DISPATCH_TIME_FOREVER);
         dispatch_release(completion_semaphore);
+        [buf_src release];
 
         //[cmd_buf waitUntilCompleted];
     }
