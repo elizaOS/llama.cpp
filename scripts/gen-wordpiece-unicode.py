@@ -14,6 +14,7 @@ def generate():
     marks = []
     controls = []
     spaces = []
+
     def add_range(table, cp):
         if table and table[-1][1] + 1 == cp:
             table[-1] = (table[-1][0], cp)
