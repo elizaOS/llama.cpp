@@ -34,3 +34,7 @@ target_include_directories(test-kokoro-layers-portable PRIVATE
 find_package(Threads REQUIRED)
 target_link_libraries(test-kokoro-layers-portable PRIVATE Threads::Threads)
 add_test(NAME test-kokoro-layers-portable COMMAND test-kokoro-layers-portable)
+
+add_executable(test-kokoro-backend test_kokoro_backend.cpp)
+target_link_libraries(test-kokoro-backend PRIVATE kokoro_lib)
+add_test(NAME test-kokoro-backend COMMAND test-kokoro-backend)
