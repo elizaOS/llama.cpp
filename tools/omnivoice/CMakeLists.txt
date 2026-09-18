@@ -336,6 +336,10 @@ if(TARGET mtmd)
     set_target_properties(elizainference_static PROPERTIES
         OUTPUT_NAME              elizainference
         POSITION_INDEPENDENT_CODE ON)
+    if(WIN32)
+        # Keep the static archive distinct from the DLL import library.
+        set_target_properties(elizainference_static PROPERTIES OUTPUT_NAME elizainference_static)
+    endif()
     add_dependencies(elizainference_static omnivoice-version)
 endif()
 
