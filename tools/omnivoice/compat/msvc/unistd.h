@@ -3,7 +3,7 @@
  * The vendored voice-classifier sources use open()/close()/read() and ssize_t
  * from <unistd.h>, which MSVC does not ship. MSVC exposes the POSIX I/O names
  * (open/close/read/lseek) from <io.h> under _CRT_DECLARE_NONSTDC_NAMES (the
- * default), and ssize_t maps to the Win32 SSIZE_T. Only on the MSVC include
+ * default), and ssize_t maps to the Win32 SSIZE_T. Only on the Windows include
  * path (see tools/omnivoice/CMakeLists.txt); POSIX hosts use the real header.
  */
 #ifndef ELIZA_COMPAT_MSVC_UNISTD_H

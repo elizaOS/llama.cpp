@@ -126,8 +126,7 @@ set_target_properties(eliza_voice_classifiers PROPERTIES
     POSITION_INDEPENDENT_CODE ON)
 target_include_directories(eliza_voice_classifiers PUBLIC
     ${OMNIVOICE_VOICE_CLASSIFIER_INCLUDE_DIRS})
-if(MSVC)
-    target_compile_options(eliza_voice_classifiers PRIVATE /W3 /wd4100)
+if(WIN32)
     # The vendored voice-classifier C sources include <sys/mman.h> and
     # <unistd.h> (POSIX) to mmap their GGUF files read-only and use
     # open/close/read. MSVC ships neither header; this compat dir provides
@@ -136,10 +135,15 @@ if(MSVC)
     # Windows. Prepended via BEFORE so <sys/mman.h>/<unistd.h> resolve here.
     target_include_directories(eliza_voice_classifiers BEFORE PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/compat/msvc)
+endif()
+if(MSVC)
+    target_compile_options(eliza_voice_classifiers PRIVATE /W3 /wd4100)
 else()
     target_compile_options(eliza_voice_classifiers PRIVATE
         -O3 -Wall -Wextra -Wno-unused-parameter)
-    target_link_libraries(eliza_voice_classifiers PUBLIC m)
+    if(NOT WIN32)
+        target_link_libraries(eliza_voice_classifiers PUBLIC m)
+    endif()
 endif()
 
 # omnivoice_lib (STATIC) — the core. Tools link against this to pull
