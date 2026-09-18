@@ -139,6 +139,7 @@ struct llama_vocab {
     bool get_treat_whitespace_as_suffix() const;
 
     int max_token_len() const;
+    uint32_t max_input_chars_per_word() const;
 
     int find_bpe_rank(const std::string & token_left, const std::string & token_right) const;
     std::vector<std::string> get_bpe_merges() const;

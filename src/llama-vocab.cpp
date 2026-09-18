@@ -748,6 +748,15 @@ struct llm_tokenizer_wpm_session {
                 continue;
             }
 
+            // WordPiece counts normalized Unicode scalar values, not UTF-8 bytes.
+            // Oversized words become one UNK; no prefix is partially encoded.
+            const auto characters = std::count_if(word.begin(), word.end(),
+                [](unsigned char byte) { return (byte & 0xC0) != 0x80; });
+            if (static_cast<uint64_t>(characters) > vocab.max_input_chars_per_word()) {
+                output.push_back(vocab.token_unk());
+                continue;
+            }
+
             // prepend phantom space
             const std::string word1 = "\xe2\x96\x81" + word;
             const int n = word1.size();
@@ -802,7 +811,7 @@ struct llm_tokenizer_wpm_session {
                 continue;
             }
 
-            const std::string s = unicode_cpt_to_utf8(unicode_tolower(cpt));
+            const std::string s = unicode_cpt_to_utf8(cpt);
             if (flags.is_punctuation || ( cpt < 0x7F && flags.is_symbol ) || is_chinese_char(cpt)) {
                 if (words.back().size()) {  // finish previous word if any
                     words.emplace_back();
@@ -1628,6 +1637,7 @@ struct llama_vocab::impl {
     enum llama_vocab_pre_type pre_type = LLAMA_VOCAB_PRE_TYPE_DEFAULT;
 
     int max_token_len = 0; // used for optimizing longest token search
+    uint32_t max_input_chars_per_word = 100; // standard WordPiece default
 
     // default LLaMA special tokens
     // TODO: should we set all of these to LLAMA_TOKEN_NULL?
@@ -1798,6 +1808,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
             special_pad_id  = LLAMA_TOKEN_NULL;
             special_mask_id = LLAMA_TOKEN_NULL;
         } else if (tokenizer_model == "bert") {
+            ml.get_key(LLM_KV_TOKENIZER_MAX_INPUT_CHARS_PER_WORD, max_input_chars_per_word, false);
             type = LLAMA_VOCAB_TYPE_WPM;
 
             // default special tokens
@@ -3775,6 +3786,10 @@ bool llama_vocab::get_treat_whitespace_as_suffix() const {
 
 int llama_vocab::max_token_len() const {
     return pimpl->max_token_len;
+}
+
+uint32_t llama_vocab::max_input_chars_per_word() const {
+    return pimpl->max_input_chars_per_word;
 }
 
 int llama_vocab::find_bpe_rank(const std::string & token_left, const std::string & token_right) const {

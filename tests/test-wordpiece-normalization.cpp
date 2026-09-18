@@ -3,6 +3,8 @@
 #include "unicode-wordpiece.h"
 #include <atomic>
 #include <cstdio>
+#include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -12,11 +14,11 @@ static void check(bool condition, const char * message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-static std::vector<llama_token> tokenize(const llama_vocab * vocab, const std::string & text) {
-    const int size = -llama_tokenize(vocab, text.data(), text.size(), nullptr, 0, true, false);
+static std::vector<llama_token> tokenize(const llama_vocab * vocab, const std::string & text, bool parse_special = false) {
+    const int size = -llama_tokenize(vocab, text.data(), text.size(), nullptr, 0, true, parse_special);
     check(size > 0, "BGE must produce special tokens");
     std::vector<llama_token> tokens(size);
-    check(llama_tokenize(vocab, text.data(), text.size(), tokens.data(), size, true, false) == size,
+    check(llama_tokenize(vocab, text.data(), text.size(), tokens.data(), size, true, parse_special) == size,
           "Token count changed between admission and allocation");
     return tokens;
 }
@@ -47,6 +49,13 @@ int main(int argc, char ** argv) {
                   "Removed control changed canonical ordering");
         }
 
+        check(normalize(U"ΟΣ") == normalize(U"ος"), "Final Sigma not contextual");
+        check(normalize(U"ΟΣΑ") == normalize(U"οσα"), "Medial Sigma became final");
+        check(normalize(U"Σ") == normalize(U"σ"), "Isolated Sigma became final");
+        check(normalize(U"AΣ'A") == normalize(U"aσ'a"), "Case-ignorable punctuation ended casing context");
+        check(normalize(U"AΣ\u0301A") == normalize(U"aσa"), "Case-ignorable Mn ended casing context");
+        check(normalize(U"A\u0301Σ") == normalize(U"aς"), "Preceding Mn lost casing context");
+
         const llama_vocab * vocab = llama_model_get_vocab(model);
         const auto cafe = tokenize(vocab, "cafe");
         check(cafe == std::vector<llama_token>({101,7668,102}), "Unexpected BGE vocabulary");
@@ -55,6 +64,38 @@ int main(int argc, char ** argv) {
         check(tokenize(vocab, u8"cafe\u0903") != cafe, "BGE swallowed spacing mark");
         check(tokenize(vocab, u8"cafe\u20dd") != cafe, "BGE swallowed enclosing mark");
         check(tokenize(vocab, std::string("before\0after",12)) == tokenize(vocab,"beforeafter"), "NUL input lost its tail");
+        check(tokenize(vocab, u8"ΟΣ") == std::vector<llama_token>({101,1169,19579,102}), "BGE Final Sigma IDs differ");
+        check(tokenize(vocab, u8"ΟΔΟΣ") == std::vector<llama_token>({101,1169,29722,15297,102}), "BGE contextual word IDs differ");
+        const std::vector<llama_token> unknown = {101,100,102};
+        check(tokenize(vocab, std::string(100, 'z')) != unknown, "100-scalar word was rejected");
+        check(tokenize(vocab, std::string(101, 'z')) == unknown, "101-scalar word was partially encoded");
+        check(tokenize(vocab, std::string(200, 'z')) == unknown, "Oversized word did not produce one UNK");
+        std::string greek_word;
+        for (int i=0; i<100; ++i) greek_word += u8"α";
+        check(tokenize(vocab, greek_word) != unknown, "WordPiece counted UTF-8 bytes instead of scalars");
+        check(tokenize(vocab, greek_word + u8"α") == unknown, "Unicode scalar limit was ignored");
+        const auto special = tokenize(vocab, "[CLS] [MASK] [SEP]", true);
+        check(special == std::vector<llama_token>({101,101,103,102,102}), "Added-token parsing diverged");
+        check(tokenize(vocab, "[CLS] [MASK] [SEP]") != special, "Default tokenizer special parsing changed");
+
+        // Exercise the loader's real GGUF metadata override path as well as
+        // the metadata-absent standard default used by the pinned fixture.
+        llama_model_kv_override overrides[2]{};
+        overrides[0].tag = LLAMA_KV_OVERRIDE_TYPE_INT;
+        std::strcpy(overrides[0].key, "tokenizer.ggml.max_input_chars_per_word");
+        overrides[0].val_i64 = 4;
+        params.kv_overrides = overrides;
+        std::unique_ptr<llama_model, decltype(&llama_model_free)> custom(
+            llama_model_load_from_file(argv[1], params), llama_model_free);
+        check(custom != nullptr, "Custom WordPiece metadata failed to load");
+        check(tokenize(llama_model_get_vocab(custom.get()), "hello") == unknown, "Custom word limit ignored");
+        check(tokenize(llama_model_get_vocab(custom.get()), "cafe") == cafe, "Custom limit rejected boundary word");
+        overrides[0].val_i64 = 0;
+        std::unique_ptr<llama_model, decltype(&llama_model_free)> zero(
+            llama_model_load_from_file(argv[1], params), llama_model_free);
+        check(zero != nullptr, "Zero WordPiece limit failed to load");
+        check(tokenize(llama_model_get_vocab(zero.get()), "cafe") == unknown, "Zero word limit ignored");
+
         std::string boundary;
         for (int i=0; i<510; ++i) boundary += "word ";
         check(tokenize(vocab,boundary).size() == 512, "512-token admission changed");

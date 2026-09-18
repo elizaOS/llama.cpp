@@ -1,5 +1,5 @@
 /*
- * libelizainference FFI ABI v14.
+ * libelizainference FFI ABI v16.
  *
  * (Banner tracks ELIZA_INFERENCE_ABI_VERSION below; the per-version history is
  * at the end of this header preamble, newest first.)
@@ -226,7 +226,7 @@ extern "C" {
  *   v7: real Silero VAD (same symbol surface as v6).
  *   v6: fused wake-word, speaker, diarizer.
  */
-#define ELIZA_INFERENCE_ABI_VERSION 15
+#define ELIZA_INFERENCE_ABI_VERSION 16
 
 /* Returns a static, NUL-terminated string of the form "15" matching
  * ELIZA_INFERENCE_ABI_VERSION at the time the library was built. The
@@ -1091,6 +1091,22 @@ int eliza_inference_embed(
     const char * text,
     size_t text_len,
     int pooling,
+    float * out_embedding,
+    size_t out_capacity,
+    int * out_dim,
+    char ** out_error);
+
+/* Additive embedding entrypoint with explicit added-token handling.
+ * parse_special is 0 (literal input) or 1 (recognize vocabulary special tokens).
+ * Canonical BGE callers use 1 for both admission and inference. This entrypoint
+ * rejects inputs beyond the encoder context instead of encoding a prefix.
+ * The existing eliza_inference_embed ABI and its defaults remain available. */
+int eliza_inference_embed_with_options(
+    EliInferenceContext * ctx,
+    const char * text,
+    size_t text_len,
+    int pooling,
+    int parse_special,
     float * out_embedding,
     size_t out_capacity,
     int * out_dim,

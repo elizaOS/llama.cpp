@@ -243,6 +243,7 @@ class Keys:
 
     class Tokenizer:
         MODEL                = "tokenizer.ggml.model"
+        MAX_INPUT_CHARS_PER_WORD = "tokenizer.ggml.max_input_chars_per_word"
         PRE                  = "tokenizer.ggml.pre"
         LIST                 = "tokenizer.ggml.tokens"
         TOKEN_TYPE           = "tokenizer.ggml.token_type"
