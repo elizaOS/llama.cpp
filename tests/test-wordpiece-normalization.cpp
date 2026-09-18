@@ -49,12 +49,13 @@ int main(int argc, char ** argv) {
                   "Removed control changed canonical ordering");
         }
 
-        check(normalize(U"ΟΣ") == normalize(U"ος"), "Final Sigma not contextual");
+        check(normalize(U"ΟΣ") == normalize(U"οσ"), "Sigma must use scalar lowercase");
         check(normalize(U"ΟΣΑ") == normalize(U"οσα"), "Medial Sigma became final");
+        check(normalize(U"ΟΣ") != normalize(U"ος"), "Explicit final sigma was rewritten");
         check(normalize(U"Σ") == normalize(U"σ"), "Isolated Sigma became final");
         check(normalize(U"AΣ'A") == normalize(U"aσ'a"), "Case-ignorable punctuation ended casing context");
         check(normalize(U"AΣ\u0301A") == normalize(U"aσa"), "Case-ignorable Mn ended casing context");
-        check(normalize(U"A\u0301Σ") == normalize(U"aς"), "Preceding Mn lost casing context");
+        check(normalize(U"A\u0301Σ") == normalize(U"aσ"), "Mn changed scalar lowercase");
 
         const llama_vocab * vocab = llama_model_get_vocab(model);
         const auto cafe = tokenize(vocab, "cafe");
@@ -64,8 +65,8 @@ int main(int argc, char ** argv) {
         check(tokenize(vocab, u8"cafe\u0903") != cafe, "BGE swallowed spacing mark");
         check(tokenize(vocab, u8"cafe\u20dd") != cafe, "BGE swallowed enclosing mark");
         check(tokenize(vocab, std::string("before\0after",12)) == tokenize(vocab,"beforeafter"), "NUL input lost its tail");
-        check(tokenize(vocab, u8"ΟΣ") == std::vector<llama_token>({101,1169,19579,102}), "BGE Final Sigma IDs differ");
-        check(tokenize(vocab, u8"ΟΔΟΣ") == std::vector<llama_token>({101,1169,29722,15297,102}), "BGE contextual word IDs differ");
+        check(tokenize(vocab, u8"ΟΣ") == std::vector<llama_token>({101,1169,29733,102}), "BGE scalar Sigma IDs differ");
+        check(tokenize(vocab, u8"ΟΔΟΣ") == std::vector<llama_token>({101,1169,29722,29730,29733,102}), "BGE scalar word IDs differ");
         const std::vector<llama_token> unknown = {101,100,102};
         check(tokenize(vocab, std::string(100, 'z')) != unknown, "100-scalar word was rejected");
         check(tokenize(vocab, std::string(101, 'z')) == unknown, "101-scalar word was partially encoded");

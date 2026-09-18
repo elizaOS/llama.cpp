@@ -228,7 +228,7 @@ extern "C" {
  */
 #define ELIZA_INFERENCE_ABI_VERSION 16
 
-/* Returns a static, NUL-terminated string of the form "15" matching
+/* Returns a static, NUL-terminated string of the form "16" matching
  * ELIZA_INFERENCE_ABI_VERSION at the time the library was built. The
  * pointer is owned by the library — do NOT free. */
 const char * eliza_inference_abi_version(void);
