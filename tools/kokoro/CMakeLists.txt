@@ -97,9 +97,12 @@ endif()
 # "no BUNDLE DESTINATION". The fused mobile slice only needs kokoro_lib folded
 # into libelizainference, never the CLI.
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    include(GNUInstallDirs)
     add_executable(kokoro-tts tools/kokoro-tts.cpp)
     target_link_libraries(kokoro-tts PRIVATE kokoro_lib)
-    install(TARGETS kokoro-tts RUNTIME)
+    install(TARGETS kokoro-tts
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        BUNDLE DESTINATION ${CMAKE_INSTALL_BINDIR})
 
     add_executable(kokoro-stage-dump tools/kokoro-stage-dump.cpp)
     target_link_libraries(kokoro-stage-dump PRIVATE kokoro_lib)
