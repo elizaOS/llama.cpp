@@ -3,4 +3,4 @@
 #include <cstdint>
 #include <vector>
 
-std::vector<uint32_t> unicode_wordpiece_nfd_strip_accents(const std::vector<uint32_t> & input);
+std::vector<uint32_t> unicode_wordpiece_normalize(const std::vector<uint32_t> & input);

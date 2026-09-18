@@ -1,6 +1,5 @@
 /** Exercises uncased WordPiece Unicode normalization and real BGE vocabulary admission. */
 #include "llama.h"
-#include "unicode.h"
 #include "unicode-wordpiece.h"
 #include <atomic>
 #include <cstdio>
@@ -30,17 +29,23 @@ int main(int argc, char ** argv) {
     if (!model) return 1;
     int status = 0;
     try {
-        const auto normalize = [](const std::string & text) {
-            return unicode_wordpiece_nfd_strip_accents(unicode_cpts_from_utf8(text));
+        const auto normalize = [](const std::u32string & text) {
+            return unicode_wordpiece_normalize(std::vector<uint32_t>(text.begin(), text.end()));
         };
-        check(normalize(u8"Café") == normalize("Cafe"), "Precomposed acute not stripped");
-        check(normalize(u8"Cafe\u0301") == normalize("Cafe"), "Decomposed Mn not stripped");
-        check(normalize(u8"Café\u0301\u0301") == normalize("Cafe"), "Repeated Mn not stripped");
-        check(normalize(u8"cafe\u0903") == std::vector<uint32_t>({'c','a','f','e',0x0903}), "Mc removed");
-        check(normalize(u8"cafe\u20dd") == std::vector<uint32_t>({'c','a','f','e',0x20dd}), "Me removed");
-        check(normalize(u8"\u09cb") == std::vector<uint32_t>({0x09c7,0x09be}), "NFD lost a spacing mark");
-        check(normalize(u8"\uac01") == std::vector<uint32_t>({0x1100,0x1161,0x11a8}), "Hangul NFD incomplete");
-        check(normalize(u8"x\u302e\u0301\u1715") == std::vector<uint32_t>({'x',0x1715,0x302e}), "Retained Mc ordering incorrect");
+        check(normalize(U"Café") == normalize(U"Cafe"), "Precomposed acute not stripped");
+        check(normalize(U"Cafe\u0301") == normalize(U"Cafe"), "Decomposed Mn not stripped");
+        check(normalize(U"Café\u0301\u0301") == normalize(U"Cafe"), "Repeated Mn not stripped");
+        check(normalize(U"cafe\u0903") == std::vector<uint32_t>({'c','a','f','e',0x0903}), "Mc removed");
+        check(normalize(U"cafe\u20dd") == std::vector<uint32_t>({'c','a','f','e',0x20dd}), "Me removed");
+        check(normalize(U"\u09cb") == std::vector<uint32_t>({0x09c7,0x09be}), "NFD lost a spacing mark");
+        check(normalize(U"\uac01") == std::vector<uint32_t>({0x1100,0x1161,0x11a8}), "Hangul NFD incomplete");
+        check(normalize(U"x\u302e\u0301\u1715") == std::vector<uint32_t>({'x',0x1715,0x302e}), "Retained Mc ordering incorrect");
+
+        for (char32_t control : {U'\0', U'\1', U'\uFFFD'}) {
+            const std::u32string text{U'x', U'\u302E', control, U'\u1715'};
+            check(normalize(text) == std::vector<uint32_t>({'x',0x1715,0x302e}),
+                  "Removed control changed canonical ordering");
+        }
 
         const llama_vocab * vocab = llama_model_get_vocab(model);
         const auto cafe = tokenize(vocab, "cafe");

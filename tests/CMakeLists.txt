@@ -119,6 +119,8 @@ endfunction()
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 llama_build(test-wordpiece-normalization.cpp)
+# Internal normalization is not part of the exported shared-library ABI.
+target_sources(test-wordpiece-normalization PRIVATE ${PROJECT_SOURCE_DIR}/src/unicode-wordpiece.cpp)
 target_include_directories(test-wordpiece-normalization PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_test(test-wordpiece-normalization ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-bert-bge.gguf)
 

@@ -1,4 +1,4 @@
-/** Applies canonical decomposition and ordering before WordPiece's Mn-only accent removal.
+/** Cleans input before canonical decomposition, ordering and WordPiece's Mn-only accent removal.
  * Generic tokenizer normalization is intentionally separate: BERT needs every
  * decomposed codepoint, including retained Mc and Me marks, rather than a base-letter projection.
  */
@@ -17,23 +17,32 @@ uint8_t combining(uint32_t cp) {
     return it != std::end(combining_classes) && it->codepoint == cp ? it->value : 0;
 }
 
+template<size_t N>
+bool in_ranges(uint32_t cp, const codepoint_range (& ranges)[N]) {
+    const auto it = std::lower_bound(std::begin(ranges), std::end(ranges), cp,
+        [](const codepoint_range & item, uint32_t value) { return item.last < value; });
+    return it != std::end(ranges) && it->first <= cp;
+}
+
 bool nonspacing(uint32_t cp) {
-    if (cp < 0x300) return false;
-    const auto it = std::lower_bound(std::begin(nonspacing_marks), std::end(nonspacing_marks), cp,
-        [](const mark_range & item, uint32_t value) { return item.last < value; });
-    return it != std::end(nonspacing_marks) && it->first <= cp;
+    return cp >= 0x300 && in_ranges(cp, nonspacing_marks);
 }
 }
 
-std::vector<uint32_t> unicode_wordpiece_nfd_strip_accents(const std::vector<uint32_t> & input) {
+std::vector<uint32_t> unicode_wordpiece_normalize(const std::vector<uint32_t> & input) {
     using namespace wordpiece_unicode_data;
     std::vector<uint32_t> result;
     result.reserve(input.size());
-    for (const uint32_t cp : input) {
+    for (uint32_t cp : input) {
+        // BERT clean_text runs before normalization. Removed controls must not
+        // act as canonical-ordering boundaries; TAB/LF/CR become spaces.
         if (cp < 0x80) {
-            result.push_back(cp);
+            if (cp == 9 || cp == 10 || cp == 13) result.push_back(0x20);
+            else if (cp >= 0x20 && cp < 0x7F) result.push_back(cp);
             continue;
         }
+        if (cp == 0xFFFD || in_ranges(cp, controls)) continue;
+        if (in_ranges(cp, spaces)) cp = 0x20;
         if (cp >= 0xAC00 && cp <= 0xD7A3) {
             const uint32_t syllable = cp - 0xAC00;
             result.push_back(0x1100 + syllable / 588);

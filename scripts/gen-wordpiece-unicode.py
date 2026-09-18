@@ -13,15 +13,24 @@ def generate():
     if ud.unidata_version != "16.0.0":
         raise RuntimeError("Use Python 3.14 with Unicode 16.0.0")
     marks = []
+    controls = []
+    spaces = []
+    def add_range(table, cp):
+        if table and table[-1][1] + 1 == cp:
+            table[-1] = (table[-1][0], cp)
+        else:
+            table.append((cp, cp))
     decompositions = []
     combining = []
     for cp in range(0x110000):
         char = chr(cp)
-        if ud.category(char) == "Mn":
-            if marks and marks[-1][1] + 1 == cp:
-                marks[-1] = (marks[-1][0], cp)
-            else:
-                marks.append((cp, cp))
+        category = ud.category(char)
+        if category == "Mn":
+            add_range(marks, cp)
+        if category in ("Cc", "Cf", "Co", "Cs"):
+            add_range(controls, cp)
+        if category in ("Zs", "Zl", "Zp"):
+            add_range(spaces, cp)
         ccc = ud.combining(char)
         if ccc:
             combining.append((cp, ccc))
@@ -37,13 +46,18 @@ def generate():
         " */",
         "#pragma once", "#include <cstdint>",
         "namespace wordpiece_unicode_data {",
-        "struct mark_range { uint32_t first; uint32_t last; };",
+        "struct codepoint_range { uint32_t first; uint32_t last; };",
         "struct combining_class { uint32_t codepoint; uint8_t value; };",
         "struct decomposition { uint32_t codepoint; uint32_t values[4]; uint8_t count; };",
-        "static constexpr mark_range nonspacing_marks[] = {",
+        "static constexpr codepoint_range nonspacing_marks[] = {",
     ]
     lines += [f"    {{0x{a:X}, 0x{b:X}}}," for a, b in marks]
-    lines += ["};", "static constexpr combining_class combining_classes[] = {"]
+    lines += ["};"]
+    for name, ranges in [("controls", controls), ("spaces", spaces)]:
+        lines += [f"static constexpr codepoint_range {name}[] = {{"]
+        lines += [f"    {{0x{a:X}, 0x{b:X}}}," for a, b in ranges]
+        lines += ["};"]
+    lines += ["static constexpr combining_class combining_classes[] = {"]
     lines += [f"    {{0x{cp:X}, {ccc}}}," for cp, ccc in combining]
     lines += ["};", "static constexpr decomposition decompositions[] = {"]
     for cp, nfd in decompositions:
