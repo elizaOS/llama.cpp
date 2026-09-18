@@ -429,18 +429,14 @@ endif()
 # The default run uses deterministic synthetic DAC block shapes; pass
 # `--gguf <omnivoice-tokenizer.gguf>` to exercise real conv_t1 weights.
 #
-# The parity harness calls ggml_backend_cpu_init / ggml_backend_cpu_set_n_threads
-# directly, so it can only be built when the ggml-cpu CMake target is present.
-# On some cross-compile configurations (Android NDK in particular) the ggml-cpu
-# target is not defined, and the executable would fail to link. Gate the whole
-# target on ggml-cpu availability so those builds skip it cleanly.
-if(TARGET ggml-cpu)
+# Registry discovery supports both linked and dynamically loaded CPU backends.
+if(GGML_CPU)
     add_executable(omnivoice-dac-parity tests/dac-parity.cpp)
     target_compile_features(omnivoice-dac-parity PRIVATE cxx_std_17)
     target_include_directories(omnivoice-dac-parity PRIVATE
         ${CMAKE_SOURCE_DIR}/ggml/include
         ${CMAKE_SOURCE_DIR}/ggml/src)
-    target_link_libraries(omnivoice-dac-parity PRIVATE ggml ggml-cpu)
+    target_link_libraries(omnivoice-dac-parity PRIVATE ggml)
     if(TARGET ggml-base)
         target_link_libraries(omnivoice-dac-parity PRIVATE ggml-base)
     endif()
