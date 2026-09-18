@@ -4128,7 +4128,7 @@ int eliza_inference_tokenize(
     if (cap == 0) {
         /* Empty token sequence is valid (e.g. empty input). Return an empty,
          * non-NULL buffer so the caller's free path is uniform. */
-        int * empty = (int *) std::malloc(1);
+        int * empty = (int *) std::malloc(sizeof(*empty));
         if (!empty) {
             eliza_set_error(out_error, "[libelizainference] tokenize: OOM");
             return ELIZA_ERR_OOM;
