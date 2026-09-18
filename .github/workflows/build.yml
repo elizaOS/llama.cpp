@@ -489,9 +489,12 @@ jobs:
       - name: Build WASM WebGPU
         run: |
           source emsdk/emsdk_env.sh
+          # Compiler ABI and OpenMP probes must use the same memory width as the targets.
           emcmake cmake -B build-wasm \
             -G "Ninja" \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS="-sMEMORY64=1" \
+            -DCMAKE_CXX_FLAGS="-sMEMORY64=1" \
             -DGGML_WEBGPU=ON \
             -DLLAMA_OPENSSL=OFF \
             -DEMDAWNWEBGPU_DIR=emdawnwebgpu_pkg
