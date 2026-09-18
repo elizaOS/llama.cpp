@@ -6,6 +6,7 @@
 #include "llama-model-loader.h"
 
 #include "unicode.h"
+#include "unicode-wordpiece.h"
 
 #include <algorithm>
 #include <cassert>
@@ -783,7 +784,7 @@ struct llm_tokenizer_wpm_session {
 
     // TODO: reduce string copies by using cpts_offs array
     static std::vector<std::string> preprocess(const std::string & text)  {
-        const std::vector<uint32_t> cpts_nfd = unicode_cpts_normalize_nfd(unicode_cpts_from_utf8(text));
+        const std::vector<uint32_t> cpts_nfd = unicode_wordpiece_nfd_strip_accents(unicode_cpts_from_utf8(text));
         std::vector<std::string> words(1, "");
 
         for (const uint32_t cpt : cpts_nfd) {
