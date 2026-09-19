@@ -2981,6 +2981,36 @@ struct test_cpy : public test_case {
     }
 };
 
+// Zero and tiny blocks must remain finite through the IQ4 scale search.
+struct test_cpy_iq4_small : public test_cpy {
+    const float magnitude;
+
+    explicit test_cpy_iq4_small(float magnitude)
+        : test_cpy(GGML_TYPE_F32, GGML_TYPE_IQ4_NL, {256, 4, 4, 4}), magnitude(magnitude) {}
+
+    std::string vars() override {
+        std::ostringstream out;
+        out << test_cpy::vars() << ",magnitude=" << magnitude;
+        return out.str();
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        // Require exact finite equality, including input nodes; zero-output NMSE is undefined.
+        for (size_t i = 0; i < n; ++i) {
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i]) || a[i] != b[i]) {
+                return 1.0;
+            }
+        }
+        return 0.0;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -magnitude, magnitude);
+        }
+    }
+};
+
 // GGML_OP_CONT
 struct test_cont : public test_case {
     const ggml_type type;
@@ -8767,6 +8797,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_fused_attn_qjl_tbq(/*n_heads*/ 8, /*n_kv_heads*/ 2, /*n_kv_tokens*/ 64, /*n_batch*/ 4));
 
+    test_cases.emplace_back(new test_cpy_iq4_small(0.0f));
+    test_cases.emplace_back(new test_cpy_iq4_small(1e-18f));
+
     // ATTN_SCORE_TBQ parity: cover all three accepted K types at a tiny
     // shape (fast inner loop) and the TBQ3_0 medium shape (eliza-1
     // representative: head_dim=128, n_kv_tokens=256, GQA 8:2).
@@ -8774,6 +8807,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_attn_score_tbq(GGML_TYPE_TBQ4_0,   /*n_heads*/ 4, /*n_kv_heads*/ 1, /*n_kv_tokens*/ 16, /*n_batch*/ 1));
     test_cases.emplace_back(new test_attn_score_tbq(GGML_TYPE_TBQ3_TCQ, /*n_heads*/ 4, /*n_kv_heads*/ 1, /*n_kv_tokens*/ 16, /*n_batch*/ 1));
     test_cases.emplace_back(new test_attn_score_tbq(GGML_TYPE_TBQ3_0,   /*n_heads*/ 8, /*n_kv_heads*/ 2, /*n_kv_tokens*/ 256, /*n_batch*/ 4));
+    // Exercise the Vulkan multiblock dispatch and a partial final workgroup.
+    test_cases.emplace_back(new test_attn_score_tbq(GGML_TYPE_TBQ3_0, 4, 2, 8193, 1));
+    test_cases.emplace_back(new test_attn_score_tbq(GGML_TYPE_TBQ4_0, 4, 2, 8193, 1));
 
     // ATTN_SCORE_POLAR parity: both use_qjl values at the tiny shape,
     // plus the eliza-1 medium shape.

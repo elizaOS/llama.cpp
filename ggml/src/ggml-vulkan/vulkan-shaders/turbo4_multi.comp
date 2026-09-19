@@ -1,12 +1,6 @@
-// ELIZA-VK-DISPATCH-PATCH-V1 — staged from packages/inference/vulkan/turbo4_multi.comp by
-// build-llama-cpp-mtp.mjs. Frozen — do not edit in fork.
-// Multi-block-per-workgroup variant of turbo4.comp. Identical decode math;
-// one workgroup processes BLOCKS_PER_WG consecutive KV indices serially in a
-// 32-thread loop. BLOCKS_PER_WG is a SPIR-V specialization constant
-// (constant_id = 0); default 1 == turbo4.comp behaviour. local_size stays 32
-// (portable shared-memory tree reduction, no subgroup assumptions).
-//
-// Dispatch: grid_x = ceil(n_kv / BLOCKS_PER_WG), tg_x = 32.
+/** Computes packed TBQ attention scores against unconditioned queries.
+ * The 32-value sign/Hadamard transform and packed codes match ggml-quants.c.
+ */
 
 #version 450
 #extension GL_EXT_shader_16bit_storage  : require
@@ -39,24 +33,7 @@ const float TURBO_CENTROIDS_4BIT[16] = float[16](
 );
 
 float fp16_to_fp32(uint h16) {
-    uint sign = (h16 & 0x8000u) << 16;
-    uint exp  = (h16 >> 10) & 0x1Fu;
-    uint mant = h16 & 0x3FFu;
-    uint u;
-    if (exp == 0u) {
-        if (mant == 0u) { u = sign; }
-        else {
-            uint e = 1u;
-            while ((mant & 0x400u) == 0u) { mant <<= 1; e += 1u; }
-            mant &= 0x3FFu;
-            u = sign | ((127u - 15u - e + 1u) << 23) | (mant << 13);
-        }
-    } else if (exp == 0x1Fu) {
-        u = sign | 0x7F800000u | (mant << 13);
-    } else {
-        u = sign | ((exp + 127u - 15u) << 23) | (mant << 13);
-    }
-    return uintBitsToFloat(u);
+    return unpackHalf2x16(h16).x;
 }
 
 uint read_byte(uint b) {
@@ -81,12 +58,43 @@ float reduce_sum_32(float v, uint tid) {
     return partials[0];
 }
 
+// Match tbq_precondition_block: the packed keys store H(sign * K).
+shared float conditioned_q[128];
+const float TBQ_SIGNS[32] = float[32](
+    1, -1, 1, 1, -1, 1, -1, -1, 1, 1, -1, 1, -1, -1, 1, -1,
+    -1, 1, 1, -1, 1, -1, -1, 1, 1, -1, 1, -1, -1, 1, -1, 1
+);
+
+void condition_query(uint tid) {
+    for (uint b = 0u; b < 4u; ++b) {
+        conditioned_q[b * 32u + tid] = q[push.q_head * push.head_dim + b * 32u + tid] * TBQ_SIGNS[tid];
+    }
+    barrier();
+    for (uint stride = 1u; stride < 32u; stride <<= 1u) {
+        float next_value[4];
+        for (uint b = 0u; b < 4u; ++b) {
+            float a = conditioned_q[b * 32u + (tid & ~stride)];
+            float z = conditioned_q[b * 32u + (tid | stride)];
+            next_value[b] = (tid & stride) == 0u ? a + z : a - z;
+        }
+        barrier();
+        for (uint b = 0u; b < 4u; ++b) {
+            conditioned_q[b * 32u + tid] = next_value[b];
+        }
+        barrier();
+    }
+    for (uint b = 0u; b < 4u; ++b) {
+        conditioned_q[b * 32u + tid] *= 0.1767766952966369;
+    }
+    barrier();
+}
+
 void main() {
     uint tid = gl_LocalInvocationID.x;
+    condition_query(tid);
     uint elem0 = tid * 4u;
     uint blk_idx = elem0 >> 5;
     uint within0 = elem0 & 31u;
-    uint q_base = push.q_head * push.head_dim + elem0;
 
     uint kv_base = gl_WorkGroupID.x * BLOCKS_PER_WG;
     for (uint b = 0u; b < BLOCKS_PER_WG; ++b) {
@@ -103,7 +111,7 @@ void main() {
             uint within = within0 + local;
             uint qs_byte = read_byte(blk_off + 2u + (within & 15u));
             uint idx = within < 16u ? (qs_byte & 0xFu) : (qs_byte >> 4);
-            acc = fma(q[q_base + local], TURBO_CENTROIDS_4BIT[idx] * norm, acc);
+            acc = fma(conditioned_q[elem0 + local], TURBO_CENTROIDS_4BIT[idx] * norm, acc);
         }
 
         float sum = reduce_sum_32(acc, tid);
