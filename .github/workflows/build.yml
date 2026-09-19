@@ -297,6 +297,7 @@ jobs:
         uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
         with:
           log-accepted-android-sdk-licenses: false
+          packages: platform-tools
 
       - name: Install NDK
         run: |
@@ -382,6 +383,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DGGML_BACKEND_DL=ON \
             -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_NATIVE=OFF \
             -DGGML_VULKAN=ON
 
       - name: Build
@@ -488,9 +490,12 @@ jobs:
       - name: Build WASM WebGPU
         run: |
           source emsdk/emsdk_env.sh
+          # Compiler ABI and OpenMP probes must use the same memory width as the targets.
           emcmake cmake -B build-wasm \
             -G "Ninja" \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS="-sMEMORY64=1" \
+            -DCMAKE_CXX_FLAGS="-sMEMORY64=1" \
             -DGGML_WEBGPU=ON \
             -DLLAMA_OPENSSL=OFF \
             -DEMDAWNWEBGPU_DIR=emdawnwebgpu_pkg
@@ -511,6 +516,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential git cmake rocblas-dev hipblas-dev libssl-dev rocwmma-dev
+
+      - name: Set up Node.js for WebUI
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
@@ -543,6 +553,11 @@ jobs:
         run: |
           apt-get update
           apt-get install -y build-essential git cmake libssl-dev
+
+      - name: Set up Node.js for WebUI
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
@@ -714,6 +729,11 @@ jobs:
           run: |
               apt update
               apt install -y cmake build-essential ninja-build libgomp1 git libssl-dev
+
+        - name: Set up Node.js for WebUI
+          uses: actions/setup-node@v6
+          with:
+            node-version: "24"
 
         - name: ccache
           uses: ggml-org/ccache-action@v1.2.21

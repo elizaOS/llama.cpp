@@ -7,6 +7,8 @@
 // one test binary without an ODR violation. Test-only trick — production
 // code always compiles the header exactly once per configuration.
 
+#include "test_kokoro_layers_test_api.h"
+
 #define KOKORO_FORCE_SCALAR 1
 #define eliza_kokoro eliza_kokoro_scalar_ref
 #include "kokoro-layers.h"

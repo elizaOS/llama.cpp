@@ -38,6 +38,9 @@ add_library(llama
             unicode-data.cpp
             unicode.cpp
             unicode.h
+            unicode-wordpiece.cpp
+            unicode-wordpiece.h
+            unicode-wordpiece-data.h
             ${LLAMA_MODELS_SOURCES}
             # milady: DFlash draft model
             models/dflash-draft.cpp

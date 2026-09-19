@@ -82,11 +82,13 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base(ggml
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy(ggml_metal_library_t lib, ggml_type tsrc, ggml_type tdst) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy(ggml_metal_library_t lib, ggml_type tsrc, ggml_type tdst, bool contiguous) {
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_cpy_%s_%s", ggml_type_name(tsrc), ggml_type_name(tdst));
+    // Contiguous CPU IQ4_NL copies use the full quantizer; strided copies use the reference quantizer.
+    const bool iq4_full = contiguous && tsrc == GGML_TYPE_F32 && tdst == GGML_TYPE_IQ4_NL;
+    snprintf(base, 256, "kernel_cpy_%s_%s%s", ggml_type_name(tsrc), ggml_type_name(tdst), iq4_full ? "_full" : "");
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);

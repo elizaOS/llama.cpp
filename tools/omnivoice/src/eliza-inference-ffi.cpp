@@ -3604,11 +3604,13 @@ static int eliza_ensure_embed_ctx_locked(
     return ELIZA_OK;
 }
 
-int eliza_inference_embed(
+static int eliza_inference_embed_impl(
     EliInferenceContext * ctx,
     const char * text,
     size_t text_len,
     int pooling,
+    bool parse_special,
+    bool strict_context,
     float * out_embedding,
     size_t out_capacity,
     int * out_dim,
@@ -3616,6 +3618,11 @@ int eliza_inference_embed(
     if (!ctx || !text || !out_embedding || !out_dim) {
         eliza_set_error(out_error,
             "[libelizainference] embed: invalid arguments");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    if (text_len > static_cast<size_t>(INT32_MAX)) {
+        eliza_set_error(out_error,
+            "[libelizainference] embed: text_len exceeds INT32_MAX; input size cannot be represented by the tokenizer");
         return ELIZA_ERR_INVALID_ARG;
     }
     if (pooling == ELIZA_POOLING_NONE) {
@@ -3649,11 +3656,10 @@ int eliza_inference_embed(
 
     const llama_vocab * vocab = llama_model_get_vocab(ctx->llm_model);
 
-    /* Tokenize (add_special = BOS, parse_special = false), then truncate to
-     * the encoder ctx — a non-causal single-ubatch layout cannot encode
-     * input longer than n_ctx. Mirrors embed() in desktop-llama-adapter.ts. */
+    /* Canonical BGE callers opt into the same added-token parsing used by
+     * their admission tokenizer. Legacy callers retain literal parsing. */
     int32_t need = llama_tokenize(vocab, text, (int32_t) text_len,
-                                  nullptr, 0, true, false);
+                                  nullptr, 0, true, parse_special);
     int32_t cap = need < 0 ? -need : need;
     if (cap == 0) {
         eliza_set_error(out_error,
@@ -3662,12 +3668,17 @@ int eliza_inference_embed(
     }
     std::vector<llama_token> tokens((size_t) cap);
     int32_t n_tok = llama_tokenize(vocab, text, (int32_t) text_len,
-                                   tokens.data(), cap, true, false);
+                                   tokens.data(), cap, true, parse_special);
     if (n_tok < 0) {
         eliza_set_error(out_error,
             "[libelizainference] embed: llama_tokenize returned " +
             std::to_string(n_tok));
         return ELIZA_ERR_FFI_FAULT;
+    }
+    if (n_tok > ctx->embed_n_ctx && strict_context) {
+        eliza_set_error(out_error,
+            "[libelizainference] embed: input exceeds encoder context; prepare a verified suffix before dispatch");
+        return ELIZA_ERR_INVALID_ARG;
     }
     if (n_tok > ctx->embed_n_ctx) n_tok = ctx->embed_n_ctx;
     tokens.resize((size_t) n_tok);
@@ -3695,6 +3706,24 @@ int eliza_inference_embed(
     std::memcpy(out_embedding, emb, (size_t) n_embd * sizeof(float));
     eliza_l2_normalize(out_embedding, n_embd);
     return ELIZA_OK;
+}
+
+int eliza_inference_embed(
+    EliInferenceContext * ctx, const char * text, size_t text_len, int pooling,
+    float * out_embedding, size_t out_capacity, int * out_dim, char ** out_error) {
+    return eliza_inference_embed_impl(ctx, text, text_len, pooling, false, false,
+        out_embedding, out_capacity, out_dim, out_error);
+}
+
+int eliza_inference_embed_with_options(
+    EliInferenceContext * ctx, const char * text, size_t text_len, int pooling,
+    int parse_special, float * out_embedding, size_t out_capacity, int * out_dim, char ** out_error) {
+    if (parse_special != 0 && parse_special != 1) {
+        eliza_set_error(out_error, "[libelizainference] embed: parse_special must be 0 or 1");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    return eliza_inference_embed_impl(ctx, text, text_len, pooling, parse_special != 0, true,
+        out_embedding, out_capacity, out_dim, out_error);
 }
 
 /* ---- End-of-turn scoring (ABI v11) -------------------------------- *
@@ -4099,7 +4128,7 @@ int eliza_inference_tokenize(
     if (cap == 0) {
         /* Empty token sequence is valid (e.g. empty input). Return an empty,
          * non-NULL buffer so the caller's free path is uniform. */
-        int * empty = (int *) std::malloc(1);
+        int * empty = (int *) std::malloc(sizeof(*empty));
         if (!empty) {
             eliza_set_error(out_error, "[libelizainference] tokenize: OOM");
             return ELIZA_ERR_OOM;

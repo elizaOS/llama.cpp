@@ -1997,14 +1997,9 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
     }
 
     @autoreleasepool {
-        // Arbitrary tensor sources need a copying buffer unless the no-copy
-        // pointer and region satisfy Metal's page alignment contract.
-        const size_t page_size = (size_t) sysconf(_SC_PAGESIZE);
-        const bool direct = (uintptr_t) data % page_size == 0 && size % page_size == 0;
-        id<MTLBuffer> buf_src = direct
-            ? [buf->dev->mtl_device newBufferWithBytesNoCopy:(void *) data length:size
-                                                   options:MTLResourceStorageModeShared deallocator:nil]
-            : [buf->dev->mtl_device newBufferWithBytes:data length:size options:MTLResourceStorageModeShared];
+        // The source is read-only; Metal's no-copy API requires mutable storage.
+        id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithBytes:data length:size
+                                                                       options:MTLResourceStorageModeShared];
 
         GGML_ASSERT(buf_src);
 

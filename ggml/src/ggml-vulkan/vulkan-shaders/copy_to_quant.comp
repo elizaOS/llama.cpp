@@ -220,6 +220,59 @@ uint best_index(float x) {
     return x - kvalues_iq4nl[mu-1] < kvalues_iq4nl[mu] - x ? mu-1 : mu;
 }
 
+#if defined(IQ4_NL_FULL)
+// Contiguous CPU copies use the full weighted scale search.
+void quantize(uint dst_idx, uint src_idx) {
+    float amax = 0.0f;
+    float max = 0.0f;
+    for (int j = 0; j < QUANT_K_IQ4_NL; ++j) {
+        if (abs(data_s[src_idx + j]) > amax) {
+            amax = abs(data_s[src_idx + j]);
+            max = data_s[src_idx + j];
+        }
+    }
+    if (amax < 1e-15f) {
+        data_q[dst_idx].d = float16_t(0.0);
+        for (int j = 0; j < QUANT_K_IQ4_NL/2; ++j) {
+            data_q[dst_idx].qs[j] = uint8_t(0);
+        }
+        return;
+    }
+
+    float d = -max/kvalues_iq4nl[0];
+    float id = 1.0f/d;
+    float sumqx = 0.0f, sumq2 = 0.0f;
+    for (int j = 0; j < QUANT_K_IQ4_NL; ++j) {
+        const float q = kvalues_iq4nl[best_index(id*data_s[src_idx + j])];
+        const float w = data_s[src_idx + j]*data_s[src_idx + j];
+        sumqx += w*q*data_s[src_idx + j];
+        sumq2 += w*q*q;
+    }
+    d = sumq2 > 0.0f ? sumqx/sumq2 : 0.0f;
+    float best = d*sumqx;
+    for (int itry = -7; itry <= 7; ++itry) {
+        id = (itry + kvalues_iq4nl[0])/max;
+        sumqx = sumq2 = 0.0f;
+        for (int j = 0; j < QUANT_K_IQ4_NL; ++j) {
+            const float q = kvalues_iq4nl[best_index(id*data_s[src_idx + j])];
+            const float w = data_s[src_idx + j]*data_s[src_idx + j];
+            sumqx += w*q*data_s[src_idx + j];
+            sumq2 += w*q*q;
+        }
+        if (sumq2 > 0.0f && sumqx*sumqx > best*sumq2) {
+            d = sumqx/sumq2;
+            best = d*sumqx;
+        }
+    }
+    data_q[dst_idx].d = float16_t(d);
+    id = d != 0.0 ? 1.0/d : 0.0;
+    for (int j = 0; j < QUANT_K_IQ4_NL/2; ++j) {
+        const uint lo = best_index(id*data_s[src_idx + j]);
+        const uint hi = best_index(id*data_s[src_idx + QUANT_K_IQ4_NL/2 + j]);
+        data_q[dst_idx].qs[j] = uint8_t(lo | (hi << 4));
+    }
+}
+#else
 void quantize(uint dst_idx, uint src_idx)
 {
     float amax = 0.0;
@@ -254,6 +307,8 @@ void quantize(uint dst_idx, uint src_idx)
     data_q[dst_idx].d = float16_t(sumq2 > 0 ? sumqx/sumq2 : d);
 
 }
+#endif
+
 #endif
 
 #if defined(DATA_A_F32) || defined(DATA_A_F16)

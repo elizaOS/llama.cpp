@@ -126,8 +126,7 @@ set_target_properties(eliza_voice_classifiers PROPERTIES
     POSITION_INDEPENDENT_CODE ON)
 target_include_directories(eliza_voice_classifiers PUBLIC
     ${OMNIVOICE_VOICE_CLASSIFIER_INCLUDE_DIRS})
-if(MSVC)
-    target_compile_options(eliza_voice_classifiers PRIVATE /W3 /wd4100)
+if(WIN32)
     # The vendored voice-classifier C sources include <sys/mman.h> and
     # <unistd.h> (POSIX) to mmap their GGUF files read-only and use
     # open/close/read. MSVC ships neither header; this compat dir provides
@@ -136,10 +135,15 @@ if(MSVC)
     # Windows. Prepended via BEFORE so <sys/mman.h>/<unistd.h> resolve here.
     target_include_directories(eliza_voice_classifiers BEFORE PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/compat/msvc)
+endif()
+if(MSVC)
+    target_compile_options(eliza_voice_classifiers PRIVATE /W3 /wd4100)
 else()
     target_compile_options(eliza_voice_classifiers PRIVATE
         -O3 -Wall -Wextra -Wno-unused-parameter)
-    target_link_libraries(eliza_voice_classifiers PUBLIC m)
+    if(NOT WIN32)
+        target_link_libraries(eliza_voice_classifiers PUBLIC m)
+    endif()
 endif()
 
 # omnivoice_lib (STATIC) — the core. Tools link against this to pull
@@ -336,6 +340,10 @@ if(TARGET mtmd)
     set_target_properties(elizainference_static PROPERTIES
         OUTPUT_NAME              elizainference
         POSITION_INDEPENDENT_CODE ON)
+    if(WIN32)
+        # Keep the static archive distinct from the DLL import library.
+        set_target_properties(elizainference_static PROPERTIES OUTPUT_NAME elizainference_static)
+    endif()
     add_dependencies(elizainference_static omnivoice-version)
 endif()
 
@@ -421,18 +429,14 @@ endif()
 # The default run uses deterministic synthetic DAC block shapes; pass
 # `--gguf <omnivoice-tokenizer.gguf>` to exercise real conv_t1 weights.
 #
-# The parity harness calls ggml_backend_cpu_init / ggml_backend_cpu_set_n_threads
-# directly, so it can only be built when the ggml-cpu CMake target is present.
-# On some cross-compile configurations (Android NDK in particular) the ggml-cpu
-# target is not defined, and the executable would fail to link. Gate the whole
-# target on ggml-cpu availability so those builds skip it cleanly.
-if(TARGET ggml-cpu)
+# Registry discovery supports both linked and dynamically loaded CPU backends.
+if(GGML_CPU)
     add_executable(omnivoice-dac-parity tests/dac-parity.cpp)
     target_compile_features(omnivoice-dac-parity PRIVATE cxx_std_17)
     target_include_directories(omnivoice-dac-parity PRIVATE
         ${CMAKE_SOURCE_DIR}/ggml/include
         ${CMAKE_SOURCE_DIR}/ggml/src)
-    target_link_libraries(omnivoice-dac-parity PRIVATE ggml ggml-cpu)
+    target_link_libraries(omnivoice-dac-parity PRIVATE ggml)
     if(TARGET ggml-base)
         target_link_libraries(omnivoice-dac-parity PRIVATE ggml-base)
     endif()

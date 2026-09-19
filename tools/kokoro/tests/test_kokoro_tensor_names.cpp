@@ -8,7 +8,7 @@
 
 #include "kokoro-tensor-names.h"
 
-#include <cassert>
+#include "ggml.h"
 #include <cstdio>
 #include <cstring>
 #include <set>
@@ -23,14 +23,14 @@ bool has_name(const char * name, void * user_data) {
 
 void expect_pick(
         const char * const * aliases,
-        const std::set<std::string> & available,
+        std::set<std::string> & available,
         const char * expected) {
     const char * actual = eliza_kokoro::kokoro_pick_tensor_name(
         aliases,
         has_name,
-        (void *) &available);
-    assert(actual != nullptr);
-    assert(std::strcmp(actual, expected) == 0);
+        &available);
+    GGML_ASSERT(actual != nullptr);
+    GGML_ASSERT(std::strcmp(actual, expected) == 0);
 }
 
 } // namespace
@@ -38,7 +38,7 @@ void expect_pick(
 int main() {
     using namespace eliza_kokoro;
 
-    const std::set<std::string> published_schema = {
+    std::set<std::string> published_schema = {
         "kokoro.bert.token_embd.weight",
         "kokoro.bert.layer.attn_q.weight",
         "kokoro.predictor.duration_proj.weight",
@@ -54,7 +54,7 @@ int main() {
     expect_pick(KOKORO_TENSOR_N_PROJ, published_schema, "kokoro.predictor.N_proj.weight");
     expect_pick(KOKORO_TENSOR_GEN_CONV_POST, published_schema, "kokoro.gen.conv_post.weight");
 
-    const std::set<std::string> legacy_schema = {
+    std::set<std::string> legacy_schema = {
         "bert.embd.tok.weight",
         "bert.layer.attn_q.weight",
         "pred.duration_proj.weight",
@@ -70,7 +70,7 @@ int main() {
     expect_pick(KOKORO_TENSOR_N_PROJ, legacy_schema, "pred.N_proj.weight");
     expect_pick(KOKORO_TENSOR_GEN_CONV_POST, legacy_schema, "dec.gen.conv_post.weight");
 
-    const std::set<std::string> published_legacy_schema = {
+    std::set<std::string> published_legacy_schema = {
         "bert.embd.tok.weight",
         "bert.attn_q.weight",
         "pred.dur_proj.weight",
@@ -86,8 +86,8 @@ int main() {
     expect_pick(KOKORO_TENSOR_N_PROJ, published_legacy_schema, "pred.N_proj.weight");
     expect_pick(KOKORO_TENSOR_GEN_CONV_POST, published_legacy_schema, "dec.gen.conv_post.weight");
 
-    const std::set<std::string> empty_schema;
-    assert(kokoro_pick_tensor_name(KOKORO_TENSOR_BERT_TOKEN_EMBD, has_name, (void *) &empty_schema) == nullptr);
+    std::set<std::string> empty_schema;
+    GGML_ASSERT(kokoro_pick_tensor_name(KOKORO_TENSOR_BERT_TOKEN_EMBD, has_name, &empty_schema) == nullptr);
 
     std::printf("test_kokoro_tensor_names: OK\n");
     return 0;

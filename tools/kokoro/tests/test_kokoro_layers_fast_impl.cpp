@@ -7,6 +7,8 @@
 // the exact code aarch64 Android runs). See the ref TU for the namespace
 // rename rationale.
 
+#include "test_kokoro_layers_test_api.h"
+
 #define KOKORO_NO_ACCELERATE 1
 #define eliza_kokoro eliza_kokoro_portable_fast
 #include "kokoro-layers.h"

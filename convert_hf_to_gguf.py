@@ -6780,6 +6780,16 @@ class BertModel(TextModel):
         tokens = list(map(phantom, tokens, toktypes))
 
         # add vocab to gguf
+        max_word_chars = 100
+        tokenizer_path = self.dir_model / "tokenizer.json"
+        if tokenizer_path.is_file():
+            with tokenizer_path.open(encoding="utf-8") as tokenizer_file:
+                tokenizer_model = json.load(tokenizer_file)["model"]
+            if tokenizer_model["type"] == "WordPiece":
+                max_word_chars = tokenizer_model.get("max_input_chars_per_word", 100)
+        if type(max_word_chars) is not int or not 0 <= max_word_chars <= 0xFFFFFFFF:
+            raise ValueError("WordPiece max_input_chars_per_word must be a uint32")
+        self.gguf_writer.add_uint32(gguf.Keys.Tokenizer.MAX_INPUT_CHARS_PER_WORD, max_word_chars)
         self.gguf_writer.add_tokenizer_model("bert")
         self.gguf_writer.add_tokenizer_pre(tokpre)
         self.gguf_writer.add_token_list(tokens)
