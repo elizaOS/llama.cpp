@@ -383,6 +383,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DGGML_BACKEND_DL=ON \
             -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_NATIVE=OFF \
             -DGGML_VULKAN=ON
 
       - name: Build
