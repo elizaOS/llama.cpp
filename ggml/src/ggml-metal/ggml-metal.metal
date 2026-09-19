@@ -509,6 +509,59 @@ void quantize_iq4_nl(device const float * src, device block_iq4_nl & dst) {
     dst.d = sumq2 > 0 ? sumqx/sumq2 : d;
 }
 
+// Match quantize_iq4_nl's weighted scale search for contiguous CPU copies.
+void quantize_iq4_nl_full(device const float * src, device block_iq4_nl & dst) {
+#pragma METAL fp math_mode(safe)
+    float amax = 0.0f;
+    float max = 0.0f;
+    for (int j = 0; j < QK4_NL; ++j) {
+        if (fabs(src[j]) > amax) {
+            amax = fabs(src[j]);
+            max = src[j];
+        }
+    }
+    if (amax < 1e-15f) {
+        dst.d = 0.0h;
+        for (int j = 0; j < QK4_NL/2; ++j) {
+            dst.qs[j] = 0;
+        }
+        return;
+    }
+
+    float d = -max/kvalues_iq4nl_f[0];
+    float id = 1.0f/d;
+    float sumqx = 0.0f, sumq2 = 0.0f;
+    for (int j = 0; j < QK4_NL; ++j) {
+        const float q = kvalues_iq4nl_f[best_index_int8(16, kvalues_iq4nl_f, id*src[j])];
+        const float w = src[j]*src[j];
+        sumqx += w*q*src[j];
+        sumq2 += w*q*q;
+    }
+    d = sumq2 > 0.0f ? sumqx/sumq2 : 0.0f;
+    float best = d*sumqx;
+    for (int itry = -7; itry <= 7; ++itry) {
+        id = (itry + kvalues_iq4nl_f[0])/max;
+        sumqx = sumq2 = 0.0f;
+        for (int j = 0; j < QK4_NL; ++j) {
+            const float q = kvalues_iq4nl_f[best_index_int8(16, kvalues_iq4nl_f, id*src[j])];
+            const float w = src[j]*src[j];
+            sumqx += w*q*src[j];
+            sumq2 += w*q*q;
+        }
+        if (sumq2 > 0.0f && sumqx*sumqx > best*sumq2) {
+            d = sumqx/sumq2;
+            best = d*sumqx;
+        }
+    }
+    dst.d = d;
+    id = d ? 1.0f/d : 0.0f;
+    for (int j = 0; j < QK4_NL/2; ++j) {
+        const uint8_t lo = best_index_int8(16, kvalues_iq4nl_f, id*src[j]);
+        const uint8_t hi = best_index_int8(16, kvalues_iq4nl_f, id*src[QK4_NL/2 + j]);
+        dst.qs[j] = lo | (hi << 4);
+    }
+}
+
 template <typename type4x4>
 void dequantize_q4_1(device const block_q4_1 * xb, short il, thread type4x4 & reg) {
     device const uint16_t * qs = ((device const uint16_t *)xb + 2);
@@ -7863,6 +7916,7 @@ template [[host_name("kernel_cpy_f32_q4_1")]]   kernel cpy_f_q_t kernel_cpy_f32_
 template [[host_name("kernel_cpy_f32_q5_0")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK5_0,  block_q5_0,   quantize_q5_0>;
 template [[host_name("kernel_cpy_f32_q5_1")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK5_1,  block_q5_1,   quantize_q5_1>;
 template [[host_name("kernel_cpy_f32_iq4_nl")]] kernel cpy_f_q_t kernel_cpy_f32_q<QK4_NL, block_iq4_nl, quantize_iq4_nl>;
+template [[host_name("kernel_cpy_f32_iq4_nl_full")]] kernel cpy_f_q_t kernel_cpy_f32_q<QK4_NL, block_iq4_nl, quantize_iq4_nl_full>;
 
 template<typename T4x4, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread T4x4 &)>
 kernel void kernel_cpy_q_f32(

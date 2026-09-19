@@ -1197,7 +1197,7 @@ int ggml_metal_op_acc(ggml_metal_op_t ctx, int idx) {
         // TODO: make a simpler cpy_bytes kernel
 
         //const id<MTLComputePipelineState> pipeline = ctx->pipelines[GGML_METAL_PIPELINE_TYPE_CPY_F32_F32].obj;
-        auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type);
+        auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type, false);
 
         ggml_metal_kargs_cpy args = {
             /*.nk0  =*/ ne00,
@@ -2357,7 +2357,7 @@ int ggml_metal_op_set(ggml_metal_op_t ctx, int idx) {
         // TODO: make a simpler cpy_bytes kernel
 
         //const id<MTLComputePipelineState> pipeline = ctx->pipelines[GGML_METAL_PIPELINE_TYPE_CPY_F32_F32].obj;
-        auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type);
+        auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type, false);
 
         ggml_metal_kargs_cpy args = {
             /*.nk0  =*/ ne00,
@@ -2391,7 +2391,7 @@ int ggml_metal_op_set(ggml_metal_op_t ctx, int idx) {
         ggml_metal_op_concurrency_reset(ctx);
     }
 
-    auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[1]->type, op->type);
+    auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[1]->type, op->type, false);
 
     GGML_ASSERT(ne10 % ggml_blck_size(op->src[1]->type) == 0);
 
@@ -2466,7 +2466,8 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
-    auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type);
+    auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type,
+            ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op));
 
     GGML_ASSERT(ne00 % ggml_blck_size(op->src[0]->type) == 0);
 
