@@ -265,7 +265,9 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_ATTENTION_GATE_LORA_RANK,          hparams.n_lora_gate);
     add_kv(LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT,  hparams.n_rel_attn_bkts);
     add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW,          hparams.n_swa);
-    // add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN,  ???);
+    if (model->arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+        add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, true);
+    }
     add_kv(LLM_KV_ATTENTION_SCALE,                   hparams.f_attention_scale);
     add_kv(LLM_KV_ATTENTION_OUTPUT_SCALE,            hparams.f_attn_out_scale);
     add_kv(LLM_KV_ATTENTION_VALUE_SCALE,             hparams.f_attn_value_scale);
@@ -400,6 +402,10 @@ void llama_model_saver::add_tensors_from_model() {
     add_tensor(model->cls_out);
     add_tensor(model->cls_out_b);
     add_tensor(model->cls_norm);
+    if (model->arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+        add_tensor(model->nextn_proj_pre);
+        add_tensor(model->nextn_proj_post);
+    }
 
     for (const struct llama_layer & layer : model->layers) {
         for (size_t i = 0; i < sizeof(layer)/sizeof(struct ggml_tensor *); ++i) {

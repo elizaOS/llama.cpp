@@ -5,17 +5,22 @@
 #include "gguf.h"
 #include "ggml-cpp.h"
 #include "llama.h"
+#include "../src/llama-ext.h"
 #include "llama-cpp.h"
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
 
+#include <algorithm>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -23,6 +28,7 @@
 
 // normalized mean squared error = mse(a, b) / mse(a, 0)
 static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
+    GGML_ASSERT(!a.empty());
     GGML_ASSERT(a.size() == b.size());
     double mse_a_b = 0.0;
     double mse_a_0 = 0.0;
@@ -30,6 +36,7 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     for (size_t i = 0; i < a.size(); i++) {
         float a_i = a[i];
         float b_i = b[i];
+        GGML_ASSERT(std::isfinite(a_i) && std::isfinite(b_i));
 
         mse_a_b += (a_i - b_i) * (a_i - b_i);
         mse_a_0 += a_i * a_i;
@@ -38,10 +45,16 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     return mse_a_b / mse_a_0;
 }
 
+struct tensor_data_params {
+    size_t seed;
+    std::set<std::string> unit_gains;
+};
+
 static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
+    const auto & params = *static_cast<const tensor_data_params *>(userdata);
     std::hash<std::string> hasher;
-    std::mt19937 gen(hasher(tensor->name) + *(const size_t *) userdata);
-    std::normal_distribution<float> dis(0.0f, 1.0e-2f);
+    std::mt19937 gen(hasher(tensor->name) + params.seed);
+    std::normal_distribution<float> dis(params.unit_gains.count(tensor->name) ? 1.0f : 0.0f, 1.0e-2f);
 
     const int64_t ne = ggml_nelements(tensor);
     if (tensor->type == GGML_TYPE_F32) {
@@ -93,6 +106,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_head = 2;
         n_ff   = 192;
         n_layer = 5; // need at least 5 for swa_pattern (every 5th is full_attention)
+    } else if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+        n_embd = 64;
+        n_head = 2;
+        n_ff = 96;
+        n_layer = 2;
     } else if (arch == LLM_ARCH_GEMMA3N) {
         n_embd = 64;
         n_head = 1;
@@ -111,7 +129,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_vocab = 10240;
     }
 
-    const uint32_t n_embd_head = n_embd / n_head;
+    const uint32_t n_embd_head = arch == LLM_ARCH_GEMMA4_ASSISTANT ? 64 : n_embd / n_head;
 
     ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,      llm_arch_name(arch));
     ms.add_kv(LLM_KV_VOCAB_SIZE,                n_vocab);
@@ -174,14 +192,22 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT, uint32_t(8));
     ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW,         n_ctx/8);
 
-    if (arch == LLM_ARCH_GEMMA4) {
+    if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+        if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+            ms.add_kv(LLM_KV_EMBEDDING_LENGTH_OUT, uint32_t(128));
+            ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH, n_embd_head);
+            ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH, n_embd_head);
+        }
         ms.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,      n_embd/2);
         ms.add_kv(LLM_KV_ATTENTION_SHARED_KV_LAYERS,      uint32_t(0));
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_SWA,        n_embd_head);
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,      n_embd_head);
         ms.add_kv(LLM_KV_ROPE_FREQ_BASE_SWA,              10000.0f);
-        // SWA pattern: every 5th layer is full attention (matches E2B layer_types)
-        ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(5));
+        // Both paired models end in a SWA layer followed by full attention.
+        // The assistant shares these two target KV layers.
+        std::vector<uint32_t> pattern(n_layer, 1);
+        pattern.back() = 0;
+        ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, pattern);
     } else if (arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35) {
         std::vector<uint32_t> pattern;
         pattern.reserve(n_layer);
@@ -251,7 +277,8 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
+        llama_context * target_ctx = nullptr) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -262,13 +289,34 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
+    ctx_params.ctx_other = target_ctx;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
     if (!encode) {
         ctx_params.n_ubatch = 64;
     }
 
-    size_t tmp = seed;
+    tensor_data_params tmp{seed, {}};
+    if (gguf_ctx) {
+        const auto arch = llm_arch_from_string(gguf_get_val_str(gguf_ctx, gguf_find_key(gguf_ctx, "general.architecture")));
+        if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+            // Gemma4 RMSNorm gains and layer scalars initialize to one. Tiny
+            // zero-centered gains compound across the paired backbone and
+            // erase meaningful attention inputs through half underflow.
+            const auto tn = LLM_TN(arch);
+            tmp.unit_gains.insert(tn(LLM_TENSOR_OUTPUT_NORM, "weight").str());
+            tmp.unit_gains.insert(tn(LLM_TENSOR_PER_LAYER_PROJ_NORM, "weight", 0).str());
+            const uint32_t n_layer = gguf_get_val_u32(gguf_ctx, gguf_find_key(gguf_ctx, LLM_KV(arch)(LLM_KV_BLOCK_COUNT).c_str()));
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                for (const auto role : {LLM_TENSOR_ATTN_NORM, LLM_TENSOR_ATTN_Q_NORM, LLM_TENSOR_ATTN_K_NORM,
+                        LLM_TENSOR_ATTN_POST_NORM, LLM_TENSOR_FFN_NORM, LLM_TENSOR_FFN_POST_NORM,
+                        LLM_TENSOR_FFN_PRE_NORM_2, LLM_TENSOR_FFN_POST_NORM_1, LLM_TENSOR_FFN_POST_NORM_2,
+                        LLM_TENSOR_PER_LAYER_POST_NORM, LLM_TENSOR_LAYER_OUT_SCALE}) {
+                    tmp.unit_gains.insert(tn(role, "weight", il).str());
+                }
+            }
+        }
+    }
     llama_model_ptr model(gguf_ctx != nullptr ?
         llama_model_init_from_user(gguf_ctx, set_tensor_data, &tmp, model_params) :
         llama_model_load_from_file_ptr(file, model_params));
@@ -283,12 +331,46 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
 }
 
 static std::vector<float> get_logits(
-        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
+        const llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens,
+        bool encode = false, llama_context * target_ctx = nullptr, llama_context * target_source = nullptr) {
+    if (!target_source) {
+        target_source = target_ctx;
+    }
+    if (target_ctx) {
+        llama_memory_clear(llama_get_memory(target_source), true);
+        llama_set_embeddings_pre_norm(target_source, true);
+        get_logits(llama_get_model(target_source), target_source, tokens);
+        if (target_source != target_ctx) {
+            std::vector<uint8_t> state(llama_state_get_size(target_source));
+            GGML_ASSERT(!state.empty());
+            GGML_ASSERT(llama_state_get_data(target_source, state.data(), state.size()) == state.size());
+            GGML_ASSERT(llama_state_set_data(target_ctx, state.data(), state.size()) == state.size());
+            const auto source_memory = llama_get_memory(target_source);
+            const auto copied_memory = llama_get_memory(target_ctx);
+            GGML_ASSERT(llama_memory_seq_pos_min(source_memory, 0) == llama_memory_seq_pos_min(copied_memory, 0));
+            GGML_ASSERT(llama_memory_seq_pos_max(source_memory, 0) == llama_memory_seq_pos_max(copied_memory, 0));
+        }
+    }
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
     const uint32_t n_ctx    = llama_n_ctx(lctx);
     const uint32_t n_tokens = tokens.size();
-    llama_batch batch = llama_batch_init(n_ctx, 0, 1);
     GGML_ASSERT(n_tokens <= n_ctx);
+    const int32_t n_embd = target_ctx ? llama_model_n_embd_out(model) : 0;
+    llama_batch batch = llama_batch_init(n_ctx, n_embd, 1);
+    if (target_ctx) {
+        GGML_ASSERT(n_embd == llama_model_n_embd(llama_get_model(target_ctx)));
+        GGML_ASSERT(n_embd == llama_model_n_embd(llama_get_model(target_source)));
+        batch.token = static_cast<llama_token *>(std::malloc(n_ctx * sizeof(llama_token)));
+        GGML_ASSERT(batch.token);
+        // Match MTP prefill: first row has no prior state; later rows consume
+        // the real target's preceding pre-normalization hidden state.
+        std::memset(batch.embd, 0, n_embd * sizeof(float));
+        for (uint32_t i = 1; i < n_tokens; ++i) {
+            const float * hidden = llama_get_embeddings_pre_norm_ith(target_source, i - 1);
+            GGML_ASSERT(hidden);
+            std::memcpy(batch.embd + i * n_embd, hidden, n_embd * sizeof(float));
+        }
+    }
     for (uint32_t pos = 0; pos < n_tokens; pos++) {
         common_batch_add(batch, tokens[pos], pos, {0}, true);
     }
@@ -313,6 +395,14 @@ static std::vector<float> get_logits(
         }
     }
     llama_batch_free(batch);
+    if (target_ctx) {
+        GGML_ASSERT(!ret.empty());
+        for (const float value : ret) {
+            GGML_ASSERT(std::isfinite(value));
+        }
+        const auto range = std::minmax_element(ret.begin(), ret.end());
+        GGML_ASSERT(*range.second - *range.first > 1.0e-6f);
+    }
     return ret;
 }
 
@@ -527,7 +617,12 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
                 continue;
             }
             gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
-            auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
+            std::pair<llama_model_ptr, llama_context_ptr> target_pair;
+            if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+                auto target_gguf = get_gguf_ctx(LLM_ARCH_GEMMA4, false);
+                target_pair = get_model_and_ctx(target_gguf.get(), nullptr, seed, {});
+            }
+            auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false, target_pair.second.get());
             const std::string path = dir + "/" + llm_arch_name(arch) + (moe ? "-moe.gguf" : "-dense.gguf");
             LOG_INF("%s: Saving %s model (%s) to %s...\n", __func__, llm_arch_name(arch), moe ? "MoE" : "dense", path.c_str());
             llama_model_save_to_file(model_and_ctx.first.get(), path.c_str());
@@ -610,9 +705,11 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
             }
             const std::string config_name = moe ? "MoE" : "Dense";
             gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+            std::pair<llama_model_ptr, llama_context_ptr> target_cpu;
             std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_cpu;
             std::vector<float> logits_cpu;
             for (device_config & dc : dev_configs) {
+                std::pair<llama_model_ptr, llama_context_ptr> target_dev;
                 std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_dev;
                 std::vector<float> logits_dev;
                 std::string status_nmse      = "\033[1;33mSKIP\033[0m";
@@ -624,16 +721,26 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
 #endif // GGML_USE_WEBGPU
                 if (!skip) {
                     if (logits_cpu.empty()) {
-                        model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
-                        logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
+                        if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+                            auto target_gguf = get_gguf_ctx(LLM_ARCH_GEMMA4, false);
+                            target_cpu = get_model_and_ctx(target_gguf.get(), nullptr, seed, {});
+                        }
+                        model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode, target_cpu.second.get());
+                        logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode, target_cpu.second.get());
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
-                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode);
-                        logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
+                        if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+                            auto target_gguf = get_gguf_ctx(LLM_ARCH_GEMMA4, false);
+                            // Hold the real target's KV and hidden-state inputs
+                            // constant while comparing assistant backends.
+                            target_dev = get_model_and_ctx(target_gguf.get(), nullptr, seed, dc.devs, dc.split_mode);
+                        }
+                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode, target_dev.second.get());
+                        logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode, target_dev.second.get(), target_cpu.second.get());
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
                         status_nmse = "\033[1;32mOK\033[0m";
-                        if (nmse_val > 1e-4) {
+                        if (!std::isfinite(nmse_val) || nmse_val > 1e-4) {
                             all_ok = false;
                             status_nmse = "\033[1;31mFAIL\033[0m";
                         }
@@ -650,9 +757,9 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                         ms.save(file);
                         rewind(file);
 
-                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, dc.devs, dc.split_mode, encode);
+                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, dc.devs, dc.split_mode, encode, target_dev.second.get());
                         const std::vector<float> logits_roundtrip = get_logits(
-                            model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
+                            model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode, target_dev.second.get(), target_cpu.second.get());
                         status_roundtrip = "\033[1;32mOK\033[0m";
                         GGML_ASSERT(logits_roundtrip.size() == logits_dev.size());
                         for (size_t i = 0; i < logits_roundtrip.size(); i++) {
