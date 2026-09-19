@@ -9559,6 +9559,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // overflow: n_tokens > K — only the last K snapshots kept.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
+    // Underflow: T < K leaves the leading snapshot slots untouched, including across sequences.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   2, 2, 1, false, false, /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   2, 2, 2, false, true,  /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   2, 2, 1, true,  true,  /*K=*/4));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
