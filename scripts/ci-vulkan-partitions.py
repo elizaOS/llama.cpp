@@ -185,6 +185,35 @@ def main():
                 selections.append({'lane': lane, 'operation': op, 'label': op + '-' + label,
                                    'partition': index, 'expected': expected, 'witnessed': known,
                                    'weight_proxy': sum(weight(g) for g in selected)})
+        # The first hosted pilot timed out after 78 completed outcomes in this
+        # selection. Preserve all 80 occurrences while isolating the two that
+        # had no terminal outcome; no selected identity may disappear.
+        representative = next(s for s in selections if s['label'] == 'FLASH_ATTN_EXT-representative')
+        unresolved = ['hsk=576,hsv=512,nh=1,nr23=[1,1],kv=1024,nb=32,mask=0,sinks=1,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_K=f16,type_V=f16,permute=[0,1,2,3]', 'hsk=576,hsv=512,nh=4,nr23=[1,1],kv=512,nb=3,mask=1,sinks=1,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_K=f16,type_V=f16,permute=[0,1,2,3]']
+        original = collections.Counter(representative['expected'])
+        if len(unresolved) != 2 or any(original[p] != 1 for p in unresolved):
+            raise ValueError('unresolved case identities changed')
+        completed = sorted(set(original) - set(unresolved))
+        subsets = [completed[0::2], completed[1::2], [unresolved[0]], [unresolved[1]]]
+        subdivisions = []
+        union = collections.Counter()
+        for index, params in enumerate(subsets):
+            expected = {p: original[p] for p in params}
+            union.update(expected)
+            prior_witnesses = [p for p in representative['witnessed'] if p in expected]
+            required_passes = prior_witnesses if index < 2 else params
+            subdivisions.append({'lane': 'broad', 'operation': 'FLASH_ATTN_EXT',
+                                 'label': 'FLASH_ATTN_EXT-subdivision-' + str(index),
+                                 'expected': expected, 'witnessed': required_passes,
+                                 'prior_witnesses': prior_witnesses,
+                                 'isolated_unresolved': index >= 2})
+        if union != original or sum(original.values()) != 80:
+            raise ValueError('subdivision changed the original selected inventory')
+        if sum(len(s['prior_witnesses']) for s in subdivisions) != len(representative['witnessed']):
+            raise ValueError('subdivision dropped a prior witness')
+        selections = subdivisions
+        manifest['followup_of_run'] = 35467120771
+        manifest['original_selected_occurrences'] = sum(original.values())
         manifest['inventory_identity_sha256'] = identity_sha
         manifest['planned_original_occurrences'] = sum(g['count'] for shard in shards for g in shard)
         manifest['pilot_only'] = True

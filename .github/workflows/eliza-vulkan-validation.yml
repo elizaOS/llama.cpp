@@ -47,7 +47,7 @@ jobs:
       - name: Clone
         uses: actions/checkout@v6
         with:
-          fetch-depth: 2
+          fetch-depth: 3
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
@@ -97,7 +97,7 @@ jobs:
       - name: Build
         run: |
           source ./vulkan_sdk/setup-env.sh
-          cmake --build build-vulkan -j $(nproc) \
+          cmake --build build-vulkan -j "$(nproc)" \
             --target llama-cli llama-completion \
                      test-backend-ops test-quantize-fns
 
