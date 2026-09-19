@@ -13,6 +13,10 @@ name: Eliza Vulkan Validation
 on:
   workflow_dispatch:
     inputs:
+      coverage_wave:
+        description: Run one bounded coverage wave; incomplete global coverage remains red.
+        type: boolean
+        default: false
       partition_pilot:
         description: Run only four bounded partition timing probes; this does not qualify the full suite.
         type: boolean
@@ -40,6 +44,7 @@ env:
 
 jobs:
   ubuntu-vulkan-llvmpipe-validation:
+    if: ${{ !inputs.coverage_wave }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
@@ -47,7 +52,7 @@ jobs:
       - name: Clone
         uses: actions/checkout@v6
         with:
-          fetch-depth: 3
+          fetch-depth: 4
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
@@ -166,4 +171,143 @@ jobs:
           path: |
             /tmp/quantize-fns.log
             /tmp/vulkan-validation
+          retention-days: 14
+
+  build:
+    permissions:
+      contents: read
+      actions: read
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.coverage_wave }}
+    env:
+      GGML_VK_VISIBLE_DEVICES: '0'
+      GGML_VK_DISABLE_F16: '1'
+      GGML_VK_DISABLE_COOPMAT: '1'
+      VULKAN_SDK_VERSION: '1.4.357.1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 4
+      - name: Install fixed Vulkan driver
+        run: |
+          sudo add-apt-repository -y ppa:kisak/kisak-mesa
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential mesa-vulkan-drivers=26.2.3~kisak1~n vulkan-tools libvulkan-dev glslang-tools spirv-tools libssl-dev
+      - uses: actions/cache@v5
+        id: sdk
+        with:
+          path: ./vulkan_sdk
+          key: vulkan-sdk-${{ env.VULKAN_SDK_VERSION }}-${{ runner.os }}
+      - if: steps.sdk.outputs.cache-hit != 'true'
+        uses: ./.github/actions/linux-setup-vulkan
+        with:
+          path: ./vulkan_sdk
+          version: ${{ env.VULKAN_SDK_VERSION }}
+      - name: Build source and preserve toolchain
+        run: |
+          set -euo pipefail
+          source ./vulkan_sdk/setup-env.sh
+          cmake -B build-vulkan -DGGML_VULKAN=ON -DGGML_METAL=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-vulkan -j "$(nproc)" --target test-backend-ops
+          mkdir -p wave-build
+          cmake --version > wave-build/cmake-version.txt
+          c++ --version > wave-build/compiler-version.txt
+          dpkg-query -W > wave-build/packages.txt
+          vulkaninfo --summary > wave-build/vulkaninfo.txt
+      - name: Fetch exact prior evidence and bind remaining inventory
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source ./vulkan_sdk/setup-env.sh
+          gh run download 35467120771 -R elizaOS/llama.cpp -n eliza-vulkan-validation-logs -D prior/pilot-hosted
+          gh run download 35470223485 -R elizaOS/llama.cpp -n eliza-vulkan-validation-logs -D prior/subdivision-hosted
+          python3 scripts/ci-vulkan-coverage-wave.py prepare --binary build-vulkan/bin/test-backend-ops --prior prior --output wave-build
+          tar -czf wave-build/runtime.tar.gz -C build-vulkan bin
+          sha256sum wave-build/runtime.tar.gz wave-build/build.json wave-build/*.txt > wave-build/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vulkan-wave-build
+          path: wave-build
+          retention-days: 14
+  worker:
+    env:
+      GGML_VK_VISIBLE_DEVICES: '0'
+      GGML_VK_DISABLE_F16: '1'
+      GGML_VK_DISABLE_COOPMAT: '1'
+      VULKAN_SDK_VERSION: '1.4.357.1'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 59
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install identical driver and loader prerequisites
+        run: |
+          sudo add-apt-repository -y ppa:kisak/kisak-mesa
+          sudo apt-get update -y
+          sudo apt-get install -y mesa-vulkan-drivers=26.2.3~kisak1~n vulkan-tools libvulkan-dev libssl-dev
+      - uses: actions/cache@v5
+        id: sdk
+        with:
+          path: ./vulkan_sdk
+          key: vulkan-sdk-${{ env.VULKAN_SDK_VERSION }}-${{ runner.os }}
+      - if: steps.sdk.outputs.cache-hit != 'true'
+        uses: ./.github/actions/linux-setup-vulkan
+        with:
+          path: ./vulkan_sdk
+          version: ${{ env.VULKAN_SDK_VERSION }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: vulkan-wave-build
+          path: wave-build
+      - name: Verify runtime bytes and execute bounded queue
+        run: |
+          set -euo pipefail
+          sha256sum -c wave-build/SHA256SUMS
+          mkdir build-vulkan
+          tar -xzf wave-build/runtime.tar.gz -C build-vulkan
+          source ./vulkan_sdk/setup-env.sh
+          python3 scripts/ci-vulkan-coverage-wave.py worker --binary build-vulkan/bin/test-backend-ops --build wave-build/build.json --worker ${{ matrix.worker }} --output worker-${{ matrix.worker }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vulkan-wave-worker-${{ matrix.worker }}
+          path: worker-${{ matrix.worker }}
+          retention-days: 14
+  coverage:
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.coverage_wave }}
+    needs: [build, worker]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: vulkan-wave-build
+          path: wave-build
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: vulkan-wave-worker-*
+          path: wave-workers
+      - name: Independently reject incomplete original coverage
+        run: |
+          set -euo pipefail
+          mkdir receipts
+          for i in 0 1 2 3; do
+            if [ -d "wave-workers/vulkan-wave-worker-$i" ]; then
+              mv "wave-workers/vulkan-wave-worker-$i" "receipts/worker-$i"
+            fi
+          done
+          python3 scripts/ci-vulkan-coverage-wave.py aggregate --build wave-build/build.json --receipts receipts --output coverage.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vulkan-wave-coverage
+          path: coverage.json
           retention-days: 14
