@@ -12,6 +12,11 @@ name: Eliza Vulkan Validation
 
 on:
   workflow_dispatch:
+    inputs:
+      partition_pilot:
+        description: Run only four bounded partition timing probes; this does not qualify the full suite.
+        type: boolean
+        default: false
   pull_request:
     types: [opened, synchronize, reopened]
     paths:
@@ -41,6 +46,8 @@ jobs:
     steps:
       - name: Clone
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
@@ -101,6 +108,7 @@ jobs:
 
       - name: test-quantize-fns (CPU; smoke for Eliza custom quants)
         run: |
+          set -euo pipefail
           ./build-vulkan/bin/test-quantize-fns | tee /tmp/quantize-fns.log
           # Must mention the Eliza-divergent quant types.
           for t in qjl1_256 q4_polar tbq3_0 tbq4_0 tbq3_tcq; do
@@ -108,103 +116,47 @@ jobs:
               || (echo "MISSING quant: $t" && exit 1)
           done
 
-      - name: test-backend-ops on Vulkan (filtered subset)
+      - name: Vulkan broad case accounting
+        if: ${{ !inputs.partition_pilot }}
         env:
           GGML_VK_VISIBLE_DEVICES: '0'
           GGML_VK_DISABLE_F16: '1'
           GGML_VK_DISABLE_COOPMAT: '1'
         run: |
           source ./vulkan_sdk/setup-env.sh
-          # Filter to ops that matter most for inference correctness.
-          # Full sweep is too slow on llvmpipe (~hours).
-          for op in MUL_MAT MUL_MAT_ID ADD MUL SOFT_MAX RMS_NORM CPY ROPE FLASH_ATTN_EXT; do
-            echo "=== $op ==="
-            timeout 600 ./build-vulkan/bin/test-backend-ops \
-              -b Vulkan0 -o "$op" \
-              2>&1 | tee -a /tmp/backend-ops.log || true
-          done
-          # Summary lines for the artifact viewer.
-          echo "=== FAIL SUMMARY ==="
-          grep -E "Backend Vulkan0:.*FAIL|tests passed|Failing tests:" \
-            /tmp/backend-ops.log || true
+          set -euo pipefail
+          python3 scripts/ci-vulkan-partitions.py \
+            --binary build-vulkan/bin/test-backend-ops \
+            --output /tmp/vulkan-validation/broad \
+            --mode full --lane broad
 
-      - name: test-backend-ops Eliza custom-quant parity (Vulkan)
+      - name: Vulkan custom case accounting
+        if: ${{ !inputs.partition_pilot }}
         env:
           GGML_VK_VISIBLE_DEVICES: '0'
           GGML_VK_DISABLE_F16: '1'
           GGML_VK_DISABLE_COOPMAT: '1'
         run: |
           source ./vulkan_sdk/setup-env.sh
-          # Eliza custom quants (Q1_0_g32/g128, TBQ3_0/4_0, TBQ3_K/4_K,
-          # QJL1_256, Q4_POLAR, TBQ3_TCQ). These have CPU+Metal kernels
-          # but no Vulkan kernels yet. The harness emits one
-          # "not supported" line per (op,type,shape) — that is the
-          # intended baseline. If a future PR adds a Vulkan kernel for
-          # any of these types, this step will start emitting real
-          # PASS/FAIL lines automatically because supports_op() will
-          # return true and the test harness will compare against CPU.
-          #
-          # We do NOT fail the job on "not supported" lines (expected).
-          # We DO fail on any "FAIL" line for these types — that would
-          # signal a Vulkan kernel that diverges from the CPU reference.
-          for op in GET_ROWS CPY MUL_MAT \
-                    ATTN_SCORE_TBQ ATTN_SCORE_POLAR \
-                    ISTFT; do
-            echo "=== $op (Eliza custom quants) ==="
-            timeout 300 ./build-vulkan/bin/test-backend-ops \
-              -b Vulkan0 -o "$op" \
-              2>&1 | tee -a /tmp/eliza-custom-quants.log || true
-          done
-          # Count skip/pass/fail among lines mentioning custom quant
-          # type names. The grep patterns target the type prefixes used
-          # in the test_case::vars() output.
-          echo "=== Eliza custom-quant summary ==="
-          for t in q1_0_g32 q1_0_g128 tbq3_0 tbq4_0 tbq3_k tbq4_k qjl1_256 q4_polar tbq3_tcq; do
-            n_skip=$(grep -c "type=$t.*not supported" /tmp/eliza-custom-quants.log || true)
-            n_fail=$(grep -c "type=$t.*FAIL"          /tmp/eliza-custom-quants.log || true)
-            n_pass=$(grep -c "type=$t.*OK"            /tmp/eliza-custom-quants.log || true)
-            echo "  $t: skip=$n_skip pass=$n_pass fail=$n_fail"
-            if [ "$n_fail" -gt 0 ]; then
-              echo "::error::Vulkan kernel divergence for type=$t (see /tmp/eliza-custom-quants.log)"
-              exit 1
-            fi
-          done
-          # ATTN_SCORE_TBQ / ATTN_SCORE_POLAR: CPU oracle landed at
-          # 4ab3e26f6. Vulkan kernels were corrected at 2e5094b2c
-          # (turbo4 uncondition) and 1cbc7e0f8 (turbo3 layout + codebook
-          # + uncondition); all 3 TBQ shapes now pass parity vs CPU.
-          # Promoted from warning to hard-fail so future shader changes
-          # cannot silently regress attention scores.
-          echo "=== Eliza custom-attention (Vulkan) ==="
-          for op_name in ATTN_SCORE_TBQ ATTN_SCORE_POLAR; do
-            n_fail=$(grep -c "$op_name.*FAIL"          /tmp/eliza-custom-quants.log || true)
-            n_skip=$(grep -c "$op_name.*not supported" /tmp/eliza-custom-quants.log || true)
-            n_pass=$(grep -c "$op_name.*OK"            /tmp/eliza-custom-quants.log || true)
-            echo "  $op_name: skip=$n_skip pass=$n_pass fail=$n_fail"
-            if [ "$n_fail" -gt 0 ]; then
-              echo "::error::Vulkan kernel diverges from CPU oracle for $op_name (see /tmp/eliza-custom-quants.log)"
-              exit 1
-            fi
-          done
-          # ISTFT: Vulkan kernel at vulkan-shaders/istft.comp + ggml_vk_istft
-          # dispatch in ggml-vulkan.cpp.  All 4 parity cases against the CPU
-          # reference must PASS — any FAIL or "not supported" line indicates
-          # a regression in the Vulkan iSTFT dispatch path or shader.
-          echo "=== ISTFT (Vulkan, gated) ==="
-          for op_name in ISTFT; do
-            n_fail=$(grep -c "$op_name.*FAIL"          /tmp/eliza-custom-quants.log || true)
-            n_skip=$(grep -c "$op_name.*not supported" /tmp/eliza-custom-quants.log || true)
-            n_pass=$(grep -c "$op_name.*OK"            /tmp/eliza-custom-quants.log || true)
-            echo "  $op_name: skip=$n_skip pass=$n_pass fail=$n_fail"
-            if [ "$n_fail" -gt 0 ]; then
-              echo "::error::Vulkan iSTFT diverges from CPU reference (see ggml-cpu/ops.cpp:ggml_compute_forward_istft_f32)"
-              exit 1
-            fi
-            if [ "$n_skip" -gt 0 ]; then
-              echo "::error::Vulkan unexpectedly reports ISTFT as not supported (regression in supports_op)"
-              exit 1
-            fi
-          done
+          set -euo pipefail
+          python3 scripts/ci-vulkan-partitions.py \
+            --binary build-vulkan/bin/test-backend-ops \
+            --output /tmp/vulkan-validation/custom \
+            --mode full --lane custom
+
+      - name: Vulkan pilot case accounting
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.partition_pilot }}
+        env:
+          GGML_VK_VISIBLE_DEVICES: '0'
+          GGML_VK_DISABLE_F16: '1'
+          GGML_VK_DISABLE_COOPMAT: '1'
+        run: |
+          source ./vulkan_sdk/setup-env.sh
+          set -euo pipefail
+          python3 scripts/ci-vulkan-partitions.py \
+            --binary build-vulkan/bin/test-backend-ops \
+            --output /tmp/vulkan-validation/pilot \
+            --mode pilot
 
       - name: Upload logs
         if: always()
@@ -213,6 +165,5 @@ jobs:
           name: eliza-vulkan-validation-logs
           path: |
             /tmp/quantize-fns.log
-            /tmp/backend-ops.log
-            /tmp/eliza-custom-quants.log
+            /tmp/vulkan-validation
           retention-days: 14
