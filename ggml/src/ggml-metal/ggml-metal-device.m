@@ -1426,6 +1426,25 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             if (!has_simdgroup_reduction) {
                 return false;
             }
+            if (op->op == GGML_OP_MUL_MAT_ID &&
+                (ggml_is_transposed(op->src[0]) || ggml_is_transposed(op->src[1]))) {
+                return false;
+            }
+            if (op->src[1]->type != GGML_TYPE_F32) {
+                // Mirror the dispatcher choice: non-f32 RHS kernels differ between mv and mm.
+                const bool use_mm = has_simdgroup_mm && op->src[0]->ne[0] >= 64 &&
+                    (op->op == GGML_OP_MUL_MAT
+                        ? !ggml_is_transposed(op->src[0]) && !ggml_is_transposed(op->src[1]) && op->src[1]->ne[1] > 8
+                        : op->src[2]->ne[1] >= 32);
+                if (op->src[1]->type == GGML_TYPE_F16) {
+                    return (op->src[0]->type == GGML_TYPE_F32 && use_mm) ||
+                           (op->src[0]->type == GGML_TYPE_F16 && (op->op == GGML_OP_MUL_MAT || use_mm));
+                }
+                if (op->src[1]->type == GGML_TYPE_BF16) {
+                    return op->src[0]->type == GGML_TYPE_BF16 && op->op == GGML_OP_MUL_MAT && !use_mm;
+                }
+                return false;
+            }
             // Match the generic matrix/vector kernels; custom attention has separate dispatch.
             switch (op->src[0]->type) {
                 case GGML_TYPE_F32:
