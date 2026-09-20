@@ -16,6 +16,8 @@ on:
     types: [opened, synchronize, reopened]
     paths:
       - '.github/workflows/eliza-vulkan-validation.yml'
+      - 'scripts/ci_verify_vulkan.py'
+      - 'scripts/test_ci_verify_vulkan.py'
       - 'ggml/src/ggml-vulkan/**'
       - 'ggml/include/**'
       - 'src/**'
@@ -34,9 +36,12 @@ env:
   LLAMA_LOG_TIMESTAMPS: 1
 
 jobs:
-  ubuntu-vulkan-llvmpipe-validation:
+  build-vulkan:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 25
+    outputs:
+      head: ${{ steps.package.outputs.head }}
+      build-sha: ${{ steps.package.outputs.build-sha }}
 
     steps:
       - name: Clone
@@ -99,120 +104,138 @@ jobs:
           source ./vulkan_sdk/setup-env.sh
           vulkaninfo --summary | head -40
 
-      - name: test-quantize-fns (CPU; smoke for Eliza custom quants)
+      - name: Check result verifier and CPU quantizers
+        shell: bash
         run: |
-          ./build-vulkan/bin/test-quantize-fns | tee /tmp/quantize-fns.log
-          # Must mention the Eliza-divergent quant types.
+          set -euo pipefail
+          python3 scripts/test_ci_verify_vulkan.py
+          ./build-vulkan/bin/test-quantize-fns | tee quantize-fns.log
           for t in qjl1_256 q4_polar tbq3_0 tbq4_0 tbq3_tcq; do
-            grep -q "Testing $t" /tmp/quantize-fns.log \
-              || (echo "MISSING quant: $t" && exit 1)
+            grep -q "Testing $t" quantize-fns.log
           done
 
-      - name: test-backend-ops on Vulkan (filtered subset)
-        env:
-          GGML_VK_VISIBLE_DEVICES: '0'
-          GGML_VK_DISABLE_F16: '1'
-          GGML_VK_DISABLE_COOPMAT: '1'
+      - name: Package one runtime for every shard
+        id: package
+        shell: bash
         run: |
-          source ./vulkan_sdk/setup-env.sh
-          # Filter to ops that matter most for inference correctness.
-          # Full sweep is too slow on llvmpipe (~hours).
-          for op in MUL_MAT MUL_MAT_ID ADD MUL SOFT_MAX RMS_NORM CPY ROPE FLASH_ATTN_EXT; do
-            echo "=== $op ==="
-            timeout 600 ./build-vulkan/bin/test-backend-ops \
-              -b Vulkan0 -o "$op" \
-              2>&1 | tee -a /tmp/backend-ops.log || true
-          done
-          # Summary lines for the artifact viewer.
-          echo "=== FAIL SUMMARY ==="
-          grep -E "Backend Vulkan0:.*FAIL|tests passed|Failing tests:" \
-            /tmp/backend-ops.log || true
+          set -euo pipefail
+          tar -czf vulkan-runtime.tar.gz -C build-vulkan bin
+          sha256sum vulkan-runtime.tar.gz > vulkan-runtime.sha256
+          echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "build-sha=$(cut -d ' ' -f 1 vulkan-runtime.sha256)" >> "$GITHUB_OUTPUT"
 
-      - name: test-backend-ops Eliza custom-quant parity (Vulkan)
-        env:
-          GGML_VK_VISIBLE_DEVICES: '0'
-          GGML_VK_DISABLE_F16: '1'
-          GGML_VK_DISABLE_COOPMAT: '1'
-        run: |
-          source ./vulkan_sdk/setup-env.sh
-          # Eliza custom quants (Q1_0_g32/g128, TBQ3_0/4_0, TBQ3_K/4_K,
-          # QJL1_256, Q4_POLAR, TBQ3_TCQ). These have CPU+Metal kernels
-          # but no Vulkan kernels yet. The harness emits one
-          # "not supported" line per (op,type,shape) — that is the
-          # intended baseline. If a future PR adds a Vulkan kernel for
-          # any of these types, this step will start emitting real
-          # PASS/FAIL lines automatically because supports_op() will
-          # return true and the test harness will compare against CPU.
-          #
-          # We do NOT fail the job on "not supported" lines (expected).
-          # We DO fail on any "FAIL" line for these types — that would
-          # signal a Vulkan kernel that diverges from the CPU reference.
-          for op in GET_ROWS CPY MUL_MAT \
-                    ATTN_SCORE_TBQ ATTN_SCORE_POLAR \
-                    ISTFT; do
-            echo "=== $op (Eliza custom quants) ==="
-            timeout 300 ./build-vulkan/bin/test-backend-ops \
-              -b Vulkan0 -o "$op" \
-              2>&1 | tee -a /tmp/eliza-custom-quants.log || true
-          done
-          # Count skip/pass/fail among lines mentioning custom quant
-          # type names. The grep patterns target the type prefixes used
-          # in the test_case::vars() output.
-          echo "=== Eliza custom-quant summary ==="
-          for t in q1_0_g32 q1_0_g128 tbq3_0 tbq4_0 tbq3_k tbq4_k qjl1_256 q4_polar tbq3_tcq; do
-            n_skip=$(grep -c "type=$t.*not supported" /tmp/eliza-custom-quants.log || true)
-            n_fail=$(grep -c "type=$t.*FAIL"          /tmp/eliza-custom-quants.log || true)
-            n_pass=$(grep -c "type=$t.*OK"            /tmp/eliza-custom-quants.log || true)
-            echo "  $t: skip=$n_skip pass=$n_pass fail=$n_fail"
-            if [ "$n_fail" -gt 0 ]; then
-              echo "::error::Vulkan kernel divergence for type=$t (see /tmp/eliza-custom-quants.log)"
-              exit 1
-            fi
-          done
-          # ATTN_SCORE_TBQ / ATTN_SCORE_POLAR: CPU oracle landed at
-          # 4ab3e26f6. Vulkan kernels were corrected at 2e5094b2c
-          # (turbo4 uncondition) and 1cbc7e0f8 (turbo3 layout + codebook
-          # + uncondition); all 3 TBQ shapes now pass parity vs CPU.
-          # Promoted from warning to hard-fail so future shader changes
-          # cannot silently regress attention scores.
-          echo "=== Eliza custom-attention (Vulkan) ==="
-          for op_name in ATTN_SCORE_TBQ ATTN_SCORE_POLAR; do
-            n_fail=$(grep -c "$op_name.*FAIL"          /tmp/eliza-custom-quants.log || true)
-            n_skip=$(grep -c "$op_name.*not supported" /tmp/eliza-custom-quants.log || true)
-            n_pass=$(grep -c "$op_name.*OK"            /tmp/eliza-custom-quants.log || true)
-            echo "  $op_name: skip=$n_skip pass=$n_pass fail=$n_fail"
-            if [ "$n_fail" -gt 0 ]; then
-              echo "::error::Vulkan kernel diverges from CPU oracle for $op_name (see /tmp/eliza-custom-quants.log)"
-              exit 1
-            fi
-          done
-          # ISTFT: Vulkan kernel at vulkan-shaders/istft.comp + ggml_vk_istft
-          # dispatch in ggml-vulkan.cpp.  All 4 parity cases against the CPU
-          # reference must PASS — any FAIL or "not supported" line indicates
-          # a regression in the Vulkan iSTFT dispatch path or shader.
-          echo "=== ISTFT (Vulkan, gated) ==="
-          for op_name in ISTFT; do
-            n_fail=$(grep -c "$op_name.*FAIL"          /tmp/eliza-custom-quants.log || true)
-            n_skip=$(grep -c "$op_name.*not supported" /tmp/eliza-custom-quants.log || true)
-            n_pass=$(grep -c "$op_name.*OK"            /tmp/eliza-custom-quants.log || true)
-            echo "  $op_name: skip=$n_skip pass=$n_pass fail=$n_fail"
-            if [ "$n_fail" -gt 0 ]; then
-              echo "::error::Vulkan iSTFT diverges from CPU reference (see ggml-cpu/ops.cpp:ggml_compute_forward_istft_f32)"
-              exit 1
-            fi
-            if [ "$n_skip" -gt 0 ]; then
-              echo "::error::Vulkan unexpectedly reports ISTFT as not supported (regression in supports_op)"
-              exit 1
-            fi
-          done
-
-      - name: Upload logs
-        if: always()
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: eliza-vulkan-validation-logs
+          name: vulkan-validation-runtime
           path: |
-            /tmp/quantize-fns.log
-            /tmp/backend-ops.log
-            /tmp/eliza-custom-quants.log
+            vulkan-runtime.tar.gz
+            vulkan-runtime.sha256
+            quantize-fns.log
+          retention-days: 14
+
+  numerical-shards:
+    needs: build-vulkan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    env:
+      GGML_VK_VISIBLE_DEVICES: '0'
+      GGML_VK_DISABLE_F16: '1'
+      GGML_VK_DISABLE_COOPMAT: '1'
+      SHARD: ${{ matrix.shard }}
+      QUALIFIED_HEAD: ${{ needs.build-vulkan.outputs.head }}
+      BUILD_SHA: ${{ needs.build-vulkan.outputs.build-sha }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: System Vulkan runtime
+        run: |
+          sudo add-apt-repository -y ppa:kisak/kisak-mesa
+          sudo apt-get update -y
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1
+      - uses: actions/download-artifact@v4
+        with:
+          name: vulkan-validation-runtime
+      - name: Verify and unpack shared build
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$QUALIFIED_HEAD"
+          test "$(cut -d ' ' -f 1 vulkan-runtime.sha256)" = "$BUILD_SHA"
+          sha256sum --check vulkan-runtime.sha256
+          mkdir build-vulkan
+          tar -xzf vulkan-runtime.tar.gz -C build-vulkan
+          mkdir results
+          : > results/ledger.jsonl
+      - name: Complete assigned numerical occurrences
+        shell: bash
+        run: |
+          set -euo pipefail
+          for group in broad custom; do
+            if [ "$group" = broad ]; then
+              ops="MUL_MAT MUL_MAT_ID ADD MUL SOFT_MAX RMS_NORM CPY ROPE FLASH_ATTN_EXT"
+              limit=600
+            else
+              ops="GET_ROWS CPY MUL_MAT ATTN_SCORE_TBQ ATTN_SCORE_POLAR ISTFT"
+              limit=300
+            fi
+            for op in $ops; do
+              shard_args=()
+              verify_args=()
+              if [ "$op" = MUL_MAT ] || [ "$op" = FLASH_ATTN_EXT ]; then
+                shard_args=(--test-shard "$SHARD/16")
+                verify_args=(--shard "$SHARD")
+              elif [ "$SHARD" != 0 ]; then
+                continue
+              fi
+              log="results/$group-$op.log"
+              timeout "$limit" ./build-vulkan/bin/test-backend-ops \
+                -b Vulkan0 -o "$op" "${shard_args[@]}" \
+                2>"results/$group-$op.stderr" | tee "$log"
+              python3 scripts/ci_verify_vulkan.py record "$group" "$op" "$log" results/ledger.jsonl \
+                --head "$QUALIFIED_HEAD" --build-sha "$BUILD_SHA" "${verify_args[@]}"
+            done
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vulkan-shard-${{ matrix.shard }}
+          path: results/
+          if-no-files-found: error
+          retention-days: 14
+
+  ubuntu-vulkan-llvmpipe-validation:
+    if: always()
+    needs: [build-vulkan, numerical-shards]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      BUILD_RESULT: ${{ needs.build-vulkan.result }}
+      SHARD_RESULT: ${{ needs.numerical-shards.result }}
+      QUALIFIED_HEAD: ${{ needs.build-vulkan.outputs.head }}
+      BUILD_SHA: ${{ needs.build-vulkan.outputs.build-sha }}
+    steps:
+      - name: Require every producer to finish successfully
+        run: |
+          test "$BUILD_RESULT" = success
+          test "$SHARD_RESULT" = success
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: vulkan-shard-*
+          path: shard-results
+      - name: Reconcile all occurrences against the complete inventories
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$QUALIFIED_HEAD"
+          python3 scripts/ci_verify_vulkan.py aggregate shard-results \
+            --head "$QUALIFIED_HEAD" --build-sha "$BUILD_SHA" | tee vulkan-coverage.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vulkan-validation-coverage
+          path: vulkan-coverage.json
           retention-days: 14
