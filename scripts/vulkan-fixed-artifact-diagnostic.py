@@ -21,6 +21,8 @@ assert sha(root / "vulkan-runtime.tar.gz") == capsule["buildSha256"]
 spec = importlib.util.spec_from_file_location(
     "verifier", root / "scripts/ci_verify_vulkan.py"
 )
+if spec is None or spec.loader is None:
+    raise RuntimeError("Cannot load the pinned Vulkan verifier")
 verifier = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(verifier)
 binary = root / "build-vulkan/bin/test-backend-ops"
