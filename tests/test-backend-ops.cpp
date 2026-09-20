@@ -57,7 +57,7 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
     std::vector<float> data(nels);
     {
         // parallel initialization
-        static const size_t n_threads = N_THREADS;
+        static const size_t n_threads = g_n_threads > 0 ? (size_t) g_n_threads : N_THREADS;
         // static RNG initialization (revisit if n_threads stops being constant)
         static std::vector<std::default_random_engine> generators = []() {
             std::random_device rd;
@@ -10049,6 +10049,11 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
         // Use reference implementation on the CPU backend for comparison
         using ggml_backend_cpu_set_use_ref_t = void (*)(ggml_backend_t, bool);
         auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+        if (g_n_threads > 0) {
+            auto * set_n_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+            GGML_ASSERT(set_n_threads != nullptr);
+            set_n_threads(backend_cpu, g_n_threads);
+        }
         auto * set_use_ref = (ggml_backend_cpu_set_use_ref_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_use_ref");
         if (set_use_ref) {
             set_use_ref(backend_cpu, true);
