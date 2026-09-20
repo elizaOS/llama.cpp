@@ -85,7 +85,9 @@ jobs:
       - name: Configure
         run: |
           source ./vulkan_sdk/setup-env.sh
+          # This runtime is shared across runners with different CPU features.
           cmake -B build-vulkan \
+            -DGGML_NATIVE=OFF \
             -DGGML_VULKAN=ON \
             -DGGML_METAL=OFF \
             -DLLAMA_CURL=OFF \
@@ -95,6 +97,7 @@ jobs:
       - name: Build
         run: |
           source ./vulkan_sdk/setup-env.sh
+          grep -q "^GGML_NATIVE:BOOL=OFF$" build-vulkan/CMakeCache.txt
           cmake --build build-vulkan -j $(nproc) \
             --target llama-cli llama-completion \
                      test-backend-ops test-quantize-fns
@@ -169,6 +172,7 @@ jobs:
           mkdir build-vulkan
           tar -xzf vulkan-runtime.tar.gz -C build-vulkan
           mkdir results
+          lscpu > results/cpu.txt
           : > results/ledger.jsonl
       - name: Complete assigned numerical occurrences
         shell: bash
