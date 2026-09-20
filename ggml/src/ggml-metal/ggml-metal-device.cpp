@@ -1591,8 +1591,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_attn_score_qjl(g
 // ELIZA-TBQ-POLAR-ATTN-DISPATCH-V1
 static const char * eliza_metal_tbq_kernel_name(ggml_type type) {
     switch (type) {
-        case GGML_TYPE_TBQ3_0:   return "kernel_turbo3_dot_multi";
-        case GGML_TYPE_TBQ4_0:   return "kernel_turbo4_dot_multi";
+        case GGML_TYPE_TBQ3_0:   return "kernel_attn_score_tbq3_0";
+        case GGML_TYPE_TBQ4_0:   return "kernel_attn_score_tbq4_0";
         case GGML_TYPE_TBQ3_TCQ: return "kernel_turbo3_tcq_dot_multi";
         default: GGML_ABORT("unsupported TurboQuant attention score type");
     }
