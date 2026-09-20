@@ -11,6 +11,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import sys
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 LANES = {
@@ -131,7 +132,8 @@ def main():
                  log=args.log.name, logSha256=sha(args.log))
         with args.ledger.open("a") as output:
             output.write(json.dumps(r) + "\n")
-        print(json.dumps({k: r[k] for k in ("group", "operation", "shard", "numericalPasses")}))
+        # stdout is the machine-readable CLI result; failures retain stderr and nonzero exit.
+        sys.stdout.write(json.dumps({k: r[k] for k in ("group", "operation", "shard", "numericalPasses")}) + "\n")
     else:
         records = []
         for ledger in sorted(args.root.glob("*/ledger.jsonl")):
@@ -144,7 +146,7 @@ def main():
                 if any(r[key] != value for key, value in verified.items()):
                     raise ValueError("Receipt does not match raw output")
                 records.append(r)
-        print(json.dumps(aggregate(records, args.head, args.build_sha), indent=2))
+        sys.stdout.write(json.dumps(aggregate(records, args.head, args.build_sha), indent=2) + "\n")
 
 
 if __name__ == "__main__":
