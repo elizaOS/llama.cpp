@@ -13,6 +13,10 @@ name: Eliza Vulkan Validation
 on:
   workflow_dispatch:
     inputs:
+      continuation_wave:
+        description: Execute only the 121 remaining partitions using preserved runtime and reviewed prior coverage.
+        type: boolean
+        default: false
       diagnostic_347:
         description: Diagnose only timed-out partition 347 using the preserved binary; not full coverage.
         type: boolean
@@ -48,7 +52,7 @@ env:
 
 jobs:
   ubuntu-vulkan-llvmpipe-validation:
-    if: ${{ !inputs.coverage_wave && !inputs.diagnostic_347 }}
+    if: ${{ !inputs.coverage_wave && !inputs.diagnostic_347 && !inputs.continuation_wave }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
@@ -181,7 +185,7 @@ jobs:
     permissions:
       contents: read
       actions: read
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.coverage_wave && !inputs.diagnostic_347 }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.coverage_wave && !inputs.diagnostic_347 && !inputs.continuation_wave }}
     env:
       GGML_VK_VISIBLE_DEVICES: '0'
       GGML_VK_DISABLE_F16: '1'
@@ -294,7 +298,7 @@ jobs:
           path: worker-${{ matrix.worker }}
           retention-days: 14
   coverage:
-    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.coverage_wave && !inputs.diagnostic_347 }}
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.coverage_wave && !inputs.diagnostic_347 && !inputs.continuation_wave }}
     needs: [build, worker]
     runs-on: ubuntu-24.04
     timeout-minutes: 4
@@ -329,7 +333,7 @@ jobs:
     permissions:
       contents: read
       actions: read
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.diagnostic_347 }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.diagnostic_347 && !inputs.continuation_wave }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
@@ -455,4 +459,262 @@ jobs:
         with:
           name: vulkan-partition-347-diagnostic
           path: diagnostic-347
+          retention-days: 14
+
+  continuation-worker:
+    permissions:
+      contents: read
+      actions: read
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.continuation_wave }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 59
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: [0, 1]
+    env:
+      GGML_VK_VISIBLE_DEVICES: '0'
+      GGML_VK_DISABLE_F16: '1'
+      GGML_VK_DISABLE_COOPMAT: '1'
+      VULKAN_SDK_VERSION: '1.4.357.1'
+      BUILD_JSON: prior/vulkan-wave-build/build.json
+      WORKER_ID: ${{ matrix.worker }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 7
+      - name: Require isolated continuation mode
+        env:
+          COVERAGE_WAVE: ${{ inputs.coverage_wave }}
+          DIAGNOSTIC: ${{ inputs.diagnostic_347 }}
+          PILOT: ${{ inputs.partition_pilot }}
+        run: test "$COVERAGE_WAVE" != true && test "$DIAGNOSTIC" != true && test "$PILOT" != true
+      - name: Install identical driver and loader prerequisites
+        run: |
+          sudo add-apt-repository -y ppa:kisak/kisak-mesa
+          sudo apt-get update -y
+          sudo apt-get install -y mesa-vulkan-drivers=26.2.3~kisak1~n vulkan-tools libvulkan-dev libssl-dev
+      - uses: actions/cache@v5
+        id: sdk
+        with:
+          path: ./vulkan_sdk
+          key: vulkan-sdk-${{ env.VULKAN_SDK_VERSION }}-${{ runner.os }}
+      - if: steps.sdk.outputs.cache-hit != 'true'
+        uses: ./.github/actions/linux-setup-vulkan
+        with:
+          path: ./vulkan_sdk
+          version: ${{ env.VULKAN_SDK_VERSION }}
+      - name: Download pinned source-bound evidence and runtime
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download 35477466317 -R elizaOS/llama.cpp -n vulkan-wave-build -n vulkan-wave-worker-0 -n vulkan-wave-worker-1 -n vulkan-wave-worker-2 -n vulkan-wave-worker-3 -D prior
+          gh run download 35479874156 -R elizaOS/llama.cpp -n vulkan-partition-347-diagnostic -D prior/diagnostic
+      - name: Verify prior ledger and execute remaining bounded queue
+        run: |
+          set -euo pipefail
+          ln -s prior/vulkan-wave-build wave-build
+          sha256sum -c wave-build/SHA256SUMS
+          mkdir build-vulkan
+          tar -xzf prior/vulkan-wave-build/runtime.tar.gz -C build-vulkan
+          set +u
+          source ./vulkan_sdk/setup-env.sh
+          set -u
+          python3 - <<'PY_CONTINUATION'
+          import collections, importlib.util, json, os, re, shutil, subprocess, time
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('wave', 'scripts/ci-vulkan-coverage-wave.py')
+          wave = importlib.util.module_from_spec(spec); spec.loader.exec_module(wave); h = wave.helper
+          build_path = Path(os.environ['BUILD_JSON'])
+          assert h.sha(build_path) == '9feefd1cab42d112e12148ae9701bead32a6f5e57ae5ac5c1cea34b75feb8efb'
+          build = json.loads(build_path.read_text())
+          assert build['source'] == h.SOURCE and build['head'] == '2f5a3564327b8e52213bba0cb7f0753564fccf9f'
+          head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          subprocess.run(['git', 'diff', '--exit-code', h.SOURCE, '--', '.',
+              ':!.github/workflows/eliza-vulkan-validation.yml', ':!scripts/ci-vulkan-partitions.py',
+              ':!scripts/ci-vulkan-pilot-witnesses.json', ':!scripts/ci-vulkan-coverage-wave.py',
+              ':!scripts/ci-vulkan-wave-inputs.json'], check=True)
+          for script in ['ci-vulkan-partitions.py', 'ci-vulkan-coverage-wave.py', 'ci-vulkan-wave-inputs.json']:
+              assert Path('scripts', script).read_bytes() == subprocess.check_output(['git', 'show', build['head'] + ':scripts/' + script])
+          prior_hashes = ['a1c5fd8fc8e6b6aac28971349f51aa917c2925cc3f85a9cd5f3ccdcddbd9cd64',
+              'd56a42f46d999eb25555b4a007f0455b6736091752e20ab7ca855528feabffae',
+              '94b88a12417f5d09e58a53faad583f5c915eadd9b464e9dd9c119c2cccb89910',
+              'cda2e4b18b937da8805e1753afcc5ae84387bc84ef5cfdde6df432f394f0429b']
+          covered = collections.Counter({tuple(row[:3]): row[3] for row in build['completed']})
+          original = collections.Counter({tuple(row[:3]): row[3] for row in build['original']})
+          done = set()
+          for worker, digest in enumerate(prior_hashes):
+              folder = Path('prior/vulkan-wave-worker-' + str(worker))
+              assert h.sha(folder / 'receipt.json') == digest
+              receipt = json.loads((folder / 'receipt.json').read_text())
+              assert receipt['worker_finished'] and receipt['head'] == build['head']
+              for inv in receipt['invocations']:
+                  if not inv['valid']:
+                      assert inv['selection']['id'] == 347 and inv['timed_out'] and inv['exit_code'] == 124
+                      continue
+                  ident = inv['selection']['id']
+                  assert ident not in done and all(inv['selection'][k] == v for k, v in build['partitions'][ident].items())
+                  covered.update(wave.verify_invocation(inv, folder)); done.add(ident)
+          folder = Path('prior/diagnostic')
+          assert h.sha(folder / 'receipt.json') == 'f8d95e88c92bda45964296a36e236f9e188dbb391ba3174e2e114c523c23c3b2'
+          diag = json.loads((folder / 'receipt.json').read_text())
+          assert diag['terminal'] and diag['complete_partition'] and diag['source'] == h.SOURCE and 347 not in done
+          split = collections.Counter()
+          for inv in diag['invocations']: split.update(wave.verify_invocation(inv, folder))
+          assert split == wave.counter(build['partitions'][347])
+          covered.update(split); done.add(347)
+          remaining = [part for part in build['partitions'] if part['id'] not in done]
+          planned = collections.Counter()
+          for part in remaining: planned.update(wave.counter(part))
+          assert len(remaining) == 121 and sum(planned.values()) == 2428
+          assert sum(covered.values()) == 5494 and not (covered - original) and covered + planned == original
+          worker = int(os.environ['WORKER_ID']); assert worker in [0, 1]
+          output = Path('continuation-worker-' + str(worker)); output.mkdir()
+          shutil.copyfile(build_path, output / 'build.json')
+          binary = Path('build-vulkan/bin/test-backend-ops').resolve()
+          for name, digest in build['payload_files'].items():
+              assert Path(name).name == name and h.sha(binary.parent / name) == digest
+          ldd, runtime = wave.libraries(binary)
+          assert runtime == build['runtime_libraries']; (output / 'ldd.txt').write_text(ldd)
+          assigned = remaining[worker::2]
+          receipt = {'head': head, 'source': h.SOURCE, 'worker': worker, 'build_sha256': h.sha(build_path),
+              'prior_covered_occurrences': 5494, 'assigned_ids': [p['id'] for p in assigned],
+              'pending_ids': [p['id'] for p in assigned], 'invocations': [], 'complete_suite': False}
+          h.write(output / 'receipt.json', receipt)
+          # Keep original IDs and deadlines; a worker checkpoint is not full acceptance.
+          started = time.monotonic()
+          for part in assigned:
+              if time.monotonic() - started + part['limit_seconds'] + 5 > 48 * 60: break
+              selection = dict(part, label='partition-' + str(part['id']))
+              regex = '^(' + '|'.join(re.escape(p) for p in sorted(part['expected'])) + ')$'
+              inv = h.run([str(binary), '-b', 'Vulkan0', '-o', part['operation'], '-p', regex],
+                          output / selection['label'], part['limit_seconds'])
+              inv['selection'] = selection
+              inv['accounting'] = h.verify((output / (selection['label'] + '.stdout')).read_text(), part['operation'],
+                  collections.Counter(part['expected']), part['witnessed'], allow_all_unsupported=True)
+              inv['valid'] = inv['exit_code'] == 0 and not inv['timed_out'] and inv['accounting']['valid']
+              receipt['invocations'].append(inv)
+              if inv['valid']: receipt['pending_ids'].remove(part['id'])
+              h.write(output / 'receipt.json', receipt)
+              print(json.dumps({'id': part['id'], 'valid': inv['valid'], 'accounting': inv['accounting']}), flush=True)
+              if not inv['valid']: break
+          receipt['worker_finished'] = True; receipt['elapsed_seconds'] = time.monotonic() - started
+          h.write(output / 'receipt.json', receipt)
+          raise SystemExit(0 if all(inv['valid'] for inv in receipt['invocations']) else 1)
+          PY_CONTINUATION
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vulkan-continuation-worker-${{ matrix.worker }}
+          path: continuation-worker-${{ matrix.worker }}
+          retention-days: 14
+  continuation-coverage:
+    permissions:
+      contents: read
+      actions: read
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.continuation_wave }}
+    needs: continuation-worker
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    env:
+      BUILD_JSON: new/vulkan-continuation-worker-0/build.json
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 7
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: vulkan-continuation-worker-*
+          path: new
+      - name: Download pinned prior ledger
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download 35477466317 -R elizaOS/llama.cpp -n vulkan-wave-worker-0 -n vulkan-wave-worker-1 -n vulkan-wave-worker-2 -n vulkan-wave-worker-3 -D prior
+          gh run download 35479874156 -R elizaOS/llama.cpp -n vulkan-partition-347-diagnostic -D prior/diagnostic
+      - name: Independently verify disjoint original coverage
+        run: |
+          python3 - <<'PY_CONTINUATION'
+          import collections, importlib.util, json, os, re, shutil, subprocess, time
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('wave', 'scripts/ci-vulkan-coverage-wave.py')
+          wave = importlib.util.module_from_spec(spec); spec.loader.exec_module(wave); h = wave.helper
+          build_path = Path(os.environ['BUILD_JSON'])
+          assert h.sha(build_path) == '9feefd1cab42d112e12148ae9701bead32a6f5e57ae5ac5c1cea34b75feb8efb'
+          build = json.loads(build_path.read_text())
+          assert build['source'] == h.SOURCE and build['head'] == '2f5a3564327b8e52213bba0cb7f0753564fccf9f'
+          head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          subprocess.run(['git', 'diff', '--exit-code', h.SOURCE, '--', '.',
+              ':!.github/workflows/eliza-vulkan-validation.yml', ':!scripts/ci-vulkan-partitions.py',
+              ':!scripts/ci-vulkan-pilot-witnesses.json', ':!scripts/ci-vulkan-coverage-wave.py',
+              ':!scripts/ci-vulkan-wave-inputs.json'], check=True)
+          for script in ['ci-vulkan-partitions.py', 'ci-vulkan-coverage-wave.py', 'ci-vulkan-wave-inputs.json']:
+              assert Path('scripts', script).read_bytes() == subprocess.check_output(['git', 'show', build['head'] + ':scripts/' + script])
+          prior_hashes = ['a1c5fd8fc8e6b6aac28971349f51aa917c2925cc3f85a9cd5f3ccdcddbd9cd64',
+              'd56a42f46d999eb25555b4a007f0455b6736091752e20ab7ca855528feabffae',
+              '94b88a12417f5d09e58a53faad583f5c915eadd9b464e9dd9c119c2cccb89910',
+              'cda2e4b18b937da8805e1753afcc5ae84387bc84ef5cfdde6df432f394f0429b']
+          covered = collections.Counter({tuple(row[:3]): row[3] for row in build['completed']})
+          original = collections.Counter({tuple(row[:3]): row[3] for row in build['original']})
+          done = set()
+          for worker, digest in enumerate(prior_hashes):
+              folder = Path('prior/vulkan-wave-worker-' + str(worker))
+              assert h.sha(folder / 'receipt.json') == digest
+              receipt = json.loads((folder / 'receipt.json').read_text())
+              assert receipt['worker_finished'] and receipt['head'] == build['head']
+              for inv in receipt['invocations']:
+                  if not inv['valid']:
+                      assert inv['selection']['id'] == 347 and inv['timed_out'] and inv['exit_code'] == 124
+                      continue
+                  ident = inv['selection']['id']
+                  assert ident not in done and all(inv['selection'][k] == v for k, v in build['partitions'][ident].items())
+                  covered.update(wave.verify_invocation(inv, folder)); done.add(ident)
+          folder = Path('prior/diagnostic')
+          assert h.sha(folder / 'receipt.json') == 'f8d95e88c92bda45964296a36e236f9e188dbb391ba3174e2e114c523c23c3b2'
+          diag = json.loads((folder / 'receipt.json').read_text())
+          assert diag['terminal'] and diag['complete_partition'] and diag['source'] == h.SOURCE and 347 not in done
+          split = collections.Counter()
+          for inv in diag['invocations']: split.update(wave.verify_invocation(inv, folder))
+          assert split == wave.counter(build['partitions'][347])
+          covered.update(split); done.add(347)
+          remaining = [part for part in build['partitions'] if part['id'] not in done]
+          planned = collections.Counter()
+          for part in remaining: planned.update(wave.counter(part))
+          assert len(remaining) == 121 and sum(planned.values()) == 2428
+          assert sum(covered.values()) == 5494 and not (covered - original) and covered + planned == original
+          errors = []; new_ids = set(); found = set()
+          for worker in range(2):
+              folder = Path('new/vulkan-continuation-worker-' + str(worker))
+              path = folder / 'receipt.json'
+              if not path.exists(): errors.append('missing worker ' + str(worker)); continue
+              receipt = json.loads(path.read_text()); found.add(worker)
+              assert receipt['head'] == head and receipt['source'] == h.SOURCE and receipt['worker'] == worker
+              assert receipt['build_sha256'] == h.sha(build_path) and receipt['prior_covered_occurrences'] == 5494
+              assert receipt['worker_finished']
+              assigned = remaining[worker::2]
+              assert receipt['assigned_ids'] == [p['id'] for p in assigned]
+              allowed = {p['id'] for p in assigned}
+              for inv in receipt['invocations']:
+                  ident = inv['selection']['id']
+                  assert ident in allowed and ident not in new_ids and ident not in done
+                  assert all(inv['selection'][k] == v for k, v in build['partitions'][ident].items())
+                  try: verified = wave.verify_invocation(inv, folder)
+                  except (ValueError, FileNotFoundError) as error: errors.append(str(error)); continue
+                  covered.update(verified); new_ids.add(ident)
+              assert receipt['pending_ids'] == [p['id'] for p in assigned if p['id'] not in new_ids]
+          assert not (covered - original)
+          missing = original - covered
+          if missing: errors.append('full original coverage incomplete')
+          result = {'head': head, 'source': h.SOURCE, 'covered_occurrences': sum(covered.values()),
+              'original_occurrences': 7922, 'complete_suite': False, 'complete_original_three_invocations': not errors,
+              'errors': errors, 'prior_completed_partition_ids': sorted(done), 'new_completed_partition_ids': sorted(new_ids),
+              'missing': [list(k) + [v] for k, v in sorted(missing.items())]}
+          h.write('continuation-coverage.json', result)
+          raise SystemExit(0 if not errors else 1)
+          PY_CONTINUATION
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vulkan-continuation-coverage
+          path: continuation-coverage.json
           retention-days: 14
