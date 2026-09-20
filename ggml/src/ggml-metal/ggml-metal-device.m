@@ -1437,13 +1437,18 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                         ? !ggml_is_transposed(op->src[0]) && !ggml_is_transposed(op->src[1]) && op->src[1]->ne[1] > 8
                         : op->src[2]->ne[1] >= 32);
                 if (op->src[1]->type == GGML_TYPE_F16) {
-                    return (op->src[0]->type == GGML_TYPE_F32 && use_mm) ||
-                           (op->src[0]->type == GGML_TYPE_F16 && (op->op == GGML_OP_MUL_MAT || use_mm));
-                }
-                if (op->src[1]->type == GGML_TYPE_BF16) {
+                    if (op->src[0]->type == GGML_TYPE_F16 && op->op == GGML_OP_MUL_MAT) {
+                        return true;
+                    }
+                    if (!use_mm || op->src[0]->type == GGML_TYPE_BF16) {
+                        return false;
+                    }
+                    // The standard quantized mm kernels also accept an f16 RHS.
+                } else if (op->src[1]->type == GGML_TYPE_BF16) {
                     return op->src[0]->type == GGML_TYPE_BF16 && op->op == GGML_OP_MUL_MAT && !use_mm;
+                } else {
+                    return false;
                 }
-                return false;
             }
             // Match the generic matrix/vector kernels; custom attention has separate dispatch.
             switch (op->src[0]->type) {
@@ -1475,7 +1480,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     return true;
                 case GGML_TYPE_Q1_0_g128:
                     // This format has ordinary kernels but no indexed matrix/vector kernels.
-                    return op->op == GGML_OP_MUL_MAT;
+                    return op->op == GGML_OP_MUL_MAT && op->src[1]->type == GGML_TYPE_F32;
                 default:
                     return false;
             }
