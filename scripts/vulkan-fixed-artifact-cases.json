@@ -1,0 +1,69 @@
+{
+  "sourceRun": 35506984389,
+  "artifactId": 10604247295,
+  "artifactName": "vulkan-validation-runtime",
+  "qualifiedMergeHead": "fded54caaf2e7fbb40be8059baf8ab491348b1a9",
+  "buildSha256": "4a8824b685224613468c7be9211244058e2d49e5e7a5de31f3f7d887d03e102a",
+  "pullRequestHead": "b3538ea8ac12e576c3b44f5b5015708322c446b1",
+  "cases": [
+    {
+      "id": "shard1-last-completed-control",
+      "sourceShard": 1,
+      "ordinal": 4801,
+      "params": "hsk=512,hsv=512,nh=4,nr23=[1,1],kv=113,nb=3,mask=0,sinks=1,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_K=f16,type_V=f16,permute=[0,1,2,3]",
+      "expectedOccurrences": 1,
+      "interpretation": "last-completed-control",
+      "sourceLogSha256": "98f9c5ba63bcdde61e88ace97603768b238d9ee6cdb179058dc124fe2d6ae499"
+    },
+    {
+      "id": "shard1-next-unconfirmed-candidate",
+      "sourceShard": 1,
+      "ordinal": 4833,
+      "params": "hsk=576,hsv=512,nh=1,nr23=[1,1],kv=113,nb=3,mask=1,sinks=1,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_K=f16,type_V=f16,permute=[0,1,2,3]",
+      "expectedOccurrences": 1,
+      "interpretation": "next-unconfirmed-candidate",
+      "sourceLogSha256": "98f9c5ba63bcdde61e88ace97603768b238d9ee6cdb179058dc124fe2d6ae499"
+    },
+    {
+      "id": "shard3-last-completed-control",
+      "sourceShard": 3,
+      "ordinal": 4995,
+      "params": "hsk=576,hsv=512,nh=1,nr23=[4,1],kv=512,nb=75,mask=1,sinks=0,max_bias=8.000000,logit_softcap=0.000000,prec=f32,type_K=f16,type_V=f16,permute=[0,1,2,3]",
+      "expectedOccurrences": 1,
+      "interpretation": "last-completed-control",
+      "sourceLogSha256": "579c1e6965ae89587d74fba3b466f39101693ab61a4e3160c2f7df6d3f8611b8"
+    },
+    {
+      "id": "shard3-next-unconfirmed-candidate",
+      "sourceShard": 3,
+      "ordinal": 5027,
+      "params": "hsk=576,hsv=512,nh=1,nr23=[1,1],kv=1024,nb=75,mask=0,sinks=1,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_K=f16,type_V=f16,permute=[0,1,2,3]",
+      "expectedOccurrences": 1,
+      "interpretation": "next-unconfirmed-candidate",
+      "sourceLogSha256": "579c1e6965ae89587d74fba3b466f39101693ab61a4e3160c2f7df6d3f8611b8"
+    },
+    {
+      "id": "shard30-last-completed-control",
+      "sourceShard": 30,
+      "ordinal": 4446,
+      "params": "hsk=256,hsv=256,nh=4,nr23=[4,1],kv=512,nb=32,mask=0,sinks=1,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_K=f16,type_V=f16,permute=[0,1,2,3]",
+      "expectedOccurrences": 1,
+      "interpretation": "last-completed-control",
+      "sourceLogSha256": "c8619f4a79a551c822d9b52afe1fa090fdbf033a58859393e293995a061e392a"
+    },
+    {
+      "id": "shard30-next-unconfirmed-candidate",
+      "sourceShard": 30,
+      "ordinal": 4478,
+      "params": "hsk=320,hsv=256,nh=1,nr23=[1,1],kv=1024,nb=32,mask=1,sinks=1,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_K=f16,type_V=f16,permute=[0,1,2,3]",
+      "expectedOccurrences": 1,
+      "interpretation": "next-unconfirmed-candidate",
+      "sourceLogSha256": "c8619f4a79a551c822d9b52afe1fa090fdbf033a58859393e293995a061e392a"
+    }
+  ],
+  "replayShard": [
+    1,
+    32
+  ],
+  "scope": "Diagnostic only. Next unconfirmed case is inferred from complete inventory and confirmed result prefix; buffered logs do not prove it was executing at timeout."
+}
