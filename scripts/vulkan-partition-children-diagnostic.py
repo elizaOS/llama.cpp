@@ -28,6 +28,8 @@ assert sha(reference) == REFERENCE_SHA
 spec = importlib.util.spec_from_file_location(
     "verifier", ROOT / "scripts/ci_verify_vulkan.py"
 )
+if spec is None or spec.loader is None:
+    raise RuntimeError("Cannot load the pinned Vulkan verifier")
 verifier = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(verifier)
 canonical = verifier.verify(reference.read_text(), "FLASH_ATTN_EXT", [0, 32])[
