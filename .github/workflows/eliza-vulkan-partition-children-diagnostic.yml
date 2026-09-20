@@ -1,0 +1,63 @@
+name: Eliza Vulkan Partition Children Diagnostic
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/eliza-vulkan-partition-children-diagnostic.yml'
+      - 'scripts/vulkan-partition-children-diagnostic.py'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GGML_VK_VISIBLE_DEVICES: '0'
+      GGML_VK_DISABLE_F16: '1'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Install matching Vulkan runtime family
+        run: |
+          sudo add-apt-repository -y ppa:kisak/kisak-mesa
+          sudo apt-get update -y
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1 vulkan-tools
+      - uses: actions/download-artifact@v4
+        with:
+          name: vulkan-validation-runtime
+          run-id: 35506984389
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: vulkan-shard-0
+          run-id: 35506984389
+          github-token: ${{ github.token }}
+          path: reference-shard
+      - name: Bind exact runtime and verifier
+        run: |
+          set -euo pipefail
+          test "$(sha256sum vulkan-runtime.tar.gz | cut -d ' ' -f 1)" = 4a8824b685224613468c7be9211244058e2d49e5e7a5de31f3f7d887d03e102a
+          sha256sum --check vulkan-runtime.sha256
+          mkdir build-vulkan
+          tar -xzf vulkan-runtime.tar.gz -C build-vulkan
+          git show b3538ea8ac12e576c3b44f5b5015708322c446b1:scripts/ci_verify_vulkan.py > scripts/ci_verify_vulkan.py
+      - name: Record host and run serial cases
+        run: |
+          set -euo pipefail
+          mkdir diagnostic-host
+          uname -a > diagnostic-host/uname.txt
+          lscpu > diagnostic-host/cpu.txt
+          vulkaninfo --summary > diagnostic-host/vulkan.txt 2>&1
+          dpkg-query -W mesa-vulkan-drivers libvulkan1 > diagnostic-host/versions.txt
+          python3 scripts/vulkan-partition-children-diagnostic.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vulkan-partition-children-diagnostic
+          path: |
+            partition-child-results
+            diagnostic-host
+            reference-shard/broad-FLASH_ATTN_EXT.log
+          if-no-files-found: error
