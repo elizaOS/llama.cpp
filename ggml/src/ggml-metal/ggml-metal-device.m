@@ -1420,9 +1420,46 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_GATED_DELTA_NET:
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
         case GGML_OP_SOLVE_TRI:
+            return has_simdgroup_reduction;
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
-            return has_simdgroup_reduction;
+            if (!has_simdgroup_reduction) {
+                return false;
+            }
+            // Match the generic matrix/vector kernels; custom attention has separate dispatch.
+            switch (op->src[0]->type) {
+                case GGML_TYPE_F32:
+                case GGML_TYPE_F16:
+                case GGML_TYPE_BF16:
+                case GGML_TYPE_Q1_0:
+                case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q4_1:
+                case GGML_TYPE_Q5_0:
+                case GGML_TYPE_Q5_1:
+                case GGML_TYPE_Q8_0:
+                case GGML_TYPE_MXFP4:
+                case GGML_TYPE_NVFP4:
+                case GGML_TYPE_Q2_K:
+                case GGML_TYPE_Q3_K:
+                case GGML_TYPE_Q4_K:
+                case GGML_TYPE_Q5_K:
+                case GGML_TYPE_Q6_K:
+                case GGML_TYPE_IQ2_XXS:
+                case GGML_TYPE_IQ2_XS:
+                case GGML_TYPE_IQ3_XXS:
+                case GGML_TYPE_IQ3_S:
+                case GGML_TYPE_IQ2_S:
+                case GGML_TYPE_IQ1_S:
+                case GGML_TYPE_IQ1_M:
+                case GGML_TYPE_IQ4_NL:
+                case GGML_TYPE_IQ4_XS:
+                    return true;
+                case GGML_TYPE_Q1_0_g128:
+                    // This format has ordinary kernels but no indexed matrix/vector kernels.
+                    return op->op == GGML_OP_MUL_MAT;
+                default:
+                    return false;
+            }
         case GGML_OP_SET:
         case GGML_OP_CPY:
         case GGML_OP_DUP:
