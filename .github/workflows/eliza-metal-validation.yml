@@ -61,6 +61,40 @@ jobs:
           evict-old-files: 1d
           save: ${{ github.event_name == 'push' }}
 
+      - name: Require bounded process execution and operation accounting
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v gtimeout >/dev/null; then
+            brew install coreutils
+          fi
+          command -v gtimeout
+          gtimeout --version
+          mkdir -p /tmp/metal-operation-logs
+          : > /tmp/metal-operation-ledger.jsonl
+          cat > /tmp/verify-metal-operation.py <<'PYTHON'
+          import json, re, sys
+          from pathlib import Path
+
+          group, op, filename = sys.argv[1:]
+          text = re.sub(r"\x1b\[[0-9;]*m", "", Path(filename).read_text())
+          results = re.findall(r"^  ([A-Z0-9_]+\(.*\)): (.*)$", text, re.M)
+          assert results, "No operation results"
+          assert all(name.startswith(op + "(") for name, _ in results), "Unexpected operation"
+          numeric = [name for name, status in results if status.strip() == "OK"]
+          unsupported = [name for name, status in results if status.startswith("not supported [")]
+          assert len(numeric) + len(unsupported) == len(results), "Failure or unaccounted operation status"
+          summary = re.findall(r"^  (\d+)/(\d+) tests passed$", text, re.M)
+          assert summary == [(str(len(numeric)), str(len(numeric)))], "Missing or inconsistent completion summary"
+          assert re.search(r"^  Backend MTL0: OK$", text, re.M), "Metal backend did not complete"
+          if group == "custom" and op in {"ATTN_SCORE_QJL", "FUSED_ATTN_QJL_TBQ", "ISTFT"}:
+              assert numeric and not unsupported, "Required numerical operation became unsupported"
+          record = {"group": group, "op": op, "numericalPasses": len(numeric), "explicitUnsupported": len(unsupported), "allUnsupported": not numeric}
+          with Path("/tmp/metal-operation-ledger.jsonl").open("a") as output:
+              output.write(json.dumps(record) + "\n")
+          print(json.dumps(record))
+          PYTHON
+
       - name: Configure
         run: |
           cmake -B build-metal \
@@ -77,7 +111,9 @@ jobs:
                      test-backend-ops test-quantize-fns
 
       - name: test-quantize-fns (CPU; smoke for Eliza custom quants)
+        shell: bash
         run: |
+          set -euo pipefail
           ./build-metal/bin/test-quantize-fns | tee /tmp/quantize-fns.log
           # Must mention the Eliza-divergent quant types.
           for t in qjl1_256 q4_polar tbq3_0 tbq4_0 tbq3_tcq; do
@@ -86,20 +122,25 @@ jobs:
           done
 
       - name: test-backend-ops on Metal (filtered subset)
+        shell: bash
         run: |
+          set -euo pipefail
           # Filter to ops that matter most for inference correctness.
           for op in MUL_MAT MUL_MAT_ID ADD MUL SOFT_MAX RMS_NORM CPY ROPE FLASH_ATTN_EXT; do
             echo "=== $op ==="
-            timeout 600 ./build-metal/bin/test-backend-ops \
-              -b Metal -o "$op" \
-              2>&1 | tee -a /tmp/backend-ops.log || true
+            gtimeout 600 ./build-metal/bin/test-backend-ops \
+              -b MTL0 -o "$op" \
+              2>"/tmp/metal-operation-logs/broad-$op.stderr" | tee "/tmp/metal-operation-logs/broad-$op.log" | tee -a /tmp/backend-ops.log
+            python3 /tmp/verify-metal-operation.py broad "$op" "/tmp/metal-operation-logs/broad-$op.log"
           done
           echo "=== FAIL SUMMARY ==="
-          grep -E "Backend Metal:.*FAIL|tests passed|Failing tests:" \
+          grep -E "Backend MTL0:.*FAIL|tests passed|Failing tests:" \
             /tmp/backend-ops.log || true
 
       - name: test-backend-ops Eliza custom-quant parity (Metal)
+        shell: bash
         run: |
+          set -euo pipefail
           # Eliza custom quants + custom attention ops on Metal.
           #
           # GET_ROWS / CPY / MUL_MAT: most custom-quant kernels are not
@@ -127,9 +168,10 @@ jobs:
                     ATTN_SCORE_TBQ ATTN_SCORE_POLAR \
                     ISTFT; do
             echo "=== $op (Eliza custom quants) ==="
-            timeout 300 ./build-metal/bin/test-backend-ops \
-              -b Metal -o "$op" \
-              2>&1 | tee -a /tmp/eliza-custom-quants.log || true
+            gtimeout 300 ./build-metal/bin/test-backend-ops \
+              -b MTL0 -o "$op" \
+              2>"/tmp/metal-operation-logs/custom-$op.stderr" | tee "/tmp/metal-operation-logs/custom-$op.log" | tee -a /tmp/eliza-custom-quants.log
+            python3 /tmp/verify-metal-operation.py custom "$op" "/tmp/metal-operation-logs/custom-$op.log"
           done
           echo "=== Eliza custom-quant summary ==="
           for t in q1_0_g32 q1_0_g128 tbq3_0 tbq4_0 tbq3_k tbq4_k qjl1_256 q4_polar tbq3_tcq; do
@@ -199,12 +241,29 @@ jobs:
             fi
           done
 
+      - name: Verify all selected operation invocations completed
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          import json
+          from collections import Counter
+          from pathlib import Path
+          rows = [json.loads(line) for line in Path('/tmp/metal-operation-ledger.jsonl').read_text().splitlines()]
+          expected = Counter(('broad', op) for op in 'MUL_MAT MUL_MAT_ID ADD MUL SOFT_MAX RMS_NORM CPY ROPE FLASH_ATTN_EXT'.split())
+          expected.update(('custom', op) for op in 'GET_ROWS CPY MUL_MAT ATTN_SCORE_QJL FUSED_ATTN_QJL_TBQ ATTN_SCORE_TBQ ATTN_SCORE_POLAR ISTFT'.split())
+          assert Counter((row['group'], row['op']) for row in rows) == expected, 'Missing or duplicate invocation'
+          print(json.dumps({'invocations': len(rows), 'numericalPasses': sum(row['numericalPasses'] for row in rows), 'explicitUnsupported': sum(row['explicitUnsupported'] for row in rows)}))
+          PYTHON
+
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: eliza-metal-validation-logs
           path: |
+            /tmp/metal-operation-logs/
+            /tmp/metal-operation-ledger.jsonl
             /tmp/quantize-fns.log
             /tmp/backend-ops.log
             /tmp/eliza-custom-quants.log
