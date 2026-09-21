@@ -1242,6 +1242,7 @@ static webgpu_encoded_op ggml_webgpu_gated_delta_net(webgpu_context & ctx,
         h,
         n_tokens,
         n_seqs,
+        (uint32_t) src5->ne[1],
         s_v * h * n_tokens * n_seqs,
 
         (uint32_t) (src0->nb[1] / ggml_type_size(src0->type)),

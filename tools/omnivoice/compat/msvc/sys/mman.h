@@ -4,7 +4,7 @@
  * map their GGUF files read-only — always
  *   mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0)  /  munmap(addr, size)
  * — so this shim implements exactly that surface over the Win32 file-mapping
- * API. It is only on the include path for MSVC builds (see the eliza_voice_
+ * API. It is only on the include path for Windows builds (see the eliza_voice_
  * classifiers target in tools/omnivoice/CMakeLists.txt); POSIX hosts use the
  * real <sys/mman.h>.
  */

@@ -74,7 +74,11 @@ set(PROVISION_SUCCESS FALSE)
 if(NOT PROVISION_SUCCESS AND NOT "${NPM_DIR}" STREQUAL "")
     if(EXISTS "${NPM_DIR}/package.json")
         # Check if npm is available before attempting npm build
-        find_program(NPM_EXECUTABLE npm)
+        if(WIN32)
+            find_program(NPM_EXECUTABLE NAMES npm.cmd npm)
+        else()
+            find_program(NPM_EXECUTABLE NAMES npm)
+        endif()
         if(NPM_EXECUTABLE)
             message(STATUS "WebUI: building from source in ${NPM_DIR}")
 
@@ -82,7 +86,7 @@ if(NOT PROVISION_SUCCESS AND NOT "${NPM_DIR}" STREQUAL "")
             if(NOT EXISTS "${NPM_DIR}/node_modules")
                 message(STATUS "WebUI: running npm install (first time)")
                 execute_process(
-                    COMMAND npm install
+                    COMMAND "${NPM_EXECUTABLE}" install
                     WORKING_DIRECTORY "${NPM_DIR}"
                     RESULT_VARIABLE NPM_INSTALL_RESULT
                     OUTPUT_VARIABLE NPM_OUT
@@ -96,7 +100,7 @@ if(NOT PROVISION_SUCCESS AND NOT "${NPM_DIR}" STREQUAL "")
 
             # Run the build
             execute_process(
-                COMMAND npm run build
+                COMMAND "${NPM_EXECUTABLE}" run build
                 WORKING_DIRECTORY "${NPM_DIR}"
                 RESULT_VARIABLE NPM_BUILD_RESULT
                 OUTPUT_VARIABLE NPM_OUT
@@ -162,6 +166,7 @@ if(NOT PROVISION_SUCCESS AND HF_ENABLED)
             if(NOT download_result EQUAL 0)
                 list(GET download_status 1 error_message)
                 message(STATUS "WebUI: failed to download ${asset} from ${url_label}: ${error_message}")
+                file(REMOVE "${download_path}")
                 set(ALL_OK FALSE)
                 break()
             endif()
@@ -217,6 +222,5 @@ if(PROVISION_SUCCESS)
         file(WRITE "${STAMP_FILE}" "${RESOLVED_VERSION}")
     endif()
 else()
-    message(WARNING "WebUI: no source available. Neither local build (${NPM_DIR}) nor HF Bucket download succeeded.")
-    message(WARNING "WebUI: building server without embedded WebUI. Set LLAMA_BUILD_WEBUI=OFF to suppress this warning.")
+    message(FATAL_ERROR "WebUI: required assets unavailable. Neither local build (${NPM_DIR}) nor HF Bucket download succeeded.")
 endif()

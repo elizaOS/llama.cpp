@@ -82,11 +82,13 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base(ggml
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy(ggml_metal_library_t lib, ggml_type tsrc, ggml_type tdst) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy(ggml_metal_library_t lib, ggml_type tsrc, ggml_type tdst, bool contiguous) {
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_cpy_%s_%s", ggml_type_name(tsrc), ggml_type_name(tdst));
+    // Contiguous CPU IQ4_NL copies use the full quantizer; strided copies use the reference quantizer.
+    const bool iq4_full = contiguous && tsrc == GGML_TYPE_F32 && tdst == GGML_TYPE_IQ4_NL;
+    snprintf(base, 256, "kernel_cpy_%s_%s%s", ggml_type_name(tsrc), ggml_type_name(tdst), iq4_full ? "_full" : "");
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -1589,8 +1591,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_attn_score_qjl(g
 // ELIZA-TBQ-POLAR-ATTN-DISPATCH-V1
 static const char * eliza_metal_tbq_kernel_name(ggml_type type) {
     switch (type) {
-        case GGML_TYPE_TBQ3_0:   return "kernel_turbo3_dot_multi";
-        case GGML_TYPE_TBQ4_0:   return "kernel_turbo4_dot_multi";
+        case GGML_TYPE_TBQ3_0:   return "kernel_attn_score_tbq3_0";
+        case GGML_TYPE_TBQ4_0:   return "kernel_attn_score_tbq4_0";
         case GGML_TYPE_TBQ3_TCQ: return "kernel_turbo3_tcq_dot_multi";
         default: GGML_ABORT("unsupported TurboQuant attention score type");
     }

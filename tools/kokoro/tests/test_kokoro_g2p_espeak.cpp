@@ -1,9 +1,4 @@
-// Standalone validation for kokoro-phonemes.cpp real G2P.
-// Compile:
-//   clang++ -std=c++17 -O2 -DKOKORO_USE_ESPEAK \
-//     -I <kokoro/include> -I /opt/homebrew/include \
-//     <this> <kokoro/src/kokoro-phonemes.cpp> \
-//     -L /opt/homebrew/lib -lespeak-ng -o /tmp/t && /tmp/t
+/** Validates the real espeak-backed Kokoro phoneme mapping. */
 
 #include "kokoro-phonemes.h"
 #include "kokoro.h"

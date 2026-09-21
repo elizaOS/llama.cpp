@@ -21,14 +21,6 @@ void llama_model_kokoro::load_arch_hparams(llama_model_loader & ml) {
 void llama_model_kokoro::load_arch_tensors(llama_model_loader &) {
 }
 
-// gcc's -Wsuggest-attribute=noreturn flags this method because the only
-// control-flow path is an unconditional throw. We can't add [[noreturn]]
-// to an overriding virtual that has a non-void return type, so silence
-// the suggestion for this single function.
-#if defined(__GNUC__) && !defined(__clang__)
-#  pragma GCC diagnostic push
-#  pragma GCC diagnostic ignored "-Wsuggest-attribute=noreturn"
-#endif
 std::unique_ptr<llm_graph_context> llama_model_kokoro::build_arch_graph(const llm_graph_params & params) const {
     // The causal-decoder graph contract cannot represent a predictor/decoder
     // TTS pipeline. Runtime synthesis enters through tools/kokoro's C ABI;
@@ -39,6 +31,3 @@ std::unique_ptr<llm_graph_context> llama_model_kokoro::build_arch_graph(const ll
         "use the tools/kokoro synthesis API."
     );
 }
-#if defined(__GNUC__) && !defined(__clang__)
-#  pragma GCC diagnostic pop
-#endif

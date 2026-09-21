@@ -37,7 +37,6 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "ggml-cpu.h"
 #include "gguf.h"
 
 #include <algorithm>
@@ -379,9 +378,11 @@ kokoro_model_ptr kokoro_load_model(
     h.sample_rate        = gguf_i32(model->gguf, "kokoro.audio.sample_rate",   h.sample_rate);
 
     // Bind backend (CPU only for now — GGML graph below is CPU-friendly).
-    model->backend = ggml_backend_cpu_init();
+    static std::once_flag load_backends;
+    std::call_once(load_backends, ggml_backend_load_all);
+    model->backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     if (!model->backend) {
-        err_out = "ggml_backend_cpu_init failed";
+        err_out = "Kokoro CPU backend unavailable";
         return {nullptr, kokoro_model_deleter{}};
     }
     int backend_threads = 0;
@@ -392,7 +393,15 @@ kokoro_model_ptr kokoro_load_model(
         const unsigned available = std::thread::hardware_concurrency();
         backend_threads = (int) std::min(available == 0 ? 4u : available, 16u);
     }
-    ggml_backend_cpu_set_n_threads(model->backend, backend_threads);
+    ggml_backend_dev_t device = ggml_backend_get_device(model->backend);
+    ggml_backend_reg_t registry = device ? ggml_backend_dev_backend_reg(device) : nullptr;
+    auto set_threads = registry ? reinterpret_cast<ggml_backend_set_n_threads_t>(
+        ggml_backend_reg_get_proc_address(registry, "ggml_backend_set_n_threads")) : nullptr;
+    if (!set_threads) {
+        err_out = "Kokoro CPU backend does not expose thread configuration";
+        return {nullptr, kokoro_model_deleter{}};
+    }
+    set_threads(model->backend, backend_threads);
     model->compute.backend = model->backend;
 
     // Second pass: allocate the on-disk tensor data (original dtypes) through

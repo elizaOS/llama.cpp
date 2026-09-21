@@ -33,6 +33,8 @@ set(KOKORO_CORE_SOURCES
 add_library(kokoro_lib STATIC
     ${KOKORO_CORE_SOURCES}
     ${KOKORO_PUBLIC_HEADERS})
+# The fused inference shared library links this static archive.
+set_target_properties(kokoro_lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_include_directories(kokoro_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -42,9 +44,6 @@ target_include_directories(kokoro_lib PUBLIC
 target_link_libraries(kokoro_lib PUBLIC ggml)
 if(TARGET ggml-base)
     target_link_libraries(kokoro_lib PUBLIC ggml-base)
-endif()
-if(TARGET ggml-cpu)
-    target_link_libraries(kokoro_lib PUBLIC ggml-cpu)
 endif()
 
 target_compile_features(kokoro_lib PUBLIC cxx_std_17)
@@ -98,9 +97,12 @@ endif()
 # "no BUNDLE DESTINATION". The fused mobile slice only needs kokoro_lib folded
 # into libelizainference, never the CLI.
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    include(GNUInstallDirs)
     add_executable(kokoro-tts tools/kokoro-tts.cpp)
     target_link_libraries(kokoro-tts PRIVATE kokoro_lib)
-    install(TARGETS kokoro-tts RUNTIME)
+    install(TARGETS kokoro-tts
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        BUNDLE DESTINATION ${CMAKE_INSTALL_BINDIR})
 
     add_executable(kokoro-stage-dump tools/kokoro-stage-dump.cpp)
     target_link_libraries(kokoro-stage-dump PRIVATE kokoro_lib)

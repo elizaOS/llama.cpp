@@ -23,6 +23,7 @@ struct Params {
     h: u32,
     n_tokens: u32,
     n_seqs: u32,
+    n_state_slots: u32,
     s_off: u32,
 
     sq1: u32,
@@ -63,10 +64,13 @@ fn main(
 
     let state_size = S_V * S_V;
     let state_base = (seq_id * params.h + head_id) * state_size;
+    // Input states are sequence-major; each sequence starts at snapshot slot zero.
+    let state_in_base = (seq_id * params.n_state_slots * params.h + head_id) * state_size;
+    let snapshot_size = params.n_seqs * params.h * state_size;
 
     var state: array<f32, S_V>;
     for (var i = 0u; i < S_V; i++) {
-        state[i] = src_state[state_base + col * S_V + i];
+        state[i] = src_state[state_in_base + col * S_V + i];
     }
 
     var attn_off = (seq_id * params.n_tokens * params.h + head_id) * S_V;
@@ -123,10 +127,21 @@ fn main(
         dst[attn_off + col] = attn_col * params.scale;
         attn_off += S_V * params.h;
 
+        // Output snapshots are slot-major. For K > T the prefix stays caller-owned.
+        let target_slot = i32(t) - (i32(params.n_tokens) - i32(params.n_state_slots));
+        if (params.n_state_slots > 1u && target_slot >= 0) {
+            let snapshot_base = params.s_off + u32(target_slot) * snapshot_size + state_base;
+            for (var i = 0u; i < S_V; i++) {
+                dst[snapshot_base + col * S_V + i] = state[i];
+            }
+        }
+
         workgroupBarrier();
     }
 
-    for (var i = 0u; i < S_V; i++) {
-        dst[params.s_off + state_base + col * S_V + i] = state[i];
+    if (params.n_state_slots == 1u) {
+        for (var i = 0u; i < S_V; i++) {
+            dst[params.s_off + state_base + col * S_V + i] = state[i];
+        }
     }
 }

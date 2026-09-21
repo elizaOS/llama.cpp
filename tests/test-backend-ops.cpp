@@ -51,13 +51,16 @@
 
 static int64_t g_perf_duration_usec = 1000000; // default: 1 second in microseconds
 static int     g_n_threads   = -1; // -1 means use backend default (N_THREADS)
+static bool    g_test_shard_requested = false;
+static size_t  g_test_shard_index = 0;
+static size_t  g_test_shard_count = 1;
 
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     size_t nels = ggml_nelements(tensor);
     std::vector<float> data(nels);
     {
         // parallel initialization
-        static const size_t n_threads = N_THREADS;
+        static const size_t n_threads = g_n_threads > 0 ? (size_t) g_n_threads : N_THREADS;
         // static RNG initialization (revisit if n_threads stops being constant)
         static std::vector<std::default_random_engine> generators = []() {
             std::random_device rd;
@@ -1303,7 +1306,9 @@ struct test_case {
     test_status_t eval(ggml_backend_t backend1,
                        ggml_backend_t backend2,
                        const char *   op_names_filter,
-                       printer *      output_printer) {
+                       printer *      output_printer,
+                       size_t &       matching_cases,
+                       size_t &       selected_cases) {
         mode = MODE_TEST;
 
         ggml_init_params params = {
@@ -1328,6 +1333,18 @@ struct test_case {
             ggml_free(ctx);
             return test_status_t::SKIPPED;
         }
+
+        // Partition after the normal op filter, before capability checks or execution.
+        // Whole-graph cases and duplicate parameter strings retain distinct indices.
+        const size_t case_index = matching_cases++;
+        if (g_test_shard_requested) {
+            printf("Shard inventory %zu: %s(%s)\n", case_index, current_op_name.c_str(), vars().c_str());
+        }
+        if (case_index % g_test_shard_count != g_test_shard_index) {
+            ggml_free(ctx);
+            return test_status_t::SKIPPED;
+        }
+        selected_cases++;
 
         // check if the backends support the ops
         bool supported = true;
@@ -2977,6 +2994,36 @@ struct test_cpy : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             // test extended range of values to check if casting between f32 and i32 is consistent
             init_tensor_uniform(t, -150.f, 150.f);
+        }
+    }
+};
+
+// Zero and tiny blocks must remain finite through the IQ4 scale search.
+struct test_cpy_iq4_small : public test_cpy {
+    const float magnitude;
+
+    explicit test_cpy_iq4_small(float magnitude)
+        : test_cpy(GGML_TYPE_F32, GGML_TYPE_IQ4_NL, {256, 4, 4, 4}), magnitude(magnitude) {}
+
+    std::string vars() override {
+        std::ostringstream out;
+        out << test_cpy::vars() << ",magnitude=" << magnitude;
+        return out.str();
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        // Require exact finite equality, including input nodes; zero-output NMSE is undefined.
+        for (size_t i = 0; i < n; ++i) {
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i]) || a[i] != b[i]) {
+                return 1.0;
+            }
+        }
+        return 0.0;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -magnitude, magnitude);
         }
     }
 };
@@ -8767,6 +8814,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_fused_attn_qjl_tbq(/*n_heads*/ 8, /*n_kv_heads*/ 2, /*n_kv_tokens*/ 64, /*n_batch*/ 4));
 
+    test_cases.emplace_back(new test_cpy_iq4_small(0.0f));
+    test_cases.emplace_back(new test_cpy_iq4_small(1e-18f));
+
     // ATTN_SCORE_TBQ parity: cover all three accepted K types at a tiny
     // shape (fast inner loop) and the TBQ3_0 medium shape (eliza-1
     // representative: head_dim=128, n_kv_tokens=256, GQA 8:2).
@@ -8774,6 +8824,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_attn_score_tbq(GGML_TYPE_TBQ4_0,   /*n_heads*/ 4, /*n_kv_heads*/ 1, /*n_kv_tokens*/ 16, /*n_batch*/ 1));
     test_cases.emplace_back(new test_attn_score_tbq(GGML_TYPE_TBQ3_TCQ, /*n_heads*/ 4, /*n_kv_heads*/ 1, /*n_kv_tokens*/ 16, /*n_batch*/ 1));
     test_cases.emplace_back(new test_attn_score_tbq(GGML_TYPE_TBQ3_0,   /*n_heads*/ 8, /*n_kv_heads*/ 2, /*n_kv_tokens*/ 256, /*n_batch*/ 4));
+    // Exercise the Vulkan multiblock dispatch and a partial final workgroup.
+    test_cases.emplace_back(new test_attn_score_tbq(GGML_TYPE_TBQ3_0, 4, 2, 8193, 1));
+    test_cases.emplace_back(new test_attn_score_tbq(GGML_TYPE_TBQ4_0, 4, 2, 8193, 1));
 
     // ATTN_SCORE_POLAR parity: both use_qjl values at the tiny shape,
     // plus the eliza-1 medium shape.
@@ -8938,6 +8991,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // however this case needs to alloc more memory which may fail in some devices (Intel Arc770, etc.)
     // this case is verified (pass) in Intel(R) Data Center GPU Max 1100 (sycl backend) and NV A30 (cuda backend)
     // test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 512, 262144, 9216, {1, 1}, {1, 1}));
+
+    // Exercise indexed custom quant routing without requiring absent backend kernels.
+    for (ggml_type type_a : eliza_custom_quant_types_mul_mat) {
+        for (int n : {1, 16}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 16, n, 256));
+        }
+    }
 
     // test large experts*tokens
     for (bool b : {false, true}) {
@@ -9559,6 +9619,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // overflow: n_tokens > K — only the last K snapshots kept.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
+    // Underflow: T < K leaves the leading snapshot slots untouched, including across sequences.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   2, 2, 1, false, false, /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   2, 2, 2, false, true,  /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   2, 2, 1, true,  true,  /*K=*/4));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
@@ -10002,6 +10066,11 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
         // Use reference implementation on the CPU backend for comparison
         using ggml_backend_cpu_set_use_ref_t = void (*)(ggml_backend_t, bool);
         auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+        if (g_n_threads > 0) {
+            auto * set_n_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+            GGML_ASSERT(set_n_threads != nullptr);
+            set_n_threads(backend_cpu, g_n_threads);
+        }
         auto * set_use_ref = (ggml_backend_cpu_set_use_ref_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_use_ref");
         if (set_use_ref) {
             set_use_ref(backend_cpu, true);
@@ -10009,9 +10078,11 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
 
         size_t n_ok = 0;
         size_t                   tests_run = 0;
+        size_t                   matching_cases = 0;
+        size_t                   selected_cases = 0;
         std::vector<std::string> failed_tests;
         for (auto & test : test_cases) {
-            test_status_t status = test->eval(backend, backend_cpu, op_names_filter, output_printer);
+            test_status_t status = test->eval(backend, backend_cpu, op_names_filter, output_printer, matching_cases, selected_cases);
             if (status == test_status_t::SKIPPED || status == test_status_t::NOT_SUPPORTED) {
                 continue;
             }
@@ -10021,6 +10092,10 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
             } else if (status == test_status_t::FAIL) {
                 failed_tests.push_back(test->current_op_name + "(" + test->vars() + ")");
             }
+        }
+        if (g_test_shard_requested) {
+            printf("Shard %zu/%zu: %zu selected of %zu matching cases\n",
+                   g_test_shard_index, g_test_shard_count, selected_cases, matching_cases);
         }
         output_printer->print_summary(test_summary_info(n_ok, tests_run, false));
         output_printer->print_failed_tests(failed_tests);
@@ -10169,7 +10244,7 @@ static void show_test_coverage() {
 
 static void usage(char ** argv) {
     printf("Usage: %s [mode] [-o <op,..>] [-b <backend>] [-p <params regex>] [--output <console|sql|csv>] [--list-ops]", argv[0]);
-    printf(" [--show-coverage] [--test-file <path>] [--perf-duration <seconds>] [--threads <n>]\n");
+    printf(" [--show-coverage] [--test-file <path>] [--perf-duration <seconds>] [--threads <n>] [--test-shard <index/count>]\n");
     printf("    valid modes:\n");
     printf("      - test (default, compare with CPU backend for correctness)\n");
     printf("      - grad (compare gradients from backpropagation with method of finite differences)\n");
@@ -10259,6 +10334,21 @@ int main(int argc, char ** argv) {
                 usage(argv);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--test-shard") == 0) {
+            std::cmatch parts;
+            if (g_test_shard_requested || i + 1 >= argc ||
+                !std::regex_match(argv[i + 1], parts, std::regex("([0-9]{1,3})/([0-9]{1,3})"))) {
+                fprintf(stderr, "error: --test-shard requires one zero-based index/count pair\n");
+                return 1;
+            }
+            g_test_shard_index = std::stoul(parts[1].str());
+            g_test_shard_count = std::stoul(parts[2].str());
+            if (g_test_shard_count == 0 || g_test_shard_count > 256 || g_test_shard_index >= g_test_shard_count) {
+                fprintf(stderr, "error: --test-shard requires index < count and count in 1..256\n");
+                return 1;
+            }
+            g_test_shard_requested = true;
+            ++i;
         } else if (strcmp(argv[i], "--threads") == 0 || strcmp(argv[i], "-t") == 0) {
             if (i + 1 < argc) {
                 g_n_threads = atoi(argv[++i]);
@@ -10275,6 +10365,11 @@ int main(int argc, char ** argv) {
             usage(argv);
             return 1;
         }
+    }
+
+    if (g_test_shard_requested && (mode != MODE_TEST || output_format != output_formats::CONSOLE)) {
+        fprintf(stderr, "error: --test-shard requires test mode and console output\n");
+        return 1;
     }
 
     // load and enumerate backends

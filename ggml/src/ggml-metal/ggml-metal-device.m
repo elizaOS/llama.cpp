@@ -1420,9 +1420,70 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_GATED_DELTA_NET:
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
         case GGML_OP_SOLVE_TRI:
+            return has_simdgroup_reduction;
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
-            return has_simdgroup_reduction;
+            if (!has_simdgroup_reduction) {
+                return false;
+            }
+            if (op->op == GGML_OP_MUL_MAT_ID &&
+                (ggml_is_transposed(op->src[0]) || ggml_is_transposed(op->src[1]))) {
+                return false;
+            }
+            if (op->src[1]->type != GGML_TYPE_F32) {
+                // Mirror the dispatcher choice: non-f32 RHS kernels differ between mv and mm.
+                const bool use_mm = has_simdgroup_mm && op->src[0]->ne[0] >= 64 &&
+                    (op->op == GGML_OP_MUL_MAT
+                        ? !ggml_is_transposed(op->src[0]) && !ggml_is_transposed(op->src[1]) && op->src[1]->ne[1] > 8
+                        : op->src[2]->ne[1] >= 32);
+                if (op->src[1]->type == GGML_TYPE_F16) {
+                    if (op->src[0]->type == GGML_TYPE_F16 && op->op == GGML_OP_MUL_MAT) {
+                        return true;
+                    }
+                    if (!use_mm || op->src[0]->type == GGML_TYPE_BF16) {
+                        return false;
+                    }
+                    // The standard quantized mm kernels also accept an f16 RHS.
+                } else if (op->src[1]->type == GGML_TYPE_BF16) {
+                    return op->src[0]->type == GGML_TYPE_BF16 && op->op == GGML_OP_MUL_MAT && !use_mm;
+                } else {
+                    return false;
+                }
+            }
+            // Match the generic matrix/vector kernels; custom attention has separate dispatch.
+            switch (op->src[0]->type) {
+                case GGML_TYPE_F32:
+                case GGML_TYPE_F16:
+                case GGML_TYPE_BF16:
+                case GGML_TYPE_Q1_0:
+                case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q4_1:
+                case GGML_TYPE_Q5_0:
+                case GGML_TYPE_Q5_1:
+                case GGML_TYPE_Q8_0:
+                case GGML_TYPE_MXFP4:
+                case GGML_TYPE_NVFP4:
+                case GGML_TYPE_Q2_K:
+                case GGML_TYPE_Q3_K:
+                case GGML_TYPE_Q4_K:
+                case GGML_TYPE_Q5_K:
+                case GGML_TYPE_Q6_K:
+                case GGML_TYPE_IQ2_XXS:
+                case GGML_TYPE_IQ2_XS:
+                case GGML_TYPE_IQ3_XXS:
+                case GGML_TYPE_IQ3_S:
+                case GGML_TYPE_IQ2_S:
+                case GGML_TYPE_IQ1_S:
+                case GGML_TYPE_IQ1_M:
+                case GGML_TYPE_IQ4_NL:
+                case GGML_TYPE_IQ4_XS:
+                    return true;
+                case GGML_TYPE_Q1_0_g128:
+                    // This format has ordinary kernels but no indexed matrix/vector kernels.
+                    return op->op == GGML_OP_MUL_MAT && op->src[1]->type == GGML_TYPE_F32;
+                default:
+                    return false;
+            }
         case GGML_OP_SET:
         case GGML_OP_CPY:
         case GGML_OP_DUP:
@@ -1997,14 +2058,9 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
     }
 
     @autoreleasepool {
-        // Arbitrary tensor sources need a copying buffer unless the no-copy
-        // pointer and region satisfy Metal's page alignment contract.
-        const size_t page_size = (size_t) sysconf(_SC_PAGESIZE);
-        const bool direct = (uintptr_t) data % page_size == 0 && size % page_size == 0;
-        id<MTLBuffer> buf_src = direct
-            ? [buf->dev->mtl_device newBufferWithBytesNoCopy:(void *) data length:size
-                                                   options:MTLResourceStorageModeShared deallocator:nil]
-            : [buf->dev->mtl_device newBufferWithBytes:data length:size options:MTLResourceStorageModeShared];
+        // The source is read-only; Metal's no-copy API requires mutable storage.
+        id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithBytes:data length:size
+                                                                       options:MTLResourceStorageModeShared];
 
         GGML_ASSERT(buf_src);
 

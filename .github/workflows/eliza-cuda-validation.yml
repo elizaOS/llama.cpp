@@ -80,12 +80,17 @@ jobs:
               apt-get install -y --no-install-recommends \
                 cmake build-essential git ccache ca-certificates >/dev/null
               nvcc --version | tail -2
+              # The toolkit stub lacks its SONAME symlink on hosts without a driver.
+              # Keep this link-only stand-in outside the artifacts and runtime RPATH.
+              driver_stubs=$(mktemp -d)
+              ln -s /usr/local/cuda/lib64/stubs/libcuda.so "$driver_stubs/libcuda.so.1"
               cmake -B build-cuda-docker \
                 -DGGML_CUDA=ON \
                 -DGGML_METAL=OFF \
                 -DLLAMA_CURL=OFF \
                 -DLLAMA_BUILD_TESTS=ON \
                 -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,$driver_stubs" \
                 -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;90"
               cmake --build build-cuda-docker -j $(nproc) \
                 --target llama-cli test-backend-ops test-quantize-fns
@@ -119,9 +124,14 @@ jobs:
         # the binary itself links cleanly with all Eliza quant types
         # registered.
         run: |
+          set -euo pipefail
           docker run --rm \
             -v "$PWD":/work -w /work \
             nvidia/cuda:12.4.1-devel-ubuntu22.04 bash -lc '
+              set -euo pipefail
+              driver_stubs=$(mktemp -d)
+              ln -s /usr/local/cuda/lib64/stubs/libcuda.so "$driver_stubs/libcuda.so.1"
+              export LD_LIBRARY_PATH="$driver_stubs:${LD_LIBRARY_PATH:-}"
               ./build-cuda-docker/bin/test-quantize-fns 2>&1
             ' | tee /tmp/quantize-fns.log
           for t in qjl1_256 q4_polar tbq3_0 tbq4_0 tbq3_tcq; do

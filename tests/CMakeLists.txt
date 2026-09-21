@@ -118,6 +118,11 @@ endfunction()
 
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
+llama_build(test-wordpiece-normalization.cpp)
+# Internal normalization is not part of the exported shared-library ABI.
+target_sources(test-wordpiece-normalization PRIVATE ${PROJECT_SOURCE_DIR}/src/unicode-wordpiece.cpp)
+target_include_directories(test-wordpiece-normalization PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_test(test-wordpiece-normalization ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-bert-bge.gguf)
 
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-bert-bge          ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-bert-bge.gguf)
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-command-r         ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-command-r.gguf)
@@ -244,6 +249,11 @@ endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-readback.cpp)
 llama_build_and_test(test-backend-ops.cpp)
+if (GGML_METAL)
+    llama_build_and_test(test-metal-matmul-support.cpp)
+    add_test(NAME test-metal-matmul-numeric COMMAND test-metal-matmul-support --numeric)
+    set_tests_properties(test-metal-matmul-support test-metal-matmul-numeric PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 llama_build_and_test(test-vulkan-uma.cpp)
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
