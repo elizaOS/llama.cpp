@@ -19,7 +19,7 @@ LANES = {
     "custom": ["GET_ROWS", "CPY", "MUL_MAT", "ATTN_SCORE_TBQ", "ATTN_SCORE_POLAR", "ISTFT"],
 }
 SHARDED = {("broad", "MUL_MAT"), ("broad", "FLASH_ATTN_EXT"), ("custom", "MUL_MAT")}
-SHARDS = 64
+SHARDS = 128
 
 
 def sha(path):
