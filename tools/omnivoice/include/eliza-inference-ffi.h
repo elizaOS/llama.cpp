@@ -1,5 +1,5 @@
 /*
- * libelizainference FFI ABI v16.
+ * libelizainference FFI ABI v17.
  *
  * (Banner tracks ELIZA_INFERENCE_ABI_VERSION below; the per-version history is
  * at the end of this header preamble, newest first.)
@@ -226,9 +226,9 @@ extern "C" {
  *   v7: real Silero VAD (same symbol surface as v6).
  *   v6: fused wake-word, speaker, diarizer.
  */
-#define ELIZA_INFERENCE_ABI_VERSION 16
+#define ELIZA_INFERENCE_ABI_VERSION 17
 
-/* Returns a static, NUL-terminated string of the form "16" matching
+/* Returns a static, NUL-terminated string of the form "17" matching
  * ELIZA_INFERENCE_ABI_VERSION at the time the library was built. The
  * pointer is owned by the library — do NOT free. */
 const char * eliza_inference_abi_version(void);
@@ -962,6 +962,19 @@ typedef struct {
 
 /* Opaque streaming-LLM session. One per active generation. */
 typedef struct EliLlmStream EliLlmStream;
+
+/* Resolve the streaming context capacity against the resident text model
+ * before token admission (ABI v17). Loads the model with n_gpu_layers when
+ * necessary. requested_context <=0 uses ELIZA_LLM_N_CTX or 8192; the result
+ * is clamped to the GGUF training context exactly as stream_open does.
+ * On success, pass *out_capacity explicitly to stream_open to preserve this
+ * decision even if the environment changes. No decode context is allocated. */
+int eliza_inference_llm_context_capacity(
+    EliInferenceContext * ctx,
+    int32_t requested_context,
+    int32_t n_gpu_layers,
+    int32_t * out_capacity,
+    char ** out_error);
 
 /* Open a session anchored to `ctx`. Loads the bundle's text GGUF on first
  * open and reuses it across sessions. Returns NULL on failure with

@@ -3071,6 +3071,40 @@ int eliza_inference_llm_kv_quant_supported(void) {
     return 1;
 }
 
+static int eliza_llm_context_capacity(
+    const llama_model * model, int32_t requested_context) {
+    const int n_ctx_train = llama_model_n_ctx_train(model);
+    int n_ctx = requested_context > 0
+        ? requested_context
+        : eliza_int_env_or_default("ELIZA_LLM_N_CTX", 8192);
+    if (n_ctx_train > 0 && n_ctx > n_ctx_train) n_ctx = n_ctx_train;
+    return n_ctx;
+}
+
+int eliza_inference_llm_context_capacity(
+    EliInferenceContext * ctx,
+    int32_t requested_context,
+    int32_t n_gpu_layers,
+    int32_t * out_capacity,
+    char ** out_error) {
+    if (!ctx || !out_capacity) {
+        eliza_set_error(out_error,
+            "[libelizainference] llm_context_capacity: ctx and out_capacity are required");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::mutex> lock(ctx->llm_mutex);
+    const int rc = eliza_load_llm_model_locked(ctx, n_gpu_layers, out_error);
+    if (rc != ELIZA_OK) return rc;
+    const int capacity = eliza_llm_context_capacity(ctx->llm_model, requested_context);
+    if (capacity <= 0) {
+        eliza_set_error(out_error,
+            "[libelizainference] llm_context_capacity: context capacity must be positive");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    *out_capacity = capacity;
+    return ELIZA_OK;
+}
+
 EliLlmStream * eliza_inference_llm_stream_open(
     EliInferenceContext * ctx,
     const eliza_llm_stream_config_t * cfg,
@@ -3102,11 +3136,13 @@ EliLlmStream * eliza_inference_llm_stream_open(
      * MTP engine's target context so both decode identically (same n_ctx /
      * batch / threads / flash-attn / KV-quant). */
     llama_context_params cparams = llama_context_default_params();
-    const int n_ctx_train = llama_model_n_ctx_train(model);
-    int n_ctx = cfg->context_size > 0
-        ? cfg->context_size
-        : eliza_int_env_or_default("ELIZA_LLM_N_CTX", 8192);
-    if (n_ctx_train > 0 && n_ctx > n_ctx_train) n_ctx = n_ctx_train;
+    const int n_ctx = eliza_llm_context_capacity(model, cfg->context_size);
+    if (n_ctx <= 0) {
+        eliza_set_error(out_error,
+            "[libelizainference] llm_stream_open: context capacity must be positive");
+        delete stream;
+        return nullptr;
+    }
     cparams.n_ctx = (uint32_t) n_ctx;
     cparams.n_batch = (uint32_t) eliza_int_env_or_default("ELIZA_LLM_N_BATCH", 512);
     cparams.n_ubatch = cparams.n_batch;
