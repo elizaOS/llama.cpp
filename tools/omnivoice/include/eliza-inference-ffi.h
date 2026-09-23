@@ -259,6 +259,14 @@ EliInferenceContext * eliza_inference_create(
     const char * bundle_dir,
     char ** out_error);
 
+/* Additive context-local text-model backend selection. Must be nonnegative;
+ * zero selects CPU. Applies before the first tokenize/embed/generation load.
+ * Does not change process-wide defaults or other contexts. */
+EliInferenceContext * eliza_inference_create_with_options(
+    const char * bundle_dir,
+    int32_t n_gpu_layers,
+    char ** out_error);
+
 /* Destroy a context. Idempotent for NULL. After this returns, every
  * pointer derived from the context (mmap regions, output buffers
  * written into via the caller) is invalid. */

@@ -141,6 +141,7 @@ struct EliInferenceContext {
      * this shared model. Protected by llm_mutex. */
     std::string llm_model_path;
     llama_model * llm_model = nullptr;
+    int32_t text_gpu_layers = -1;  /* explicit context policy, or legacy env fallback */
     std::mutex llm_mutex;
     /* Dedicated embedding context over the shared text model (ABI v9). Lazily
      * created on the first eliza_inference_embed call. Embeddings require
@@ -1220,9 +1221,11 @@ static int eliza_load_llm_model_locked(
     /* -1 = all layers on GPU (99 per llama.cpp convention); 0 = CPU. The
      * env knob remains the fallback when the caller passes -1. */
     mparams.n_gpu_layers =
-        n_gpu_layers >= 0
-            ? n_gpu_layers
-            : (eliza_bool_env_or_default("ELIZA_LLM_USE_GPU", true) ? 99 : 0);
+        ctx->text_gpu_layers >= 0
+            ? ctx->text_gpu_layers
+            : (n_gpu_layers >= 0
+                ? n_gpu_layers
+                : (eliza_bool_env_or_default("ELIZA_LLM_USE_GPU", true) ? 99 : 0));
     mparams.use_mmap = true;
     ctx->llm_model =
         llama_model_load_from_file(ctx->llm_model_path.c_str(), mparams);
@@ -1659,6 +1662,19 @@ EliInferenceContext * eliza_inference_create(
     // Metadata-only: heavy voice weights are intentionally loaded by
     // eliza_inference_mmap_acquire("tts") so voice-off does not keep
     // OmniVoice resident.
+    return ctx;
+}
+
+EliInferenceContext * eliza_inference_create_with_options(
+    const char * bundle_dir,
+    int32_t n_gpu_layers,
+    char ** out_error) {
+    if (n_gpu_layers < 0) {
+        eliza_set_error(out_error, "[libelizainference] context GPU layers must be nonnegative");
+        return nullptr;
+    }
+    EliInferenceContext * ctx = eliza_inference_create(bundle_dir, out_error);
+    if (ctx) ctx->text_gpu_layers = n_gpu_layers;
     return ctx;
 }
 
