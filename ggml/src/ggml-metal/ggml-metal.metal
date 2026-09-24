@@ -17,6 +17,12 @@ __embed_ggml-common.h__
 
 using namespace metal;
 
+#ifdef GGML_METAL_HAS_TENSOR
+// The host must select the dispatch layout compiled into this library, not
+// infer it solely from the GPU family when loading a precompiled metallib.
+kernel void ggml_metal_tensor_api_marker() {}
+#endif
+
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 #define SWAP(x, y) { auto tmp = (x); (x) = (y); (y) = tmp; }

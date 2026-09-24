@@ -925,6 +925,15 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
                 GGML_LOG_ERROR("%s: error: failed to create library\n", __func__);
             }
 
+            // A precompiled library may contain the legacy simdgroup kernels
+            // even on a tensor-capable GPU. Their dispatch geometry differs;
+            // selecting the tensor layout for those kernels corrupts results.
+            if (dev->props.has_tensor && dev->library &&
+                ![[dev->library->obj functionNames] containsObject:@"ggml_metal_tensor_api_marker"]) {
+                GGML_LOG_INFO("%s: loaded Metal library uses the simdgroup layout; disabling tensor API dispatch\n", __func__);
+                dev->props.has_tensor = false;
+            }
+
             // // ELIZA-METAL-BF16-LIBRARY-GATE (#11612)
             // has_bfloat reflects GPU-family capability, but a precompiled
             // (embedded) metallib built with MSL < 3.1 has every bf16 kernel

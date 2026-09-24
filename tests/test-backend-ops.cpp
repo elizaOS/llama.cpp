@@ -8733,6 +8733,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 128, 32, 1));
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 128, 32, 4));
 
+    // Encoder-sized matrices exercise both partial and complete output tiles.
+    // On M5, selecting tensor dispatch for a legacy precompiled Metal library
+    // previously returned zero products instead of the CPU reference result.
+    for (const auto type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (const int64_t n : {10, 32}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 384, n, 384, {1, 1}, {1, 1}));
+        }
+    }
+
     // FWHT tests
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 64, 1, 64));
