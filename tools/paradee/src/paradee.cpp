@@ -26,6 +26,7 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <iterator>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -229,8 +230,23 @@ paradee_model_ptr paradee_load_model(const std::string & gguf_path, std::string 
         m->lock.band_lo_hz = (float) band_lo;
         m->lock.band_hi_hz = (float) band_hi;
         m->lock.sample_rate = h.sample_rate;
-        if (rates.size() != 2 || h.pad_id != 0 || h.max_ids < 3 || h.max_ids > h.text_max_position ||
-            h.text_n_head <= 0 || h.text_d_model % h.text_n_head != 0 || h.sample_rate <= 0) {
+        const int widths[] = {
+            h.text_n_layer, h.text_n_head, h.text_d_model, h.text_d_ff, h.text_vocab_size,
+            h.text_max_position, h.hidden_dim, h.predictor_n_layer, h.predictor_max_dur,
+            h.text_encoder_kernel, h.style_text_dim, h.style_decoder_dim, h.asr_dim, h.istft_hop,
+        };
+        const bool widths_ok = std::all_of(std::begin(widths), std::end(widths),
+                                           [](int v) { return v > 0 && v <= (1 << 16); });
+        // Phase-lock parameters come from the file too; bound them so a
+        // corrupt GGUF cannot ask for giant FFT buffers.
+        const paradee_lock_params & lp = m->lock;
+        const bool lock_ok = lp.n_fft >= 16 && lp.n_fft <= 8192 && (lp.n_fft & (lp.n_fft - 1)) == 0 &&
+                             lp.hop > 0 && lp.hop <= lp.n_fft && lp.smooth_frames >= 1 &&
+                             lp.smooth_frames <= 1025 && lp.f0_hop > 0 && std::isfinite(lp.voiced_f0_hz);
+        if (!widths_ok || !lock_ok || rates.size() != 2 || rates[0] <= 0 || rates[0] > 64 ||
+            rates[1] <= 0 || rates[1] > 64 ||
+            h.pad_id != 0 || h.max_ids < 3 || h.max_ids > h.text_max_position ||
+            h.text_d_model % h.text_n_head != 0 || h.sample_rate <= 0 || h.sample_rate > 192000) {
             err = "unsupported Paradee hparams";
             return nullptr;
         }
@@ -320,18 +336,26 @@ const paradee_lock_params * paradee_get_lock_params(const paradee_model * model)
 
 namespace {
 
-// Vocabulary ids of every symbol; `max_symbols` = 0 means no limit.
+// Vocabulary ids of every symbol; `max_symbols` = 0 means no limit. With
+// `n_dropped` non-null, symbols outside the vocabulary are skipped and
+// counted instead of rejected, and empty input maps to no ids.
 paradee_status map_symbols(
         const paradee_model * model,
         const std::string & misaki_utf8,
         size_t max_symbols,
         bool pads,
         std::vector<int32_t> & ids,
-        std::string & err) noexcept {
+        std::string & err,
+        size_t * n_dropped = nullptr) noexcept {
     err.clear();
     ids.clear();
+    if (n_dropped) *n_dropped = 0;
     if (!model) { err = "null model"; return PARADEE_E_INVALID_ARG; }
-    if (misaki_utf8.empty()) { err = "empty phoneme string"; return PARADEE_E_INVALID_ARG; }
+    if (misaki_utf8.empty()) {
+        if (n_dropped) return PARADEE_OK;
+        err = "empty phoneme string";
+        return PARADEE_E_INVALID_ARG;
+    }
     try {
         if (pads) ids.push_back(model->hp.pad_id);
         const size_t lead = ids.size();
@@ -346,6 +370,7 @@ paradee_status map_symbols(
             }
             const auto it = model->vocab.find(cp);
             if (it == model->vocab.end()) {
+                if (n_dropped) { ++*n_dropped; continue; }
                 err = "phoneme " + codepoint_label(cp) + " at byte " + std::to_string(at) +
                       " is not in the Paradee vocabulary";
                 ids.clear();
@@ -388,6 +413,15 @@ paradee_status paradee_phonemes_to_symbol_ids(
         std::vector<int32_t> & ids,
         std::string & err) noexcept {
     return map_symbols(model, misaki_utf8, 0, /*pads*/ false, ids, err);
+}
+
+paradee_status paradee_phonemes_to_symbol_ids_lenient(
+        const paradee_model * model,
+        const std::string & misaki_utf8,
+        std::vector<int32_t> & ids,
+        size_t & n_dropped,
+        std::string & err) noexcept {
+    return map_symbols(model, misaki_utf8, 0, /*pads*/ false, ids, err, &n_dropped);
 }
 
 namespace {
@@ -484,8 +518,9 @@ paradee_status paradee_synthesize_ids_staged(
             return PARADEE_E_INVALID_ARG;
         }
     }
-    if (!std::isfinite(speed) || speed <= 0.0f) {
-        err = "speed must be finite and > 0";
+    if (!std::isfinite(speed) || speed < PARADEE_MIN_SPEED || speed > PARADEE_MAX_SPEED) {
+        err = "speed must be finite and in [" + std::to_string(PARADEE_MIN_SPEED) + ", " +
+              std::to_string(PARADEE_MAX_SPEED) + "]";
         return PARADEE_E_INVALID_ARG;
     }
 

@@ -302,11 +302,14 @@ if (LLAMA_BUILD_MISAKI_G2P AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
     endif()
 endif()
 if (LLAMA_BUILD_PARADEE AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
-    if (NOT LLAMA_BUILD_KOKORO)
-        message(FATAL_ERROR "LLAMA_BUILD_PARADEE=ON needs LLAMA_BUILD_KOKORO=ON (Paradee runs on "
-                            "the tools/kokoro layers); pass -DLLAMA_BUILD_PARADEE=OFF to build without it.")
+    # Paradee runs on the tools/kokoro layers. A build that turns Kokoro off
+    # (backend-only CI, for example) skips Paradee instead of failing; the
+    # fused library then reports paradee_supported() == 0.
+    if (LLAMA_BUILD_KOKORO)
+        add_subdirectory(tools/paradee)
+    else()
+        message(STATUS "LLAMA_BUILD_PARADEE: skipped because LLAMA_BUILD_KOKORO=OFF")
     endif()
-    add_subdirectory(tools/paradee)
 endif()
 
 if (LLAMA_BUILD_OMNIVOICE)

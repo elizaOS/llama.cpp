@@ -20,7 +20,8 @@ target_compile_definitions(test-paradee-phase-lock PRIVATE PARADEE_FIXTURE_DIR="
 add_test(NAME test-paradee-phase-lock COMMAND test-paradee-phase-lock)
 
 add_executable(test-paradee-api test_paradee_api.cpp)
-target_link_libraries(test-paradee-api PRIVATE paradee_lib)
+find_package(Threads REQUIRED)
+target_link_libraries(test-paradee-api PRIVATE paradee_lib Threads::Threads)
 add_test(NAME test-paradee-api COMMAND test-paradee-api)
 
 add_executable(test-paradee-parity test_paradee_parity.cpp)

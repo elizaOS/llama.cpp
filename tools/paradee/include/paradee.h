@@ -43,6 +43,11 @@ using paradee_model_ptr = std::unique_ptr<paradee_model, paradee_model_deleter>;
 constexpr int PARADEE_MAX_INPUT_IDS = 512;
 constexpr int PARADEE_PAD_ID = 0;
 
+// Accepted speed range. Durations scale with 1/speed, so a tiny speed would
+// make the frame count (and every decoder buffer) arbitrarily large.
+constexpr float PARADEE_MIN_SPEED = 0.25f;
+constexpr float PARADEE_MAX_SPEED = 4.0f;
+
 enum paradee_status {
     PARADEE_OK               = 0,
     PARADEE_E_INVALID_ARG    = 1,  // null model, bad ids, bad speed, malformed input
@@ -89,9 +94,21 @@ paradee_status paradee_phonemes_to_symbol_ids(
         std::vector<int32_t> & ids,
         std::string & err) noexcept;
 
+// The same unpadded, unlimited mapping, but symbols outside the vocabulary
+// are skipped (and counted in `n_dropped`) instead of rejected, as Kokoro and
+// misaki do; empty input (or input that is all dropped) gives no ids and
+// PARADEE_OK. Invalid UTF-8 is still rejected. This is the libelizainference
+// contract ("characters outside the model vocab are dropped").
+paradee_status paradee_phonemes_to_symbol_ids_lenient(
+        const paradee_model * model,
+        const std::string & misaki_utf8,
+        std::vector<int32_t> & ids,
+        size_t & n_dropped,
+        std::string & err) noexcept;
+
 // Synthesize from input ids (with the pad at each end, 3..512 ids, every id
-// in [0, n_token)). `speed` > 0 and finite (1.0 = native rate; larger is
-// faster). `cancel` (optional) is polled between stages and inside the
+// in [0, n_token)). `speed` finite and in [PARADEE_MIN_SPEED,
+// PARADEE_MAX_SPEED] (1.0 = native rate; larger is faster). `cancel` (optional) is polled between stages and inside the
 // generator loops; when it returns true the call returns PARADEE_CANCELLED
 // with `pcm` empty. Calls on one model are serialised.
 paradee_status paradee_synthesize_ids(

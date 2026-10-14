@@ -54,11 +54,13 @@ int paradee_sample_rate(const paradee_model * model) noexcept {
     return model ? 24000 : -1;
 }
 
-paradee_status paradee_phonemes_to_ids(
+paradee_status paradee_phonemes_to_symbol_ids_lenient(
     const paradee_model * model,
     const std::string & s,
     std::vector<int32_t> & ids,
+    size_t & n_dropped,
     std::string & err_out) noexcept {
+    n_dropped = 0;
     if (!model) { err_out = "fake: null model"; return PARADEE_E_INVALID_ARG; }
     ids.clear();
     for (size_t i = 0; i < s.size();) {
@@ -76,7 +78,7 @@ paradee_status paradee_phonemes_to_ids(
         else if (cp == "\xE2\x80\x94") ids.push_back(9);
         else if (cp == "\xE2\x80\xA6") ids.push_back(10);
         else if (cp == " ") ids.push_back(16);
-        else if (cp == "#") continue;
+        else if (cp == "#") { ++n_dropped; continue; }
         else if (len == 1 && c >= 'a' && c <= 'z') ids.push_back(43 + (c - 'a'));
         else ids.push_back(100);
     }
@@ -95,7 +97,10 @@ paradee_status paradee_synthesize(
         err_out = "fake: bad input_ids (size " + std::to_string(input_ids.size()) + ")";
         return PARADEE_E_INVALID_ARG;
     }
-    if (!(opts.speed > 0.0f)) { err_out = "fake: bad speed"; return PARADEE_E_INVALID_ARG; }
+    if (!(opts.speed >= PARADEE_MIN_SPEED && opts.speed <= PARADEE_MAX_SPEED)) {
+        err_out = "fake: bad speed";
+        return PARADEE_E_INVALID_ARG;
+    }
     g_state.synth_calls.fetch_add(1);
     {
         std::lock_guard<std::mutex> lock(g_state.sizes_mutex);
