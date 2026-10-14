@@ -109,6 +109,10 @@ void ggml_metal_library_free(ggml_metal_library_t lib);
 
 ggml_metal_device_t ggml_metal_library_get_device(ggml_metal_library_t lib);
 
+// Matrix dispatch must match the loaded shader's layout, including precompiled
+// libraries built without tensor API support on tensor-capable hardware.
+bool ggml_metal_library_has_tensor_layout(ggml_metal_library_t lib);
+
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline    (ggml_metal_library_t lib, const char * name);
 struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_metal_library_t lib, const char * base, const char * name, ggml_metal_cv_t cv);
 
@@ -117,9 +121,10 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy      
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pool_1d           (ggml_metal_library_t lib, const struct ggml_tensor * op, enum ggml_op_pool op_pool);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pool_2d           (ggml_metal_library_t lib, const struct ggml_tensor * op, enum ggml_op_pool op_pool);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_get_rows          (ggml_metal_library_t lib, enum ggml_type tsrc);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_set_rows          (ggml_metal_library_t lib, enum ggml_type tidx, enum ggml_type tdst);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_set_rows          (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_diag              (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_repeat            (ggml_metal_library_t lib, enum ggml_type tsrc);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_concat            (ggml_metal_library_t lib, enum ggml_type tsrc);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_unary             (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_glu               (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_sum               (ggml_metal_library_t lib, const struct ggml_tensor * op);
@@ -155,8 +160,10 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rope     
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_im2col            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_transpose_1d (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_transpose_2d (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_col2im_1d         (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_snake             (ggml_metal_library_t lib, enum ggml_type type);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_2d           (ggml_metal_library_t lib, const struct ggml_tensor * op);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_2d_dw        (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_2d_dw        (ggml_metal_library_t lib, const struct ggml_tensor * op, bool tiled);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_3d           (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_upscale           (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pad               (ggml_metal_library_t lib, const struct ggml_tensor * op);
@@ -242,6 +249,30 @@ void ggml_metal_rsets_free(ggml_metal_rsets_t rsets);
 // device
 //
 
+enum ggml_metal_device_id {
+    GGML_METAL_DEVICE_GENERIC = 0,
+
+    GGML_METAL_DEVICE_M1,
+    GGML_METAL_DEVICE_M1_PRO,
+    GGML_METAL_DEVICE_M1_MAX,
+    GGML_METAL_DEVICE_M1_ULTRA,
+    GGML_METAL_DEVICE_M2,
+    GGML_METAL_DEVICE_M2_PRO,
+    GGML_METAL_DEVICE_M2_MAX,
+    GGML_METAL_DEVICE_M2_ULTRA,
+    GGML_METAL_DEVICE_M3,
+    GGML_METAL_DEVICE_M3_PRO,
+    GGML_METAL_DEVICE_M3_MAX,
+    GGML_METAL_DEVICE_M3_ULTRA,
+    GGML_METAL_DEVICE_M4,
+    GGML_METAL_DEVICE_M4_PRO,
+    GGML_METAL_DEVICE_M4_MAX,
+    GGML_METAL_DEVICE_M5,
+    GGML_METAL_DEVICE_M5_PRO,
+    GGML_METAL_DEVICE_M5_MAX,
+    GGML_METAL_DEVICE_M5_ULTRA,
+};
+
 struct ggml_metal_device_props {
     int device;
     char name[128];
@@ -261,6 +292,8 @@ struct ggml_metal_device_props {
     bool use_managed_buffers;  // Use Managed mode for discrete GPUs
 
     bool supports_gpu_family_apple7;
+
+    enum ggml_metal_device_id device_id;
 
     int op_offload_min_batch_size;
 };

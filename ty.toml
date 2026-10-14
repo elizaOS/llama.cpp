@@ -30,6 +30,7 @@ include = [
     # composition at the mixin level, so the super() calls and
     # base-class attributes (ftype, metadata) appear unresolved.
     "./conversion/**",
+    "./tools/mtmd/tests/**",
 ]
 
 [overrides.rules]

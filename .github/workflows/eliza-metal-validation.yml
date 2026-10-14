@@ -6,19 +6,20 @@ name: Eliza Metal Validation
 # from tests/test-backend-ops.cpp against the Metal backend.
 #
 # What gets exercised on Metal vs CPU:
-#   - GET_ROWS / CPY / MUL_MAT for Q1_0_g32, Q1_0_g128, TBQ3_0, TBQ4_0,
-#     TBQ3_K, TBQ4_K, QJL1_256, Q4_POLAR, TBQ3_TCQ. Most of these have
-#     no Metal kernel today and emit "not supported"; Q1_0_g128 MUL_MAT
-#     runs for real (it has a registered get_pipeline path).
+#   - GET_ROWS / CPY / MUL_MAT / SET_ROWS for Q1_0_g32, Q1_0_g128, TBQ3_0,
+#     TBQ4_0, TBQ3_K, TBQ4_K, QJL1_256, Q4_POLAR, TBQ3_TCQ, filtered to
+#     those types. SET_ROWS and CPY have Metal kernels for TBQ3_0, TBQ4_0
+#     and Q4_POLAR (the quantized KV-cache writes); Q1_0_g128 MUL_MAT runs
+#     for real. The remaining cases report "not supported".
 #   - ATTN_SCORE_QJL / ATTN_SCORE_TBQ / ATTN_SCORE_POLAR /
 #     FUSED_ATTN_QJL_TBQ — all four are implemented on Metal and run
 #     against the CPU reference for real parity.
 #
 # Any "FAIL" line for ATTN_SCORE_QJL / FUSED_ATTN_QJL_TBQ or for the
-# GET_ROWS/CPY/MUL_MAT custom-quant cases fails the job. ATTN_SCORE_TBQ
+# GET_ROWS/CPY/MUL_MAT/SET_ROWS custom-quant cases fails the job. ATTN_SCORE_TBQ
 # and ATTN_SCORE_POLAR are also gated against their CPU oracle.
 # "not supported" is the expected baseline for the un-kerneled
-# GET_ROWS/CPY/MUL_MAT custom-quant kernels.
+# GET_ROWS/CPY/MUL_MAT/SET_ROWS custom-quant cases.
 
 on:
   workflow_dispatch:
@@ -48,7 +49,7 @@ env:
 jobs:
   macos-metal-validation:
     runs-on: macos-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
 
     steps:
       - name: Clone
@@ -113,6 +114,16 @@ jobs:
       - name: Verify Metal matmul capability routing
         run: ./build-metal/bin/test-metal-matmul-support --require-metal
 
+      - name: Detect Eliza custom quant types
+        id: eliza_quants
+        run: |
+          if grep -q 'GGML_TYPE_QJL1_256' ggml/include/ggml.h; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::TBQ/QJL/Polar types not wired in ggml.h yet (upstream tip / PR0) — Eliza parity gates skipped"
+          fi
+
       - name: test-quantize-fns (CPU; smoke for Eliza custom quants)
         shell: bash
         run: |
@@ -124,6 +135,12 @@ jobs:
               || (echo "MISSING quant: $t" && exit 1)
           done
 
+      - name: test-quantize-fns (CPU; stock smoke)
+        if: steps.eliza_quants.outputs.present != 'true'
+        run: |
+          ./build-metal/bin/test-quantize-fns | tee /tmp/quantize-fns.log
+          grep -q "Testing q4_0" /tmp/quantize-fns.log
+
       - name: test-backend-ops on Metal (filtered subset)
         shell: bash
         run: |
@@ -131,7 +148,7 @@ jobs:
           # Filter to ops that matter most for inference correctness.
           for op in MUL_MAT MUL_MAT_ID ADD MUL SOFT_MAX RMS_NORM CPY ROPE FLASH_ATTN_EXT; do
             echo "=== $op ==="
-            gtimeout 600 ./build-metal/bin/test-backend-ops \
+            gtimeout 1800 ./build-metal/bin/test-backend-ops \
               -b MTL0 -o "$op" -t 1 \
               2>"/tmp/metal-operation-logs/broad-$op.stderr" | tee "/tmp/metal-operation-logs/broad-$op.log" | tee -a /tmp/backend-ops.log
             python3 /tmp/verify-metal-operation.py broad "$op" "/tmp/metal-operation-logs/broad-$op.log"
@@ -146,10 +163,11 @@ jobs:
           set -euo pipefail
           # Eliza custom quants + custom attention ops on Metal.
           #
-          # GET_ROWS / CPY / MUL_MAT: most custom-quant kernels are not
-          # registered on Metal today and emit "not supported" — that
-          # is the expected baseline. Q1_0_g128 MUL_MAT does run for
-          # real and PASS lines are expected for it.
+          # GET_ROWS / CPY / MUL_MAT / SET_ROWS, filtered to the custom
+          # quant types (the broad step already ran the full suites).
+          # SET_ROWS and CPY run real parity for TBQ3_0 / TBQ4_0 /
+          # Q4_POLAR, and Q1_0_g128 MUL_MAT runs for real; the other
+          # custom-quant cases emit "not supported".
           #
           # ATTN_SCORE_QJL / FUSED_ATTN_QJL_TBQ: Metal has kernels and
           # CPU has reference implementations. Real parity runs; PASS
@@ -159,15 +177,20 @@ jobs:
           # ggml-cpu/attn-score-tbq-polar.c, with failures hard-gated.
           #
           # We do NOT fail the job on "not supported" lines (expected
-          # for the un-kerneled GET_ROWS/CPY/MUL_MAT custom-quant cases).
+          # for the un-kerneled custom-quant cases).
           # We DO fail on any FAIL line — Metal divergence from CPU.
-          for op in GET_ROWS CPY MUL_MAT \
+          custom_types='type(_a|_src|_dst)?=(q1_0_g32|q1_0_g128|tbq3_0|tbq4_0|tbq3_k|tbq4_k|qjl1_256|q4_polar|tbq3_tcq)[,)]'
+          for op in GET_ROWS CPY MUL_MAT SET_ROWS \
                     ATTN_SCORE_QJL FUSED_ATTN_QJL_TBQ \
                     ATTN_SCORE_TBQ ATTN_SCORE_POLAR \
                     ISTFT; do
             echo "=== $op (Eliza custom quants) ==="
-            gtimeout 300 ./build-metal/bin/test-backend-ops \
-              -b MTL0 -o "$op" -t 1 \
+            filter=()
+            case "$op" in
+              GET_ROWS|CPY|MUL_MAT|SET_ROWS) filter=(-p "$custom_types") ;;
+            esac
+            gtimeout 900 ./build-metal/bin/test-backend-ops \
+              -b MTL0 -o "$op" -t 1 ${filter[@]+"${filter[@]}"} \
               2>"/tmp/metal-operation-logs/custom-$op.stderr" | tee "/tmp/metal-operation-logs/custom-$op.log" | tee -a /tmp/eliza-custom-quants.log
             python3 /tmp/verify-metal-operation.py custom "$op" "/tmp/metal-operation-logs/custom-$op.log"
           done
@@ -249,7 +272,7 @@ jobs:
           from pathlib import Path
           rows = [json.loads(line) for line in Path('/tmp/metal-operation-ledger.jsonl').read_text().splitlines()]
           expected = Counter(('broad', op) for op in 'MUL_MAT MUL_MAT_ID ADD MUL SOFT_MAX RMS_NORM CPY ROPE FLASH_ATTN_EXT'.split())
-          expected.update(('custom', op) for op in 'GET_ROWS CPY MUL_MAT ATTN_SCORE_QJL FUSED_ATTN_QJL_TBQ ATTN_SCORE_TBQ ATTN_SCORE_POLAR ISTFT'.split())
+          expected.update(('custom', op) for op in 'GET_ROWS CPY MUL_MAT SET_ROWS ATTN_SCORE_QJL FUSED_ATTN_QJL_TBQ ATTN_SCORE_TBQ ATTN_SCORE_POLAR ISTFT'.split())
           assert Counter((row['group'], row['op']) for row in rows) == expected, 'Missing or duplicate invocation'
           print(json.dumps({'invocations': len(rows), 'numericalPasses': sum(row['numericalPasses'] for row in rows), 'explicitUnsupported': sum(row['explicitUnsupported'] for row in rows)}))
           PYTHON

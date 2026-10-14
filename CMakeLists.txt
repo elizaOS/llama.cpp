@@ -104,14 +104,13 @@ option(LLAMA_SANITIZE_UNDEFINED "llama: enable undefined sanitizer" OFF)
 option(LLAMA_BUILD_COMMON "llama: build common utils library" ${LLAMA_STANDALONE})
 
 # extra artifacts
-option(LLAMA_BUILD_TESTS            "llama: build tests"                                                                            ${LLAMA_STANDALONE})
-option(LLAMA_BUILD_TOOLS            "llama: build tools"                                                                            ${LLAMA_STANDALONE})
-option(LLAMA_BUILD_EXAMPLES         "llama: build examples"                                                                         ${LLAMA_STANDALONE})
-option(LLAMA_BUILD_SERVER           "llama: build server example"                                                                   ${LLAMA_STANDALONE})
-option(LLAMA_BUILD_WEBUI            "llama: build the embedded Web UI for server"                                                   ON)
-option(LLAMA_USE_PREBUILT_WEBUI     "llama: use prebuilt WebUI from HF Bucket when available (requires LLAMA_BUILD_WEBUI=ON)"       ON)
-option(LLAMA_TOOLS_INSTALL          "llama: install tools"                                                                          ${LLAMA_TOOLS_INSTALL_DEFAULT})
-option(LLAMA_TESTS_INSTALL          "llama: install tests"                                                                          ON)
+option(LLAMA_BUILD_TESTS     "llama: build tests"                                                                ${LLAMA_STANDALONE})
+option(LLAMA_BUILD_TOOLS     "llama: build tools"                                                                ${LLAMA_STANDALONE})
+option(LLAMA_BUILD_EXAMPLES  "llama: build examples"                                                             ${LLAMA_STANDALONE})
+option(LLAMA_BUILD_SERVER    "llama: build server example"                                                       ${LLAMA_STANDALONE})
+option(LLAMA_BUILD_APP       "llama: build the unified binary"                                                   ${LLAMA_STANDALONE})
+option(LLAMA_BUILD_UI        "llama: build the embedded Web UI for server"                                       ON)
+option(LLAMA_USE_PREBUILT_UI "llama: use prebuilt UI from HF Bucket when available (requires LLAMA_BUILD_UI=ON)" ON)
 
 # omnivoice.cpp merged subtree. Compiled against the same GGML + backend
 # selection as the rest of llama.cpp, producing the libomnivoice shared
@@ -156,6 +155,8 @@ if(ELIZA_FUSE_OMNIVOICE AND NOT LLAMA_BUILD_OMNIVOICE)
     set(LLAMA_BUILD_OMNIVOICE ON CACHE BOOL
         "Build the merged omnivoice TTS subtree" FORCE)
 endif()
+option(LLAMA_TOOLS_INSTALL "llama: install tools" ${LLAMA_TOOLS_INSTALL_DEFAULT})
+option(LLAMA_TESTS_INSTALL "llama: install tests" ON)
 
 # 3rd party libs
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
@@ -260,16 +261,15 @@ if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
     add_subdirectory(tools)
 endif()
 
-# Standalone libmtmd build (e.g. for Apple XCFramework packaging) without pulling
-# in the rest of the tools/ tree. When the full tools build is already enabled,
-# mtmd is built by the tools/ subdirectory above; this hook only fires when
-# LLAMA_BUILD_TOOLS is OFF to avoid double-adding the target.
-#
-# This MUST be added before tools/omnivoice below: the fused `elizainference`
-# target in tools/omnivoice/CMakeLists.txt is gated on `if(TARGET mtmd)`, so the
-# mtmd target has to exist by the time omnivoice configures. In the full
-# LLAMA_BUILD_TOOLS=ON path tools/CMakeLists.txt already orders mtmd before
-# omnivoice; this block mirrors that ordering for the embed-as-library case.
+if (LLAMA_BUILD_APP)
+    add_subdirectory(app)
+endif()
+
+# Standalone libmtmd build without pulling in the rest of the tools/ tree.
+# Useful when packaging just the mtmd library for language bindings (e.g. an
+# Apple XCFramework, or a WASM build). When the full tools build is enabled,
+# mtmd is already built by the tools/ subdirectory above; this hook only fires
+# when LLAMA_BUILD_TOOLS is OFF to avoid double-adding the target.
 option(LLAMA_BUILD_MTMD "llama: build tools/mtmd library standalone" OFF)
 if (LLAMA_BUILD_MTMD AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
     add_subdirectory(tools/mtmd)
@@ -384,29 +384,9 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
               ${CMAKE_CURRENT_BINARY_DIR}/llama-version.cmake
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/llama)
 
-install(
-    FILES convert_hf_to_gguf.py
-    PERMISSIONS
-        OWNER_READ
-        OWNER_WRITE
-        OWNER_EXECUTE
-        GROUP_READ
-        GROUP_EXECUTE
-        WORLD_READ
-        WORLD_EXECUTE
-    DESTINATION ${CMAKE_INSTALL_BINDIR})
-
 configure_file(cmake/llama.pc.in
         "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
         @ONLY)
 
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
-
-
-# ELIZA-OMNIVOICE-FUSION-GRAFT-V1 (REMOVED — W3-3 merged path is canonical)
-# The pre-W3-3 legacy graft block lived here. The merged build is now
-# self-contained inside `tools/omnivoice/CMakeLists.txt`. The
-# `ELIZA_FUSE_OMNIVOICE` deprecation redirect lives near the top of
-# this file (next to the LLAMA_BUILD_OMNIVOICE option declaration) so
-# the option ON state is visible when add_subdirectory(tools) runs.

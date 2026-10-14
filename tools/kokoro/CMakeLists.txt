@@ -39,6 +39,16 @@ set_target_properties(kokoro_lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(kokoro_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
+# kokoro_lib is folded into the fused libelizainference SHARED library
+# (tools/omnivoice/CMakeLists.txt links it PRIVATE). When the parent build is
+# configured with BUILD_SHARED_LIBS=ON (e.g. the OpenVINO Linux CI job), the
+# static archive's objects must be position-independent or ld refuses to fold
+# them into a -shared object ("relocation R_X86_64_PC32 ... can not be used
+# when making a shared object; recompile with -fPIC"). PIC is not transitive
+# from the SHARED consumer, so set it on the static target itself — mirroring
+# eliza_voice_classifiers / omnivoice_lib in the sibling omnivoice subtree.
+set_target_properties(kokoro_lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # ggml + llama are already configured by the parent build; pulling them via
 # target_link_libraries gives us the include paths and the link line.
 target_link_libraries(kokoro_lib PUBLIC ggml)
@@ -103,13 +113,15 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     install(TARGETS kokoro-tts
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         BUNDLE DESTINATION ${CMAKE_INSTALL_BINDIR})
-
-    add_executable(kokoro-stage-dump tools/kokoro-stage-dump.cpp)
-    target_link_libraries(kokoro-stage-dump PRIVATE kokoro_lib)
-
-    add_executable(kokoro-decoder-test tools/kokoro-decoder-test.cpp)
-    target_link_libraries(kokoro-decoder-test PRIVATE kokoro_lib)
 endif()
+
+add_executable(kokoro-stage-dump tools/kokoro-stage-dump.cpp)
+target_link_libraries(kokoro-stage-dump PRIVATE kokoro_lib)
+set_target_properties(kokoro-stage-dump PROPERTIES MACOSX_BUNDLE OFF)
+
+add_executable(kokoro-decoder-test tools/kokoro-decoder-test.cpp)
+target_link_libraries(kokoro-decoder-test PRIVATE kokoro_lib)
+set_target_properties(kokoro-decoder-test PROPERTIES MACOSX_BUNDLE OFF)
 
 # Server-mount handler: compiled into kokoro_lib only when the server target
 # exists. The handler is guarded by `#ifdef LLAMA_BUILD_KOKORO` and pulls in

@@ -4,22 +4,21 @@ void llama_model_gemma4_assistant::load_arch_hparams(llama_model_loader & ml) {
     hparams.n_embd_inp_impl = hparams.n_embd_out();
 
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
-    ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer);
+    ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, hparams.n_layer());
 
     uint32_t n_kv_shared_layers = 0;
     ml.get_key(LLM_KV_ATTENTION_SHARED_KV_LAYERS, n_kv_shared_layers, false);
 
     hparams.f_attention_scale = 1.0f;
 
-    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
+    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
+    GGML_ASSERT(hparams.n_layer_nextn == hparams.n_layer_all && "n_layer_nextn must be == n_layer_impl");
 
     ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA,           hparams.rope_freq_base_train_swa, false);
     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,     hparams.n_swa);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,  hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_SWA,     hparams.n_embd_head_k_swa);
     ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,   hparams.n_embd_head_v_swa);
-
-    type = LLM_TYPE_E2B;
 }
 
 void llama_model_gemma4_assistant::load_arch_tensors(llama_model_loader &) {
@@ -47,8 +46,6 @@ void llama_model_gemma4_assistant::load_arch_tensors(llama_model_loader &) {
     nextn_proj_post = create_tensor(tn(LLM_TENSOR_NEXTN_PROJ_POST, "weight"), { n_embd, n_embd_backbone }, 0);
 
     int rope_freqs_flag = 0;
-
-    const int n_layer_nextn = (int) hparams.n_layer;
 
     for (int i = 0; i < n_layer_nextn; ++i) {
         auto & layer = layers[i];
@@ -90,8 +87,6 @@ std::unique_ptr<llm_graph_context> llama_model_gemma4_assistant::build_arch_grap
 llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_graph_params & params) :
         llm_graph_context(params) {
     const int64_t n_embd_backbone = hparams.n_embd_inp();
-
-    const int n_layer_nextn = (int) hparams.n_layer;
 
     ggml_tensor * inp_tokens;
     ggml_tensor * inp_h;
@@ -202,13 +197,6 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
     ggml_tensor * h_next = ggml_mul_mat(ctx0, model.nextn_proj_post, cur);
     cb(h_next, "h_nextn", -1);
     res->t_h_nextn = h_next;
-    ggml_set_output(res->t_h_nextn);
-
-    // Route the next-token hidden state through the existing pre-norm extraction
-    // seam so the MTP runtime (common/speculative.cpp) can chain it back as the
-    // drafter's input hidden for the next speculative step. The pre-norm/nextn
-    // hidden width is n_embd_out (the backbone width), not the drafter's n_embd.
-    res->t_h_pre_norm = h_next;
 
     ggml_build_forward_expand(gf, logits);
     ggml_build_forward_expand(gf, h_next);
