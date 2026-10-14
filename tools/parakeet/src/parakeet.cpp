@@ -735,10 +735,14 @@ void ensure_rpos_cache(pk_model * m, int need) {
         }
     }
     quantize_acts(*m->pool, res.data(), n, D, D, q2);
+    // PK_DEBUG_F32_ACTS runs the first pass on the fp32 source already
+    const bool f32_debug = std::getenv("PK_DEBUG_F32_ACTS") != nullptr;
     m->rcache.resize(m->hp.n_layers);
     for (int l = 0; l < m->hp.n_layers; ++l) {
         gemm_q8(*m->pool, *m->kt, m->layers[l].pos, q, r.data(), D, epi::store);
-        gemm_q8(*m->pool, *m->kt, m->layers[l].pos, q2, r.data(), D, epi::add, 1.0f);
+        if (!f32_debug) {
+            gemm_q8(*m->pool, *m->kt, m->layers[l].pos, q2, r.data(), D, epi::add, 1.0f);
+        }
         auto & c = m->rcache[l];
         c.resize((size_t) n * D);
         m->pool->parallel_for(n, 16, [&](int b, int e) {

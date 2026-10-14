@@ -123,9 +123,14 @@ void pool::worker(int tid) {
     for (;;) {
         uint64_t g = gen_.load(std::memory_order_acquire);
         if (g == seen) {
-            // spin ~50-100 us, then sleep
+            // spin briefly, then yield (other threads may need this core when
+            // the CPU is oversubscribed), then sleep
             for (int i = 0; i < 20000 && g == seen; ++i) {
-                PK_RELAX();
+                if (i < 2000) {
+                    PK_RELAX();
+                } else {
+                    std::this_thread::yield();
+                }
                 g = gen_.load(std::memory_order_acquire);
             }
             if (g == seen) {
@@ -158,8 +163,12 @@ void pool::run(const std::function<void(int)> & f) {
         cv_.notify_all();
     }
     f(0);
-    while (remaining_.load(std::memory_order_acquire) > 0) {
-        PK_RELAX();
+    for (int i = 0; remaining_.load(std::memory_order_acquire) > 0; ++i) {
+        if (i < 2000) {
+            PK_RELAX();
+        } else {
+            std::this_thread::yield();  // a worker was preempted; let it run
+        }
     }
 }
 

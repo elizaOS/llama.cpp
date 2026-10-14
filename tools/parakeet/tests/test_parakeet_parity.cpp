@@ -17,7 +17,9 @@
 //                         the transcript gate is the functional one.
 //   PK_DEBUG_F32_ACTS=1   the same graph and weights with fp32 activations
 //                         (slow diagnostic GEMM): checks the graph itself
-//                         against the reference, cos >= 0.9999, L2 <= 0.005.
+//                         against the reference, cos >= 0.9999, L2 <= 0.02
+//                         (what remains is the fp16 key cache and the
+//                         per-row int8 grid of the five-value levels).
 //   transcript at least PK_GATE_TEXT (default 0.9) of the utterances
 //              text-identical to the reference
 // The native encoder quantises activations to int8 (see parakeet.cpp), so
@@ -80,7 +82,7 @@ int main(int argc, char ** argv) {
     const double gate_cos = std::getenv("PK_GATE_ENC_COS") ? std::atof(std::getenv("PK_GATE_ENC_COS"))
                                                            : (f32_acts ? 0.9999 : 0.98);
     const double gate_l2 = std::getenv("PK_GATE_ENC_L2") ? std::atof(std::getenv("PK_GATE_ENC_L2"))
-                                                         : (f32_acts ? 0.005 : 0.25);
+                                                         : (f32_acts ? 0.02 : 0.25);
     const double gate_text = std::getenv("PK_GATE_TEXT") ? std::atof(std::getenv("PK_GATE_TEXT")) : 0.9;
     char err[512] = { 0 };
     pk_params pp = pk_default_params();
