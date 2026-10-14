@@ -132,7 +132,7 @@ jobs:
           for op in MUL_MAT MUL_MAT_ID ADD MUL SOFT_MAX RMS_NORM CPY ROPE FLASH_ATTN_EXT; do
             echo "=== $op ==="
             gtimeout 600 ./build-metal/bin/test-backend-ops \
-              -b MTL0 -o "$op" \
+              -b MTL0 -o "$op" -t 1 \
               2>"/tmp/metal-operation-logs/broad-$op.stderr" | tee "/tmp/metal-operation-logs/broad-$op.log" | tee -a /tmp/backend-ops.log
             python3 /tmp/verify-metal-operation.py broad "$op" "/tmp/metal-operation-logs/broad-$op.log"
           done
@@ -167,7 +167,7 @@ jobs:
                     ISTFT; do
             echo "=== $op (Eliza custom quants) ==="
             gtimeout 300 ./build-metal/bin/test-backend-ops \
-              -b MTL0 -o "$op" \
+              -b MTL0 -o "$op" -t 1 \
               2>"/tmp/metal-operation-logs/custom-$op.stderr" | tee "/tmp/metal-operation-logs/custom-$op.log" | tee -a /tmp/eliza-custom-quants.log
             python3 /tmp/verify-metal-operation.py custom "$op" "/tmp/metal-operation-logs/custom-$op.log"
           done
