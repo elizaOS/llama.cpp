@@ -27,6 +27,10 @@ include = [
     # Same for the Paradee reference dumper (kokoro, misaki, espeakng_loader
     # and the paradee training scripts are pinned in its own environment).
     "./tools/paradee/tools/**",
+    # Same for the Parakeet reference dumper and bench scorer (torch,
+    # transformers, soundfile, librosa and whisper_normalizer live in the
+    # pinned reference env, see tools/parakeet/pins.json).
+    "./tools/parakeet/tools/**",
     # conversion/* defines mixins (e.g. _Qwen35MtpMixin) whose super()
     # chains resolve to attributes provided by the composed Model
     # subclasses in convert_hf_to_gguf.py. ty cannot see that
