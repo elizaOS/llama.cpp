@@ -133,6 +133,8 @@ int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_wi
 struct ggml_metal_library {
     id<MTLLibrary> obj;
 
+    bool has_tensor_layout;
+
     ggml_metal_device_t dev;
     ggml_metal_pipelines_t pipelines; // cache of compiled pipelines
 
@@ -299,6 +301,7 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
     ggml_metal_library_t res = calloc(1, sizeof(struct ggml_metal_library));
 
     res->obj       = library;
+    res->has_tensor_layout = [library.functionNames containsObject:@"ggml_metal_tensor_layout_v1"];
     res->dev       = dev;
     res->pipelines = ggml_metal_pipelines_init();
     res->lock      = [NSLock new];
@@ -366,6 +369,7 @@ ggml_metal_library_t ggml_metal_library_init_from_source(ggml_metal_device_t dev
     }
 
     res->obj       = library;
+    res->has_tensor_layout = [library.functionNames containsObject:@"ggml_metal_tensor_layout_v1"];
     res->dev       = dev;
     res->pipelines = ggml_metal_pipelines_init();
     res->lock      = [NSLock new];
@@ -391,6 +395,10 @@ void ggml_metal_library_free(ggml_metal_library_t lib) {
 
 ggml_metal_device_t ggml_metal_library_get_device(ggml_metal_library_t lib) {
     return lib->dev;
+}
+
+bool ggml_metal_library_has_tensor_layout(ggml_metal_library_t lib) {
+    return lib->has_tensor_layout;
 }
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline(ggml_metal_library_t lib, const char * name) {

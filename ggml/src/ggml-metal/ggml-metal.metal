@@ -17,6 +17,14 @@ __embed_ggml-common.h__
 
 using namespace metal;
 
+#ifdef GGML_METAL_HAS_TENSOR
+// Identifies the matrix tile layout in this compiled library. Host hardware
+// support alone cannot tell whether a precompiled library used the tensor API.
+kernel void ggml_metal_tensor_layout_v1(device uint * out [[buffer(0)]]) {
+    out[0] = 1;
+}
+#endif
+
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 #define SWAP(x, y) { auto tmp = (x); (x) = (y); (y) = tmp; }
