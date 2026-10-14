@@ -19,14 +19,17 @@
 
 #include "fake-paradee-control.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <random>
 #include <thread>
 
-static int g_failures = 0;
-static int g_checks = 0;
+/* Atomic: CHECK runs on the worker threads of the cancel / race tests too, and
+ * a lost ++g_failures there would turn a failure into a PASS. */
+static std::atomic<int> g_failures{0};
+static std::atomic<int> g_checks{0};
 
 #define CHECK(cond) do { \
         ++g_checks; \
@@ -612,6 +615,6 @@ int main() {
     test_evict_reload();
     test_asr_cancel();
     std::fprintf(stderr, "%s: %d checks, %d failures\n",
-        g_failures ? "FAIL" : "PASS", g_checks, g_failures);
-    return g_failures ? 1 : 0;
+        g_failures.load() ? "FAIL" : "PASS", g_checks.load(), g_failures.load());
+    return g_failures.load() ? 1 : 0;
 }

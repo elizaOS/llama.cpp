@@ -396,6 +396,9 @@ if(TARGET mtmd)
             endif()
             if(BUILD_TESTING)
                 add_test(NAME eliza-inference-test-abi COMMAND eliza-inference-test-abi)
+                # "main" is the label CI runs (ctest -L main); unlabelled
+                # tests are built but never executed there.
+                set_property(TEST eliza-inference-test-abi PROPERTY LABELS main)
             endif()
         endif()
 
@@ -423,6 +426,7 @@ if(TARGET mtmd)
 
         if(BUILD_TESTING)
             add_test(NAME eliza-inference-test-paradee-asr COMMAND eliza-inference-test-paradee-asr)
+            set_property(TEST eliza-inference-test-paradee-asr PROPERTY LABELS main)
         endif()
     endif()
 endif()
