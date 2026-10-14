@@ -64,7 +64,7 @@
   "gguf": {
     "file": "phonon-2-fv5.gguf",
     "size": 330632256,
-    "sha256": "22c3c56dd8e6ba0cb591ebd5605e5212a44ff4c14845874a2d1001b600d2c156",
+    "sha256": "dc552eb786486167dde3ac80bbe49a6088c8ef39c03c257d5a090fc57b2c47b3",
     "format": "fv5-pair16-v1",
     "note": "convert_phonon2_to_gguf.py --archive output; byte-reproducible. Changes whenever the converter changes, because its git blob sha is in the metadata."
   }
