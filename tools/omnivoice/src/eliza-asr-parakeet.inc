@@ -23,6 +23,8 @@
 
 #include "parakeet.h"
 
+#include <climits>
+
 static std::atomic<int> g_eliza_parakeet_loaded{ 0 };
 
 struct EliParakeetAsr {
@@ -31,7 +33,8 @@ struct EliParakeetAsr {
     uint64_t generation = 0;  /* bumped on every load, so open streams notice an evict */
 };
 
-static uint64_t g_eliza_parakeet_generation = 0;
+/* Shared by every context (each bumps it under its own asr_mutex). */
+static std::atomic<uint64_t> g_eliza_parakeet_generation{ 0 };
 
 static int eliza_parakeet_cancel_cb(void * user) {
     auto * ctx = (EliInferenceContext *) user;
@@ -92,7 +95,7 @@ static int eliza_parakeet_load_locked(EliInferenceContext * ctx, char ** out_err
     if (!ctx->parakeet) ctx->parakeet = new EliParakeetAsr();
     ctx->parakeet->model = m;
     ctx->parakeet->path = path;
-    ctx->parakeet->generation = ++g_eliza_parakeet_generation;
+    ctx->parakeet->generation = g_eliza_parakeet_generation.fetch_add(1) + 1;
     g_eliza_parakeet_loaded.fetch_add(1);
     eliza_asr_debug_log("parakeet-tdt ASR ready");
     return 1;
@@ -152,21 +155,29 @@ static int eliza_parakeet_transcribe_locked(
 
 /* ---- streaming ---------------------------------------------------------- */
 
+/* Threading: feed() may run on the audio thread while partial()/finish()
+ * decode on another. feed() only resamples into `pending` under `feed_mu`
+ * (never waits for a decode); partial()/finish() hold ctx->asr_mutex, move
+ * `pending` into the pk_stream under `feed_mu`, then decode without it.
+ * close() must not race any other call on the same stream. */
 struct EliAsrStream {
     EliInferenceContext * ctx = nullptr;
     pk_stream * st = nullptr;
     uint64_t generation = 0;
     int in_rate = 16000;
-    /* continuous linear resampler state (in_rate -> 16 kHz) */
+    std::mutex feed_mu;
+    std::vector<float> pending;  /* 16 kHz, not yet handed to st */
+    bool finished = false;       /* under feed_mu */
+    /* continuous linear resampler state (in_rate -> 16 kHz), under feed_mu */
     double phase = 0.0;
     float last = 0.0f;
     bool have_last = false;
 };
 
+/* Appends to `out`. Caller holds s->feed_mu. */
 static void eliza_parakeet_stream_resample(EliAsrStream * s, const float * pcm, size_t n, std::vector<float> & out) {
-    out.clear();
     if (s->in_rate == 16000) {
-        out.assign(pcm, pcm + n);
+        out.insert(out.end(), pcm, pcm + n);
         return;
     }
     const double step = (double) s->in_rate / 16000.0;

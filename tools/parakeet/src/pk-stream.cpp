@@ -50,7 +50,14 @@ struct pk_stream {
     std::vector<pk_token> committed;  // absolute frames
     std::vector<pk_token> tentative;  // absolute frames
     bool done = false;
+    float speech_level = 0.0f;  // loud (90th percentile) 10 ms energy of the last window with tokens
     int n_decodes = 0;
+    int n_skipped = 0;          // decodes skipped on quiet audio
+    size_t committed_in_segment(int f0) const {
+        size_t n = 0;
+        while (n < committed.size() && committed[committed.size() - 1 - n].frame >= f0) ++n;
+        return n;
+    }
     double decode_ms = 0.0;
     double first_ms = -1.0;
 };
@@ -111,6 +118,31 @@ static std::vector<float> frame_energy(const pk_stream * s, size_t a, size_t b) 
         e.push_back((float) (acc / hop));
     }
     return e;
+}
+
+// 90th percentile of the 10 ms frame energies over [a, b)
+static float loud_level(const pk_stream * s, size_t a, size_t b) {
+    std::vector<float> e = frame_energy(s, a, b);
+    if (e.empty()) return 0.0f;
+    std::nth_element(e.begin(), e.begin() + e.size() * 9 / 10, e.end());
+    return e[e.size() * 9 / 10];
+}
+
+// Quiet: every 10 ms frame below -60 dBFS, or below -30 dB of the speech
+// level of the last window that held tokens.
+static bool is_quiet(const pk_stream * s, size_t a, size_t b) {
+    const float thr = std::max(1e-6f, 0.03f * 0.03f * s->speech_level);
+    for (float v : frame_energy(s, a, b)) {
+        if (v >= thr) return false;
+    }
+    return true;
+}
+
+static void drop_before(pk_stream * s, size_t abs_sample) {
+    if (abs_sample > s->audio_base) {
+        s->audio.erase(s->audio.begin(), s->audio.begin() + (abs_sample - s->audio_base));
+        s->audio_base = abs_sample;
+    }
 }
 
 // true when sample x falls in no committed token's span [frame, frame + dur)
@@ -189,11 +221,12 @@ static int decode_window(pk_stream * s, bool final, pk_cancel_cb cancel, void * 
 
     const int f0 = (int) (ws / fs);
     for (auto & t : toks) t.frame += f0;
+    // PK_STREAM_DEBUG: window geometry and token counts only. Transcript
+    // text and token ids never go to a log.
     const bool dbg = std::getenv("PK_STREAM_DEBUG") != nullptr;
     if (dbg) {
-        std::string raw;
-        for (const auto & t : toks) raw += "[" + std::to_string(t.frame) + "]" + m->pieces[t.id];
-        std::fprintf(stderr, "[pk-stream] window %.2f-%.2fs raw %s\n", ws / 16000.0, s->total / 16000.0, raw.c_str());
+        std::fprintf(stderr, "[pk-stream] window %.2f-%.2fs: %zu tokens, %.1f ms\n", ws / 16000.0,
+                     s->total / 16000.0, toks.size(), ms);
     }
 
     // The window re-decodes this segment's committed tokens too. Skip them by
@@ -247,14 +280,22 @@ static int decode_window(pk_stream * s, bool final, pk_cancel_cb cancel, void * 
     if (force) {
         while (k < hyp.size() && hyp[k].frame < stable) ++k;
     }
-    // whole words only: the next token must start a word
-    while (k > 0 && !(k < hyp.size() && m->word_start[hyp[k].id])) --k;
+    // whole words only: the next token must start a word. The newest word
+    // also counts as finished when every token of the hypothesis ends before
+    // the stable point (right_context of audio with no further token):
+    // otherwise the last word before a pause would wait for the next word.
+    const bool tail_done = !hyp.empty() && hyp.back().frame + std::max(1, hyp.back().duration) <= stable;
+    while (k > 0 && !(k < hyp.size() ? m->word_start[hyp[k].id] != 0 : tail_done)) --k;
     if (k > 0) {
         s->committed.insert(s->committed.end(), hyp.begin(), hyp.begin() + k);
-        // commit point: the start frame of the first uncommitted token
-        s->commit_sample = std::max(s->commit_sample, (size_t) hyp[k].frame * fs);
+        // commit point: the start frame of the first uncommitted token, or
+        // the end of the last committed one when nothing is left
+        const size_t cp = k < hyp.size() ? (size_t) hyp[k].frame * fs
+                                         : (size_t) (hyp.back().frame + std::max(1, hyp.back().duration)) * fs;
+        s->commit_sample = std::max(s->commit_sample, cp);
     }
     s->tentative.assign(hyp.begin() + k, hyp.end());
+    if (!toks.empty()) s->speech_level = loud_level(s, ws, s->total);
 
     // Start a new segment in a pause, so the next window begins in silence.
     // Preferred: a pause between the last committed token and the first
@@ -262,7 +303,18 @@ static int decode_window(pk_stream * s, bool final, pk_cancel_cb cancel, void * 
     // the latest pause in the last 3 s of committed audio (its committed
     // tokens are re-decoded and skipped above). Past max_window with no
     // pause at all: the quietest 100 ms of the last 2 s of committed audio.
-    if (!s->committed.empty() && s->commit_sample > ws + fs) {
+    // Past max_window with no token at all (noise, no speech): keep the
+    // newest half window, so cost and memory stay bounded and the window is
+    // still long enough for the per-window feature normalisation.
+    if (hyp.empty() && s->committed_in_segment(f0) == 0 && force) {
+        const size_t keep = ms_to_samples(s, s->p.max_window_ms / 2);
+        const size_t cut = ((s->total - keep) / fs) * fs;
+        if (cut > ws) {
+            s->seg_start = cut;
+            s->commit_sample = std::max(s->commit_sample, cut);
+            drop_before(s, cut);
+        }
+    } else if (!s->committed.empty() && s->commit_sample > ws + fs) {
         const pk_token & lc = s->committed.back();
         const size_t gap_lo = std::max(ws + fs, (size_t) (lc.frame + std::max(1, lc.duration)) * fs);
         size_t cut = gap_lo < s->commit_sample ? find_pause(s, gap_lo, s->commit_sample) : 0;
@@ -277,16 +329,13 @@ static int decode_window(pk_stream * s, bool final, pk_cancel_cb cancel, void * 
         cut = (cut / fs) * fs;
         if (cut > ws && cut <= s->commit_sample) {
             s->seg_start = cut;
-            if (s->seg_start > s->audio_base) {
-                s->audio.erase(s->audio.begin(), s->audio.begin() + (s->seg_start - s->audio_base));
-                s->audio_base = s->seg_start;
-            }
+            drop_before(s, cut);
         }
     }
     if (dbg) {
-        std::fprintf(stderr, "[pk-stream]   commit+%zu -> %.2fs, tentative '%s', segment from %.2fs%s\n", k,
-                     s->commit_sample / 16000.0, detokenize(m, s->tentative.data(), s->tentative.size()).c_str(),
-                     s->seg_start / 16000.0, force ? " (forced)" : "");
+        std::fprintf(stderr, "[pk-stream]   commit+%zu -> %.2fs, %zu tentative, segment from %.2fs%s\n", k,
+                     s->commit_sample / 16000.0, s->tentative.size(), s->seg_start / 16000.0,
+                     force ? " (forced)" : "");
     }
     return 0;
 }
@@ -296,7 +345,11 @@ static int write_text(pk_stream * s, char * out, size_t cap) {
     all.insert(all.end(), s->tentative.begin(), s->tentative.end());
     const std::string t = detokenize(s->m, all.data(), all.size());
     if (!out || cap == 0) return (int) t.size();
-    const size_t n = std::min(t.size(), cap - 1);
+    size_t n = std::min(t.size(), cap - 1);
+    // never cut a UTF-8 sequence: back off over continuation bytes
+    if (n < t.size()) {
+        while (n > 0 && ((unsigned char) t[n] & 0xC0) == 0x80) --n;
+    }
     std::memcpy(out, t.data(), n);
     out[n] = '\0';
     return (int) n;
@@ -308,8 +361,34 @@ extern "C" int pk_stream_partial(pk_stream * s, char * out, size_t cap, pk_cance
     const size_t win = s->total - s->seg_start;
     const size_t hop = std::max(ms_to_samples(s, s->p.min_hop_ms), win / 6);
     if (!s->done && s->total - s->last_decode_total >= hop) {
-        const int rc = decode_window(s, false, cancel, cu);
-        if (rc < 0) return rc;
+        if (s->tentative.empty() && s->last_decode_total > s->seg_start &&
+            is_quiet(s, s->last_decode_total, s->total)) {
+            // Nothing pending and only quiet audio since the last decode: a
+            // decode could only re-read silence (and short noise windows are
+            // where the model invents words). Skip it, and keep at most the
+            // newest 1.5 s of a quiet stretch, so a long pause neither grows
+            // the next window nor the buffer.
+            s->n_skipped++;
+            s->last_decode_total = s->total;
+            const size_t fs = (size_t) s->m->hp.hop_length * 8;
+            size_t lo = s->seg_start + fs;
+            if (!s->committed.empty()) {
+                const pk_token & lc = s->committed.back();
+                lo = std::max(lo, (size_t) (lc.frame + std::max(1, lc.duration)) * fs);
+            }
+            const size_t keep = ms_to_samples(s, 1500);
+            if (s->total > lo + keep + fs) {
+                const size_t cut = ((s->total - keep) / fs) * fs;
+                if (cut > lo && is_quiet(s, std::max(lo, cut - fs), s->total)) {
+                    s->seg_start = cut;
+                    s->commit_sample = std::max(s->commit_sample, cut);
+                    drop_before(s, cut);
+                }
+            }
+        } else {
+            const int rc = decode_window(s, false, cancel, cu);
+            if (rc < 0) return rc;
+        }
     }
     return write_text(s, out, cap);
 }

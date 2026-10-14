@@ -69,11 +69,19 @@ a **pause-delimited segment**, from the segment start to the newest sample.
 - **Committing.** A token is committed when two consecutive decodes agree on it and it ends at least
   `right_context_ms` before the newest sample. Commits happen on word boundaries only. Committed text never
   changes.
-- **Starting a new segment.** A segment ends when a pause of at least 200 ms lies between the last committed
+- **Starting a new segment.** A segment ends when a pause of at least 150 ms lies between the last committed
   token and the first uncommitted one. The next segment starts inside that pause, so windows begin in silence
   and stay short.
 - **Bounded windows.** Past `max_window_ms`, stable tokens are committed without agreement and the segment is
   cut at the quietest point of that gap, which bounds every decode.
+- **Finished words.** The newest word is committed once the agreed hypothesis has no token in the last
+  `right_context_ms`, so it does not wait for the next word.
+- **Quiet audio.** With nothing uncommitted and only quiet audio since the last decode (every 10 ms frame below
+  -60 dBFS, or 30 dB under the speech level of the last window that held tokens), the decode is skipped and the
+  window keeps at most the newest 1.5 s of the pause. A long pause therefore costs no decodes and does not grow
+  the next window, and the model is not run on short windows of near-silence, which is where it invents words.
+- **No speech at all.** A window past `max_window_ms` with no token keeps its newest half, which bounds noise
+  without speech.
 - **Decode interval.** It is at least `min_hop_ms` and grows to a sixth of the window.
 - **`finish()`** decodes the open segment with full right context.
 

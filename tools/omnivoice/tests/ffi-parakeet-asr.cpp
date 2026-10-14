@@ -74,8 +74,9 @@ int main() {
     rc = eliza_inference_asr_transcribe(ctx, pcm.data(), pcm.size(), 16000, text, sizeof(text), &err);
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     CHECK(rc > 0, "transcribe rc %d %s", rc, err ? err : "");
-    std::printf("batch (%.0f ms for %.2f s): %s\n", ms, pcm.size() / 16000.0, text);
-    if (expect) CHECK(std::strcmp(text, expect) == 0, "transcript differs from expected:\n  %s\n  %s", text, expect);
+    // lengths only: transcripts stay out of logs, CI logs included
+    std::printf("batch (%.0f ms for %.2f s): %zu words\n", ms, pcm.size() / 16000.0, count_words(text));
+    if (expect) CHECK(std::strcmp(text, expect) == 0, "transcript differs from the expected text");
 
     // timed
     char text2[4096];
@@ -120,9 +121,57 @@ int main() {
         char fin[4096];
         rc = eliza_inference_asr_stream_finish(st, fin, sizeof(fin), nullptr, nullptr, &err);
         CHECK(rc > 0, "finish rc %d", rc);
-        std::printf("stream (%d partial updates): %s\n", partials, fin);
+        std::printf("stream (%d partial updates): %zu words\n", partials, count_words(fin));
         CHECK(partials >= 1, "no partial transcript before finish");
+        CHECK(eliza_inference_asr_stream_feed(st, pcm.data(), 160, &err) < 0, "feed after finish must fail");
+        eliza_inference_free_string(err);
+        err = nullptr;
         eliza_inference_asr_stream_close(st);
+    }
+
+    // feed from an audio thread while another thread polls partials (the
+    // JNI shape); run under TSan to check the stream's locking
+    {
+        EliAsrStream * cs = eliza_inference_asr_stream_open(ctx, 48000, &err);
+        CHECK(cs, "stream_open (concurrent): %s", err ? err : "");
+        if (cs) {
+            std::atomic<bool> fed{ false };
+            std::thread feeder([&] {
+                char * e = nullptr;
+                for (size_t p = 0; p < up.size(); p += 960) {
+                    const size_t n = std::min<size_t>(960, up.size() - p);
+                    if (eliza_inference_asr_stream_feed(cs, up.data() + p, n, &e) != (int) n) {
+                        std::fprintf(stderr, "FAIL concurrent feed\n");
+                        ++fails;
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::microseconds(200));
+                }
+                eliza_inference_free_string(e);
+                fed = true;
+            });
+            int polls = 0;
+            while (!fed.load()) {
+                char part[4096];
+                char * e = nullptr;
+                rc = eliza_inference_asr_stream_partial(cs, part, sizeof(part), nullptr, nullptr, &e);
+                eliza_inference_free_string(e);
+                CHECK(rc >= 0, "concurrent partial rc %d", rc);
+                ++polls;
+            }
+            feeder.join();
+            char fin[4096];
+            rc = eliza_inference_asr_stream_finish(cs, fin, sizeof(fin), nullptr, nullptr, &err);
+            CHECK(rc > 0, "concurrent finish rc %d", rc);
+            CHECK(count_words(fin) + 3 >= count_words(text) && count_words(fin) <= count_words(text) + 3,
+                  "concurrent stream word count %zu far from batch %zu", count_words(fin), count_words(text));
+            std::printf("concurrent feed/partial: %d polls, %zu words\n", polls, count_words(fin));
+            // a tiny buffer: truncated, NUL-terminated, length < capacity
+            char tiny[5];
+            rc = eliza_inference_asr_stream_partial(cs, tiny, sizeof(tiny), nullptr, nullptr, &err);
+            CHECK(rc >= 0 && rc < (int) sizeof(tiny) && tiny[rc] == '\0', "tiny buffer rc %d", rc);
+            eliza_inference_asr_stream_close(cs);
+        }
     }
 
     // cancel a batch call from another thread

@@ -190,12 +190,22 @@ struct loader {
     uint32_t u32(const char * key, uint32_t def) {
         const std::string k = std::string("parakeet.") + key;
         const int64_t id = gguf_find_key(m->gg, k.c_str());
-        return id < 0 ? def : gguf_get_val_u32(m->gg, id);
+        if (id < 0) return def;
+        if (gguf_get_kv_type(m->gg, id) != GGUF_TYPE_UINT32) {
+            if (err.empty()) err = k + ": expected uint32";
+            return def;
+        }
+        return gguf_get_val_u32(m->gg, id);
     }
     float f32kv(const char * key, float def) {
         const std::string k = std::string("parakeet.") + key;
         const int64_t id = gguf_find_key(m->gg, k.c_str());
-        return id < 0 ? def : gguf_get_val_f32(m->gg, id);
+        if (id < 0) return def;
+        if (gguf_get_kv_type(m->gg, id) != GGUF_TYPE_FLOAT32) {
+            if (err.empty()) err = k + ": expected float32";
+            return def;
+        }
+        return gguf_get_val_f32(m->gg, id);
     }
 
     void fv5(wmat & w, const std::string & name, int O, int K) {
@@ -290,19 +300,23 @@ extern "C" pk_model * pk_model_load(const char * path, pk_params params, char * 
         return nullptr;
     }
     {
-        const int64_t id = gguf_find_key(m->gg, "general.architecture");
-        if (id < 0 || std::strcmp(gguf_get_val_str(m->gg, id), "parakeet-tdt") != 0) {
+        // gguf_get_val_* abort on a type mismatch, so check the type first
+        auto str_kv = [&](const char * key) -> const char * {
+            const int64_t kid = gguf_find_key(m->gg, key);
+            return kid >= 0 && gguf_get_kv_type(m->gg, kid) == GGUF_TYPE_STRING ? gguf_get_val_str(m->gg, kid) : nullptr;
+        };
+        const char * arch = str_kv("general.architecture");
+        if (!arch || std::strcmp(arch, "parakeet-tdt") != 0) {
             set_err(err, err_len, "general.architecture is not parakeet-tdt");
             return nullptr;
         }
-        const int64_t fid = gguf_find_key(m->gg, "parakeet.weights.format");
-        if (fid < 0 || std::strcmp(gguf_get_val_str(m->gg, fid), "fv5-pair16-v1") != 0) {
+        const char * fmt = str_kv("parakeet.weights.format");
+        if (!fmt || std::strcmp(fmt, "fv5-pair16-v1") != 0) {
             set_err(err, err_len, "parakeet.weights.format is not fv5-pair16-v1 (re-run convert_phonon2_to_gguf.py)");
             return nullptr;
         }
-        const int64_t nid = gguf_find_key(m->gg, "parakeet.notice");
-        if (nid >= 0) {
-            m->notice = gguf_get_val_str(m->gg, nid);
+        if (const char * notice = str_kv("parakeet.notice")) {
+            m->notice = notice;
         }
     }
     loader L{ m.get(), {} };
@@ -329,24 +343,44 @@ extern "C" pk_model * pk_model_load(const char * path, pk_params params, char * 
     hp.log_guard = L.f32kv("log_guard", 5.9604644775390625e-8f);
     hp.norm_eps = L.f32kv("norm_eps", 1e-5f);
     hp.ln_eps = L.f32kv("ln_eps", 1e-5f);
-    if (hp.sub_factor != 8 || hp.pred_layers != 2 || hp.d_model % hp.n_heads || hp.d_model / hp.n_heads != 128 ||
-        hp.n_mels != 128 || hp.n_fft != 512) {
+    if (!L.err.empty()) {
+        set_err(err, err_len, L.err);
+        return nullptr;
+    }
+    if (hp.sub_factor != 8 || hp.pred_layers != 2 || hp.n_heads <= 0 || hp.d_model % hp.n_heads ||
+        hp.d_model / hp.n_heads != 128 || hp.n_mels != 128 || hp.n_fft != 512 || hp.n_layers <= 0 ||
+        hp.vocab <= 0 || hp.blank_id != hp.vocab || hp.max_symbols <= 0 || hp.hop_length <= 0 ||
+        hp.win_length <= 1 || hp.win_length > hp.n_fft || hp.sample_rate <= 0 || hp.conv_kernel <= 0 ||
+        hp.conv_kernel % 2 == 0) {
         set_err(err, err_len, "unsupported parakeet-tdt hyper-parameters");
         return nullptr;
     }
     {
         const int64_t id = gguf_find_key(m->gg, "parakeet.durations");
         if (id >= 0) {
+            if (gguf_get_kv_type(m->gg, id) != GGUF_TYPE_ARRAY || gguf_get_arr_type(m->gg, id) != GGUF_TYPE_INT32) {
+                set_err(err, err_len, "parakeet.durations: expected an int32 array");
+                return nullptr;
+            }
             const size_t n = gguf_get_arr_n(m->gg, id);
             hp.durations.clear();
             for (size_t i = 0; i < n; ++i) {
                 hp.durations.push_back(((const int32_t *) gguf_get_arr_data(m->gg, id))[i]);
             }
         }
+        // the greedy decoder indexes durations and advances by them: a
+        // negative duration would loop forever, an empty table read past it
+        bool ok = !hp.durations.empty() && hp.durations.size() <= 64;
+        for (int d : hp.durations) ok = ok && d >= 0 && d <= 64;
+        if (!ok) {
+            set_err(err, err_len, "parakeet.durations missing or out of range");
+            return nullptr;
+        }
     }
     {
         const int64_t id = gguf_find_key(m->gg, "tokenizer.ggml.tokens");
-        if (id < 0 || (int) gguf_get_arr_n(m->gg, id) != hp.vocab) {
+        if (id < 0 || gguf_get_kv_type(m->gg, id) != GGUF_TYPE_ARRAY ||
+            gguf_get_arr_type(m->gg, id) != GGUF_TYPE_STRING || (int) gguf_get_arr_n(m->gg, id) != hp.vocab) {
             set_err(err, err_len, "tokenizer.ggml.tokens missing or wrong size");
             return nullptr;
         }
@@ -712,29 +746,54 @@ inline void f16_to_f32_row(const uint16_t * src, float * dst, int n) {
     for (; i < n; ++i) dst[i] = ggml_fp16_to_fp32((ggml_fp16_t) src[i]);
 }
 
-void rel_pos_embed_P(int P, int D, std::vector<float> & pe);
+// sinusoidal relative-position embedding rows for positions p (the
+// ParakeetEncoderRelPositionalEncoding values)
+void rel_pos_rows(const std::vector<int> & pos, int D, std::vector<float> & pe) {
+    const int n = (int) pos.size();
+    pe.resize((size_t) n * D);
+    for (int i = 0; i < D / 2; ++i) {
+        const float inv = (float) (1.0 / std::pow(10000.0, (2.0 * i) / D));
+        for (int r = 0; r < n; ++r) {
+            const float a = inv * (float) pos[r];
+            pe[(size_t) r * D + 2 * i] = std::sin(a);
+            pe[(size_t) r * D + 2 * i + 1] = std::cos(a);
+        }
+    }
+}
 
-// make sure the per-layer position-key cache covers |p| <= need
+// make sure the per-layer position-key cache covers |p| <= need.
+// Cache rows c = 0..2P hold position p = P - c. Every row is computed on its
+// own (per-row activation scales), so growing the cache only computes the
+// new rows at both ends and keeps the old ones: the result is bit-identical
+// to a full rebuild, and a stream whose window grows pays for each row once.
 void ensure_rpos_cache(pk_model * m, int need) {
     if (need <= m->rc_P) return;
     const int P = ((std::max(need, 1) + 63) / 64) * 64;
     const int D = m->hp.d_model, n = 2 * P + 1;
-    std::vector<float> pe, r((size_t) n * D);
-    rel_pos_embed_P(P, D, pe);
+    const int oldP = m->rc_P;  // -1 when empty
+    const int n_top = oldP < 0 ? n : P - oldP;           // positions P .. oldP+1 (or everything)
+    const int n_bot = oldP < 0 ? 0 : P - oldP;           // positions -oldP-1 .. -P
+    std::vector<int> pos;
+    pos.reserve((size_t) n_top + n_bot);
+    for (int i = 0; i < n_top; ++i) pos.push_back(P - i);
+    for (int i = 0; i < n_bot; ++i) pos.push_back(-oldP - 1 - i);
+    const int nn = (int) pos.size();
+    std::vector<float> pe, r((size_t) nn * D);
+    rel_pos_rows(pos, D, pe);
     // Two-pass (residual) int8 quantisation: pe ~ s1*q1 + s2*q2, so the
     // cached keys carry ~14-bit activations. The keys feed every attention
-    // logit, and the cache is built once, so the second pass is free.
+    // logit, and each row is built once, so the second pass is cheap.
     qact q, q2;
-    quantize_acts(*m->pool, pe.data(), n, D, D, q);
+    quantize_acts(*m->pool, pe.data(), nn, D, D, q);
     std::vector<float> res(pe.size());
-    for (int t = 0; t < n; ++t) {
+    for (int t = 0; t < nn; ++t) {
         for (int k = 0; k < D; ++k) {
             const int c = k / 8, j = k % 8;
             const int8_t v = q.buf[(size_t) (t / 2) * q.pair_stride() + (size_t) c * 16 + (t & 1) * 8 + j];
             res[(size_t) t * D + k] = pe[(size_t) t * D + k] - (float) v * q.scale[t];
         }
     }
-    quantize_acts(*m->pool, res.data(), n, D, D, q2);
+    quantize_acts(*m->pool, res.data(), nn, D, D, q2);
     // PK_DEBUG_F32_ACTS runs the first pass on the fp32 source already
     const bool f32_debug = std::getenv("PK_DEBUG_F32_ACTS") != nullptr;
     m->rcache.resize(m->hp.n_layers);
@@ -743,28 +802,27 @@ void ensure_rpos_cache(pk_model * m, int need) {
         if (!f32_debug) {
             gemm_q8(*m->pool, *m->kt, m->layers[l].pos, q2, r.data(), D, epi::add, 1.0f);
         }
-        auto & c = m->rcache[l];
-        c.resize((size_t) n * D);
-        m->pool->parallel_for(n, 16, [&](int b, int e) {
-            for (size_t i = (size_t) b * D; i < (size_t) e * D; ++i) c[i] = (uint16_t) ggml_fp32_to_fp16(r[i]);
-        });
+        std::vector<uint16_t> c((size_t) n * D);
+        // new rows: [0, n_top) are cache rows 0..n_top-1; [n_top, nn) are the
+        // bottom rows n - n_bot .. n - 1; the old cache sits in between
+        auto put = [&](int src_row, int dst_row, int count) {
+            m->pool->parallel_for(count, 16, [&](int b, int e) {
+                for (int i = b; i < e; ++i) {
+                    const float * sr = r.data() + (size_t) (src_row + i) * D;
+                    uint16_t * dr = c.data() + (size_t) (dst_row + i) * D;
+                    for (int k = 0; k < D; ++k) dr[k] = (uint16_t) ggml_fp32_to_fp16(sr[k]);
+                }
+            });
+        };
+        put(0, 0, n_top);
+        if (oldP >= 0) {
+            const auto & old = m->rcache[l];
+            std::memcpy(c.data() + (size_t) n_top * D, old.data(), sizeof(uint16_t) * old.size());
+            put(n_top, n - n_bot, n_bot);
+        }
+        m->rcache[l].swap(c);
     }
     m->rc_P = P;
-}
-
-void rel_pos_embed_P(int P, int D, std::vector<float> & pe) {
-    // rows c = 0..2P, position p = P - c (the ParakeetEncoderRelPositionalEncoding order)
-    const int n = 2 * P + 1;
-    pe.resize((size_t) n * D);
-    for (int i = 0; i < D / 2; ++i) {
-        const float inv = (float) (1.0 / std::pow(10000.0, (2.0 * i) / D));
-        for (int r = 0; r < n; ++r) {
-            const float p = (float) (P - r);
-            const float a = inv * p;
-            pe[(size_t) r * D + 2 * i] = std::sin(a);
-            pe[(size_t) r * D + 2 * i + 1] = std::cos(a);
-        }
-    }
 }
 
 // rel-pos multi-head self-attention (Transformer-XL), full context.

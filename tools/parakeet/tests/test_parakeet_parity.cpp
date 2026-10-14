@@ -21,12 +21,20 @@
 //                         (what remains is the fp16 key cache and the
 //                         per-row int8 grid of the five-value levels).
 //   transcript at least PK_GATE_TEXT (default 0.9) of the utterances
-//              text-identical to the reference
+//              text-identical to the reference, and the word error rate
+//              against the reference transcripts (all utterances pooled,
+//              case-folded, punctuation kept) at most PK_GATE_REF_WER
+//              (default 0.02). The second gate bounds how far the
+//              utterances that differ may drift.
+//   An empty or unreadable fixture set fails: a parity gate that compared
+//   nothing must not pass.
 // The native encoder quantises activations to int8 (see parakeet.cpp), so
 // it is not bit-exact; the report prints the actual numbers.
 #include "parakeet.h"
 #include "pk-model.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -48,6 +56,30 @@ static bool read_f32(const std::string & path, std::vector<float> & out) {
 struct cmp {
     double max_abs = 0, min_cos = 1, mean_cos = 0, rel_l2 = 0;
 };
+
+static std::vector<std::string> words_of(const std::string & s) {
+    std::vector<std::string> w;
+    std::istringstream is(s);
+    std::string x;
+    while (is >> x) {
+        for (auto & ch : x) ch = (char) std::tolower((unsigned char) ch);
+        w.push_back(x);
+    }
+    return w;
+}
+
+static size_t edit_distance(const std::vector<std::string> & a, const std::vector<std::string> & b) {
+    std::vector<size_t> d(b.size() + 1), nd(b.size() + 1);
+    for (size_t j = 0; j <= b.size(); ++j) d[j] = j;
+    for (size_t i = 1; i <= a.size(); ++i) {
+        nd[0] = i;
+        for (size_t j = 1; j <= b.size(); ++j) {
+            nd[j] = std::min({ d[j] + 1, nd[j - 1] + 1, d[j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1) });
+        }
+        d.swap(nd);
+    }
+    return d[b.size()];
+}
 
 static cmp compare(const std::vector<float> & a, const std::vector<float> & b, int rows, int cols) {
     cmp c;
@@ -84,6 +116,7 @@ int main(int argc, char ** argv) {
     const double gate_l2 = std::getenv("PK_GATE_ENC_L2") ? std::atof(std::getenv("PK_GATE_ENC_L2"))
                                                          : (f32_acts ? 0.02 : 0.25);
     const double gate_text = std::getenv("PK_GATE_TEXT") ? std::atof(std::getenv("PK_GATE_TEXT")) : 0.9;
+    const double gate_wer = std::getenv("PK_GATE_REF_WER") ? std::atof(std::getenv("PK_GATE_REF_WER")) : 0.02;
     char err[512] = { 0 };
     pk_params pp = pk_default_params();
     pk_model * m = pk_model_load(argv[1], pp, err, sizeof(err));
@@ -100,6 +133,7 @@ int main(int argc, char ** argv) {
     }
     std::string line;
     int n = 0, same_text = 0, same_ids = 0, fails = 0, n_enc = 0;
+    size_t wer_err = 0, wer_words = 0;
     double worst_mel = 0, worst_cos = 1, worst_mean_cos = 1, worst_l2 = 0;
     while (std::getline(man, line)) {
         std::vector<std::string> f;
@@ -159,6 +193,11 @@ int main(int argc, char ** argv) {
         for (auto & t : toks) ids.push_back(t.id);
         const std::string text = pk::detokenize(m, toks.data(), toks.size());
         const bool st = text == ref_text, si = ids == ref_ids;
+        {
+            const auto rw = words_of(ref_text), gw = words_of(text);
+            wer_err += edit_distance(rw, gw);
+            wer_words += rw.size();
+        }
         same_text += st;
         same_ids += si;
         std::printf("  text %s\n", st ? "same" : "DIFF");
@@ -168,6 +207,16 @@ int main(int argc, char ** argv) {
     std::printf("\n%d utterances: text identical %d, token ids identical %d; worst mel max|d| %.2e; encoder over %d "
                 "dumps: worst mean frame cosine %.5f, worst min frame cosine %.5f, worst relative L2 %.4f\n",
                 n, same_text, same_ids, worst_mel, n_enc, worst_mean_cos, worst_cos, worst_l2);
+    const double ref_wer = wer_words ? (double) wer_err / (double) wer_words : 0.0;
+    std::printf("WER against the reference transcripts: %.4f (%zu errors / %zu words)\n", ref_wer, wer_err, wer_words);
+    if (n == 0 || wer_words == 0) {
+        std::printf("FAIL: no fixtures with reference transcripts were compared\n");
+        ++fails;
+    }
+    if (ref_wer > gate_wer) {
+        std::printf("FAIL: WER against the reference %.4f > %.4f\n", ref_wer, gate_wer);
+        ++fails;
+    }
     if (worst_mel > 2e-3) {
         std::printf("FAIL: mel differs by %.2e > 2e-3\n", worst_mel);
         ++fails;

@@ -937,10 +937,10 @@ static bool eliza_tts_stream_chunk(const float * samples, int n_samples, void * 
 #endif
 
 static void eliza_free_asr(EliInferenceContext * ctx) {
+    if (!ctx) return;
 #ifdef ELIZA_ENABLE_PARAKEET
     eliza_parakeet_free_locked(ctx);
 #endif
-    if (!ctx) return;
     if (ctx->asr_sampler) {
         llama_sampler_free(ctx->asr_sampler);
         ctx->asr_sampler = nullptr;
@@ -3211,13 +3211,16 @@ int eliza_inference_asr_stream_feed(
         eliza_set_error(out_error, "[libelizainference] asr_stream_feed: invalid arguments");
         return ELIZA_ERR_INVALID_ARG;
     }
-    std::vector<float> a;
-    eliza_parakeet_stream_resample(stream, pcm, n_samples, a);
-    const int rc = pk_stream_feed(stream->st, a.data(), a.size());
-    if (rc < 0) {
+    if (n_samples > (size_t) INT_MAX) {
+        eliza_set_error(out_error, "[libelizainference] asr_stream_feed: chunk too large");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::mutex> lock(stream->feed_mu);
+    if (stream->finished) {
         eliza_set_error(out_error, "[libelizainference] asr_stream_feed: stream already finished");
         return ELIZA_ERR_INVALID_ARG;
     }
+    eliza_parakeet_stream_resample(stream, pcm, n_samples, stream->pending);
     return (int) n_samples;
 }
 
@@ -3233,6 +3236,14 @@ static int eliza_parakeet_stream_text(EliAsrStream * stream, bool finish, char *
     if (!eliza_parakeet_active_locked(ctx) || ctx->parakeet->generation != stream->generation) {
         eliza_set_error(out_error, "[libelizainference] asr_stream: the ASR region was evicted; open a new stream");
         return ELIZA_ERR_INVALID_ARG;
+    }
+    {
+        std::lock_guard<std::mutex> flock(stream->feed_mu);
+        if (!stream->pending.empty()) {
+            pk_stream_feed(stream->st, stream->pending.data(), stream->pending.size());
+            stream->pending.clear();
+        }
+        if (finish) stream->finished = true;  /* later feeds fail */
     }
     ctx->asr_cancel.store(false, std::memory_order_release);
     const int rc = finish
