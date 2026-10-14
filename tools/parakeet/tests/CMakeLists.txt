@@ -4,6 +4,8 @@ add_executable(test-parakeet-kernels test_parakeet_kernels.cpp)
 target_link_libraries(test-parakeet-kernels PRIVATE parakeet_lib)
 target_include_directories(test-parakeet-kernels PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 add_test(NAME test-parakeet-kernels COMMAND test-parakeet-kernels)
+# weight-free and fast: runs in CI (ctest -L main)
+set_property(TEST test-parakeet-kernels PROPERTY LABELS main)
 
 # Model parity gate against reference_transformers.py dumps
 # (tools/dump_parakeet_reference.py). Needs the converted GGUF and the
