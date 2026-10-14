@@ -203,6 +203,8 @@ static void test_api(const std::string & lex) {
         int rc = 0;
         std::string out = phonemize(g, "[hello](/hɛ5o/)", &rc);
         CHECK(rc != 0 && out.find("vocabulary") != std::string::npos);
+        // the error must not echo text derived from the caller's input (it may be logged)
+        CHECK(out.find("hɛ") == std::string::npos);
         check_eq(phonemize(g, "[hello](/hɛlˈO/) world"), "hɛlˈO wˈɜɹld", "phoneme override");
     }
     // hostile input stays bounded: long runs, many subtokens, long numbers
