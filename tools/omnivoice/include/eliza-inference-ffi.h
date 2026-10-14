@@ -1,5 +1,5 @@
 /*
- * libelizainference FFI ABI v12.
+ * libelizainference FFI ABI v18.
  *
  * (Banner tracks ELIZA_INFERENCE_ABI_VERSION below; the per-version history is
  * at the end of this header preamble, newest first.)
@@ -134,6 +134,67 @@ extern "C" {
  * load and refuses to bind if they disagree.
  *
  * Changelog:
+ *   v18: text-model context capacity resolved before stream admission.
+ *         - `eliza_inference_llm_context_capacity(ctx, requested_context,
+ *           n_gpu_layers, &out_capacity, &err)` loads the resident text model
+ *           (if needed) and returns the context size `llm_stream_open` would
+ *           use: `requested_context`, else ELIZA_LLM_N_CTX, else 8192, clamped
+ *           to the GGUF training context. No decode context is allocated.
+ *         - `llm_stream_open` now shares that resolution and rejects a
+ *           non-positive capacity instead of creating a zero-sized context.
+ *       Additive symbol; no existing signature changes. A v17 library lacks
+ *       the symbol, so loaders must treat it as absent.
+ *   v17: Paradee-8M TTS with native misaki G2P, plus cancellation and
+ *       eviction for every TTS head and for ASR. All additions are new
+ *       symbols; no existing signature changes.
+ *         - `eliza_inference_paradee_supported/load/sample_rate/g2p_kind/
+ *           phonemize/synthesize_alloc/synthesize_phonemes_alloc`. Built
+ *           with `ELIZA_ENABLE_PARADEE` (TARGETs paradee_lib + misaki_g2p).
+ *           Text goes through the native misaki lexicon, is split into
+ *           <= 510-id chunks, and the PCM is concatenated. PCM is released
+ *           with `eliza_inference_free_pcm`.
+ *         - `eliza_inference_cancel_tts` now also stops in-flight Kokoro and
+ *           Paradee synthesis (ELIZA_ERR_CANCELLED). Paradee polls the flag
+ *           inside its graph and between chunks; Kokoro checks it before and
+ *           after the forward pass (kokoro_lib has no in-graph hook).
+ *         - `eliza_inference_asr_cancel` + `eliza_inference_asr_supported`.
+ *           Cancel is an atomic flag (no asr_mutex), checked by the llama
+ *           abort callback during prefill/decode, between mtmd chunks, and
+ *           before every decode token.
+ *         - `mmap_evict("tts")` frees Kokoro and Paradee (+ lexicon) as well
+ *           as OmniVoice, keeping their paths; the next synth or
+ *           `mmap_acquire("tts")` reloads them. `mmap_acquire("tts")` on a
+ *           bundle without OmniVoice weights succeeds when a Kokoro or
+ *           Paradee head is configured on the ctx.
+ *         - The OmniVoice GGUF picker skips `tts/paradee/` and `paradee*`
+ *           files, as it already skipped `tts/kokoro/`.
+ *       Streaming ASR (`asr_stream_*`) is unchanged and still reports
+ *       `asr_stream_supported() == 0`.
+ *   v16: context-local text-model GPU selection
+ *       (`eliza_inference_create_with_options`).
+ *   v15: Kokoro synthesis can return an exact-size, library-owned PCM buffer
+ *       through `eliza_inference_kokoro_synthesize_alloc` and
+ *       `eliza_inference_kokoro_synthesize_ipa_alloc`; callers release it with
+ *       `eliza_inference_free_pcm`. This removes guessed duration ceilings and
+ *       avoids running the model twice to discover an output size.
+ *   v14: Kokoro IPA input + G2P-kind capability query.
+ *        `eliza_inference_kokoro_g2p_kind()` reports whether the linked
+ *        kokoro_lib phonemizes raw text with real espeak-ng
+ *        (ELIZA_KOKORO_G2P_ESPEAK) or only the lossy per-byte ASCII fallback
+ *        (ELIZA_KOKORO_G2P_ASCII). `eliza_inference_kokoro_synthesize_ipa()`
+ *        takes precomputed espeak-ng IPA and routes it through the fixed Kokoro
+ *        vocab (`ipa_to_token_ids`), bypassing the in-lib phonemizer — the
+ *        intelligible path for espeak-less Android / iOS / host builds, fed by
+ *        the TS espeak-ng-WASM phonemizer (#11776). Before this, an espeak-less
+ *        fused build phonemized raw text with the ASCII grapheme fallback and
+ *        produced speech-shaped but unintelligible audio on every mobile build
+ *        and any host without libespeak-ng. Additive symbols — a v12/v13 caller
+ *        is unaffected; a library that predates this surface reports the symbols
+ *        absent and the loader falls back to the raw-text path.
+ *        NOTE ON NUMBERING: v13 (token-by-token vision describe) is the
+ *        main-lineage vision surface. This develop-pinned lineage (fork-sync
+ *        #11386) advances 12 -> 14 for the Kokoro IPA surface so the two
+ *        independent bumps stay collision-free through reconciliation.
  *   v13: token-by-token vision describe. `eliza_inference_vision_stream_supported()`
  *        + `_describe_image_stream` run the SAME mmproj-prefill + greedy decode as
  *        `_describe_image`, but invoke an `eliza_vision_chunk_cb` with each decoded
@@ -213,9 +274,9 @@ extern "C" {
  *   v7: real Silero VAD (same symbol surface as v6).
  *   v6: fused wake-word, speaker, diarizer.
  */
-#define ELIZA_INFERENCE_ABI_VERSION 13
+#define ELIZA_INFERENCE_ABI_VERSION 18
 
-/* Returns a static, NUL-terminated string of the form "13" matching
+/* Returns a static, NUL-terminated string of the form "18" matching
  * ELIZA_INFERENCE_ABI_VERSION at the time the library was built. The
  * pointer is owned by the library — do NOT free. */
 const char * eliza_inference_abi_version(void);
@@ -231,7 +292,34 @@ const char * eliza_inference_abi_version(void);
 #define ELIZA_ERR_FFI_FAULT       -4   /* mmap/madvise/syscall failure */
 #define ELIZA_ERR_OOM             -5   /* allocation failure */
 #define ELIZA_ERR_ABI_MISMATCH    -6   /* loader vs library disagree */
-#define ELIZA_ERR_CANCELLED       -7   /* caller requested cancellation (chunk cb / cancel_tts) */
+#define ELIZA_ERR_CANCELLED       -7   /* caller requested cancellation (chunk cb / cancel_tts / asr_cancel) */
+
+/* ---- Capability probes (per capability) --------------------------- *
+ *
+ * Probe before binding a surface; an absent symbol (older library) means
+ * unsupported. All probes are build properties and take no ctx unless noted.
+ *
+ *   capability              probe                                   since
+ *   ----------------------  --------------------------------------  -----
+ *   batch ASR + cancel      eliza_inference_asr_supported            v17
+ *   ASR word timestamps     eliza_inference_asr_timestamps_supported v12
+ *   streaming ASR           eliza_inference_asr_stream_supported     v2 (0 today)
+ *   OmniVoice stream+cancel eliza_inference_tts_stream_supported     v2
+ *   Kokoro TTS              eliza_inference_kokoro_supported         v10
+ *   Kokoro G2P kind         eliza_inference_kokoro_g2p_kind(ctx)     v14
+ *   Paradee TTS + misaki    eliza_inference_paradee_supported        v17
+ *   misaki fallback kind    eliza_inference_paradee_g2p_kind(ctx)    v17
+ *   Silero VAD              eliza_inference_vad_supported            v3/v7
+ *   wake word               eliza_inference_wakeword_supported       v5
+ *   speaker embedding       eliza_inference_speaker_supported        v6
+ *   diarizer                eliza_inference_diariz_supported         v6
+ *   streaming LLM           eliza_inference_llm_stream_supported     v4
+ *   MTP / KV-cache quant    eliza_inference_llm_{mtp,kv_quant}_supported v8
+ *   embeddings              eliza_inference_embed_supported          v9
+ *   vision describe         eliza_inference_vision_supported         v9
+ *   tokenize / detokenize   eliza_inference_tokenize_supported       v9
+ *   end-of-turn scoring     eliza_inference_llm_eot_supported        v11
+ */
 
 /* ---- Lifecycle ------------------------------------------------------ */
 
@@ -246,6 +334,14 @@ EliInferenceContext * eliza_inference_create(
     const char * bundle_dir,
     char ** out_error);
 
+/* Additive context-local text-model backend selection. Must be nonnegative;
+ * zero selects CPU. Applies before the first tokenize/embed/generation load.
+ * Does not change process-wide defaults or other contexts. */
+EliInferenceContext * eliza_inference_create_with_options(
+    const char * bundle_dir,
+    int32_t n_gpu_layers,
+    char ** out_error);
+
 /* Destroy a context. Idempotent for NULL. After this returns, every
  * pointer derived from the context (mmap regions, output buffers
  * written into via the caller) is invalid. */
@@ -258,7 +354,10 @@ void eliza_inference_destroy(EliInferenceContext * ctx);
  * by calling `mmap_evict(...)` on the same region names.
  *
  * `region_name` is a stable string in the set:
- *   - "tts"  : OmniVoice weights (mmap of tts/omnivoice-*.gguf)
+ *   - "tts"  : every TTS head on the ctx. OmniVoice weights (mmap of
+ *              tts/omnivoice-*.gguf), plus the Kokoro model + voice and the
+ *              Paradee model + misaki lexicon once they have been loaded with
+ *              `kokoro_load` / `paradee_load`.
  *   - "asr"  : ASR weights (mmap of asr/...)
  *   - "text" : text+vision weights (kept hot — always acquired)
  *   - "dflash" : drafter weights (kept hot — always acquired)
@@ -270,7 +369,20 @@ void eliza_inference_destroy(EliInferenceContext * ctx);
  * voice-only region to minimize voice-off RSS. Callers must treat an
  * evicted region as unavailable until a later `mmap_acquire(region)`.
  * The "text" and "dflash" regions are allowed to be no-ops because the
- * text runtime keeps them hot for voice-off text turns. */
+ * text runtime keeps them hot for voice-off text turns.
+ *
+ * Region semantics (ABI v17):
+ *   evict("tts")   frees OmniVoice, Kokoro and Paradee + lexicon. Each head
+ *                  is freed under its own lock, so a synth in flight on that
+ *                  head finishes first. Kokoro / Paradee paths are kept.
+ *   acquire("tts") reloads any Kokoro / Paradee head evicted above, then
+ *                  loads OmniVoice. It succeeds without OmniVoice weights in
+ *                  the bundle when a Kokoro or Paradee head is configured.
+ *   Kokoro / Paradee synth calls also reload an evicted head themselves, so
+ *   acquire("tts") is optional for them. OmniVoice synth still requires it.
+ *   evict("asr")   frees the ASR model, context, mmproj and sampler
+ *                  (unchanged); acquire("asr") reloads them.
+ *   "text", "dflash", "vad": no-ops. */
 int eliza_inference_mmap_acquire(
     EliInferenceContext * ctx,
     const char * region_name,
@@ -352,7 +464,15 @@ int eliza_inference_tts_synthesize_stream(
  * `eliza_inference_tts_synthesize_stream` on another thread). The
  * in-flight call returns ELIZA_ERR_CANCELLED at the next kernel
  * boundary. Returns ELIZA_OK whether or not a forward pass was running
- * (cancelling nothing is not an error). */
+ * (cancelling nothing is not an error).
+ *
+ * ABI v17: also cancels in-flight Kokoro (`kokoro_synthesize*`) and Paradee
+ * (`paradee_synthesize*`) calls. Each engine has its own flag and clears it
+ * when a call on that engine starts, so a cancel never carries over into a
+ * call that starts after it. Paradee stops inside the graph or between
+ * chunks; Kokoro is checked before and after its forward pass, so a Kokoro
+ * call finishes its current pass and then returns ELIZA_ERR_CANCELLED with
+ * no audio. */
 int eliza_inference_cancel_tts(
     EliInferenceContext * ctx,
     char ** out_error);
@@ -400,6 +520,149 @@ int eliza_inference_kokoro_synthesize(
 /* The loaded Kokoro model's audio sample rate (24000 for v1.0), or a
  * negative ELIZA_* code if no Kokoro model is loaded. */
 int eliza_inference_kokoro_sample_rate(EliInferenceContext * ctx);
+
+/* ---- Kokoro G2P kind + IPA synthesis (ABI v14) -------------------- *
+ *
+ * Which grapheme->phoneme path the linked kokoro_lib uses, so the TS voice
+ * layer can decide whether it must pre-phonemize:
+ *   ELIZA_KOKORO_G2P_ESPEAK (1): the lib links libespeak-ng and phonemizes raw
+ *       text correctly inside `eliza_inference_kokoro_synthesize` — pass text.
+ *   ELIZA_KOKORO_G2P_ASCII (0): the lib has NO espeak; the text path uses the
+ *       lossy per-byte ASCII grapheme fallback (unintelligible). The caller MUST
+ *       run its own espeak-ng G2P and call
+ *       `eliza_inference_kokoro_synthesize_ipa` with the IPA instead.
+ * This is a build property (independent of any loaded model); `ctx` is accepted
+ * for API symmetry. Returns a negative ELIZA_* code on a non-Kokoro build. */
+#define ELIZA_KOKORO_G2P_ASCII  0
+#define ELIZA_KOKORO_G2P_ESPEAK 1
+int eliza_inference_kokoro_g2p_kind(EliInferenceContext * ctx);
+
+/* Synthesize from precomputed espeak-ng IPA (UTF-8) instead of raw text: the
+ * IPA is mapped straight to Kokoro vocab ids (`ipa_to_token_ids`), bypassing the
+ * in-lib phonemizer. This is the intelligible path on espeak-less builds
+ * (Android / iOS / host-without-libespeak) — the TS layer runs the espeak-ng
+ * WASM phonemizer and passes the IPA here. Same return contract as
+ * `eliza_inference_kokoro_synthesize`. */
+int eliza_inference_kokoro_synthesize_ipa(
+    EliInferenceContext * ctx,
+    const char * ipa,
+    size_t ipa_len,
+    float speed,
+    float * out_pcm,
+    size_t max_samples,
+    char ** out_error);
+
+/* ---- Exact-size Kokoro PCM ownership (ABI v15) ------------------- *
+ *
+ * These entries run the same raw-text / IPA synthesis as the caller-buffer
+ * forms above, then transfer an exact-size malloc-owned PCM buffer to the
+ * caller. On success `*out_pcm` is NULL only when `*out_samples == 0`.
+ * Release every non-NULL result with `eliza_inference_free_pcm`.
+ *
+ * The allocation is owned by the library so callers do not guess an utterance
+ * duration, truncate valid audio, or repeat an expensive model forward merely
+ * to learn the required sample count. */
+int eliza_inference_kokoro_synthesize_alloc(
+    EliInferenceContext * ctx,
+    const char * text,
+    size_t text_len,
+    float speed,
+    float ** out_pcm,
+    size_t * out_samples,
+    char ** out_error);
+
+int eliza_inference_kokoro_synthesize_ipa_alloc(
+    EliInferenceContext * ctx,
+    const char * ipa,
+    size_t ipa_len,
+    float speed,
+    float ** out_pcm,
+    size_t * out_samples,
+    char ** out_error);
+
+void eliza_inference_free_pcm(float * pcm);
+
+/* ---- Paradee-8M TTS + native misaki G2P (ABI v17) ----------------- *
+ *
+ * Paradee-8M v1.0 (Apache-2.0, distilled from Kokoro-82M): one voice
+ * (af_heart), 24 kHz mono fp32 out. The model input is misaki phoneme ids
+ * (the Kokoro vocab) with a 0 pad at each end, at most 512 ids, plus a speed
+ * scalar. G2P runs natively through the misaki English lexicon + fallback
+ * linked into this library; no ONNX, no host phonemizer.
+ *
+ * Build flag `ELIZA_ENABLE_PARADEE` (TARGETs paradee_lib + misaki_g2p). In a
+ * build without it `paradee_supported() == 0` and every other entry returns
+ * ELIZA_ERR_NOT_IMPLEMENTED. Model + lexicon are owned by the ctx, guarded by
+ * their own lock (independent of OmniVoice / Kokoro), freed by
+ * `mmap_evict("tts")` (reloaded lazily) and by `eliza_inference_destroy`.
+ * `eliza_inference_cancel_tts` cancels an in-flight Paradee synth. */
+
+/* 1 when this build linked paradee_lib + misaki_g2p; 0 otherwise. */
+int eliza_inference_paradee_supported(void);
+
+/* Load the Paradee GGUF and the misaki lexicon into `ctx`. A repeat call with
+ * the same paths is a no-op. `espeak_data_dir` may be NULL: the lexicon then
+ * uses its rules fallback for out-of-vocabulary words (see `g2p_kind`).
+ * On failure the previously loaded model, if any, stays loaded. Returns
+ * ELIZA_OK or a negative ELIZA_* code with `*out_error` set. */
+int eliza_inference_paradee_load(
+    EliInferenceContext * ctx,
+    const char * gguf_path,
+    const char * lexicon_path,
+    const char * espeak_data_dir,
+    char ** out_error);
+
+/* Sample rate of the loaded model (24000 for v1.0). Still answers after
+ * `mmap_evict("tts")`. Negative ELIZA_* if `paradee_load` never succeeded. */
+int eliza_inference_paradee_sample_rate(EliInferenceContext * ctx);
+
+/* How the loaded misaki lexicon phonemizes words it does not contain. */
+#define ELIZA_PARADEE_G2P_LEXICON_ONLY 0  /* no fallback */
+#define ELIZA_PARADEE_G2P_RULES        1  /* native letter-to-sound rules */
+#define ELIZA_PARADEE_G2P_ESPEAK       2  /* eSpeak NG, converted to misaki spelling */
+/* Returns one of ELIZA_PARADEE_G2P_*, or a negative ELIZA_* code when no
+ * lexicon was loaded (or on a non-Paradee build). */
+int eliza_inference_paradee_g2p_kind(EliInferenceContext * ctx);
+
+/* Run the native G2P only: UTF-8 English text in, misaki phoneme string out.
+ * On success `*out_utf8` is a NUL-terminated heap string (free it with
+ * `eliza_inference_free_string`) and the return value is its byte length. */
+int eliza_inference_paradee_phonemize(
+    EliInferenceContext * ctx,
+    const char * text,
+    size_t text_len,
+    char ** out_utf8,
+    char ** out_error);
+
+/* Text -> PCM. Native misaki G2P, then the phoneme string is split into
+ * <= 510-id chunks (sentence ends, then clause punctuation, then spaces),
+ * each chunk is padded and synthesized, and the PCM is concatenated. `speed`
+ * scales the speaking rate (1.0 = native; <= 0 or non-finite means 1.0;
+ * other values are clamped to [0.25, 4]).
+ * On success `*out_pcm` is a malloc-owned buffer of `*out_samples` floats at
+ * `paradee_sample_rate` (NULL only when `*out_samples == 0`); release it with
+ * `eliza_inference_free_pcm`. Returns ELIZA_OK, ELIZA_ERR_CANCELLED after
+ * `eliza_inference_cancel_tts`, or another negative ELIZA_* code. */
+int eliza_inference_paradee_synthesize_alloc(
+    EliInferenceContext * ctx,
+    const char * text,
+    size_t text_len,
+    float speed,
+    float ** out_pcm,
+    size_t * out_samples,
+    char ** out_error);
+
+/* Same as `paradee_synthesize_alloc`, but the input is a misaki phoneme
+ * string (as returned by `paradee_phonemize`); G2P is skipped. Characters
+ * outside the model vocab are dropped. */
+int eliza_inference_paradee_synthesize_phonemes_alloc(
+    EliInferenceContext * ctx,
+    const char * misaki_phonemes,
+    size_t phonemes_len,
+    float speed,
+    float ** out_pcm,
+    size_t * out_samples,
+    char ** out_error);
 
 /* ---- OmniVoice reference encode (ABI v4) -------------------------- *
  *
@@ -696,6 +959,27 @@ int eliza_inference_asr_transcribe(
     size_t max_text_bytes,
     char ** out_error);
 
+/* ---- ASR probe + cancel (ABI v17) --------------------------------- */
+
+/* 1 when this build has the batch ASR path (mtmd audio encoder compiled in).
+ * Always 1 for libelizainference, which is only built with mtmd. Whether the
+ * bundle has ASR weights is answered by `mmap_acquire("asr")`. */
+int eliza_inference_asr_supported(void);
+
+/* Cancel the `asr_transcribe` / `asr_transcribe_timed` call in flight on
+ * `ctx` (from another thread). Sets an atomic flag without taking the ASR
+ * lock. The flag is checked by the llama abort callback during the prefill
+ * and decode graphs, between prompt chunks, and before every decode token;
+ * the audio encoder pass itself has no abort hook, so a cancel during it
+ * lands when that pass ends. The cancelled call returns ELIZA_ERR_CANCELLED.
+ * Each transcription clears the flag when it starts (after it holds the ASR
+ * lock), so a cancel with nothing in flight has no effect on later calls.
+ * Returns ELIZA_OK (cancelling nothing is not an error), or
+ * ELIZA_ERR_INVALID_ARG for a NULL ctx. */
+int eliza_inference_asr_cancel(
+    EliInferenceContext * ctx,
+    char ** out_error);
+
 /* ---- ASR word timestamps (ABI v12) -------------------------------- */
 
 /* Capability probe: returns 1 when this build can emit per-word timestamps
@@ -889,6 +1173,19 @@ typedef struct {
 /* Opaque streaming-LLM session. One per active generation. */
 typedef struct EliLlmStream EliLlmStream;
 
+/* Resolve the streaming context capacity against the resident text model
+ * before token admission (ABI v18). Loads the model with n_gpu_layers when
+ * necessary. requested_context <=0 uses ELIZA_LLM_N_CTX or 8192; the result
+ * is clamped to the GGUF training context exactly as stream_open does.
+ * On success, pass *out_capacity explicitly to stream_open to preserve this
+ * decision even if the environment changes. No decode context is allocated. */
+int eliza_inference_llm_context_capacity(
+    EliInferenceContext * ctx,
+    int32_t requested_context,
+    int32_t n_gpu_layers,
+    int32_t * out_capacity,
+    char ** out_error);
+
 /* Open a session anchored to `ctx`. Loads the bundle's text GGUF on first
  * open and reuses it across sessions. Returns NULL on failure with
  * `*out_error` populated. Close exactly once via `_close`. */
@@ -1017,6 +1314,22 @@ int eliza_inference_embed(
     const char * text,
     size_t text_len,
     int pooling,
+    float * out_embedding,
+    size_t out_capacity,
+    int * out_dim,
+    char ** out_error);
+
+/* Additive embedding entrypoint with explicit added-token handling.
+ * parse_special is 0 (literal input) or 1 (recognize vocabulary special tokens).
+ * Canonical BGE callers use 1 for both admission and inference. This entrypoint
+ * rejects inputs beyond the encoder context instead of encoding a prefix.
+ * The existing eliza_inference_embed ABI and its defaults remain available. */
+int eliza_inference_embed_with_options(
+    EliInferenceContext * ctx,
+    const char * text,
+    size_t text_len,
+    int pooling,
+    int parse_special,
     float * out_embedding,
     size_t out_capacity,
     int * out_dim,

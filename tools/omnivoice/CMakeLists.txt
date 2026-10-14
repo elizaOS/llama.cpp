@@ -139,8 +139,7 @@ set_target_properties(eliza_voice_classifiers PROPERTIES
     POSITION_INDEPENDENT_CODE ON)
 target_include_directories(eliza_voice_classifiers PUBLIC
     ${OMNIVOICE_VOICE_CLASSIFIER_INCLUDE_DIRS})
-if(MSVC)
-    target_compile_options(eliza_voice_classifiers PRIVATE /W3 /wd4100)
+if(WIN32)
     # The vendored voice-classifier C sources include <sys/mman.h> and
     # <unistd.h> (POSIX) to mmap their GGUF files read-only and use
     # open/close/read. MSVC ships neither header; this compat dir provides
@@ -149,10 +148,15 @@ if(MSVC)
     # Windows. Prepended via BEFORE so <sys/mman.h>/<unistd.h> resolve here.
     target_include_directories(eliza_voice_classifiers BEFORE PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/compat/msvc)
+endif()
+if(MSVC)
+    target_compile_options(eliza_voice_classifiers PRIVATE /W3 /wd4100)
 else()
     target_compile_options(eliza_voice_classifiers PRIVATE
         -O3 -Wall -Wextra -Wno-unused-parameter)
-    target_link_libraries(eliza_voice_classifiers PUBLIC m)
+    if(NOT WIN32)
+        target_link_libraries(eliza_voice_classifiers PUBLIC m)
+    endif()
 endif()
 
 # omnivoice_lib (STATIC) — the core. Tools link against this to pull
@@ -258,8 +262,28 @@ option(ELIZA_ENABLE_LITERT_LM "Build the LiteRT-LM in-process streaming-LLM back
 # (cutover plan M5 — Apple Silicon). OFF by default; ON is Apple-only and
 # requires the MLX / CoreML toolchain. See docs/multi-backend-ffi-seam.md.
 option(ELIZA_ENABLE_MLX "Build the CoreML/MLX in-process LLM backend (M5)" OFF)
+# Paradee-8M TTS + native misaki G2P (ABI v17). Folded in only when BOTH
+# paradee_lib and misaki_g2p exist (tools/paradee, tools/misaki-g2p; they must
+# be added before this directory, like kokoro_lib). PRIVATE: the
+# eliza_paradee:: / eliza_misaki:: C++ APIs stay behind the
+# eliza_inference_paradee_* surface.
+function(eliza_inference_fold_paradee target)
+    if(TARGET paradee_lib AND TARGET misaki_g2p)
+        target_link_libraries(${target} PRIVATE paradee_lib misaki_g2p)
+        target_include_directories(${target} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../paradee/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/../misaki-g2p/include)
+        target_compile_definitions(${target} PRIVATE ELIZA_ENABLE_PARADEE)
+    endif()
+endfunction()
 
 if(TARGET mtmd)
+    if(TARGET paradee_lib AND TARGET misaki_g2p)
+        message(STATUS "elizainference: Paradee TTS + misaki G2P enabled (ABI v17)")
+    elseif(TARGET paradee_lib OR TARGET misaki_g2p)
+        message(WARNING "elizainference: Paradee needs both paradee_lib and misaki_g2p; "
+                        "building without Paradee (paradee_supported() == 0)")
+    endif()
     add_library(elizainference SHARED
         ${OMNIVOICE_CORE_SOURCES}
         ${OMNIVOICE_FFI_SOURCES})
@@ -369,6 +393,7 @@ if(TARGET mtmd)
         target_link_libraries(elizainference PRIVATE
             "-framework Foundation" "-framework CoreML" "-framework Metal")
     endif()
+    eliza_inference_fold_paradee(elizainference)
     set_target_properties(elizainference PROPERTIES
         OUTPUT_NAME              elizainference
         POSITION_INDEPENDENT_CODE ON
@@ -423,10 +448,76 @@ if(TARGET mtmd)
             ${CMAKE_CURRENT_SOURCE_DIR}/../kokoro/include)
         target_compile_definitions(elizainference_static PRIVATE ELIZA_ENABLE_KOKORO)
     endif()
+    eliza_inference_fold_paradee(elizainference_static)
     set_target_properties(elizainference_static PROPERTIES
         OUTPUT_NAME              elizainference
         POSITION_INDEPENDENT_CODE ON)
+    if(WIN32)
+        # Keep the static archive distinct from the DLL import library.
+        set_target_properties(elizainference_static PROPERTIES OUTPUT_NAME elizainference_static)
+    endif()
     add_dependencies(elizainference_static omnivoice-version)
+
+    # FFI tests (ABI v18).
+    #   eliza-inference-test-abi      links the real libelizainference: ABI
+    #                                 string, probes, cancel/evict no-ops, and
+    #                                 (opt-in, ELIZA_TEST_ASR_DIR) a real-model
+    #                                 ASR cancel during prefill.
+    #   eliza-inference-test-paradee-asr  compiles the FFI bridge into the test
+    #                                 (ELIZA_INFERENCE_TEST_HOOKS) against the
+    #                                 scripted Paradee/misaki doubles in
+    #                                 tests/paradee-contract/: load/synth/cancel
+    #                                 race, chunking, evict -> reload, ASR cancel
+    #                                 during prefill and decode.
+    option(ELIZA_INFERENCE_BUILD_FFI_TESTS "Build the libelizainference FFI tests" ${LLAMA_BUILD_TESTS})
+    if(ELIZA_INFERENCE_BUILD_FFI_TESTS)
+        if(NOT WIN32)   # POSIX threads / mkdtemp
+            add_executable(eliza-inference-test-abi tests/ffi-abi.c)
+            set_target_properties(eliza-inference-test-abi PROPERTIES
+                C_STANDARD 11
+                C_STANDARD_REQUIRED ON)
+            target_include_directories(eliza-inference-test-abi PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/include)
+            find_package(Threads REQUIRED)
+            target_link_libraries(eliza-inference-test-abi PRIVATE elizainference Threads::Threads)
+            if(TARGET paradee_lib AND TARGET misaki_g2p)
+                target_compile_definitions(eliza-inference-test-abi PRIVATE ELIZA_TEST_EXPECT_PARADEE=1)
+            endif()
+            if(BUILD_TESTING)
+                add_test(NAME eliza-inference-test-abi COMMAND eliza-inference-test-abi)
+                # "main" is the label CI runs (ctest -L main); unlabelled
+                # tests are built but never executed there.
+                set_property(TEST eliza-inference-test-abi PROPERTY LABELS main)
+            endif()
+        endif()
+
+        add_executable(eliza-inference-test-paradee-asr
+            tests/ffi-paradee-asr.cpp
+            tests/paradee-contract/fake-paradee.cpp)
+        target_compile_features(eliza-inference-test-paradee-asr PRIVATE cxx_std_17)
+        target_compile_definitions(eliza-inference-test-paradee-asr PRIVATE
+            ${OMNIVOICE_COMPILE_DEFINITIONS}
+            ELIZA_ENABLE_PARADEE ELIZA_INFERENCE_TEST_HOOKS)
+        # The contract doubles come first so "paradee.h" / "misaki-g2p.h"
+        # resolve to them even when the real libraries are also configured.
+        target_include_directories(eliza-inference-test-paradee-asr BEFORE PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/paradee-contract)
+        target_include_directories(eliza-inference-test-paradee-asr PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ${OMNIVOICE_LLAMA_PRIVATE_INCLUDE_DIRS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../mtmd
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../common)
+        target_link_libraries(eliza-inference-test-paradee-asr PRIVATE
+            omnivoice_lib llama mtmd eliza_voice_classifiers llama-common)
+
+        if(BUILD_TESTING)
+            add_test(NAME eliza-inference-test-paradee-asr COMMAND eliza-inference-test-paradee-asr)
+            set_property(TEST eliza-inference-test-paradee-asr PROPERTY LABELS main)
+        endif()
+    endif()
 endif()
 
 # llama-server wiring — mount the OmniVoice POST /v1/audio/speech route
@@ -511,18 +602,14 @@ endif()
 # The default run uses deterministic synthetic DAC block shapes; pass
 # `--gguf <omnivoice-tokenizer.gguf>` to exercise real conv_t1 weights.
 #
-# The parity harness calls ggml_backend_cpu_init / ggml_backend_cpu_set_n_threads
-# directly, so it can only be built when the ggml-cpu CMake target is present.
-# On some cross-compile configurations (Android NDK in particular) the ggml-cpu
-# target is not defined, and the executable would fail to link. Gate the whole
-# target on ggml-cpu availability so those builds skip it cleanly.
-if(TARGET ggml-cpu)
+# Registry discovery supports both linked and dynamically loaded CPU backends.
+if(GGML_CPU)
     add_executable(omnivoice-dac-parity tests/dac-parity.cpp)
     target_compile_features(omnivoice-dac-parity PRIVATE cxx_std_17)
     target_include_directories(omnivoice-dac-parity PRIVATE
         ${CMAKE_SOURCE_DIR}/ggml/include
         ${CMAKE_SOURCE_DIR}/ggml/src)
-    target_link_libraries(omnivoice-dac-parity PRIVATE ggml ggml-cpu)
+    target_link_libraries(omnivoice-dac-parity PRIVATE ggml)
     if(TARGET ggml-base)
         target_link_libraries(omnivoice-dac-parity PRIVATE ggml-base)
     endif()

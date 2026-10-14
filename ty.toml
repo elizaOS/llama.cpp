@@ -15,6 +15,10 @@ include = [
     "./tools/server/tests/**",
     "./scripts/snapdragon/qdc/**",
     "./tools/mtmd/tests/**",
+    # Reference tools need the separately pinned Python speech environment.
+    "./tools/kokoro/tools/**",
+    "./tools/misaki-g2p/scripts/**",
+    "./tools/misaki-g2p/tests/**",
 ]
 
 [overrides.rules]

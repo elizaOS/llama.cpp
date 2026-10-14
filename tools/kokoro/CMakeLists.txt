@@ -19,6 +19,7 @@ set(KOKORO_PUBLIC_HEADERS
     include/kokoro-server-mount.h
     include/kokoro-tensor-names.h
     include/kokoro-layers.h
+    include/kokoro-model-internal.h
     include/kokoro-predictor.h)
 
 set(KOKORO_CORE_SOURCES
@@ -32,6 +33,8 @@ set(KOKORO_CORE_SOURCES
 add_library(kokoro_lib STATIC
     ${KOKORO_CORE_SOURCES}
     ${KOKORO_PUBLIC_HEADERS})
+# The fused inference shared library links this static archive.
+set_target_properties(kokoro_lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_include_directories(kokoro_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -52,11 +55,9 @@ target_link_libraries(kokoro_lib PUBLIC ggml)
 if(TARGET ggml-base)
     target_link_libraries(kokoro_lib PUBLIC ggml-base)
 endif()
-if(TARGET ggml-cpu)
-    target_link_libraries(kokoro_lib PUBLIC ggml-cpu)
-endif()
 
 target_compile_features(kokoro_lib PUBLIC cxx_std_17)
+target_compile_definitions(kokoro_lib PRIVATE KOKORO_USE_GGML_BACKEND)
 
 # kokoro-layers.h routes the Conv1d/ConvTranspose1d/Linear/LSTM hot loops
 # through the Accelerate BLAS (im2col + sgemm/sgemv) on Apple platforms —
@@ -70,12 +71,18 @@ else()
     find_package(Threads REQUIRED)
     target_link_libraries(kokoro_lib PUBLIC Threads::Threads)
 endif()
+if(ANDROID)
+    target_link_libraries(kokoro_lib PUBLIC log)
+endif()
 
 # Real G2P via libespeak-ng. When present, kokoro_phonemize() drives
 # espeak_TextToPhonemes() (en-us IPA) and maps codepoints to Kokoro vocab ids,
-# reproducing the reference token sequence. When absent, the build falls back
-# to the degraded ASCII grapheme mapping and the TS layer must supply IPA.
-# Override the search with -DKOKORO_ESPEAK_ROOT=<prefix> (e.g. Homebrew).
+# reproducing the reference token sequence. When absent, the text path falls
+# back to the degraded ASCII grapheme mapping — so an espeak-less build reports
+# `eliza_inference_kokoro_g2p_kind() == ELIZA_KOKORO_G2P_ASCII` and the TS voice
+# layer supplies espeak-ng (WASM) IPA through
+# `eliza_inference_kokoro_synthesize_ipa()` (ABI v14, #11776) to stay
+# intelligible. Override the search with -DKOKORO_ESPEAK_ROOT=<prefix> (Homebrew).
 option(KOKORO_ENABLE_ESPEAK "Link libespeak-ng for real Kokoro G2P" ON)
 if(KOKORO_ENABLE_ESPEAK)
     find_path(ESPEAK_NG_INCLUDE_DIR espeak-ng/speak_lib.h
@@ -90,7 +97,7 @@ if(KOKORO_ENABLE_ESPEAK)
         target_compile_definitions(kokoro_lib PRIVATE KOKORO_USE_ESPEAK)
         message(STATUS "Kokoro G2P: libespeak-ng found (${ESPEAK_NG_LIBRARY}) — real IPA path enabled")
     else()
-        message(STATUS "Kokoro G2P: libespeak-ng not found — falling back to ASCII grapheme mapping (TS layer must supply IPA)")
+        message(STATUS "Kokoro G2P: libespeak-ng not found — ASCII grapheme fallback; g2p_kind() reports ASCII so the TS layer feeds IPA via kokoro_synthesize_ipa (#11776)")
     endif()
 endif()
 

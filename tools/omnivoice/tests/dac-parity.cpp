@@ -9,7 +9,6 @@
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "ggml-cpu.h"
 #include "ggml.h"
 #include "gguf.h"
 
@@ -158,9 +157,14 @@ static void new_dac_conv_t1d_ggml(
     // ggml_graph_compute_with_ctx was removed upstream — use the ggml-backend
     // CPU path. Tensors live in the user-managed ctx buffer, which the CPU
     // backend can compute against directly.
-    ggml_backend_t backend = ggml_backend_cpu_init();
-    GGML_ASSERT(backend);
-    ggml_backend_cpu_set_n_threads(backend, 4);
+    ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    GGML_ASSERT(backend && "CPU backend unavailable");
+    ggml_backend_dev_t device = ggml_backend_get_device(backend);
+    ggml_backend_reg_t registry = device ? ggml_backend_dev_backend_reg(device) : nullptr;
+    auto set_threads = registry ? reinterpret_cast<ggml_backend_set_n_threads_t>(
+        ggml_backend_reg_get_proc_address(registry, "ggml_backend_set_n_threads")) : nullptr;
+    GGML_ASSERT(set_threads && "CPU backend does not expose thread configuration");
+    set_threads(backend, 4);
     ggml_backend_graph_compute(backend, gf);
     ggml_backend_free(backend);
 
@@ -269,6 +273,7 @@ static bool load_real_block(
 }
 
 int main(int argc, char ** argv) {
+    ggml_backend_load_all();
     const char * gguf_path   = nullptr;
     int          real_T_in   = 8;
     int          max_blocks  = 5;

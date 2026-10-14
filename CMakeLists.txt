@@ -115,6 +115,12 @@ option(LLAMA_USE_PREBUILT_UI "llama: use prebuilt UI from HF Bucket when availab
 option(LLAMA_TOOLS_INSTALL "llama: install tools" ${LLAMA_TOOLS_INSTALL_DEFAULT})
 option(LLAMA_TESTS_INSTALL "llama: install tests" ON)
 
+option(LLAMA_BUILD_KOKORO "Build native Kokoro speech" ON)
+option(LLAMA_BUILD_PARADEE "Build native Paradee speech" ON)
+option(LLAMA_BUILD_MISAKI_G2P "Build native misaki G2P" ON)
+option(LLAMA_BUILD_OMNIVOICE "Build native OmniVoice and fused inference" ON)
+option(OMNIVOICE_SHARED "Build libomnivoice for ABI consumers" OFF)
+
 # 3rd party libs
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
@@ -230,6 +236,21 @@ endif()
 option(LLAMA_BUILD_MTMD "llama: build tools/mtmd library standalone" OFF)
 if (LLAMA_BUILD_MTMD AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
     add_subdirectory(tools/mtmd)
+endif()
+
+if (NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
+    if (LLAMA_BUILD_KOKORO)
+        add_subdirectory(tools/kokoro)
+    endif()
+    if (LLAMA_BUILD_MISAKI_G2P)
+        add_subdirectory(tools/misaki-g2p)
+    endif()
+    if (LLAMA_BUILD_PARADEE AND LLAMA_BUILD_KOKORO)
+        add_subdirectory(tools/paradee)
+    endif()
+    if (LLAMA_BUILD_OMNIVOICE)
+        add_subdirectory(tools/omnivoice)
+    endif()
 endif()
 
 #
