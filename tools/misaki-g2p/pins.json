@@ -1,0 +1,117 @@
+{
+  "comment": "Inputs of tools/misaki-g2p. Paradee-8M was trained only on phonemes from misaki 0.9.4 configured as in paradee/tts.py: en.G2P(trf=False, british=False, fallback=espeak.EspeakFallback(british=False), unk=''). Everything here pins that configuration.",
+  "misaki": {
+    "repo": "https://github.com/hexgrad/misaki",
+    "commit": "fba1236595f2d2bf21d414ba6e57d25256afada3",
+    "license": "Apache-2.0",
+    "raw_url": "https://raw.githubusercontent.com/hexgrad/misaki/{commit}/{path}",
+    "files": {
+      "misaki/en.py": {
+        "bytes": 32505,
+        "sha256": "a9c36c90a3fa6c6084e9042fd8e19f6049add4f1435d8fe5ca1b77f3529a98f4",
+        "note": "Differs from the 0.9.4 wheel's en.py (sha256 ddf67ad3bc4dd98143dcc9b6fbcde259b9d879d8b91684201cf0deeb07aa9910) only by the FallbackNetwork class and its default, which paradee replaces with EspeakFallback; the G2P logic is the same."
+      },
+      "misaki/espeak.py": {
+        "bytes": 3799,
+        "sha256": "ebc39e807eeae7b99322109d8477aa16b605427f9cc852a4b1f6f72c45806a09",
+        "note": "Identical to the 0.9.4 wheel."
+      },
+      "misaki/data/us_gold.json": {
+        "bytes": 3000469,
+        "sha256": "dc414872a49a28ae6c141463d502fd945f3b2fde040484fdc47d00cc4612686f",
+        "note": "Identical to the 0.9.4 wheel."
+      },
+      "misaki/data/us_silver.json": {
+        "bytes": 3099517,
+        "sha256": "de8f67be911bb6c659187b4a65fd966b6a30e56350e0f790d763210b053ac475",
+        "note": "Identical to the 0.9.4 wheel."
+      }
+    },
+    "pypi_wheel": {
+      "file": "misaki-0.9.4-py3-none-any.whl",
+      "sha256": "90e2eeb169786c014c429e5058d2ea6bcd02d651f2a24450ba6c9ffc0f8da15a"
+    }
+  },
+  "lexicon": {
+    "file": "misaki-en-us.lex",
+    "format_version": 1,
+    "bytes": 12947790,
+    "sha256": "fbf09090cff0a41f3f579bf03ab9fc42710b04d7284767b10467a5f182c23925",
+    "note": "Output of convert_misaki_lexicon.py on the pinned us_gold.json/us_silver.json; deterministic, checked by the converter."
+  },
+  "espeak_ng": {
+    "version": "1.52.0",
+    "url": "https://github.com/espeak-ng/espeak-ng/archive/refs/tags/1.52.0.tar.gz",
+    "bytes": 17739803,
+    "sha256": "bb4338102ff3b49a81423da8a1a158b420124b055b60fa76cfb4b18677130a23",
+    "license": "GPL-3.0-or-later",
+    "license_flag": "GPL-3.0-or-later. Linking libespeak-ng makes the combined binary GPL; flagged, not blocked. Without it the OOV fallback spells words out (misaki_g2p_fallback_kind() == 0).",
+    "data": [
+      "phontab",
+      "phonindex",
+      "phondata",
+      "intonations",
+      "en_dict",
+      "lang/gmw/en",
+      "lang/gmw/en-US"
+    ],
+    "same_as": "espeakng-loader 0.2.4 (bundles libespeak-ng 1.52.0 with byte-identical en data), which misaki's EspeakFallback loads"
+  },
+  "e2m": {
+    "sources": [
+      "hexgrad/misaki@fba1236595f2d2bf21d414ba6e57d25256afada3 misaki/espeak.py EspeakFallback.E2M",
+      "sahilmahendrakar/paradee@9c8b4d7504cbee7e64de2d0341bb690f0b0ab708 web/misaki.js (sha256 84072f9db03f1139448044ca2549271de1e29d9e7b43da09607cd2cc413a5e39)"
+    ],
+    "note": "The native fallback asks libespeak-ng for tie marks like phonemizer does, so it applies misaki's espeak.py table exactly; web/misaki.js is the tie-less adaptation of the same table and is the cross-check."
+  },
+  "paradee": {
+    "repo": "https://github.com/sahilmahendrakar/paradee",
+    "commit": "9c8b4d7504cbee7e64de2d0341bb690f0b0ab708",
+    "license": "Apache-2.0",
+    "tts_py_sha256": "978c6eeea27f764e495065cf34cd1ca3da2a2d3645a615457e0a711f7af35042",
+    "wikitext_sents_json": {
+      "path": "training/data/wikitext_sents.json",
+      "bytes": 1308404,
+      "sha256": "95d7edd69cfbacb67ef7c4df120d31c1dab2a3c91a12fd287abe506760c6ac15",
+      "license": "CC-BY-SA-3.0 (WikiText-103, from Wikipedia)",
+      "license_flag": "CC-BY-SA share-alike text; the first 200 sentences are copied into tests/corpus/wikitext_heldout_200.txt as test data only."
+    }
+  },
+  "paradee_model": {
+    "repo": "https://huggingface.co/sahilmahendrakar/Paradee-8M-v1.0",
+    "revision": "8f34b01ef8adcb0bec470b89bf2fd62a7b2369e6",
+    "tag": "v1.0",
+    "config_json_sha256": "f24046974a3a8c747affefb45c7c504263a99d5081787908b16abe8f5ac94fcd",
+    "samples_sentences_txt_sha256": "2d411facb6b0429ad05f6ea3abf9c6a79ba6613990cadf54e2213e11a8c9fd1b"
+  },
+  "reference_python": {
+    "python": "3.12",
+    "misaki": "0.9.4",
+    "spacy": "3.8.16",
+    "en_core_web_sm": "3.8.0",
+    "en_core_web_sm_url": "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+    "num2words": "0.5.14",
+    "num2words_license_flag": "LGPL-2.1; used only by the reference script, never copied: the native number rules are written independently.",
+    "phonemizer-fork": "3.3.2",
+    "espeakng-loader": "0.2.4",
+    "source": "paradee/training/uv.lock at the paradee commit above (en_core_web_sm is what misaki downloads at first use for spaCy 3.8)"
+  },
+  "generator": {
+    "comment": "scripts/gen_tables.py: Python string tables and spaCy tokenizer exceptions compiled into src/*.inc",
+    "python": "3.12",
+    "spacy": "3.8.16",
+    "spacy_license": "MIT"
+  },
+  "eliza_android_sentences": {
+    "repo": "https://github.com/elizaOS/eliza",
+    "path": "packages/app/scripts/kokoro-voice/qualify/app/src/androidTest/assets/sentences.txt",
+    "sha256": "51387dfe3e38a4371821f31943bb91043a9a571f6424b82591613259ae03529d",
+    "commit": "38c892072c93a897dc8357436fc3915859be3bb0",
+    "copy": "tests/corpus/eliza_android_sentences.txt"
+  },
+  "fixtures": {
+    "reference.txt": "073a90f89a2b8af01b26d9e2aade8b60ae7cadaecdfc1a459c21daeac7e7c19b",
+    "agent_style.txt": "de406bbe3d4a388e596f36d1da9ff4103dfb1e52494172c5a162e5720f514654",
+    "comment": "Python misaki 0.9.4 reference phonemes (tests/compare_misaki.py reference); each has a .sha256 file the gate checks."
+  }
+}
