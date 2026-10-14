@@ -1,6 +1,8 @@
 // tools/parakeet/src/pk-kernels.h - int8 GEMM kernels for the five-value
 // (fv5) encoder linears and the int6 tables, plus the dispatch table.
 //
+// Tiers: scalar (portable), dotprod and i8mm (aarch64), avx2 (x86_64).
+//
 // Shared layouts (K is always a multiple of 16, rows a multiple of 8):
 //
 //   activations  [N/2 token pairs][K/8 chunks][16 bytes]
@@ -27,7 +29,7 @@
 
 namespace pk {
 
-enum class tier : int { scalar = 1, dotprod = 2, i8mm = 3 };
+enum class tier : int { scalar = 1, dotprod = 2, i8mm = 3, avx2 = 4 };
 
 struct kernel_table {
     tier t;
@@ -49,6 +51,7 @@ struct kernel_table {
 const kernel_table & kernels_for(int want /*0 = best*/);
 bool cpu_has_dotprod();
 bool cpu_has_i8mm();
+bool cpu_has_avx2();  // CPUID AVX2 and the OS saving YMM state (XGETBV)
 
 // per-tier tables (defined in their own translation units)
 const kernel_table & kernels_scalar();
@@ -56,6 +59,10 @@ const kernel_table & kernels_scalar();
 #define PK_HAVE_ARM_EXT 1
 const kernel_table & kernels_dotprod();
 const kernel_table & kernels_i8mm();
+#endif
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(PK_NO_X86_EXT)
+#define PK_HAVE_X86_EXT 1
+const kernel_table & kernels_avx2();
 #endif
 
 }  // namespace pk
