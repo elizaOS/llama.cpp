@@ -77,7 +77,7 @@ def main():
     check(a.container, PINS["archive_members"]["model.fermion"])
     sys.path.insert(0, str(a.snapshot))
     import torch
-    import reference_transformers as rt  # noqa: E402
+    import reference_transformers as rt  # type: ignore  # noqa: E402  (from the pinned snapshot)
 
     torch.set_num_threads(4)
     model, processor, info = rt.load_model(str(a.container), a.base_dir)

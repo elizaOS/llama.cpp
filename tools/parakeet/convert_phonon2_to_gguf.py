@@ -55,6 +55,7 @@ import subprocess
 import sys
 import tarfile
 from pathlib import Path
+from typing import Any, NoReturn
 
 import numpy as np
 
@@ -68,7 +69,7 @@ ARCH = "parakeet-tdt"
 NS = "parakeet"
 FORMAT = "fermion-five-value-parakeet-v1"
 
-HP = {
+HP: dict[str, Any] = {
     "d_model": 1024,
     "n_layers": 24,
     "n_heads": 8,
@@ -101,7 +102,7 @@ def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
-def die(msg: str) -> None:
+def die(msg: str) -> NoReturn:
     print(f"convert_phonon2_to_gguf: {msg}", file=sys.stderr)
     sys.exit(1)
 
@@ -504,7 +505,7 @@ def verify(out: Path, b: Builder, recs: dict):
         err = float(np.max(np.abs(ref.astype(np.float32) - t["feat.mel_fb"])))
         if err > 1e-7:
             die(f"verify: mel filterbank differs from librosa by {err}")
-        mel = f"librosa {librosa.__version__} max abs diff {err:.1e}"
+        mel = f"librosa {getattr(librosa, '__version__', '?')} max abs diff {err:.1e}"
     except ImportError:
         mel = "librosa not installed; filterbank not cross-checked"
     print(f"verify: OK, {nfv} five-value records and {nint} int records bit-identical; "

@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 
 def normaliser():
@@ -89,7 +90,8 @@ def main():
     for p in a.reference:
         for r in json.loads(Path(p).read_text())["rows"]:
             ref_text[r["id"]] = r["text"]
-    summary = {"normaliser": norm_name, "n": len(rows), "host_note": "host CPU numbers; not device evidence", "runs": {}}
+    summary: dict[str, Any] = {"normaliser": norm_name, "n": len(rows),
+                               "host_note": "host CPU numbers; not device evidence", "runs": {}}
     ok = True
     for th in a.threads:
         res = run(a.bench, a.model, rows, th, a.stream, a.extra.split())
@@ -97,7 +99,7 @@ def main():
         per = {r["id"]: r for r in res if not r.get("summary")}
         byid = {r["id"]: r for r in rows}
         splits = sorted({r.get("split", "all") for r in rows})
-        s = {k: tail[k] for k in ("kernel", "threads", "audio_s", "wall_s", "cpu_s", "rtfx_wall", "rtfx_cpu",
+        s: dict[str, Any] = {k: tail[k] for k in ("kernel", "threads", "audio_s", "wall_s", "cpu_s", "rtfx_wall", "rtfx_cpu",
                                   "peak_rss_mb", "load_ms", "loadavg")}
         refs = [norm(byid[i]["ref"]) for i in per]
         hyps = [norm(per[i]["text"]) for i in per]
