@@ -6,6 +6,7 @@
 #include "pk-ops.h"
 #include "pk-pool.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>

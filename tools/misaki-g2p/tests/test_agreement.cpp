@@ -12,6 +12,7 @@
 #include "misaki-g2p.h"
 #include "misaki-internal.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>

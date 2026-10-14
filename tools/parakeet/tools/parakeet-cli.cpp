@@ -6,6 +6,7 @@
 #include "parakeet.h"
 #include "pk-wav.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>

@@ -2,6 +2,7 @@
 // Reader for misaki-en-us.lex (written by convert_misaki_lexicon.py).
 #include "misaki-internal.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -124,7 +125,7 @@ std::unique_ptr<LexFile> LexFile::open(const std::string & path, std::string & e
 
 LexFile::~LexFile() {
 #if !defined(MISAKI_NO_MMAP)
-    if (mapped_ && base_) munmap((void *) base_, size_);
+    if (mapped_ && base_) munmap(const_cast<uint8_t *>(base_), size_);
 #endif
 }
 
