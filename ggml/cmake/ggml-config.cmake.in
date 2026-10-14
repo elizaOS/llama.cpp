@@ -188,7 +188,7 @@ if(NOT TARGET ggml::ggml)
     if (TARGET ggml::${_ggml_backend})
         list(APPEND _ggml_all_targets ggml::${_ggml_backend})
     endif()
-endforeach()
+endif()
 
 # Synthetic ggml::all aggregating every available backend — matches the
 # upstream contract used by examples/simple-cmake-pkg and any external
