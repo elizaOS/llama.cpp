@@ -144,6 +144,28 @@ extern "C" {
  *           non-positive capacity instead of creating a zero-sized context.
  *       Additive symbol; no existing signature changes. A v17 library lacks
  *       the symbol, so loaders must treat it as absent.
+ *       Parakeet-TDT ASR backend (additive behaviour, no new symbols, no
+ *       version bump):
+ *       builds that fold tools/parakeet (`ELIZA_ENABLE_PARAKEET`) serve the
+ *       ASR surface from a parakeet-tdt GGUF under `<bundle>/asr/` (e.g.
+ *       FermionResearch/Phonon-2, CC-BY-4.0) when `mmap_acquire("asr")`
+ *       finds one; `ELIZA_ASR_BACKEND=qwen3|parakeet` overrides. With it:
+ *         - `asr_transcribe_timed` returns TDT token-frame word times (80 ms
+ *           resolution) instead of duration-proportional ones;
+ *         - `asr_stream_supported()` returns 1 while at least one context has
+ *           the parakeet backend loaded (0 before `mmap_acquire("asr")`, after
+ *           `mmap_evict("asr")`, and for the Qwen3-ASR backend), and the
+ *           `asr_stream_*` session decodes pause-delimited windows with local
+ *           agreement. `stream_open` fails cleanly without the backend;
+ *           partial/finish on a stream whose region was evicted return
+ *           ELIZA_ERR_INVALID_ARG;
+ *         - stream `out_tokens` are never written (`*io_n_tokens = 0`):
+ *           Parakeet's SentencePiece vocabulary is not the text model's;
+ *         - `asr_cancel` is polled between encoder layers and decode steps;
+ *         - `asr_stream_feed` may run on another thread than partial/finish
+ *           (it only buffers, and never waits for a decode); `close` must not
+ *           race other calls on the same stream. Partial/finish truncate at a
+ *           UTF-8 boundary when `max_text_bytes` is too small.
  *   v17: Paradee-8M TTS with native misaki G2P, plus cancellation and
  *       eviction for every TTS head and for ASR. All additions are new
  *       symbols; no existing signature changes.
@@ -293,7 +315,7 @@ const char * eliza_inference_abi_version(void);
  *   ----------------------  --------------------------------------  -----
  *   batch ASR + cancel      eliza_inference_asr_supported            v17
  *   ASR word timestamps     eliza_inference_asr_timestamps_supported v12
- *   streaming ASR           eliza_inference_asr_stream_supported     v2 (0 today)
+ *   streaming ASR           eliza_inference_asr_stream_supported     v2 (1 with parakeet loaded, v18)
  *   OmniVoice stream+cancel eliza_inference_tts_stream_supported     v2
  *   Kokoro TTS              eliza_inference_kokoro_supported         v10
  *   Kokoro G2P kind         eliza_inference_kokoro_g2p_kind(ctx)     v14

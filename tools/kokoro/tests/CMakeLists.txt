@@ -50,3 +50,7 @@ add_test(NAME test-kokoro-layer-options COMMAND test-kokoro-layer-options)
 add_executable(test-kokoro-cancel test_kokoro_cancel.cpp)
 target_link_libraries(test-kokoro-cancel PRIVATE kokoro_lib)
 add_test(NAME test-kokoro-cancel COMMAND test-kokoro-cancel)
+
+# "main" is the label CI runs (ctest -L main); unlabelled tests are built but
+# never executed there. Only the self-contained, weight-free, offline tests.
+set_tests_properties(test-kokoro-cancel test-kokoro-layer-options test-kokoro-istft test-kokoro-layers-portable PROPERTIES LABELS main)
