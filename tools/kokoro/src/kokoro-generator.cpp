@@ -15,6 +15,10 @@
 //   - spec = exp(x[:11]), phase = sin(x[11:22]),
 //   - inverse STFT (center=True) -> audio.
 //
+// Widths, rates and the source convention come from GeneratorConfig; the
+// defaults (and kokoro_generator_forward) are Kokoro v1.0. Paradee-8M runs the
+// same code at Cin 128, stage channels 64/32, style 16.
+//
 // Config (kokoro v1.0 istftnet):
 //   style_dim=128, upsample_initial_channel=512,
 //   upsample_rates=[10,6], upsample_kernel_sizes=[20,12],
@@ -113,9 +117,53 @@ static void interp_linear(const float * x, int C, int T_in, int T_out, float * y
 // window. Output: mag[F, n_frames], phase[F, n_frames], F=n_fft/2+1,
 // n_frames = N/hop + 1.
 // ----------------------------------------------------------------------------
+// Canonical source STFT (GeneratorConfig::canonical_source_stft): the same
+// centred DFT with a double-precision window and basis tables, then values
+// at or below the frame's rounding floor (1e-12 * sum|x*w|) set to exactly 0
+// and torch.angle's convention for the phase (pi for a negative real value).
+// A float-rounded window would leave ~1e-8 residue in the empty bins of a
+// constant frame, above any useful floor, so the window here stays double.
+static void stft_center_canonical(const std::vector<float> & padded, int n_fft, int hop, int win,
+                                  int n_frames, std::vector<float> & mag, std::vector<float> & phase) {
+    const int F = n_fft / 2 + 1;
+    std::vector<double> w((size_t) win), cs((size_t) F * win), sn((size_t) F * win);
+    for (int k = 0; k < win; ++k) w[(size_t) k] = 0.5 - 0.5 * std::cos(2.0 * K_PI * (double) k / (double) win);
+    for (int f = 0; f < F; ++f) {
+        for (int k = 0; k < win; ++k) {
+            const double ang = 2.0 * K_PI * (double) f * (double) k / (double) n_fft;
+            cs[(size_t) f * win + k] = std::cos(ang) * w[(size_t) k];
+            sn[(size_t) f * win + k] = -std::sin(ang) * w[(size_t) k];
+        }
+    }
+    std::vector<double> x((size_t) win);
+    for (int t = 0; t < n_frames; ++t) {
+        const int off = t * hop;
+        double floor_abs = 0.0;
+        for (int k = 0; k < win; ++k) {
+            x[(size_t) k] = (double) padded[(size_t) (off + k)];
+            floor_abs += std::fabs(x[(size_t) k] * w[(size_t) k]);
+        }
+        floor_abs *= 1e-12;
+        for (int f = 0; f < F; ++f) {
+            double re = 0.0, im = 0.0;
+            const double * c = cs.data() + (size_t) f * win;
+            const double * s = sn.data() + (size_t) f * win;
+            for (int k = 0; k < win; ++k) {
+                re += x[(size_t) k] * c[k];
+                im += x[(size_t) k] * s[k];
+            }
+            if (std::fabs(re) <= floor_abs) re = 0.0;
+            if (std::fabs(im) <= floor_abs) im = 0.0;
+            mag[(size_t) f * n_frames + t] = (float) std::sqrt(re * re + im * im);
+            phase[(size_t) f * n_frames + t] =
+                (im == 0.0 && re < 0.0) ? (float) K_PI : (float) std::atan2(im, re);
+        }
+    }
+}
+
 static void stft_center(const float * sig, int N, int n_fft, int hop, int win,
                         std::vector<float> & mag, std::vector<float> & phase,
-                        int & F, int & n_frames) {
+                        int & F, int & n_frames, bool canonical) {
     F = n_fft / 2 + 1;
     const int pad = n_fft / 2;
     const int Np = N + 2 * pad;
@@ -130,6 +178,10 @@ static void stft_center(const float * sig, int N, int n_fft, int hop, int win,
     const std::vector<float> window = hann_periodic(win);
     mag.assign((size_t) F * n_frames, 0.0f);
     phase.assign((size_t) F * n_frames, 0.0f);
+    if (canonical) {
+        stft_center_canonical(padded, n_fft, hop, win, n_frames, mag, phase);
+        return;
+    }
     for (int t = 0; t < n_frames; ++t) {
         const int off = t * hop;
         for (int f = 0; f < F; ++f) {
@@ -141,8 +193,10 @@ static void stft_center(const float * sig, int N, int n_fft, int hop, int win,
                 re += v * std::cos(ang);
                 im += v * std::sin(ang);
             }
-            mag[(size_t) f * n_frames + t]   = (float) std::sqrt(re * re + im * im);
-            phase[(size_t) f * n_frames + t] = (float) std::atan2(im, re);
+            {
+                mag[(size_t) f * n_frames + t]   = (float) std::sqrt(re * re + im * im);
+                phase[(size_t) f * n_frames + t] = (float) std::atan2(im, re);
+            }
         }
     }
 }
@@ -163,17 +217,32 @@ static void istft_center(const float * mag, const float * phase,
     const std::vector<float> window = hann_periodic(win);
 
     std::vector<double> frame((size_t) n_fft);
+    // Basis tables and per-frame (re, im): the same double values the
+    // straightforward triple loop computes, evaluated once instead of n_fft
+    // times, so the sums (and their order) are unchanged.
+    std::vector<double> cos_t((size_t) F * n_fft), sin_t((size_t) F * n_fft);
+    for (int f = 0; f < F; ++f) {
+        for (int n = 0; n < n_fft; ++n) {
+            const double ang = 2.0 * K_PI * (double) f * (double) n / (double) n_fft;
+            cos_t[(size_t) f * n_fft + n] = std::cos(ang);
+            sin_t[(size_t) f * n_fft + n] = std::sin(ang);
+        }
+    }
+    std::vector<double> re_f((size_t) F), im_f((size_t) F);
     for (int t = 0; t < n_frames; ++t) {
+        for (int f = 0; f < F; ++f) {
+            const double m = mag[(size_t) f * n_frames + t];
+            const double p = phase[(size_t) f * n_frames + t];
+            re_f[(size_t) f] = m * std::cos(p);
+            im_f[(size_t) f] = m * std::sin(p);
+        }
         // irfft of the hermitian spectrum -> n_fft real samples.
         for (int n = 0; n < n_fft; ++n) {
             double s = 0.0;
             for (int f = 0; f < F; ++f) {
-                const double m = mag[(size_t) f * n_frames + t];
-                const double p = phase[(size_t) f * n_frames + t];
-                const double re = m * std::cos(p);
-                const double im = m * std::sin(p);
-                const double ang = 2.0 * K_PI * (double) f * (double) n / (double) n_fft;
-                double term = re * std::cos(ang) - im * std::sin(ang);
+                const double re = re_f[(size_t) f];
+                const double im = im_f[(size_t) f];
+                double term = re * cos_t[(size_t) f * n_fft + n] - im * sin_t[(size_t) f * n_fft + n];
                 if (f != 0 && !(n_fft % 2 == 0 && f == F - 1)) term *= 2.0;
                 s += term;
             }
@@ -203,6 +272,9 @@ static void istft_center(const float * mag, const float * phase,
 // ----------------------------------------------------------------------------
 static int get_padding(int k, int d) { return (k * d - d) / 2; }
 
+// Length after F.interpolate(scale_factor = 1 / upsample_scale).
+static int Lds_of(int L, int upsample_scale) { return L / upsample_scale; }
+
 static void adain_resblock1(const GenAdaResBlockWeights & w,
                             float * x, int C, int T, const float * s, int Sdim,
                             int K, const int dil[3]) {
@@ -210,12 +282,14 @@ static void adain_resblock1(const GenAdaResBlockWeights & w,
     for (int i = 0; i < 3; ++i) {
         const GenSubBlockWeights & sb = w.sub[i];
         std::memcpy(xt.data(), x, sizeof(float) * (size_t) C * T);
-        adain1d_forward(xt.data(), C, T, s, Sdim, sb.adain1_fc_w, sb.adain1_fc_b);
+        adain1d_forward(xt.data(), C, T, s, Sdim, sb.adain1_fc_w, sb.adain1_fc_b,
+                        sb.adain1_norm_w, sb.adain1_norm_b);
         snake1d_forward(xt.data(), C, T, sb.alpha1);
         const int d1 = dil[i];
         conv1d_forward(xt.data(), C, T, sb.conv1_w, sb.conv1_b, C, K, 1,
                        get_padding(K, d1), d1, y1.data(), T);
-        adain1d_forward(y1.data(), C, T, s, Sdim, sb.adain2_fc_w, sb.adain2_fc_b);
+        adain1d_forward(y1.data(), C, T, s, Sdim, sb.adain2_fc_w, sb.adain2_fc_b,
+                        sb.adain2_norm_w, sb.adain2_norm_b);
         snake1d_forward(y1.data(), C, T, sb.alpha2);
         conv1d_forward(y1.data(), C, T, sb.conv2_w, sb.conv2_b, C, K, 1,
                        get_padding(K, 1), 1, y2.data(), T);
@@ -226,25 +300,31 @@ static void adain_resblock1(const GenAdaResBlockWeights & w,
 } // namespace
 
 // ============================================================================
-// kokoro_generator_forward
+// generator_forward
 // ============================================================================
-void kokoro_generator_forward(
-        const float * x_in,      // [512, T0]
+bool generator_forward(
+        const float * x_in,      // [cfg.Cin, T0]
         int T0,                  // input time (== 2 * predictor T_frame)
-        const float * s,         // [128]
+        const float * s,         // [cfg.Sdim]
         const float * f0_curve,  // [T0]
         const GeneratorWeights & w,
-        std::vector<float> & audio /* out [T0 * 300] */) {
+        const GeneratorConfig & cfg,
+        std::vector<float> & audio /* out [T0 * upsample_scale] */) {
 
-    const int Sdim   = 128;
-    const int up0    = 10, up1 = 6;    // upsample rates
-    const int hop    = 5;
-    const int n_fft  = 20, win = 20;
-    const int upsample_scale = up0 * up1 * hop;  // 300
-    const int dim = 9;  // harmonic_num (8) + fundamental
-    const float sine_amp = 0.1f;
-    const float voiced_threshold = 10.0f;
-    const float sr = 24000.0f;
+    const int Sdim   = cfg.Sdim;
+    const int up0    = cfg.up_rates[0], up1 = cfg.up_rates[1];    // upsample rates
+    const int hop    = cfg.hop;
+    const int n_fft  = cfg.n_fft, win = cfg.n_fft;
+    const int upsample_scale = up0 * up1 * hop;  // Kokoro: 300
+    const int dim = cfg.harmonics;  // harmonic_num + fundamental (Kokoro: 9)
+    const float sine_amp = cfg.sine_amp;
+    const float voiced_threshold = cfg.voiced_threshold;
+    const float sr = cfg.sample_rate;
+    const auto cancelled = [&]() {
+        if (!cfg.cancel || !cfg.cancel(cfg.cancel_user)) return false;
+        audio.clear();
+        return true;
+    };
 
     // Phase checkpoints (KOKORO_PROFILE=1): logs the delta since the previous
     // mark, attributing generator time to source/stft, the two upsample
@@ -267,45 +347,83 @@ void kokoro_generator_forward(
         for (int r = 0; r < upsample_scale; ++r)
             f0_up[(size_t) t * upsample_scale + r] = f0_curve[t];
 
-    // fn = f0 * [1..9]; rad = (fn / sr) % 1 ; [dim, L] channel-major.
-    std::vector<float> rad((size_t) dim * L);
-    for (int h = 0; h < dim; ++h) {
-        const float mul = (float) (h + 1);
-        for (int t = 0; t < L; ++t) {
-            float v = f0_up[(size_t) t] * mul / sr;
-            v = v - std::floor(v);  // % 1
-            rad[(size_t) h * L + t] = v;
-        }
-    }
-    // Deterministic: rad[:,0,:] += 0 (no random initial phase).
-    // _f02sine: downsample rad by 1/upsample_scale (linear), cumsum*2pi,
-    // upsample by *upsample_scale (with phase scaled by upsample_scale), sin.
-    const int Lds = L / upsample_scale;  // 264
-    std::vector<float> rad_ds((size_t) dim * Lds);
-    interp_linear(rad.data(), dim, L, Lds, rad_ds.data());
-    // cumsum over time per channel, * 2*pi.
-    std::vector<float> phase_ds((size_t) dim * Lds);
-    for (int h = 0; h < dim; ++h) {
-        double cum = 0.0;
-        for (int t = 0; t < Lds; ++t) {
-            cum += (double) rad_ds[(size_t) h * Lds + t];
-            phase_ds[(size_t) h * Lds + t] = (float) (cum * 2.0 * K_PI);
-        }
-    }
-    // F.interpolate(phase * upsample_scale, scale=upsample_scale, linear).
-    std::vector<float> phase_scaled((size_t) dim * Lds);
-    for (size_t i = 0; i < (size_t) dim * Lds; ++i)
-        phase_scaled[i] = phase_ds[i] * (float) upsample_scale;
-    std::vector<float> phase_up((size_t) dim * L);
-    interp_linear(phase_scaled.data(), dim, Lds, L, phase_up.data());
-    // sines = sin(phase) * sine_amp ; voiced mask uv = (f0 > thr).
-    // sine_waves = sines * uv  (+ noise = 0). sine_merge = tanh(l_linear(sine_waves)).
     std::vector<float> sine_waves((size_t) dim * L);
-    for (int h = 0; h < dim; ++h) {
-        for (int t = 0; t < L; ++t) {
-            const float uv = (f0_up[(size_t) t] > voiced_threshold) ? 1.0f : 0.0f;
-            sine_waves[(size_t) h * L + t] =
-                std::sin(phase_up[(size_t) h * L + t]) * sine_amp * uv;
+    if (!cfg.precise_source) {
+        // fn = f0 * [1..9]; rad = (fn / sr) % 1 ; [dim, L] channel-major.
+        std::vector<float> rad((size_t) dim * L);
+        for (int h = 0; h < dim; ++h) {
+            const float mul = (float) (h + 1);
+            for (int t = 0; t < L; ++t) {
+                float v = f0_up[(size_t) t] * mul / sr;
+                v = v - std::floor(v);  // % 1
+                rad[(size_t) h * L + t] = v;
+            }
+        }
+        // Deterministic: rad[:,0,:] += 0 (no random initial phase).
+        // _f02sine: downsample rad by 1/upsample_scale (linear), cumsum*2pi,
+        // upsample by *upsample_scale (with phase scaled by upsample_scale), sin.
+        const int Lds = L / upsample_scale;  // 264
+        std::vector<float> rad_ds((size_t) dim * Lds);
+        interp_linear(rad.data(), dim, L, Lds, rad_ds.data());
+        // cumsum over time per channel, * 2*pi.
+        std::vector<float> phase_ds((size_t) dim * Lds);
+        for (int h = 0; h < dim; ++h) {
+            double cum = 0.0;
+            for (int t = 0; t < Lds; ++t) {
+                cum += (double) rad_ds[(size_t) h * Lds + t];
+                phase_ds[(size_t) h * Lds + t] = (float) (cum * 2.0 * K_PI);
+            }
+        }
+        // F.interpolate(phase * upsample_scale, scale=upsample_scale, linear).
+        std::vector<float> phase_scaled((size_t) dim * Lds);
+        for (size_t i = 0; i < (size_t) dim * Lds; ++i)
+            phase_scaled[i] = phase_ds[i] * (float) upsample_scale;
+        std::vector<float> phase_up((size_t) dim * L);
+        interp_linear(phase_scaled.data(), dim, Lds, L, phase_up.data());
+        // sines = sin(phase) * sine_amp ; voiced mask uv = (f0 > thr).
+        // sine_waves = sines * uv  (+ noise = 0). sine_merge = tanh(l_linear(sine_waves)).
+        for (int h = 0; h < dim; ++h) {
+            for (int t = 0; t < L; ++t) {
+                const float uv = (f0_up[(size_t) t] > voiced_threshold) ? 1.0f : 0.0f;
+                sine_waves[(size_t) h * L + t] =
+                    std::sin(phase_up[(size_t) h * L + t]) * sine_amp * uv;
+            }
+        }
+    } else {
+        // The same SineGen._f02sine steps in double, so the phase of the top
+        // harmonic (~1e5 rad after a few seconds) keeps sub-microradian
+        // precision; values are rounded to float only as sine_waves.
+        const double scale_dn = (double) L / (double) Lds_of(L, upsample_scale);
+        const int Lds = Lds_of(L, upsample_scale);
+        const double scale_up = (double) Lds / (double) L;
+        std::vector<double> phase_ds((size_t) Lds);
+        for (int h = 0; h < dim; ++h) {
+            const double mul = (double) (h + 1);
+            auto rad_at = [&](int t) {
+                double v = (double) f0_up[(size_t) t] * mul / (double) sr;
+                return v - std::floor(v);   // % 1
+            };
+            double cum = 0.0;
+            for (int o = 0; o < Lds; ++o) {
+                double src = ((double) o + 0.5) * scale_dn - 0.5;
+                if (src < 0.0) src = 0.0;
+                int s0 = std::min((int) src, L - 1);
+                const int s1 = s0 < L - 1 ? s0 + 1 : s0;
+                const double frac = std::min(std::max(src - (double) s0, 0.0), 1.0);
+                const double r0 = rad_at(s0), r1 = rad_at(s1);
+                cum += r0 * (1.0 - frac) + r1 * frac;
+                phase_ds[(size_t) o] = cum * 2.0 * K_PI * (double) upsample_scale;
+            }
+            for (int t = 0; t < L; ++t) {
+                double src = ((double) t + 0.5) * scale_up - 0.5;
+                if (src < 0.0) src = 0.0;
+                int s0 = std::min((int) src, Lds - 1);
+                const int s1 = s0 < Lds - 1 ? s0 + 1 : s0;
+                const double frac = std::min(std::max(src - (double) s0, 0.0), 1.0);
+                const double ph = phase_ds[(size_t) s0] * (1.0 - frac) + phase_ds[(size_t) s1] * frac;
+                const double uv = ((double) f0_up[(size_t) t] > (double) voiced_threshold) ? 1.0 : 0.0;
+                sine_waves[(size_t) h * L + t] = (float) (std::sin(ph) * (double) sine_amp * uv);
+            }
         }
     }
     // l_linear: Linear(9 -> 1). weight [1, 9], bias [1]. har_source[L].
@@ -316,14 +434,20 @@ void kokoro_generator_forward(
             acc += (double) w.l_linear_w[h] * (double) sine_waves[(size_t) h * L + t];
         har_source[(size_t) t] = std::tanh((float) acc);
     }
+    if (cfg.har_source_in && cfg.har_source_in->size() == har_source.size()) {
+        har_source = *cfg.har_source_in;
+    }
     DBG("har_source", har_source.data(), har_source.size());
+    if (cfg.har_source_out) *cfg.har_source_out = har_source;
+    if (cancelled()) return false;
 
     // ------------------------------------------------------------------
     // 2. STFT of har_source -> har = cat(mag, phase) [22, n_frames].
     // ------------------------------------------------------------------
     std::vector<float> hmag, hphase;
     int F = 0, n_frames = 0;
-    stft_center(har_source.data(), L, n_fft, hop, win, hmag, hphase, F, n_frames);
+    stft_center(har_source.data(), L, n_fft, hop, win, hmag, hphase, F, n_frames,
+                cfg.canonical_source_stft);
     const int Hc = 2 * F;  // 22
     std::vector<float> har((size_t) Hc * n_frames);
     std::memcpy(har.data(), hmag.data(), sizeof(float) * (size_t) F * n_frames);
@@ -343,15 +467,16 @@ void kokoro_generator_forward(
     // 3. Upsample stages.
     // ------------------------------------------------------------------
     const int ups_rate[2]   = { up0, up1 };
-    const int ups_k[2]      = { 20, 12 };
-    const int ch_after[2]   = { 256, 128 };   // upsample_initial_channel >> (i+1)
-    const int dil135[3]     = { 1, 3, 5 };
+    const int ups_k[2]      = { cfg.up_kernels[0], cfg.up_kernels[1] };
+    const int ch_after[2]   = { cfg.ch[0], cfg.ch[1] };   // upsample_initial_channel >> (i+1)
+    const int dil135[3]     = { cfg.dil[0], cfg.dil[1], cfg.dil[2] };
 
-    // current x: [512, 264] (copy, mutable).
-    int curC = 512, curT = T0;
+    // current x: [Cin, T0] (copy, mutable).
+    int curC = cfg.Cin, curT = T0;
     std::vector<float> x(x_in, x_in + (size_t) curC * curT);
 
     for (int i = 0; i < 2; ++i) {
+        if (cancelled()) return false;
         const int u = ups_rate[i], k = ups_k[i];
         const int outC = ch_after[i];
 
@@ -413,8 +538,9 @@ void kokoro_generator_forward(
 
         // resblocks: xs_sum = sum_j resblock[i*3+j](x, s) / 3.
         std::vector<float> accum((size_t) outC * xT, 0.0f);
-        const int rb_k[3] = { 3, 7, 11 };
+        const int rb_k[3] = { cfg.rb_kernels[0], cfg.rb_kernels[1], cfg.rb_kernels[2] };
         for (int j = 0; j < 3; ++j) {
+            if (cancelled()) return false;
             std::vector<float> rb(xs);  // copy current x
             adain_resblock1(w.resblocks[i * 3 + j], rb.data(), outC, xT, s, Sdim,
                             rb_k[j], dil135);
@@ -431,6 +557,7 @@ void kokoro_generator_forward(
     // ------------------------------------------------------------------
     // 4. conv_post -> spec/phase -> iSTFT.
     // ------------------------------------------------------------------
+    if (cancelled()) return false;
     leaky_relu(x.data(), curC * curT, 0.01f);  // F.leaky_relu (no slope arg) = default 0.01
     const int cpC = n_fft + 2;  // 22
     std::vector<float> cp((size_t) cpC * curT);
@@ -449,6 +576,21 @@ void kokoro_generator_forward(
     }
     istft_center(spec.data(), phase.data(), n_fft, hop, win, curT, audio);
     prof_mark("  gen: post+istft");
+    return true;
+}
+
+// ============================================================================
+// kokoro_generator_forward (Kokoro-82M defaults)
+// ============================================================================
+void kokoro_generator_forward(
+        const float * x_in,      // [512, T0]
+        int T0,                  // input time (== 2 * predictor T_frame)
+        const float * s,         // [128]
+        const float * f0_curve,  // [T0]
+        const GeneratorWeights & w,
+        std::vector<float> & audio /* out [T0 * 300] */) {
+    GeneratorConfig cfg;
+    generator_forward(x_in, T0, s, f0_curve, w, cfg, audio);
 }
 
 } // namespace eliza_kokoro
