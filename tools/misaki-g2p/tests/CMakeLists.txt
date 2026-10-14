@@ -39,6 +39,9 @@ set_tests_properties(misaki_g2p_mini_lexicon PROPERTIES FIXTURES_SETUP misaki_mi
 
 add_test(NAME misaki_g2p_unit COMMAND test-misaki-g2p ${MINI_LEX} ${MISAKI_TEST_DATA})
 set_tests_properties(misaki_g2p_unit PROPERTIES FIXTURES_REQUIRED misaki_mini_lex)
+# "main" is the label CI runs (ctest -L main): both are offline (committed
+# mini lexicon data) and need neither eSpeak nor model weights.
+set_tests_properties(misaki_g2p_mini_lexicon misaki_g2p_unit PROPERTIES LABELS main)
 
 if (MISAKI_G2P_LEXICON)
     set(FULL_LEX ${MISAKI_G2P_LEXICON})
