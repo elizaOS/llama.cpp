@@ -81,6 +81,19 @@ def test_invalid_rerank_req(documents):
     assert "error" in res.body
 
 
+@pytest.mark.parametrize("field", ["documents", "texts"])
+def test_rerank_negative_top_n(field):
+    global server
+    server.start()
+    res = server.make_request("POST", "/rerank", data={
+        "query": "Machine learning is",
+        field: TEST_DOCUMENTS,
+        "top_n": -1,
+    })
+    assert res.status_code == 400
+    assert "error" in res.body
+
+
 @pytest.mark.parametrize(
     "query,doc1,doc2,n_tokens",
     [

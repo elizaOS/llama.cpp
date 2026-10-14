@@ -13,13 +13,13 @@
 #ifndef GGML_SYCL_DPCT_HELPER_HPP
 #define GGML_SYCL_DPCT_HELPER_HPP
 
-#include <cstdlib>
-#include <iostream>
-#include <map>
-
 #include <sycl/sycl.hpp>
 #include <sycl/half_type.hpp>
 #include <oneapi/mkl.hpp>
+
+#include <map>
+
+#include "ggml.h"
 
 #if defined(__linux__)
 #include <sys/mman.h>
@@ -43,7 +43,6 @@
 #include <windows.h>
 #endif
 
-
 #define DPCT_COMPATIBILITY_TEMP (900)
 
 #if defined(_MSC_VER)
@@ -59,13 +58,6 @@
 #else
 #define __dpct_noinline__ __attribute__((noinline))
 #endif
-
-#define DPCT_UNUSED(x) (void)(x)
-
-inline void _abort(const char * str) {
-    std::cerr << str << std::endl;
-    std::abort();
-}
 
 inline std::string get_device_type_name(const sycl::device &Device) {
     auto DeviceType = Device.get_info<sycl::info::device::device_type>();
@@ -1025,7 +1017,7 @@ namespace dpct
             if (backend == "opencl:cpu") return 4;
             if (backend == "opencl:acc") return 5;
             printf("convert_backend_index: can't handle backend=%s\n", backend.c_str());
-            _abort("fatal error");
+            GGML_ABORT("fatal error");
         }
         static bool compare_backend(std::string &backend1, std::string &backend2) {
             return convert_backend_index(backend1) < convert_backend_index(backend2);
@@ -1434,7 +1426,7 @@ namespace dpct
             if (!size)
                 return sycl::event{};
             return q.memcpy(to_ptr, from_ptr, size, dep_events);
-            DPCT_UNUSED(direction);
+            GGML_UNUSED(direction);
         }
 
         // Get actual copy range and make sure it will not exceed range.
@@ -2100,7 +2092,7 @@ namespace dpct
         if (!size)
             return sycl::event{};
         return q.memcpy(to_ptr, from_ptr, size, dep_events);
-        DPCT_UNUSED(direction);
+        GGML_UNUSED(direction);
     }
 
     // Get actual copy range and make sure it will not exceed range.

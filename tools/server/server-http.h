@@ -3,12 +3,10 @@
 #include <atomic>
 #include <functional>
 #include <map>
-#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 #include <cstdint>
-#include <unordered_map>
 
 struct common_params;
 
@@ -24,13 +22,11 @@ struct server_http_res {
     std::string data;
     std::map<std::string, std::string> headers;
 
+    // TODO: move this to a virtual function once we have proper polymorphism support
     std::function<bool(std::string &)> next = nullptr;
     bool is_stream() const {
         return next != nullptr;
     }
-
-    // fired before req and res are destroyed
-    virtual void on_complete() {}
 
     virtual ~server_http_res() = default;
 };
@@ -77,8 +73,7 @@ struct server_http_context {
 
     std::string path_prefix;
     std::string hostname;
-    int port    = 8080;
-    bool is_ssl = false;
+    int port;
 
     server_http_context();
     ~server_http_context();
@@ -89,11 +84,10 @@ struct server_http_context {
 
     void get(const std::string & path, const handler_t & handler) const;
     void post(const std::string & path, const handler_t & handler) const;
-    void del(const std::string & path, const handler_t & handler) const;
 
     // Register the Google Cloud Platform (Vertex AI) compat (AIP_PREDICT_ROUTE env var, or /predict)
     // Must be called AFTER all other API routes are registered
-    void register_gcp_compat() const;
+    void register_gcp_compat();
 
     // for debugging
     std::string listening_address;

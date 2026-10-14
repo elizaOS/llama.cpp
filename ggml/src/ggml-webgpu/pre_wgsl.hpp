@@ -37,31 +37,13 @@ static std::string trim(const std::string & s) {
 }
 
 static std::string trim_value(std::istream & is) {
-    std::ostringstream ss;
-    ss << is.rdbuf();
-    return trim(ss.str());
+    std::string str;
+    std::getline(is, str);
+    return trim(str);
 }
 
 static bool isIdentChar(char c) {
     return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
-}
-
-static bool endsWithContinuation(const std::string & line) {
-    size_t i = line.size();
-    while (i > 0 && std::isspace((unsigned char) line[i - 1])) {
-        i--;
-    }
-    return i > 0 && line[i - 1] == '\\';
-}
-
-static void stripContinuation(std::string & line) {
-    size_t i = line.size();
-    while (i > 0 && std::isspace((unsigned char) line[i - 1])) {
-        i--;
-    }
-    if (i > 0 && line[i - 1] == '\\') {
-        line.erase(i - 1);
-    }
 }
 
 static std::string expandMacrosRecursiveInternal(const std::string &                                  line,
@@ -613,31 +595,19 @@ class Preprocessor {
         std::string        line;
 
         while (std::getline(in, line)) {
-            std::string logical = line;
-            std::string t       = trim(logical);
-            if (!t.empty() && t[0] == '#') {
-                while (endsWithContinuation(logical)) {
-                    stripContinuation(logical);
-                    if (!std::getline(in, line)) {
-                        break;
-                    }
-                    logical += "\n";
-                    logical += line;
-                }
-                t = trim(logical);
-            }
+            std::string t = trim(line);
 
             if (!t.empty() && t[0] == '#') {
                 bool handled = handleDirective(t, out, macros, predefined_macros, cond, include_stack, mode);
                 if (mode == DirectiveMode::IncludesOnly && !handled) {
-                    out << logical << "\n";
+                    out << line << "\n";
                 }
             } else {
                 if (mode == DirectiveMode::IncludesOnly) {
-                    out << logical << "\n";
+                    out << line << "\n";
                 } else if (condActive(cond)) {
                     // Expand macros in the line before outputting
-                    std::string expanded = expandMacrosRecursive(logical, macros);
+                    std::string expanded = expandMacrosRecursive(line, macros);
                     out << expanded << "\n";
                 }
             }

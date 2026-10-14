@@ -12,6 +12,10 @@
 #include <cstdio>
 #include <cstdlib>
 
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
+
 namespace eliza_kokoro {
 
 inline bool kokoro_profile_enabled() {
@@ -22,8 +26,16 @@ inline bool kokoro_profile_enabled() {
     return on;
 }
 
-// RAII phase timer: logs "<label> <ms>" to stderr on scope exit when
-// KOKORO_PROFILE is set.
+inline void kokoro_profile_emit(const char * label, double ms) {
+#if defined(__ANDROID__)
+    __android_log_print(ANDROID_LOG_INFO, "KokoroProfile", "%s %.1f ms", label, ms);
+#else
+    std::fprintf(stderr, "[kokoro-profile] %-28s %10.1f ms\n", label, ms);
+#endif
+}
+
+// Android sends phases to logcat because app-process stderr is not observable;
+// other hosts use stderr so CLI benchmarks remain pipe-friendly.
 class kokoro_phase_timer {
   public:
     explicit kokoro_phase_timer(const char * label)
@@ -36,7 +48,7 @@ class kokoro_phase_timer {
         if (!kokoro_profile_enabled()) return;
         const double ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t0_).count();
-        std::fprintf(stderr, "[kokoro-profile] %-28s %10.1f ms\n", label_, ms);
+        kokoro_profile_emit(label_, ms);
     }
 
   private:

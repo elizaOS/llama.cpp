@@ -1,0 +1,134 @@
+/** Computes packed TBQ attention scores against unconditioned queries.
+ * The 32-value sign/Hadamard transform and packed codes match ggml-quants.c.
+ */
+
+#version 450
+#extension GL_EXT_shader_16bit_storage  : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+// blocks_per_workgroup — one SPV, device-specialized at pipeline-create time.
+layout(constant_id = 0) const uint BLOCKS_PER_WG = 1u;
+
+layout(std430, binding = 0) readonly buffer QBuf {
+    float q[];
+};
+layout(std430, binding = 1) readonly buffer KBuf {
+    uint k_packed[];
+};
+layout(std430, binding = 2) writeonly buffer OutBuf {
+    float scores[];
+};
+
+layout(push_constant) uniform Push {
+    uint head_dim;          // must be 128
+    uint n_kv;
+    uint kv_stride_blocks;  // 4 for d=128
+    uint q_head;
+    uint head_offset_bytes;
+} push;
+
+const float TURBO_CENTROIDS_3BIT[8] = float[8](
+    -2.1519457, -1.3439093, -0.7560053, -0.2450942,
+     0.2450942, 0.7560053, 1.3439093, 2.1519457
+);
+
+float fp16_to_fp32(uint h16) {
+    return unpackHalf2x16(h16).x;
+}
+
+uint read_byte(uint b) {
+    uint w = k_packed[b >> 2];
+    return (w >> ((b & 3u) * 8u)) & 0xFFu;
+}
+uint read_u16(uint b) {
+    return read_byte(b) | (read_byte(b + 1u) << 8u);
+}
+
+shared float partials[32];
+
+float reduce_sum_32(float v, uint tid) {
+    partials[tid] = v;
+    barrier();
+    for (uint stride = 16u; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        barrier();
+    }
+    return partials[0];
+}
+
+// Match tbq_precondition_block: the packed keys store H(sign * K).
+shared float conditioned_q[128];
+const float TBQ_SIGNS[32] = float[32](
+    1, -1, 1, 1, -1, 1, -1, -1, 1, 1, -1, 1, -1, -1, 1, -1,
+    -1, 1, 1, -1, 1, -1, -1, 1, 1, -1, 1, -1, -1, 1, -1, 1
+);
+
+void condition_query(uint tid) {
+    for (uint b = 0u; b < 4u; ++b) {
+        conditioned_q[b * 32u + tid] = q[push.q_head * push.head_dim + b * 32u + tid] * TBQ_SIGNS[tid];
+    }
+    barrier();
+    for (uint stride = 1u; stride < 32u; stride <<= 1u) {
+        float next_value[4];
+        for (uint b = 0u; b < 4u; ++b) {
+            float a = conditioned_q[b * 32u + (tid & ~stride)];
+            float z = conditioned_q[b * 32u + (tid | stride)];
+            next_value[b] = (tid & stride) == 0u ? a + z : a - z;
+        }
+        barrier();
+        for (uint b = 0u; b < 4u; ++b) {
+            conditioned_q[b * 32u + tid] = next_value[b];
+        }
+        barrier();
+    }
+    for (uint b = 0u; b < 4u; ++b) {
+        conditioned_q[b * 32u + tid] *= 0.1767766952966369;
+    }
+    barrier();
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    condition_query(tid);
+    uint base_elem = tid * 4u;
+    uint block = base_elem >> 5;              // 0..3
+    uint within0 = base_elem & 31u;           // 0,4,8,...,28
+
+    uint kv_base = gl_WorkGroupID.x * BLOCKS_PER_WG;
+    for (uint b = 0u; b < BLOCKS_PER_WG; ++b) {
+        uint kv_idx = kv_base + b;
+        if (kv_idx >= push.n_kv) {
+            // Every thread agrees on the trip count (kv_idx is uniform), so a
+            // collective return here is safe even though reduce uses barrier().
+            return;
+        }
+
+        uint group_byte_off = push.head_offset_bytes + kv_idx * (push.kv_stride_blocks * 14u);
+        uint blk_off = group_byte_off + block * 14u;
+        float norm = fp16_to_fp32(read_u16(blk_off));
+
+        float acc = 0.0;
+        for (uint local = 0u; local < 4u; local += 1u) {
+            uint within = within0 + local;
+            uint bit = within * 3u;
+            uint byte_offset = bit >> 3u;
+            uint bits = read_byte(blk_off + 2u + byte_offset) >> (bit & 7u);
+            if ((bit & 7u) > 5u && byte_offset + 1u < 12u) {
+                bits |= read_byte(blk_off + 3u + byte_offset) << (8u - (bit & 7u));
+            }
+            uint idx = bits & 7u;
+            float k_val = TURBO_CENTROIDS_3BIT[idx] * norm;
+            acc = fma(conditioned_q[base_elem + local], k_val, acc);
+        }
+
+        float sum = reduce_sum_32(acc, tid);
+        if (tid == 0u) {
+            scores[push.q_head * push.n_kv + kv_idx] = sum;
+        }
+    }
+}

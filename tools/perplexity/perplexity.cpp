@@ -24,6 +24,11 @@
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
 
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 struct results_perplexity {
     std::vector<llama_token> tokens;
     double                   ppl_value;
@@ -157,7 +162,7 @@ static void process_logits(std::ostream& out, int n_vocab, const float * logits,
                 break;
             }
             lock.unlock();
-            const double v = log_softmax(n_vocab, logits + size_t(i)*n_vocab, log_probs.data() + size_t(i)*nv, tokens[i+1]);
+            const double v = log_softmax(n_vocab, logits + size_t(i)*n_vocab, log_probs.data() + i*nv, tokens[i+1]);
             local_nll += v;
             local_nll2 += v*v;
         }
@@ -169,7 +174,7 @@ static void process_logits(std::ostream& out, int n_vocab, const float * logits,
     for (auto & w : workers) {
         w.join();
     }
-    out.write((const char *)log_probs.data(), size_t(n_token)*nv*sizeof(uint16_t));
+    out.write((const char *)log_probs.data(), n_token*nv*sizeof(uint16_t));
 }
 
 struct kl_divergence_result {
@@ -279,7 +284,7 @@ static void process_logits(int n_vocab, const float * logits, const int * tokens
                 break;
             }
             lock.unlock();
-            std::pair<double, float> v = log_softmax(n_vocab, logits + size_t(i)*n_vocab, base_log_probs.data() + size_t(i)*nv, tokens[i+1], local_kld);
+            std::pair<double, float> v = log_softmax(n_vocab, logits + size_t(i)*n_vocab, base_log_probs.data() + i*nv, tokens[i+1], local_kld);
             kld_values[i]    = (float)v.first;
             p_diff_values[i] = v.second;
         }
@@ -524,7 +529,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
         logits_stream.write((const char *)&n_chunk, sizeof(n_chunk));
         logits_stream.write((const char *)tokens.data(), n_chunk*n_ctx*sizeof(tokens[0]));
         const int nv = 2*((n_vocab + 1)/2) + 4;
-        log_probs.resize(size_t(n_ctx) * nv);
+        log_probs.resize(n_ctx * nv);
     }
 
     // We get the logits for all the tokens in the context window (params.n_ctx)
@@ -923,7 +928,7 @@ static void hellaswag_score(llama_context * ctx, const common_params & params) {
         }
 
         if (i0 == i1) {
-            LOG_ERR("%s : task %zu does not fit in the context window (requires %zu tokens)\n", __func__, i0, hs_data[i0].required_tokens);
+            LOG_ERR("%s : task %zu does not fit in the context window (requires %lu tokens)\n", __func__, i0, hs_data[i0].required_tokens);
             return;
         }
 
@@ -1216,7 +1221,7 @@ static void winogrande_score(llama_context * ctx, const common_params & params) 
         }
 
         if (i0 == i1) {
-            LOG_ERR("%s : task %zu does not fit in the context window (requires %zu tokens)\n", __func__, i0, data[i0].required_tokens);
+            LOG_ERR("%s : task %zu does not fit in the context window (requires %lu tokens)\n", __func__, i0, data[i0].required_tokens);
             return;
         }
 
@@ -1595,7 +1600,7 @@ static void multiple_choice_score(llama_context * ctx, const common_params & par
         }
 
         if (i0 == i1) {
-            LOG_ERR("%s : task %zu does not fit in the context window (requires %zu tokens)\n", __func__, i0, tasks[i0].required_tokens);
+            LOG_ERR("%s : task %zu does not fit in the context window (requires %lu tokens)\n", __func__, i0, tasks[i0].required_tokens);
             return;
         }
 
@@ -2005,10 +2010,27 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     LOG("Same top p: %6.3lf ± %5.3lf %%\n", 100.0*same_top_p, 100.0*sqrt(same_top_p*(1.0 - same_top_p)/(kld.count - 1)));
 }
 
-// satisfies -Wmissing-declarations
-int llama_perplexity(int argc, char ** argv);
+static bool release_mem(struct ggml_tensor * t, const bool ask, void * user_data) {
+    const auto * params = (common_params *) user_data;
+    if (ask) {
+        if (t->op == GGML_OP_MUL_MAT_ID || t->op == GGML_OP_MUL_MAT) { return true; }
+        return false;
+    }
 
-int llama_perplexity(int argc, char ** argv) {
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
+    if (params->use_mmap && t->src[0] && t->src[0]->buffer && ggml_backend_buffer_is_host(t->src[0]->buffer)) {
+        const size_t page_size = sysconf(_SC_PAGESIZE);
+        const uintptr_t addr = (uintptr_t)t->src[0]->data;
+        const uintptr_t aligned_addr = addr & ~(page_size - 1);
+        const size_t size = ggml_nbytes(t->src[0]) + (addr - aligned_addr);
+        madvise((void *)aligned_addr, size, MADV_DONTNEED); // hint OS pages in this region are not needed anymore
+    }
+#endif
+
+    return true;
+}
+
+int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
     common_params params;
@@ -2022,8 +2044,10 @@ int llama_perplexity(int argc, char ** argv) {
         return 1;
     }
 
-    const int32_t n_ctx = params.n_ctx;
+    params.cb_eval = release_mem;
+    params.cb_eval_user_data = & params;
 
+    const int32_t n_ctx = params.n_ctx;
     if (n_ctx <= 0) {
         LOG_ERR("%s: perplexity tool requires '--ctx-size' > 0\n", __func__);
         return 1;

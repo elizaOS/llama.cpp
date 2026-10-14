@@ -5,6 +5,8 @@ on:
   push:
     branches:
       - master
+      - main
+      - 'eliza/**'
     paths: [
       '.github/workflows/build-sycl.yml',
       '**/CMakeLists.txt',
@@ -29,11 +31,12 @@ concurrency:
 env:
   GGML_NLOOP: 3
   GGML_N_THREADS: 1
-  LLAMA_ARG_LOG_COLORS: 1
-  LLAMA_ARG_LOG_PREFIX: 1
-  LLAMA_ARG_LOG_TIMESTAMPS: 1
+  LLAMA_LOG_COLORS: 1
+  LLAMA_LOG_PREFIX: 1
+  LLAMA_LOG_TIMESTAMPS: 1
 
 jobs:
+
   ubuntu-24-sycl:
     strategy:
       matrix:
@@ -55,12 +58,18 @@ jobs:
     continue-on-error: true
 
     steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+
+      - name: Use oneAPI Installation Cache
+        uses: actions/cache@v5
+        id: cache-sycl
+        with:
+          path: ${{ env.ONEAPI_ROOT }}
+          key: oneAPI-${{ env.ONEAPI_INSTALLER_VERSION }}-${{ runner.os }}
 
       - name: Download & Install oneAPI
         shell: bash
+        if: steps.cache-sycl.outputs.cache-hit != 'true'
         run: |
           cd /tmp
           wget https://registrationcenter-download.intel.com/akdlm/IRC_NAS/56f7923a-adb8-43f3-8b02-2b60fcac8cab/intel-deep-learning-essentials-2025.3.3.16_offline.sh -O intel-deep-learning-essentials_offline.sh
@@ -74,10 +83,14 @@ jobs:
           wget -q "https://github.com/oneapi-src/level-zero/releases/download/v${LEVEL_ZERO_VERSION}/level-zero-devel_${LEVEL_ZERO_VERSION}%2B${LEVEL_ZERO_UBUNTU_VERSION}_amd64.deb" -O level-zero-devel.deb
           sudo apt-get install -y ./level-zero.deb ./level-zero-devel.deb
 
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: sycl-ubuntu-24-${{ matrix.build }}
+          key: ubuntu-24-sycl-${{ matrix.build }}
           evict-old-files: 1d
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
 
@@ -114,8 +127,16 @@ jobs:
         id: checkout
         uses: actions/checkout@v6
 
+      - name: Use oneAPI Installation Cache
+        uses: actions/cache@v5
+        id: cache-sycl
+        with:
+          path: ${{ env.ONEAPI_ROOT }}
+          key: oneAPI-${{ env.ONEAPI_INSTALLER_VERSION }}-${{ runner.os }}
+
       - name: Download & Install oneAPI
         shell: bash
+        if: steps.cache-sycl.outputs.cache-hit != 'true'
         run: |
           scripts/install-oneapi.bat $WINDOWS_BASEKIT_URL $WINDOWS_DPCPP_MKL
 
@@ -129,7 +150,7 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: sycl-windows-latest
+          key: windows-latest-sycl
           variant: ccache
           evict-old-files: 1d
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}

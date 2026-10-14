@@ -225,9 +225,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                     }
 
                     case GGML_BACKEND_DEVICE_TYPE_IGPU:
-                        if (igpus.empty()) {
-                            igpus.push_back({false, dev});
-                        }
+                        igpus.push_back({false, dev});
                         break;
                     case GGML_BACKEND_DEVICE_TYPE_META:
                         GGML_ABORT("fatal error");
@@ -241,15 +239,14 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
         // add GPUs
         model->devices.insert(model->devices.end(), gpus.begin(), gpus.end());
 
-        // add integrated GPUs only if no discrete GPUs were found
-        // (RPC servers do not count, otherwise the local iGPU would be dropped on iGPU+RPC setups)
-        if (gpus.empty()) {
+        // add integrated GPUs only if no other devices were found
+        if (model->devices.empty()) {
             model->devices.insert(model->devices.end(), igpus.begin(), igpus.end());
         }
     }
 
     // if using single GPU mode, remove all except the main GPU
-    if (params.split_mode == LLAMA_SPLIT_MODE_NONE && !model->devices.empty()) {
+    if (params.split_mode == LLAMA_SPLIT_MODE_NONE) {
         if (params.main_gpu < 0) {
             model->devices.clear();
         } else {

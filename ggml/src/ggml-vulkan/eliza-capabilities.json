@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "contracts": {
+    "tbq-attention-raw-query-v1": {
+      "operation": "ATTN_SCORE_TBQ",
+      "headDim": 128,
+      "queryBasis": "unconditioned",
+      "keyTypes": {
+        "tbq3_0": {
+          "blockElements": 32,
+          "blockBytes": 14,
+          "packing": "12 bytes of consecutive little-endian 3-bit codes after fp16 scale"
+        },
+        "tbq4_0": {
+          "blockElements": 32,
+          "blockBytes": 18,
+          "packing": "16 low nibbles then 16 high nibbles after fp16 scale"
+        }
+      },
+      "conditioning": "per-32 signed normalized Hadamard matching ggml-quants.c",
+      "multiBlockThreshold": 8192,
+      "requiredSources": [
+        "ggml/src/ggml-quants.c",
+        "ggml/src/ggml-cpu/attn-score-tbq-polar.c",
+        "ggml/src/ggml-vulkan/ggml-vulkan.cpp",
+        "ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp",
+        "ggml/src/ggml-vulkan/vulkan-shaders/turbo3.comp",
+        "ggml/src/ggml-vulkan/vulkan-shaders/turbo3_multi.comp",
+        "ggml/src/ggml-vulkan/vulkan-shaders/turbo4.comp",
+        "ggml/src/ggml-vulkan/vulkan-shaders/turbo4_multi.comp"
+      ],
+      "behavioralTest": "tests/test-backend-ops.cpp: ATTN_SCORE_TBQ"
+    }
+  }
+}

@@ -8,13 +8,14 @@
 // loaded by `kokoro_load_model` (see kokoro.cpp); see
 // `convert_kokoro_pth_to_gguf.py` for the canonical names.
 //
-// All compute runs on the host with plain C++ scalar loops. The
-// implementation is verified against reference activations produced by
-// `tools/dump_reference_activations.py` (run on the actual Python kokoro
-// package) using `tests/test_kokoro_predictor.cpp`.
+// Dense, convolution, and recurrent kernels route through kokoro-layers'
+// platform backend; ordering-sensitive normalization and activation steps stay
+// in direct C++. Reference activations from the Python Kokoro package verify
+// the complete predictor in `tests/test_kokoro_predictor.cpp`.
 
 #include "kokoro-predictor.h"
 #include "kokoro.h"
+#include "kokoro-model-internal.h"
 
 #include "ggml.h"
 #include "gguf.h"
@@ -35,7 +36,6 @@ namespace eliza_kokoro {
 // To access the loaded ggml_context we need to forward-declare a getter or
 // include the loader's internal layout. We expose a small private accessor.
 
-extern ggml_context * kokoro_model_ggml_ctx(const kokoro_model * model);
 extern const kokoro_hparams * kokoro_get_hparams(const kokoro_model * model) noexcept;
 
 namespace {
@@ -43,20 +43,30 @@ namespace {
 // Tensor lookup helper.
 struct TLookup {
     ggml_context * ctx = nullptr;
-    const float * get(const std::string & name, std::string * err = nullptr) const {
-        ggml_tensor * t = ggml_get_tensor(ctx, name.c_str());
+    std::string ns = "kokoro";
+    // Expand a namespace-relative name: ".bert.x" -> "<ns>.bert.x". Names that
+    // do not start with '.' are used as given.
+    std::string full(const std::string & name) const {
+        return (!name.empty() && name[0] == '.') ? ns + name : name;
+    }
+    ggml_tensor * tensor(const std::string & name) const {
+        return kokoro_find_tensor_compat(ctx, full(name));
+    }
+    const float * get(const std::string & rel, std::string * err = nullptr) const {
+        const std::string name = full(rel);
+        ggml_tensor * t = kokoro_find_tensor_compat(ctx, name);
         if (!t) {
             if (err) *err = "missing tensor '" + name + "'";
             return nullptr;
         }
         return (const float *) t->data;
     }
-    const float * get_or_null(const std::string & name) const {
-        ggml_tensor * t = ggml_get_tensor(ctx, name.c_str());
+    const float * get_or_null(const std::string & rel) const {
+        ggml_tensor * t = kokoro_find_tensor_compat(ctx, full(rel));
         return t ? (const float *) t->data : nullptr;
     }
-    bool has(const std::string & name) const {
-        return ggml_get_tensor(ctx, name.c_str()) != nullptr;
+    bool has(const std::string & rel) const {
+        return kokoro_find_tensor_compat(ctx, full(rel)) != nullptr;
     }
 };
 
@@ -96,19 +106,22 @@ static void bert_forward(
         std::vector<float> & out /* [N, d_model] */,
         std::string & err) {
     const int N = (int) ids.size();
-    const int d_embd = 128;
+    // Factorized ALBERT embedding width (128 for Kokoro-82M and Paradee-8M),
+    // read from the token embedding [vocab, d_embd] (ggml ne[0] = d_embd).
+    ggml_tensor * tok_t = T.tensor(".bert.token_embd.weight");
+    const int d_embd = tok_t ? (int) tok_t->ne[0] : 128;
     const int head_dim = d_model / n_head;
 
-    const float * tok_embd = T.get("kokoro.bert.token_embd.weight", &err);     // [vocab, 128]
-    const float * pos_embd = T.get("kokoro.bert.position_embd.weight", &err);  // [maxpos, 128]
-    const float * tt_embd  = T.get("kokoro.bert.tok_type_embd.weight", &err);  // [2, 128]
-    const float * ln_w     = T.get("kokoro.bert.embd_ln.weight", &err);
-    const float * ln_b     = T.get("kokoro.bert.embd_ln.bias", &err);
-    const float * proj_w   = T.get("kokoro.bert.embd_proj.weight", &err);      // [768, 128]
-    const float * proj_b   = T.get("kokoro.bert.embd_proj.bias", &err);
+    const float * tok_embd = T.get(".bert.token_embd.weight", &err);     // [vocab, 128]
+    const float * pos_embd = T.get(".bert.position_embd.weight", &err);  // [maxpos, 128]
+    const float * tt_embd  = T.get(".bert.tok_type_embd.weight", &err);  // [2, 128]
+    const float * ln_w     = T.get(".bert.embd_ln.weight", &err);
+    const float * ln_b     = T.get(".bert.embd_ln.bias", &err);
+    const float * proj_w   = T.get(".bert.embd_proj.weight", &err);      // [768, 128]
+    const float * proj_b   = T.get(".bert.embd_proj.bias", &err);
     if (!tok_embd || !pos_embd || !tt_embd || !ln_w || !ln_b || !proj_w || !proj_b) return;
 
-    // Step 1+2+3: embed → LN(128) → project to 768.
+    // Step 1+2+3: embed → LN(d_embd) → project to d_model.
     std::vector<float> h(N * d_embd, 0.0f);
     for (int t = 0; t < N; ++t) {
         const int id = ids[t];
@@ -128,22 +141,22 @@ static void bert_forward(
     }
 
     // Step 4: 12 layers — shared params (Albert num_hidden_groups=1).
-    const float * attn_q_w = T.get("kokoro.bert.layer.attn_q.weight");
-    const float * attn_q_b = T.get("kokoro.bert.layer.attn_q.bias");
-    const float * attn_k_w = T.get("kokoro.bert.layer.attn_k.weight");
-    const float * attn_k_b = T.get("kokoro.bert.layer.attn_k.bias");
-    const float * attn_v_w = T.get("kokoro.bert.layer.attn_v.weight");
-    const float * attn_v_b = T.get("kokoro.bert.layer.attn_v.bias");
-    const float * attn_o_w = T.get("kokoro.bert.layer.attn_o.weight");
-    const float * attn_o_b = T.get("kokoro.bert.layer.attn_o.bias");
-    const float * attn_ln_w = T.get("kokoro.bert.layer.attn_ln.weight");
-    const float * attn_ln_b = T.get("kokoro.bert.layer.attn_ln.bias");
-    const float * full_ln_w = T.get("kokoro.bert.layer.full_ln.weight");
-    const float * full_ln_b = T.get("kokoro.bert.layer.full_ln.bias");
-    const float * ffn_w     = T.get("kokoro.bert.layer.ffn.weight");        // [2048, 768]
-    const float * ffn_b     = T.get("kokoro.bert.layer.ffn.bias");
-    const float * ffn_out_w = T.get("kokoro.bert.layer.ffn_out.weight");    // [768, 2048]
-    const float * ffn_out_b = T.get("kokoro.bert.layer.ffn_out.bias");
+    const float * attn_q_w = T.get(".bert.layer.attn_q.weight");
+    const float * attn_q_b = T.get(".bert.layer.attn_q.bias");
+    const float * attn_k_w = T.get(".bert.layer.attn_k.weight");
+    const float * attn_k_b = T.get(".bert.layer.attn_k.bias");
+    const float * attn_v_w = T.get(".bert.layer.attn_v.weight");
+    const float * attn_v_b = T.get(".bert.layer.attn_v.bias");
+    const float * attn_o_w = T.get(".bert.layer.attn_o.weight");
+    const float * attn_o_b = T.get(".bert.layer.attn_o.bias");
+    const float * attn_ln_w = T.get(".bert.layer.attn_ln.weight");
+    const float * attn_ln_b = T.get(".bert.layer.attn_ln.bias");
+    const float * full_ln_w = T.get(".bert.layer.full_ln.weight");
+    const float * full_ln_b = T.get(".bert.layer.full_ln.bias");
+    const float * ffn_w     = T.get(".bert.layer.ffn.weight");        // [2048, 768]
+    const float * ffn_b     = T.get(".bert.layer.ffn.bias");
+    const float * ffn_out_w = T.get(".bert.layer.ffn_out.weight");    // [768, 2048]
+    const float * ffn_out_b = T.get(".bert.layer.ffn_out.bias");
 
     std::vector<float> q(N * d_model), k(N * d_model), v(N * d_model);
     std::vector<float> ctx(N * d_model);
@@ -275,7 +288,7 @@ static void duration_encoder_forward(
 
     for (int il = 0; il < n_layer; ++il) {
         // BiLSTM over x [T, hid+sty] → y [T, 2*half=hid].
-        const std::string pfx = "kokoro.predictor.de.lstm" + std::to_string(il) + ".";
+        const std::string pfx = ".predictor.de.lstm" + std::to_string(il) + ".";
         lw.W_ih   = TL.get(pfx + "weight_ih_l0");
         lw.W_hh   = TL.get(pfx + "weight_hh_l0");
         lw.b_ih   = TL.get(pfx + "bias_ih_l0");
@@ -288,7 +301,7 @@ static void duration_encoder_forward(
         bilstm_forward(x.data(), T_phon, d_hid + sty_dim, half, lw, y.data());
 
         // AdaLayerNorm(style_dim, channels=d_hid). fc(s) → 2*d_hid; chunk → gamma,beta.
-        const std::string apfx = "kokoro.predictor.de.adaln" + std::to_string(il) + ".fc.";
+        const std::string apfx = ".predictor.de.adaln" + std::to_string(il) + ".fc.";
         const float * fc_w = TL.get(apfx + "weight");
         const float * fc_b = TL.get(apfx + "bias");
 
@@ -320,14 +333,14 @@ static void predictor_main_lstm_forward(
         const float * d /* [T_phon, 640] */, int T_phon, int d_hid, int sty_dim,
         std::vector<float> & out /* [T_phon, 512] */) {
     LSTMWeights lw;
-    lw.W_ih   = TL.get("kokoro.predictor.lstm.weight_ih_l0");
-    lw.W_hh   = TL.get("kokoro.predictor.lstm.weight_hh_l0");
-    lw.b_ih   = TL.get("kokoro.predictor.lstm.bias_ih_l0");
-    lw.b_hh   = TL.get("kokoro.predictor.lstm.bias_hh_l0");
-    lw.W_ih_r = TL.get("kokoro.predictor.lstm.weight_ih_l0_r");
-    lw.W_hh_r = TL.get("kokoro.predictor.lstm.weight_hh_l0_r");
-    lw.b_ih_r = TL.get("kokoro.predictor.lstm.bias_ih_l0_r");
-    lw.b_hh_r = TL.get("kokoro.predictor.lstm.bias_hh_l0_r");
+    lw.W_ih   = TL.get(".predictor.lstm.weight_ih_l0");
+    lw.W_hh   = TL.get(".predictor.lstm.weight_hh_l0");
+    lw.b_ih   = TL.get(".predictor.lstm.bias_ih_l0");
+    lw.b_hh   = TL.get(".predictor.lstm.bias_hh_l0");
+    lw.W_ih_r = TL.get(".predictor.lstm.weight_ih_l0_r");
+    lw.W_hh_r = TL.get(".predictor.lstm.weight_hh_l0_r");
+    lw.b_ih_r = TL.get(".predictor.lstm.bias_ih_l0_r");
+    lw.b_hh_r = TL.get(".predictor.lstm.bias_hh_l0_r");
     out.assign(T_phon * d_hid, 0.0f);
     bilstm_forward(d, T_phon, d_hid + sty_dim, d_hid / 2, lw, out.data());
 }
@@ -339,10 +352,11 @@ static void predictor_main_lstm_forward(
 static void duration_predictor_forward(
         const TLookup & TL,
         const float * x_lstm, int T_phon, int d_hid, int max_dur, float speed,
+        bool torch_round,
         std::vector<float> & duration /* [T_phon] */,
         std::vector<int32_t> & pred_dur /* [T_phon] */) {
-    const float * w = TL.get("kokoro.predictor.duration_proj.weight");
-    const float * b = TL.get("kokoro.predictor.duration_proj.bias");
+    const float * w = TL.get(".predictor.duration_proj.weight");
+    const float * b = TL.get(".predictor.duration_proj.bias");
     duration.assign(T_phon, 0.0f);
     pred_dur.assign(T_phon, 1);
     std::vector<float> tmp(max_dur);
@@ -355,7 +369,10 @@ static void duration_predictor_forward(
         }
         const float dur_f = (float)(sum / speed);
         duration[t] = dur_f;
-        const int32_t d_round = (int32_t) std::round(dur_f);
+        // torch.round rounds half to even; Kokoro-82M keeps std::round
+        // (half away from zero) so its durations are unchanged.
+        const int32_t d_round = torch_round ? (int32_t) std::nearbyint(dur_f)
+                                            : (int32_t) std::round(dur_f);
         pred_dur[t] = std::max(1, d_round);
     }
 }
@@ -400,11 +417,10 @@ static void length_regulate(
 // =================================================================
 static void text_encoder_forward(
         const TLookup & TL,
-        const std::vector<int32_t> & ids, int n_cnn, int hid,
+        const std::vector<int32_t> & ids, int n_cnn, int hid, int K,
         std::vector<float> & out /* [T, hid] */) {
     const int T = (int) ids.size();
-    const int K = 5;
-    const float * embd = TL.get("kokoro.text_encoder.embd.weight");  // [vocab, hid]
+    const float * embd = TL.get(".text_encoder.embd.weight");  // [vocab, hid]
     if (!embd) return;
 
     // Step 1: embedding → [T, hid].
@@ -421,7 +437,7 @@ static void text_encoder_forward(
 
     std::vector<float> tmp(hid * T);
     for (int il = 0; il < n_cnn; ++il) {
-        const std::string cpfx = "kokoro.text_encoder.cnn." + std::to_string(il) + ".";
+        const std::string cpfx = ".text_encoder.cnn." + std::to_string(il) + ".";
         const float * cw = TL.get(cpfx + "weight");
         const float * cb = TL.get(cpfx + "bias");
         conv1d_forward(x_ct.data(), hid, T, cw, cb, hid, K,
@@ -432,8 +448,8 @@ static void text_encoder_forward(
         // LayerNorm: gamma/beta over channel dim. The Python LayerNorm
         // transposes (1,-1) before F.layer_norm — that swaps channels onto
         // the last dim. So we normalize across channels for each time step.
-        const float * gamma = TL.get(std::string("kokoro.text_encoder.ln.") + std::to_string(il) + ".gamma");
-        const float * beta  = TL.get(std::string("kokoro.text_encoder.ln.") + std::to_string(il) + ".beta");
+        const float * gamma = TL.get(std::string(".text_encoder.ln.") + std::to_string(il) + ".gamma");
+        const float * beta  = TL.get(std::string(".text_encoder.ln.") + std::to_string(il) + ".beta");
         for (int t = 0; t < T; ++t) {
             double sum = 0, sumsq = 0;
             for (int c = 0; c < hid; ++c) {
@@ -462,14 +478,14 @@ static void text_encoder_forward(
 
     // BiLSTM.
     LSTMWeights lw;
-    lw.W_ih   = TL.get("kokoro.text_encoder.lstm.weight_ih_l0");
-    lw.W_hh   = TL.get("kokoro.text_encoder.lstm.weight_hh_l0");
-    lw.b_ih   = TL.get("kokoro.text_encoder.lstm.bias_ih_l0");
-    lw.b_hh   = TL.get("kokoro.text_encoder.lstm.bias_hh_l0");
-    lw.W_ih_r = TL.get("kokoro.text_encoder.lstm.weight_ih_l0_r");
-    lw.W_hh_r = TL.get("kokoro.text_encoder.lstm.weight_hh_l0_r");
-    lw.b_ih_r = TL.get("kokoro.text_encoder.lstm.bias_ih_l0_r");
-    lw.b_hh_r = TL.get("kokoro.text_encoder.lstm.bias_hh_l0_r");
+    lw.W_ih   = TL.get(".text_encoder.lstm.weight_ih_l0");
+    lw.W_hh   = TL.get(".text_encoder.lstm.weight_hh_l0");
+    lw.b_ih   = TL.get(".text_encoder.lstm.bias_ih_l0");
+    lw.b_hh   = TL.get(".text_encoder.lstm.bias_hh_l0");
+    lw.W_ih_r = TL.get(".text_encoder.lstm.weight_ih_l0_r");
+    lw.W_hh_r = TL.get(".text_encoder.lstm.weight_hh_l0_r");
+    lw.b_ih_r = TL.get(".text_encoder.lstm.bias_ih_l0_r");
+    lw.b_hh_r = TL.get(".text_encoder.lstm.bias_hh_l0_r");
     out.assign(T * hid, 0.0f);
     bilstm_forward(x_th2.data(), T, hid, hid / 2, lw, out.data());
 }
@@ -500,7 +516,7 @@ static void text_encoder_forward(
 static void adainresblk1d_forward(
         const TLookup & TL, const std::string & pfx,
         const float * x, int Cin, int T_in, int Sdim, const float * s,
-        int Cout, bool upsample, bool learned_sc,
+        int Cout, bool upsample, bool learned_sc, bool instnorm_affine,
         std::vector<float> & y, int & T_out) {
 
     const float * n1_w = TL.get(pfx + ".norm1.fc.weight");
@@ -515,11 +531,16 @@ static void adainresblk1d_forward(
     const float * c1x1_b = learned_sc ? TL.get_or_null(pfx + ".conv1x1.bias") : nullptr;
     const float * pool_w = upsample ? TL.get(pfx + ".pool.weight") : nullptr;
     const float * pool_b = upsample ? TL.get(pfx + ".pool.bias")  : nullptr;
+    // Trained InstanceNorm affine (students); absent/unused for Kokoro-82M.
+    const float * n1_nw = instnorm_affine ? TL.get(pfx + ".norm1.norm.weight") : nullptr;
+    const float * n1_nb = instnorm_affine ? TL.get(pfx + ".norm1.norm.bias")   : nullptr;
+    const float * n2_nw = instnorm_affine ? TL.get(pfx + ".norm2.norm.weight") : nullptr;
+    const float * n2_nb = instnorm_affine ? TL.get(pfx + ".norm2.norm.bias")   : nullptr;
 
     // === Residual branch ===
     // norm1 (AdaIN1d on Cin channels)
     std::vector<float> r(x, x + (size_t)Cin * T_in);  // copy
-    adain1d_forward(r.data(), Cin, T_in, s, Sdim, n1_w, n1_b);
+    adain1d_forward(r.data(), Cin, T_in, s, Sdim, n1_w, n1_b, n1_nw, n1_nb);
     // leaky relu
     for (size_t i = 0; i < r.size(); ++i) if (r[i] < 0) r[i] *= 0.2f;
 
@@ -540,7 +561,7 @@ static void adainresblk1d_forward(
                    /*stride*/1, /*pad*/1, /*dil*/1, r3.data(), T_after_pool);
 
     // norm2 (AdaIN1d on Cout channels)
-    adain1d_forward(r3.data(), Cout, T_after_pool, s, Sdim, n2_w, n2_b);
+    adain1d_forward(r3.data(), Cout, T_after_pool, s, Sdim, n2_w, n2_b, n2_nw, n2_nb);
     // leaky relu
     for (size_t i = 0; i < r3.size(); ++i) if (r3[i] < 0) r3[i] *= 0.2f;
 
@@ -600,17 +621,17 @@ static void adainresblk1d_forward(
 static void f0n_train_forward(
         const TLookup & TL,
         const float * en /* [T_frame, 640] */, int T_frame, int d_hid, int sty_dim,
-        const float * s /* [sty_dim] = 128 */,
+        const float * s /* [sty_dim] */, bool instnorm_affine,
         std::vector<float> & F0_pred, std::vector<float> & N_pred) {
     LSTMWeights lw;
-    lw.W_ih   = TL.get("kokoro.predictor.shared.weight_ih_l0");
-    lw.W_hh   = TL.get("kokoro.predictor.shared.weight_hh_l0");
-    lw.b_ih   = TL.get("kokoro.predictor.shared.bias_ih_l0");
-    lw.b_hh   = TL.get("kokoro.predictor.shared.bias_hh_l0");
-    lw.W_ih_r = TL.get("kokoro.predictor.shared.weight_ih_l0_r");
-    lw.W_hh_r = TL.get("kokoro.predictor.shared.weight_hh_l0_r");
-    lw.b_ih_r = TL.get("kokoro.predictor.shared.bias_ih_l0_r");
-    lw.b_hh_r = TL.get("kokoro.predictor.shared.bias_hh_l0_r");
+    lw.W_ih   = TL.get(".predictor.shared.weight_ih_l0");
+    lw.W_hh   = TL.get(".predictor.shared.weight_hh_l0");
+    lw.b_ih   = TL.get(".predictor.shared.bias_ih_l0");
+    lw.b_hh   = TL.get(".predictor.shared.bias_hh_l0");
+    lw.W_ih_r = TL.get(".predictor.shared.weight_ih_l0_r");
+    lw.W_hh_r = TL.get(".predictor.shared.weight_hh_l0_r");
+    lw.b_ih_r = TL.get(".predictor.shared.bias_ih_l0_r");
+    lw.b_hh_r = TL.get(".predictor.shared.bias_hh_l0_r");
 
     std::vector<float> x_shared(T_frame * d_hid);
     bilstm_forward(en, T_frame, d_hid + sty_dim, d_hid / 2, lw, x_shared.data());
@@ -631,19 +652,19 @@ static void f0n_train_forward(
     // F0.1: Cin=d_hid, Cout=d_hid/2, upsample=True, learned_sc=True
     // F0.2: Cin=d_hid/2, Cout=d_hid/2, upsample=False, learned_sc=False
     std::vector<float> tmp; int T_after = T_frame;
-    adainresblk1d_forward(TL, "kokoro.predictor.F0.0", F0.data(), d_hid, T_after, sty_dim, s,
-                          d_hid, false, false, tmp, T_after);
+    adainresblk1d_forward(TL, ".predictor.F0.0", F0.data(), d_hid, T_after, sty_dim, s,
+                          d_hid, false, false, instnorm_affine, tmp, T_after);
     F0 = std::move(tmp);
-    adainresblk1d_forward(TL, "kokoro.predictor.F0.1", F0.data(), d_hid, T_after, sty_dim, s,
-                          d_hid / 2, true, true, tmp, T_after);
+    adainresblk1d_forward(TL, ".predictor.F0.1", F0.data(), d_hid, T_after, sty_dim, s,
+                          d_hid / 2, true, true, instnorm_affine, tmp, T_after);
     F0 = std::move(tmp);
-    adainresblk1d_forward(TL, "kokoro.predictor.F0.2", F0.data(), d_hid / 2, T_after, sty_dim, s,
-                          d_hid / 2, false, false, tmp, T_after);
+    adainresblk1d_forward(TL, ".predictor.F0.2", F0.data(), d_hid / 2, T_after, sty_dim, s,
+                          d_hid / 2, false, false, instnorm_affine, tmp, T_after);
     F0 = std::move(tmp);
     // F0_proj: Conv1d(d_hid/2, 1, kernel=1) → [1, T_after].
     {
-        const float * w = TL.get("kokoro.predictor.F0_proj.weight");
-        const float * b = TL.get("kokoro.predictor.F0_proj.bias");
+        const float * w = TL.get(".predictor.F0_proj.weight");
+        const float * b = TL.get(".predictor.F0_proj.bias");
         F0_pred.assign(T_after, 0.0f);
         std::vector<float> proj(1 * T_after);
         conv1d_forward(F0.data(), d_hid / 2, T_after, w, b, 1, 1, 1, 0, 1, proj.data(), T_after);
@@ -652,28 +673,177 @@ static void f0n_train_forward(
 
     // N chain (mirror).
     int T_after_N = T_frame;
-    adainresblk1d_forward(TL, "kokoro.predictor.N.0", N.data(), d_hid, T_after_N, sty_dim, s,
-                          d_hid, false, false, tmp, T_after_N);
+    adainresblk1d_forward(TL, ".predictor.N.0", N.data(), d_hid, T_after_N, sty_dim, s,
+                          d_hid, false, false, instnorm_affine, tmp, T_after_N);
     N = std::move(tmp);
-    adainresblk1d_forward(TL, "kokoro.predictor.N.1", N.data(), d_hid, T_after_N, sty_dim, s,
-                          d_hid / 2, true, true, tmp, T_after_N);
+    adainresblk1d_forward(TL, ".predictor.N.1", N.data(), d_hid, T_after_N, sty_dim, s,
+                          d_hid / 2, true, true, instnorm_affine, tmp, T_after_N);
     N = std::move(tmp);
-    adainresblk1d_forward(TL, "kokoro.predictor.N.2", N.data(), d_hid / 2, T_after_N, sty_dim, s,
-                          d_hid / 2, false, false, tmp, T_after_N);
+    adainresblk1d_forward(TL, ".predictor.N.2", N.data(), d_hid / 2, T_after_N, sty_dim, s,
+                          d_hid / 2, false, false, instnorm_affine, tmp, T_after_N);
     N = std::move(tmp);
     {
-        const float * w = TL.get("kokoro.predictor.N_proj.weight");
-        const float * b = TL.get("kokoro.predictor.N_proj.bias");
+        const float * w = TL.get(".predictor.N_proj.weight");
+        const float * b = TL.get(".predictor.N_proj.bias");
         std::vector<float> proj(1 * T_after_N);
         conv1d_forward(N.data(), d_hid / 2, T_after_N, w, b, 1, 1, 1, 0, 1, proj.data(), T_after_N);
         N_pred = std::move(proj);
     }
 }
 
+
+// =================================================================
+// asr projection MLP (Paradee TextStudent preset "+mlp"):
+//   asr_tok = Linear(asr_dim, asr_dim)(GELU(Linear(hid, asr_dim)(t_en)))
+// nn.GELU() is the exact (erf) GELU, not ALBERT's tanh approximation.
+// =================================================================
+static bool asr_proj_mlp_forward(
+        const TLookup & TL, const float * t_en, int T_phon, int hid,
+        std::vector<float> & out, int & asr_dim, std::string & err) {
+    ggml_tensor * w0t = TL.tensor(".asr_proj.0.weight");   // [asr_dim, hid]
+    ggml_tensor * w1t = TL.tensor(".asr_proj.1.weight");   // [asr_dim, asr_dim]
+    const float * b0 = TL.get(".asr_proj.0.bias");
+    const float * b1 = TL.get(".asr_proj.1.bias");
+    if (!w0t || !w1t || !b0 || !b1) { err = "missing asr_proj tensors"; return false; }
+    if ((int) w0t->ne[0] != hid || w1t->ne[0] != w0t->ne[1] || w1t->ne[1] != w0t->ne[1]) {
+        err = "asr_proj tensor shapes do not match the predictor width";
+        return false;
+    }
+    asr_dim = (int) w0t->ne[1];
+    const float * w0 = (const float *) w0t->data;
+    const float * w1 = (const float *) w1t->data;
+    out.assign((size_t) T_phon * asr_dim, 0.0f);
+    std::vector<float> h((size_t) asr_dim);
+    const float inv_sqrt2 = 0.70710678118654752440f;
+    for (int t = 0; t < T_phon; ++t) {
+        linear_forward(t_en + (size_t) t * hid, hid, w0, b0, asr_dim, h.data());
+        for (int j = 0; j < asr_dim; ++j) {
+            const float v = h[(size_t) j];
+            h[(size_t) j] = 0.5f * v * (1.0f + std::erf(v * inv_sqrt2));
+        }
+        linear_forward(h.data(), asr_dim, w1, b1, asr_dim, out.data() + (size_t) t * asr_dim);
+    }
+    return true;
+}
+
 } // namespace
 
 // =================================================================
-// Public entry: full predictor forward.
+// Generic entry: full predictor forward over a loaded F32 context.
+// =================================================================
+bool predictor_forward(
+        ggml_context * ctx,
+        const PredictorConfig & cfg,
+        const std::vector<int32_t> & phoneme_ids,
+        float speed,
+        PredictorOut & out, std::string & err_out) {
+    if (!ctx) { err_out = "null model context"; return false; }
+    if (!cfg.style) { err_out = "null predictor style"; return false; }
+    if (phoneme_ids.empty()) { err_out = "empty phoneme ids"; return false; }
+
+    TLookup TL { ctx, cfg.ns };
+    const auto cancelled = [&]() {
+        if (!cfg.cancel || !cfg.cancel(cfg.cancel_user)) return false;
+        out.cancelled = true;
+        err_out = "cancelled";
+        return true;
+    };
+
+    // Widths from the tensor shapes (ggml ne[] is the reversed PyTorch shape):
+    //   bert_encoder.weight        [hid, d_model]  -> ne[1] = hid
+    //   predictor.de.adaln0.fc.weight [2*hid, sty] -> ne[0] = sty
+    ggml_tensor * be_t = TL.tensor(".bert_encoder.weight");
+    ggml_tensor * adaln_t = TL.tensor(".predictor.de.adaln0.fc.weight");
+    ggml_tensor * dur_t = TL.tensor(".predictor.duration_proj.weight");
+    if (!be_t || !adaln_t || !dur_t) { err_out = "missing predictor tensors"; return false; }
+    const int hid = (int) be_t->ne[1];
+    const int sty = (int) adaln_t->ne[0];
+    if ((int) be_t->ne[0] != cfg.text_d_model || (int) adaln_t->ne[1] != 2 * hid ||
+        (int) dur_t->ne[0] != hid || (int) dur_t->ne[1] != cfg.max_dur) {
+        err_out = "predictor tensor shapes do not match the hparams";
+        return false;
+    }
+
+    const int T_phon = (int) phoneme_ids.size();
+    out.T_phon = T_phon;
+    out.hid = hid;
+    out.sty = sty;
+    out.cancelled = false;
+    const int d_model = cfg.text_d_model;
+    const int d_ff    = cfg.text_d_ff;
+    const int n_layer = cfg.text_n_layer;
+    const int n_head  = cfg.text_n_head;
+    const int max_dur = cfg.max_dur;
+    const int pred_nl = cfg.n_layer;
+    const float * style = cfg.style;
+
+    // 1. BERT.
+    std::vector<float> bert_out;
+    bert_forward(TL, phoneme_ids, d_model, d_ff, n_layer, n_head, bert_out, err_out);
+    if (!err_out.empty()) return false;
+    if (cancelled()) return false;
+
+    // 2. bert_encoder Linear d_model→hid → d_en [T, hid] row-major.
+    const float * be_w = TL.get(".bert_encoder.weight");
+    const float * be_b = TL.get(".bert_encoder.bias");
+    if (!be_w || !be_b) { err_out = "missing bert_encoder weights"; return false; }
+    std::vector<float> d_en((size_t)T_phon * hid);
+    for (int t = 0; t < T_phon; ++t) {
+        linear_forward(bert_out.data() + (size_t)t * d_model, d_model,
+                       be_w, be_b, hid, d_en.data() + (size_t)t * hid);
+    }
+    if (cfg.keep_bert) out.bert = std::move(bert_out);
+
+    // 3. DurationEncoder.
+    duration_encoder_forward(TL, d_en.data(), T_phon, hid, sty, pred_nl, style, out.d);
+
+    // 4. predictor.lstm.
+    predictor_main_lstm_forward(TL, out.d.data(), T_phon, hid, sty, out.x_lstm);
+
+    // 5. duration_proj → sigmoid → sum → /speed → pred_dur.
+    duration_predictor_forward(TL, out.x_lstm.data(), T_phon, hid, max_dur, speed,
+                               cfg.torch_round, out.duration, out.pred_dur);
+    if (cancelled()) return false;
+
+    // 6. Length regulate `d` → en [T_frame, hid+sty].
+    length_regulate(out.d.data(), T_phon, hid + sty, out.pred_dur, out.en, out.T_frame);
+
+    // 7. text_encoder forward (separate from BERT).
+    text_encoder_forward(TL, phoneme_ids, pred_nl, hid, cfg.text_kernel, out.t_en);
+
+    // 8. Length regulate the asr features [T_phon, asr_dim] → asr [T_frame, asr_dim].
+    {
+        const float * asr_src = out.t_en.data();
+        std::vector<float> asr_tok;
+        int asr_dim = hid;
+        if (cfg.asr_proj_mlp) {
+            if (!asr_proj_mlp_forward(TL, out.t_en.data(), T_phon, hid, asr_tok, asr_dim, err_out)) {
+                return false;
+            }
+            asr_src = asr_tok.data();
+        }
+        out.asr_dim = asr_dim;
+        int T_frame_check = 0;
+        length_regulate(asr_src, T_phon, asr_dim, out.pred_dur, out.asr, T_frame_check);
+        if (T_frame_check != out.T_frame) {
+            err_out = "internal: T_frame mismatch between en and asr";
+            return false;
+        }
+    }
+    if (cancelled()) return false;
+
+    // 9. F0/N predict.
+    // The shared LSTM expects input [T_frame, hid+sty]. en is already that shape
+    // (length-regulated d, which is hid+sty wide).
+    f0n_train_forward(TL, out.en.data(), out.T_frame, hid, sty,
+                      style, cfg.instnorm_affine, out.F0_pred, out.N_pred);
+    if (cancelled()) return false;
+
+    return true;
+}
+
+// =================================================================
+// Kokoro-82M entry.
 // =================================================================
 bool kokoro_predictor_forward(
         const kokoro_model * model,
@@ -683,69 +853,29 @@ bool kokoro_predictor_forward(
     if (!model) { err_out = "null model"; return false; }
     const kokoro_hparams * hp = kokoro_get_hparams(model);
     if (!hp) { err_out = "null hparams"; return false; }
+    if (!ref_s) { err_out = "null ref_s"; return false; }
 
-    TLookup TL { kokoro_model_ggml_ctx(model) };
+    ggml_context * ctx = kokoro_model_ggml_ctx(model);
+    TLookup TL { ctx, "kokoro" };
+    ggml_tensor * be_t = TL.tensor(".bert_encoder.weight");
+    if (!be_t) { err_out = "missing bert_encoder weights"; return false; }
 
-    const int T_phon = (int) phoneme_ids.size();
-    out.T_phon = T_phon;
-    const int d_model = hp->text_d_model;
-    const int d_ff    = hp->text_d_ff;
-    const int n_layer = hp->text_n_layer;
-    const int n_head  = hp->text_n_head;
-    const int hid     = 512;     // hidden_dim from config.json
-    const int sty     = 128;     // per-half style_dim
-    const int max_dur = 50;
-    const int pred_nl = 3;
-
-    // 1. BERT.
-    std::vector<float> bert_out;
-    bert_forward(TL, phoneme_ids, d_model, d_ff, n_layer, n_head, bert_out, err_out);
-    if (!err_out.empty()) return false;
-
-    // 2. bert_encoder Linear 768→512 → d_en [T, 512] row-major.
-    const float * be_w = TL.get("kokoro.bert_encoder.weight");
-    const float * be_b = TL.get("kokoro.bert_encoder.bias");
-    if (!be_w || !be_b) { err_out = "missing bert_encoder weights"; return false; }
-    std::vector<float> d_en((size_t)T_phon * hid);
-    for (int t = 0; t < T_phon; ++t) {
-        linear_forward(bert_out.data() + (size_t)t * d_model, d_model,
-                       be_w, be_b, hid, d_en.data() + (size_t)t * hid);
-    }
-
-    // 3. DurationEncoder.
-    duration_encoder_forward(TL, d_en.data(), T_phon, hid, sty, pred_nl,
-                             ref_s + hid /* predictor-half = ref_s[128:] */, out.d);
-
-    // 4. predictor.lstm.
-    predictor_main_lstm_forward(TL, out.d.data(), T_phon, hid, sty, out.x_lstm);
-
-    // 5. duration_proj → sigmoid → sum → /speed → pred_dur.
-    duration_predictor_forward(TL, out.x_lstm.data(), T_phon, hid, max_dur, speed,
-                               out.duration, out.pred_dur);
-
-    // 6. Length regulate `d` → en [T_frame, 640].
-    length_regulate(out.d.data(), T_phon, hid + sty, out.pred_dur, out.en, out.T_frame);
-
-    // 7. text_encoder forward (separate from BERT).
-    text_encoder_forward(TL, phoneme_ids, pred_nl, hid, out.t_en);
-
-    // 8. Length regulate t_en [T_phon, 512] → asr [T_frame, 512].
-    {
-        int T_frame_check = 0;
-        length_regulate(out.t_en.data(), T_phon, hid, out.pred_dur, out.asr, T_frame_check);
-        if (T_frame_check != out.T_frame) {
-            err_out = "internal: T_frame mismatch between en and asr";
-            return false;
-        }
-    }
-
-    // 9. F0/N predict.
-    // The shared LSTM expects input [T_frame, hid+sty]. en is already that shape
-    // (length-regulated d, which is hid+sty wide).
-    f0n_train_forward(TL, out.en.data(), out.T_frame, hid, sty,
-                      ref_s + hid /* predictor-half */, out.F0_pred, out.N_pred);
-
-    return true;
+    PredictorConfig cfg;
+    cfg.ns = "kokoro";
+    cfg.text_n_layer = hp->text_n_layer;
+    cfg.text_n_head  = hp->text_n_head;
+    cfg.text_d_model = hp->text_d_model;
+    cfg.text_d_ff    = hp->text_d_ff;
+    cfg.n_layer      = 3;
+    cfg.max_dur      = 50;
+    cfg.text_kernel  = 5;
+    // KNOWN ISSUE, kept bit-for-bit here: the predictor style is read at
+    // ref_s + hid (hid = 512 for Kokoro-82M), not at ref_s + 128 where
+    // kokoro/model.py takes ref_s[:, 128:]. That is two rows further into the
+    // voice pack, and past its end for the longest inputs. Fixing it changes
+    // Kokoro's audio, so it is a separate change with its own parity run.
+    cfg.style = ref_s + (int) be_t->ne[1];
+    return predictor_forward(ctx, cfg, phoneme_ids, speed, out, err_out);
 }
 
 } // namespace eliza_kokoro

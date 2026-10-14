@@ -1,0 +1,90 @@
+name: Metal Transfer Validation
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/metal-transfer-validation.yml'
+      - 'ggml/src/ggml-metal/**'
+      - 'ggml/include/**'
+      - 'tests/CMakeLists.txt'
+      - 'tests/test-backend-readback.cpp'
+      - 'tests/test-backend-ops.cpp'
+
+permissions:
+  contents: read
+
+jobs:
+  metal-transfer-validation:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 3
+      GGML_N_THREADS: 1
+    steps:
+      - uses: actions/checkout@v6
+      - name: Configure backend regression targets
+        run: >-
+          cmake -B build-transfer
+          -DCMAKE_BUILD_TYPE=Release
+          -DGGML_METAL=ON
+          -DGGML_METAL_EMBED_LIBRARY=ON
+          -DLLAMA_BUILD_TESTS=ON
+          -DLLAMA_BUILD_SERVER=OFF
+          -DLLAMA_BUILD_OMNIVOICE=OFF
+          -DLLAMA_BUILD_KOKORO=OFF
+      - name: Build backend regression targets
+        run: cmake --build build-transfer --target test-backend-readback test-backend-ops
+      - name: Exercise real transfers and operator parity
+        shell: python
+        run: |
+          """Require actual backend execution and preserve every subprocess result."""
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+          logs = Path("transfer-logs")
+          logs.mkdir()
+          cases = [
+              ("metal-shared", ["test-backend-readback", "MTL0"], False, "MTL0"),
+              ("metal-private", ["test-backend-readback", "MTL0"], True, "MTL0"),
+              ("cpu", ["test-backend-readback", "CPU"], False, "CPU"),
+              ("metal-add", ["test-backend-ops", "test", "-b", "MTL0", "-o", "ADD", "-t", "1"], False, None),
+          ]
+          for name, args, private, backend in cases:
+              env = dict(os.environ)
+              env.pop("GGML_METAL_SHARED_BUFFERS_DISABLE", None)
+              if private:
+                  env["GGML_METAL_SHARED_BUFFERS_DISABLE"] = "1"
+              command = [str(Path("build-transfer/bin") / args[0]), *args[1:]]
+              with (logs / f"{name}.log").open("w") as output:
+                  # Timeout failures propagate; partial output remains in the log.
+                  result = subprocess.run(command, env=env, stdout=output,
+                                          stderr=subprocess.STDOUT, timeout=600)
+              text = (logs / f"{name}.log").read_text()
+              print(text, flush=True)
+              result.check_returncode()
+              if backend:
+                  marker = f"{backend}: exact guarded synchronous/asynchronous readback passed"
+                  if text.count(marker) != 1 or "queued SCALE unsupported" in text:
+                      raise RuntimeError(f"{name}: required transfer/compute cases did not execute")
+                  if backend == "MTL0":
+                      mode = "false" if private else "true"
+                      if f"use shared buffers    = {mode}" not in text:
+                          raise RuntimeError(f"{name}: requested Metal buffer mode not active")
+              else:
+                  plain = re.sub(r"\x1b\[[0-9;]*m", "", text)
+                  totals = re.findall(r"(\d+)/(\d+) tests passed", plain)
+                  if ("Backend MTL0: OK" not in plain or not totals
+                          or not all(int(a) == int(b) and int(b) > 0 for a, b in totals)):
+                      raise RuntimeError("Metal ADD parity did not execute positive passing cases")
+      - name: Preserve transfer logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metal-transfer-validation-logs
+          path: transfer-logs/
+          if-no-files-found: warn
+          retention-days: 14

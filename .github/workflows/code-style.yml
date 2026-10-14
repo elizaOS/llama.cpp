@@ -5,9 +5,13 @@ on:
   push:
     branches:
       - master
+      - main
+      - 'eliza/**'
   pull_request:
     branches:
       - master
+      - main
+      - 'eliza/**'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
@@ -15,7 +19,7 @@ concurrency:
 
 jobs:
   model-naming:
-    runs-on: [self-hosted, fast]
+    runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@v6
       - name: Check model naming conventions

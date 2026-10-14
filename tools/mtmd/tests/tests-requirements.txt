@@ -1,3 +1,5 @@
-jiwer
-sacrebleu
-rapidfuzz
+sentence-transformers
+transformers
+tokenizers
+torch
+torchvision

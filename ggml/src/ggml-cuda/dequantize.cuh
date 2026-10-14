@@ -1,9 +1,11 @@
 #include "common.cuh"
+#include "turboquant.cuh"
 
 static __device__ __forceinline__ void dequantize_q1_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q1_0 * x = (const block_q1_0 *) vx;
 
     const float d = x[ib].d;
+    const float neg_d = -d;
 
     const int bit_index_0 = iqs;
     const int bit_index_1 = iqs + 1;
@@ -14,12 +16,58 @@ static __device__ __forceinline__ void dequantize_q1_0(const void * vx, const in
     const int byte_index_1 = bit_index_1 / 8;
     const int bit_offset_1 = bit_index_1 % 8;
 
-    // Extract bits: 1 = +d, 0 = -d (branchless)
-    const int bit_0 = (x[ib].qs[byte_index_0] >> bit_offset_0) & 1;
-    const int bit_1 = (x[ib].qs[byte_index_1] >> bit_offset_1) & 1;
+    // Extract bits: 1 = +d, 0 = -d
+    const uint8_t bit_0 = (x[ib].qs[byte_index_0] >> bit_offset_0) & 1;
+    const uint8_t bit_1 = (x[ib].qs[byte_index_1] >> bit_offset_1) & 1;
 
-    v.x = (2*bit_0 - 1) * d;
-    v.y = (2*bit_1 - 1) * d;
+    v.x = bit_0 ? d : neg_d;
+    v.y = bit_1 ? d : neg_d;
+}
+
+static __device__ __forceinline__ void dequantize_q1_0_g128(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_q1_0_g128 * x = (const block_q1_0_g128 *) vx;
+
+    const float d = x[ib].d;
+    const float neg_d = -d;
+
+    const int bit_index_0 = iqs;
+    const int bit_index_1 = iqs + 1;
+
+    const int byte_index_0 = bit_index_0 / 8;
+    const int bit_offset_0 = bit_index_0 % 8;
+
+    const int byte_index_1 = bit_index_1 / 8;
+    const int bit_offset_1 = bit_index_1 % 8;
+
+    // Extract bits: 1 = +d, 0 = -d
+    const uint8_t bit_0 = (x[ib].qs[byte_index_0] >> bit_offset_0) & 1;
+    const uint8_t bit_1 = (x[ib].qs[byte_index_1] >> bit_offset_1) & 1;
+
+    v.x = bit_0 ? d : neg_d;
+    v.y = bit_1 ? d : neg_d;
+}
+
+static __device__ __forceinline__ void dequantize_q1_0_g32(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_q1_0_g32 * x = (const block_q1_0_g32 *) vx;
+
+    const float d = x[ib].d;
+    const float neg_d = -d;
+
+    const int bit_index_0 = iqs;
+    const int bit_index_1 = iqs + 1;
+
+    const int byte_index_0 = bit_index_0 / 8;
+    const int bit_offset_0 = bit_index_0 % 8;
+
+    const int byte_index_1 = bit_index_1 / 8;
+    const int bit_offset_1 = bit_index_1 % 8;
+
+    // Extract bits: 1 = +d, 0 = -d
+    const uint8_t bit_0 = (x[ib].qs[byte_index_0] >> bit_offset_0) & 1;
+    const uint8_t bit_1 = (x[ib].qs[byte_index_1] >> bit_offset_1) & 1;
+
+    v.x = bit_0 ? d : neg_d;
+    v.y = bit_1 ? d : neg_d;
 }
 
 static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
@@ -96,4 +144,20 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
 
     v.x *= d;
     v.y *= d;
+}
+
+static __device__ __forceinline__ void dequantize_tbq3_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    float block[QK_TBQ];
+    tbq_decode_block_cuda(((const block_tbq3_0 *) vx)[ib], block);
+
+    v.x = block[iqs + 0];
+    v.y = block[iqs + QK_TBQ/2];
+}
+
+static __device__ __forceinline__ void dequantize_tbq4_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    float block[QK_TBQ];
+    tbq_decode_block_cuda(((const block_tbq4_0 *) vx)[ib], block);
+
+    v.x = block[iqs + 0];
+    v.y = block[iqs + QK_TBQ/2];
 }

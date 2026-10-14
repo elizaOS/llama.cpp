@@ -2,6 +2,7 @@
 
 #include "ggml-common.h"
 #include "convert.cuh"
+#include "turboquant.cuh"
 
 static __device__ __forceinline__ int best_index_int8(int n, const int8_t * val, float x) {
     if (x <= val[0]) return 0;
@@ -205,6 +206,14 @@ static __device__ void cpy_blck_f32_q5_1(const char * cxi, char * cdsti) {
 
 static __device__ void cpy_blck_f32_q8_0(const char * cxi, char * cdsti) {
     quantize_f32_q8_0_block((const float *)cxi, (block_q8_0 *)cdsti);
+}
+
+static __device__ void cpy_blck_f32_tbq3_0(const char * cxi, char * cdsti) {
+    quantize_f32_tbq3_0_block((const float *) cxi, (block_tbq3_0 *) cdsti);
+}
+
+static __device__ void cpy_blck_f32_tbq4_0(const char * cxi, char * cdsti) {
+    quantize_f32_tbq4_0_block((const float *) cxi, (block_tbq4_0 *) cdsti);
 }
 
 static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {

@@ -1,0 +1,129 @@
+/** Computes packed TBQ attention scores against unconditioned queries.
+ * The 32-value sign/Hadamard transform and packed codes match ggml-quants.c.
+ */
+
+#version 450
+#extension GL_EXT_shader_16bit_storage  : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer QBuf {
+    float q[];
+};
+
+layout(std430, binding = 1) readonly buffer KBuf {
+    uint k_packed[];        // each block_tbq4_0 = 18 bytes
+};
+
+layout(std430, binding = 2) writeonly buffer OutBuf {
+    float scores[];
+};
+
+layout(push_constant) uniform Push {
+    uint head_dim;          // must be 128
+    uint n_kv;
+    uint kv_stride_blocks;  // 4 for d=128
+    uint q_head;
+    uint head_offset_bytes;
+} push;
+
+const uint TURBO4_BLOCK_BYTES = 18u;
+
+const float TURBO_CENTROIDS_4BIT[16] = float[16](
+    -2.7321365, -2.0685055, -1.6175243, -1.2557391,
+    -0.9419147, -0.6564307, -0.3878412, -0.1283243,
+     0.1283243,  0.3878412,  0.6564307,  0.9419147,
+     1.2557391,  1.6175243,  2.0685055,  2.7321365
+);
+
+float fp16_to_fp32(uint h16) {
+    return unpackHalf2x16(h16).x;
+}
+
+uint read_byte(uint b) {
+    uint w = k_packed[b >> 2];
+    return (w >> ((b & 3u) * 8u)) & 0xFFu;
+}
+uint read_u16(uint b) {
+    return read_byte(b) | (read_byte(b + 1u) << 8u);
+}
+
+// 32-thread tree reduction over a workgroup-shared scratch. Driver-portable:
+// does NOT depend on any specific subgroup size, unlike subgroupAdd (which is
+// only correct when a single 32-lane subgroup covers the whole workgroup).
+shared float partials[32];
+
+float reduce_sum_32(float v, uint tid) {
+    partials[tid] = v;
+    barrier();
+    for (uint stride = 16u; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        barrier();
+    }
+    return partials[0];
+}
+
+// Match tbq_precondition_block: the packed keys store H(sign * K).
+shared float conditioned_q[128];
+const float TBQ_SIGNS[32] = float[32](
+    1, -1, 1, 1, -1, 1, -1, -1, 1, 1, -1, 1, -1, -1, 1, -1,
+    -1, 1, 1, -1, 1, -1, -1, 1, 1, -1, 1, -1, -1, 1, -1, 1
+);
+
+void condition_query(uint tid) {
+    for (uint b = 0u; b < 4u; ++b) {
+        conditioned_q[b * 32u + tid] = q[push.q_head * push.head_dim + b * 32u + tid] * TBQ_SIGNS[tid];
+    }
+    barrier();
+    for (uint stride = 1u; stride < 32u; stride <<= 1u) {
+        float next_value[4];
+        for (uint b = 0u; b < 4u; ++b) {
+            float a = conditioned_q[b * 32u + (tid & ~stride)];
+            float z = conditioned_q[b * 32u + (tid | stride)];
+            next_value[b] = (tid & stride) == 0u ? a + z : a - z;
+        }
+        barrier();
+        for (uint b = 0u; b < 4u; ++b) {
+            conditioned_q[b * 32u + tid] = next_value[b];
+        }
+        barrier();
+    }
+    for (uint b = 0u; b < 4u; ++b) {
+        conditioned_q[b * 32u + tid] *= 0.1767766952966369;
+    }
+    barrier();
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    condition_query(tid);
+    uint kv_idx = gl_WorkGroupID.x;
+    if (kv_idx >= push.n_kv) return;
+
+    uint elem0 = tid * 4u;
+    uint blk_idx = elem0 >> 5;
+    uint within0 = elem0 & 31u;
+    uint group_off = push.head_offset_bytes +
+                     kv_idx * push.kv_stride_blocks * TURBO4_BLOCK_BYTES;
+    uint blk_off = group_off + blk_idx * TURBO4_BLOCK_BYTES;
+
+    uint norm16 = read_u16(blk_off + 0u);
+    float norm = fp16_to_fp32(norm16);
+
+    float acc = 0.0;
+    for (uint local = 0u; local < 4u; local += 1u) {
+        uint within = within0 + local;
+        uint qs_byte = read_byte(blk_off + 2u + (within & 15u));
+        uint idx = within < 16u ? (qs_byte & 0xFu) : (qs_byte >> 4);
+        acc = fma(conditioned_q[elem0 + local], TURBO_CENTROIDS_4BIT[idx] * norm, acc);
+    }
+
+    float sum = reduce_sum_32(acc, tid);
+    if (tid == 0u) {
+        scores[push.q_head * push.n_kv + kv_idx] = sum;
+    }
+}

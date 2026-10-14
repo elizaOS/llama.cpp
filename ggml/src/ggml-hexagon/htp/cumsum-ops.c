@@ -9,7 +9,6 @@
 #include "ggml-common.h"
 #include "htp-ctx.h"
 #include "htp-ops.h"
-#include "htp-tensor.h"
 #include "hvx-types.h"
 #include "hvx-utils.h"
 #include "hex-dma.h"
@@ -256,10 +255,16 @@ int op_cumsum_f32(struct htp_ops_context * octx) {
 int op_cumsum(struct htp_ops_context * octx) {
     const struct htp_tensor * dst = octx->dst;
 
+    int err = HTP_STATUS_OK;
+
     switch (dst->type) {
         case HTP_TYPE_F32:
-            return op_cumsum_f32(octx);
+            err = op_cumsum_f32(octx);
+            break;
         default:
-            return HTP_STATUS_NO_SUPPORT;
+            err = HTP_STATUS_NO_SUPPORT;
+            break;
     }
+
+    return err;
 }

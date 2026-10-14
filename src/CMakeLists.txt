@@ -24,8 +24,6 @@ add_library(llama
             llama-io.cpp
             llama-kv-cache.cpp
             llama-kv-cache-iswa.cpp
-            llama-kv-cache-dsa.cpp
-            llama-kv-cache-dsv4.cpp
             llama-memory.cpp
             llama-memory-hybrid.cpp
             llama-memory-hybrid-iswa.cpp
@@ -40,7 +38,14 @@ add_library(llama
             unicode-data.cpp
             unicode.cpp
             unicode.h
+            unicode-wordpiece.cpp
+            unicode-wordpiece.h
+            unicode-wordpiece-data.h
             ${LLAMA_MODELS_SOURCES}
+            # milady: DFlash draft model
+            models/dflash-draft.cpp
+            # EAGLE3 speculative-decoding scaffolding (upstream PR #18039)
+            llama-eagle3.cpp
             )
 
 set_target_properties(llama PROPERTIES

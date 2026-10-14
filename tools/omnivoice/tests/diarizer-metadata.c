@@ -26,7 +26,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <io.h>
+#include <windows.h>
+#define dup _dup
+#define dup2 _dup2
+#define open _open
+#define close _close
+#define unlink _unlink
+#else
 #include <unistd.h>
+#endif
 
 #define VC_GGUF_MAGIC "GGUF"
 #define VC_GGUF_VERSION 3
@@ -156,11 +166,39 @@ static int open_capture_stderr(const char * gguf, const char * err_path,
     return rc;
 }
 
+#ifdef _WIN32
+static int create_temp_file(char path[MAX_PATH]) {
+    char directory[MAX_PATH];
+    const DWORD length = GetTempPathA(MAX_PATH, directory);
+    if (length == 0 || length >= MAX_PATH) {
+        fprintf(stderr, "cannot resolve temporary directory: Windows error %lu\n", GetLastError());
+        return -1;
+    }
+    /* A zero unique value makes Windows create and close the file atomically. */
+    if (GetTempFileNameA(directory, "ovd", 0, path) == 0) {
+        fprintf(stderr, "cannot create temporary file: Windows error %lu\n", GetLastError());
+        return -1;
+    }
+    return 0;
+}
+#endif
+
 int main(void) {
     int failures = 0;
+    char err_buf[4096];
+#ifdef _WIN32
+    char tmpl[MAX_PATH];
+    char errtmpl[MAX_PATH];
+    if (create_temp_file(tmpl) != 0) {
+        return 1;
+    }
+    if (create_temp_file(errtmpl) != 0) {
+        unlink(tmpl);
+        return 1;
+    }
+#else
     char tmpl[] = "/tmp/omnivoice_diarizer_metadata_XXXXXX";
     char errtmpl[] = "/tmp/omnivoice_diarizer_stderr_XXXXXX";
-    char err_buf[4096];
     int fd = mkstemp(tmpl);
     if (fd < 0) {
         perror("mkstemp");
@@ -174,6 +212,7 @@ int main(void) {
         return 1;
     }
     close(fd);
+#endif
 
     /* 1. Explicit epoch-2 IFGO metadata parses correctly. */
     if (write_diarizer_meta(tmpl, DIAR_CONVERTER_EPOCH, "IFGO") != 0) {

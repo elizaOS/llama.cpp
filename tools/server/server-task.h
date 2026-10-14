@@ -19,7 +19,6 @@ enum server_task_type {
     SERVER_TASK_TYPE_RERANK,
     SERVER_TASK_TYPE_INFILL,
     SERVER_TASK_TYPE_CANCEL,
-    SERVER_TASK_TYPE_CONTROL,
     SERVER_TASK_TYPE_NEXT_RESPONSE,
     SERVER_TASK_TYPE_METRICS,
     SERVER_TASK_TYPE_SLOT_SAVE,
@@ -47,14 +46,32 @@ enum stop_type {
     STOP_TYPE_LIMIT,
 };
 
+// Eliza-1 guided-decode forced-token fast-forward (`eliza_prefill_plan`).
+// See structured-output.ts ElizaPrefillPlan in @elizaos/app-core. Each run is
+// a sequence of deterministic bytes anchored by the index of the free span it
+// follows (-1 = leading assistant-turn prefill, 0..N = run after free span N).
+// A request without a plan still produces byte-identical output via the lazy
+// GBNF — the plan only skips the per-token sampling overhead for forced runs.
+struct task_prefill_run {
+    int32_t after_free_span = -1;
+    std::string text;
+};
+
+struct task_prefill_plan {
+    std::string                   prefix;       // mirror of runs[0].text when after_free_span == -1
+    std::vector<task_prefill_run> runs;
+    int32_t                       free_count = 0;
+    std::string                   id;           // opaque cache key
+
+    bool empty() const { return runs.empty(); }
+};
+
 struct task_params {
-    bool stream          = false;
+    bool stream          = true;
     bool include_usage   = false;
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
     bool return_tokens   = false;
     bool return_progress = false;
-
-    int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables
 
     int32_t n_keep    =  0; // number of tokens to keep from initial prompt
     int32_t n_discard =  0; // number of tokens after n_keep that may be discarded when shifting context, 0 defaults to half
@@ -84,21 +101,20 @@ struct task_params {
     std::string        oaicompat_model;
     std::string        oaicompat_cmpl_id;
 
-    // realtime control (SERVER_TASK_TYPE_CONTROL)
-    std::string        control_action;
-    std::string        control_cmpl_id;
-
     // per-request parameters for chat parsing
     common_chat_parser_params chat_parser_params;
 
-    // message spans for checkpointing
-    common_chat_msg_spans message_spans;
+    // Eliza-1 forced-token fast-forward (off by default). See task_prefill_plan
+    // above; when empty the lazy GBNF still forces the same bytes.
+    task_prefill_plan prefill_plan;
 
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
 
     json format_logit_bias(const std::vector<llama_logit_bias> & logit_bias) const;
     json to_json(bool only_metrics = false) const;
+
+    int32_t checkpoint_before_last_user_token = -1;
 };
 
 // struct for tracking the state of a task (e.g., for streaming)
@@ -117,13 +133,16 @@ struct task_result_state {
     bool text_block_started = false;
 
     // for OpenAI Responses streaming API
-    bool oai_resp_created = false;
     const std::string oai_resp_id;
     const std::string oai_resp_reasoning_id;
     const std::string oai_resp_message_id;
     std::string oai_resp_fc_id; // function call ID for current args delta
 
-    task_result_state(const common_chat_parser_params & chat_parser_params);
+    task_result_state(const common_chat_parser_params & chat_parser_params)
+        : chat_parser_params(chat_parser_params)
+        , oai_resp_id("resp_" + random_string())
+        , oai_resp_reasoning_id("rs_" + random_string())
+        , oai_resp_message_id("msg_" + random_string()) {}
 
     // parse partial tool calls and update the internal state
     common_chat_msg update_chat_msg(
@@ -212,6 +231,13 @@ struct server_task {
                 return false;
         }
     }
+
+    static task_params params_from_json_cmpl(
+        const llama_vocab * vocab,
+        const common_params & params_base,
+        const int n_ctx_slot,
+        const std::vector<llama_logit_bias> & logit_bias_eog,
+        const json & data);
 
     // utility function
     static std::unordered_set<int> get_list_id(const std::vector<server_task> & tasks) {
@@ -308,9 +334,6 @@ struct server_task_result {
     }
     virtual json to_json() = 0;
     virtual ~server_task_result() = default;
-    virtual server_task_result * clone() const {
-        GGML_ABORT("not implemented for this task type");
-    }
 };
 
 // using shared_ptr for polymorphism of server_task_result
@@ -422,8 +445,6 @@ struct server_task_result_cmpl_partial : server_task_result {
 
     bool post_sampling_probs;
     bool is_progress = false;
-    bool is_begin = false; // whether to send 200 status to HTTP client (begin of SSE stream)
-                           // ref: https://github.com/ggml-org/llama.cpp/pull/23884
     completion_token_output prob_output;
     result_timings timings;
     result_prompt_progress progress;
@@ -441,7 +462,6 @@ struct server_task_result_cmpl_partial : server_task_result {
     bool text_block_started     = false;
 
     // for OpenAI Responses API
-    bool oai_resp_created = false;
     std::string oai_resp_id;
     std::string oai_resp_reasoning_id;
     std::string oai_resp_message_id;
@@ -532,6 +552,13 @@ struct server_task_result_metrics : server_task_result {
     uint64_t n_decode_total     = 0;
     uint64_t n_busy_slots_total = 0;
 
+    // Speculative decoding totals (Eliza DFlash port). Mirrors fields on
+    // `server_metrics` in server-context.cpp; surfaced through to_json() and
+    // the Prometheus /metrics endpoint so consumers can verify the drafter is
+    // actually engaged.
+    uint64_t n_drafted_total          = 0;
+    uint64_t n_drafted_accepted_total = 0;
+
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result
     json slots_data = json::array();
@@ -556,19 +583,6 @@ struct server_task_result_slot_erase : server_task_result {
     virtual json to_json() override;
 };
 
-struct server_task_result_control : server_task_result {
-    bool        success = false;
-    std::string message; // optional detail when success is false
-
-    virtual json to_json() override {
-        json out = json { { "success", success } };
-        if (!message.empty()) {
-            out["message"] = message;
-        }
-        return out;
-    }
-};
-
 struct server_task_result_get_lora : server_task_result {
     struct lora {
         common_adapter_lora_info info;
@@ -584,28 +598,6 @@ struct server_task_result_apply_lora : server_task_result {
     virtual json to_json() override;
 };
 
-struct server_prompt {
-    server_tokens tokens;
-
-    std::list<common_prompt_checkpoint> checkpoints;
-
-    void clear() {
-        tokens.clear();
-        checkpoints.clear();
-    }
-
-    int n_tokens() const {
-        return tokens.size();
-    }
-
-    server_prompt clone() const {
-        return server_prompt {
-            tokens.clone(),
-            checkpoints,
-        };
-    }
-};
-
 struct server_prompt_data {
     std::vector<uint8_t> main;
     std::vector<uint8_t> drft;
@@ -615,18 +607,35 @@ struct server_prompt_data {
     }
 };
 
-struct server_prompt_cache_state {
-    server_prompt prompt;
+struct server_prompt {
+    server_tokens tokens;
+
     server_prompt_data data;
 
-    size_t size() const {
-        size_t res = data.size();
+    std::list<common_prompt_checkpoint> checkpoints;
 
-        for (const auto & ckpt : prompt.checkpoints) {
+    size_t size() const {
+        size_t res = 0;
+
+        res += data.size();
+
+        for (const auto & ckpt : checkpoints) {
             res += ckpt.size();
         }
 
         return res;
+    }
+
+    int n_tokens() const {
+        return tokens.size();
+    }
+
+    server_prompt clone() const {
+        return server_prompt {
+            tokens.clone(),
+            data,
+            checkpoints,
+        };
     }
 };
 
@@ -636,7 +645,7 @@ struct server_prompt_cache {
         this->limit_tokens = limit_tokens;
     }
 
-    std::list<server_prompt_cache_state> states;
+    std::list<server_prompt> states;
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;
@@ -648,18 +657,9 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    server_prompt * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
 
     void update();
-};
-
-// used exclusively by router mode
-struct server_task_result_router : server_task_result {
-    json data;
-    virtual json to_json() override { return data; }
-    virtual server_task_result * clone() const override {
-        return new server_task_result_router(*this);
-    }
 };

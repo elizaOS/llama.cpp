@@ -79,9 +79,9 @@ def test_load_split_model():
     assert match_regex("(little|girl)+", res.body["content"])
 
 
-def test_no_ui():
+def test_no_webui():
     global server
-    # default: UI enabled
+    # default: webui enabled
     server.start()
     url = f"http://{server.server_host}:{server.server_port}"
     res = requests.get(url)
@@ -89,8 +89,8 @@ def test_no_ui():
     assert "<!doctype html>" in res.text
     server.stop()
 
-    # with --no-ui, the UI should be disabled
-    server.no_ui = True
+    # with --no-webui
+    server.no_webui = True
     server.start()
     res = requests.get(url)
     assert res.status_code == 404

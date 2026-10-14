@@ -134,7 +134,6 @@ static __global__ void rope_neox(const T *            x,
                                  const float *        freq_factors,
                                  const int64_t *      row_indices,
                                  const int            set_rows_stride) {
-    ggml_cuda_pdl_lc();
     const int i0 = 2*(blockDim.y*blockIdx.y + threadIdx.y);
 
     if (i0 >= ne00) {
@@ -149,7 +148,6 @@ static __global__ void rope_neox(const T *            x,
 
     int       idst = i0 / 2 + i1 * s1  + i2 * s2  + i3 * s3;
     const int ix   = i0 / 2 + i1 * s01 + i2 * s02 + i3 * s03;
-    ggml_cuda_pdl_sync();
 
     // Fusion optimization: ROPE + VIEW + SET_ROWS.
     // The rope output is viewed as a 1D tensor and offset based on a row index in row_indices.
@@ -218,7 +216,6 @@ static __global__ void rope_multi(const T *            x,
     int       idst = i0 / 2 + i1 * s1  + i2 * s2  + i3 * s3;
     const int ix   = i0 / 2 + i1 * s01 + i2 * s02 + i3 * s03;
 
-    ggml_cuda_pdl_sync();
     if (i0 >= n_dims) {
         dst[idst + i0/2 + 0] = x[ix + i0/2 + 0];
         dst[idst + i0/2 + 1] = x[ix + i0/2 + 1];
@@ -303,7 +300,6 @@ static __global__ void rope_vision(const T *            x,
     int       idst = i0 / 2 + i1 * s1  + i2 * s2  + i3 * s3;
     const int ix   = i0 / 2 + i1 * s01 + i2 * s02 + i3 * s03;
 
-    ggml_cuda_pdl_sync();
     const int sect_dims = sections.v[0] + sections.v[1];
     const int sec_w     = sections.v[1] + sections.v[0];
     const int sector    = (i0 / 2) % sect_dims;
@@ -403,14 +399,13 @@ static void rope_neox_cuda(const T *            x,
     const dim3 block_nums(nr, n_blocks_x, 1);
 
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
-    const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
 
     if (freq_factors == nullptr) {
-        ggml_cuda_kernel_launch(rope_neox<forward, false, T, D>, launch_params,
+        rope_neox<forward, false><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
             attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride);
     } else {
-        ggml_cuda_kernel_launch(rope_neox<forward, true, T, D>, launch_params,
+        rope_neox<forward, true><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
             attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride);
     }
@@ -448,13 +443,11 @@ static void rope_multi_cuda(const T *            x,
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
 
     if (freq_factors == nullptr) {
-        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
-        ggml_cuda_kernel_launch(rope_multi<forward, false, T>, launch_params,
+        rope_multi<forward, false, T><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
             attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope);
     } else {
-        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
-        ggml_cuda_kernel_launch(rope_multi<forward, true, T>, launch_params,
+        rope_multi<forward, true, T><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
             attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope);
     }

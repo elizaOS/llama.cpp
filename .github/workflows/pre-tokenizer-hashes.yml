@@ -3,16 +3,16 @@ name: Check Pre-Tokenizer Hashes
 on:
     push:
         paths:
-            - 'conversion/base.py'
+            - 'convert_hf_to_gguf.py'
             - 'convert_hf_to_gguf_update.py'
     pull_request:
         paths:
-            - 'conversion/base.py'
+            - 'convert_hf_to_gguf.py'
             - 'convert_hf_to_gguf_update.py'
 
 jobs:
     pre-tokenizer-hashes:
-        runs-on: [self-hosted, fast]
+        runs-on: ubuntu-slim
 
         steps:
         - name: Checkout repository
@@ -30,16 +30,16 @@ jobs:
 
         - name: Update pre-tokenizer hashes
           run: |
-              cp conversion/base.py /tmp
+              cp convert_hf_to_gguf.py /tmp
               .venv/bin/python convert_hf_to_gguf_update.py --check-missing
 
         - name: Check if committed pre-tokenizer hashes matches generated version
           run: |
-              if ! diff -q conversion/base.py /tmp/base.py; then
-                  echo "Model pre-tokenizer hashes (in conversion/base.py) do not match generated hashes (from convert_hf_to_gguf_update.py)."
-                  echo "To fix: run ./convert_hf_to_gguf_update.py and commit the updated conversion/base.py along with your changes"
+              if ! diff -q convert_hf_to_gguf.py /tmp/convert_hf_to_gguf.py; then
+                  echo "Model pre-tokenizer hashes (in convert_hf_to_gguf.py) do not match generated hashes (from convert_hf_to_gguf_update.py)."
+                  echo "To fix: run ./convert_hf_to_gguf_update.py and commit the updated convert_hf_to_gguf.py along with your changes"
                   echo "Differences found:"
-                  diff conversion/base.py /tmp/base.py || true
+                  diff convert_hf_to_gguf.py /tmp/convert_hf_to_gguf.py || true
                   exit 1
               fi
               echo "Model pre-tokenizer hashes are up to date."

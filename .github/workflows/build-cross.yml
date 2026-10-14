@@ -6,6 +6,8 @@ on:
   push:
     branches:
       - master
+      - main
+      - 'eliza/**'
     paths: [
       '.github/workflows/build-cross.yml',
       'ggml/src/spacemit/*',
@@ -277,7 +279,7 @@ jobs:
 
     env:
       # Make sure this is in sync with build-cache.yml
-      SPACEMIT_IME_TOOLCHAIN_VERSION: "1.2.4"
+      SPACEMIT_IME_TOOLCHAIN_VERSION: "1.1.2"
 
     steps:
       - uses: actions/checkout@v6
@@ -287,7 +289,7 @@ jobs:
       #  id: cache-toolchain
       #  with:
       #    path: ./spacemit_toolchain
-      #    key: cache-gha-spacemit-ime-toolchain-v${{ env.SPACEMIT_IME_TOOLCHAIN_VERSION }}-${{ runner.os }}
+      #    key: spacemit-ime-toolchain-v${{ env.SPACEMIT_IME_TOOLCHAIN_VERSION }}-${{ runner.os }}
 
       - name: Setup SpacemiT Toolchain
         #if: steps.cache-toolchain.outputs.cache-hit != 'true'

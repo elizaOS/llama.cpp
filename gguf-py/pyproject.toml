@@ -37,7 +37,7 @@ packages = [
 [tool.poetry.dependencies]
 python = ">=3.10"
 
-[tool.poetry.group.dev.dependencies]
+[tool.poetry.dev-dependencies]
 pytest = "^5.2"
 
 [build-system]

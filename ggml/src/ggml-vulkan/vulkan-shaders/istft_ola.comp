@@ -1,0 +1,61 @@
+#version 450
+
+// ---------------------------------------------------------------------------
+// istft_ola.comp — Overlap-add pass for iSTFT.
+//
+// Reads the windowed frames written by istft.comp and accumulates them into
+// the final output buffer with OLA + window-energy normalization.
+//
+// Workgroup: one per output sample (gl_GlobalInvocationID.x = output index i).
+// Threads: local_size_x=256.
+//
+// Binding 0 : frames F32 [T * win_length]  windowed per-frame output
+// Binding 1 : window F32 [win_length]      Hann window (for norm)
+// Binding 2 : dst    F32 [n_out]           final PCM output
+//
+// Push constants: n_fft, hop_length, win_length, T, n_out
+// ---------------------------------------------------------------------------
+
+#include "types.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Frames { float frames_data[]; };
+layout(binding = 1) readonly buffer Window { float win_data[]; };
+layout(binding = 2) writeonly buffer Dst   { float dst_data[]; };
+
+layout(push_constant) uniform Params {
+    uint n_fft;
+    uint hop_length;
+    uint win_length;
+    uint T;
+    uint n_out;
+} p;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n_out) return;
+
+    // Find the range of frames that contribute to output sample i.
+    // Frame t contributes samples [t*hop, t*hop + win_length).
+    // So i is covered by t if  t*hop <= i < t*hop + win_length
+    //   => t >= (i - win_length + 1) / hop  and  t <= i / hop.
+    const uint t_max = min(i / p.hop_length, p.T - 1u);
+    uint t_min = 0u;
+    if (i + 1u > p.win_length) {
+        t_min = (i + 1u - p.win_length + p.hop_length - 1u) / p.hop_length;
+    }
+
+    float acc  = 0.0;
+    float norm = 0.0;
+
+    for (uint t = t_min; t <= t_max; ++t) {
+        const uint off = i - t * p.hop_length;  // position within the frame window
+        if (off >= p.win_length) continue;
+        const float w  = win_data[off];
+        acc  += frames_data[t * p.win_length + off];
+        norm += w * w;
+    }
+
+    dst_data[i] = (norm > 1e-8) ? (acc / norm) : 0.0;
+}

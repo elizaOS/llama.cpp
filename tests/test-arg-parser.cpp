@@ -10,7 +10,7 @@
 #undef NDEBUG
 #include <cassert>
 
-static void test(void) {
+int main(void) {
     common_params params;
 
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");
@@ -209,14 +209,4 @@ static void test(void) {
     }
 
     printf("test-arg-parser: all tests OK\n\n");
-}
-
-int main(void) {
-    try {
-        test();
-    } catch (std::exception & e) {
-        fprintf(stderr, "test-arg-parser: exception: %s\n", e.what());
-        return 1;
-    }
-    return 0;
 }

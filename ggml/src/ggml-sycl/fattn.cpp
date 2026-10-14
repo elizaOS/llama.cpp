@@ -18,7 +18,6 @@
 #include "fattn-tile.hpp"
 #include "fattn-vec.hpp"
 #include "fattn.hpp"
-#include "fattn-onednn.hpp"
 
 
 #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
@@ -97,7 +96,6 @@ static void ggml_sycl_flash_attn_ext_vec(ggml_backend_sycl_context & ctx, ggml_t
 enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE     =   0,
     BEST_FATTN_KERNEL_VEC      = 100,
-    BEST_FATTN_KERNEL_ONEDNN   = 150, // added enum for onednn==150
     BEST_FATTN_KERNEL_TILE     = 200,
 };
 
@@ -191,11 +189,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     const bool can_use_vector_kernel = Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
-    // Fused-XMX path: oneDNN Graph SDPA (flash attention). Strictly
-    // additive -- taken only when statically supported, otherwise falls through to VEC/TILE below.
-    if (ggml_sycl_flash_attn_ext_onednn_supported(dst)) {
-        return BEST_FATTN_KERNEL_ONEDNN;
-    }
+    // Todo: Use the XMX kernel if possible:
 
     // If there are no tensor cores available, use the generic tile kernel:
     if (can_use_vector_kernel) {
@@ -219,13 +213,6 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
     switch (ggml_sycl_get_best_fattn_kernel(ggml_sycl_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("Not support Flash-Attention");
-        case BEST_FATTN_KERNEL_ONEDNN:
-            // guarded: ggml_sycl_flash_attn_ext_onednn() is only defined under GGML_SYCL_DNNL;
-            // the reference must be compiled out here or the GGML_SYCL_DNNL=0 build fails to link.
-#if GGML_SYCL_DNNL
-            ggml_sycl_flash_attn_ext_onednn(ctx, dst);
-#endif
-            break;
         case BEST_FATTN_KERNEL_TILE:
             ggml_sycl_flash_attn_ext_tile(ctx, dst);
             break;

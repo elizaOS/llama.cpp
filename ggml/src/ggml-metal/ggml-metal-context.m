@@ -1,3 +1,6 @@
+/** Submits Metal tensor operations and synchronizes GPU transfers with caller-owned memory. */
+#include <unistd.h>
+
 #import "ggml-metal-context.h"
 
 #import "ggml-impl.h"
@@ -76,7 +79,8 @@ struct ggml_metal {
     ggml_abort_callback abort_callback;
     void *              abort_callback_data;
 
-    // error state - set when a command buffer fails during synchronize
+    // error state - set when a command buffer fails during synchronize or when
+    // graph encoding fails (e.g. a required compute pipeline is nil, #11612)
     // once set, graph_compute will return GGML_STATUS_FAILED until the backend is recreated
     bool has_error;
 };
@@ -133,8 +137,16 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
     res->d_queue = dispatch_queue_create("ggml-metal", DISPATCH_QUEUE_CONCURRENT);
 
-    res->use_fusion      = getenv("GGML_METAL_FUSION_DISABLE") == nil;
-    res->use_concurrency = getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil;
+    res->use_fusion = getenv("GGML_METAL_FUSION_DISABLE") == nil;
+
+    // Auto-disable concurrent dispatch on non-Apple GPUs (AMD/Intel)
+    // MTLDispatchTypeConcurrent has broken memory barriers on these GPUs
+    bool is_apple_gpu = props_dev->supports_gpu_family_apple7;
+    res->use_concurrency = is_apple_gpu && (getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil);
+
+    if (!is_apple_gpu && getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil) {
+        GGML_LOG_INFO("%s: disabling concurrent dispatch (non-Apple GPU detected)\n", __func__);
+    }
 
     {
         const char * val = getenv("GGML_METAL_GRAPH_DEBUG");
@@ -349,12 +361,19 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
 }
 
 void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    if (size == 0) {
+        return;
+    }
     @autoreleasepool {
         id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
-        id<MTLBuffer> buf_dst = [device newBufferWithBytesNoCopy:data
-                                                          length:size
-                                                         options:MTLResourceStorageModeShared
-                                                     deallocator:nil];
+        // Pooled outputs may be smaller than a page and use ordinary heap storage.
+        // Metal's no-copy API requires both pointer and length to be page aligned.
+        const size_t page_size = (size_t) sysconf(_SC_PAGESIZE);
+        const bool direct = (uintptr_t) data % page_size == 0 && size % page_size == 0;
+        id<MTLBuffer> buf_dst = direct
+            ? [device newBufferWithBytesNoCopy:data length:size
+                                             options:MTLResourceStorageModeShared deallocator:nil]
+            : [device newBufferWithLength:size options:MTLResourceStorageModeShared];
 
         GGML_ASSERT(buf_dst);
 
@@ -379,12 +398,17 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
 
         [encoder endEncoding];
         [cmd_buf commit];
+        if (!direct) {
+            // Finish the staging copy before exposing bytes to the caller or freeing it.
+            [cmd_buf waitUntilCompleted];
+            if (cmd_buf.status == MTLCommandBufferStatusCompleted) {
+                memcpy(data, buf_dst.contents, size);
+            }
+            // Failed commands remain registered below for synchronize's error state.
+        }
         [buf_dst release];
 
-        // do not wait here for completion
-        //[cmd_buf waitUntilCompleted];
-
-        // instead, remember a reference to the command buffer and wait for it later if needed
+        // Aligned direct copies finish at backend synchronization.
         [ctx->cmd_bufs_ext addObject:cmd_buf];
         ctx->cmd_buf_last = cmd_buf;
 
@@ -611,6 +635,13 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
     }
 
+    // encoding runs synchronously above (main-thread encode_async + the
+    // dispatch_apply barrier), so an encode failure is visible here
+    if (ctx->has_error) {
+        GGML_LOG_ERROR("%s: graph encode failed (nil compute pipeline or encoder error) - returning GGML_STATUS_FAILED\n", __func__);
+        return GGML_STATUS_FAILED;
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
@@ -707,6 +738,10 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
         for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
             const int res = ggml_metal_op_encode(ctx_op, idx);
             if (res == 0) {
+                // encode failure (e.g. nil compute pipeline, issue #11612) -
+                // latch the backend error state so graph_compute reports
+                // GGML_STATUS_FAILED instead of consuming a partial graph
+                ctx->has_error = true;
                 break;
             }
 

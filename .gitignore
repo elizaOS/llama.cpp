@@ -54,6 +54,7 @@
 /tmp/
 /autogen-*.md
 /common/build-info.cpp
+/tools/server/public
 
 # Deprecated
 
@@ -91,6 +92,11 @@
 !/examples/*/*/*.kts
 !/examples/sycl/*.bat
 !/examples/sycl/*.sh
+
+# Server Web UI temporary files
+
+/tools/server/webui/node_modules
+/tools/server/webui/dist
 
 # Python
 
@@ -153,3 +159,4 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+CMakeUserPresets.json

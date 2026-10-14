@@ -10,11 +10,8 @@ file(MAKE_DIRECTORY ${SHADER_OUTPUT_DIR})
 
 message(STATUS "Shader output dir: ${SHADER_OUTPUT_DIR}")
 
-# Find all WGSL sources
-file(GLOB WGSL_SHADER_FILES
-    "${SHADER_DIR}/*.wgsl"
-    "${SHADER_DIR}/*.tmpl"
-)
+# Find all WGSL files
+file(GLOB WGSL_SHADER_FILES "${SHADER_DIR}/*.wgsl")
 
 # Generate the header using a Python script
 add_custom_command(

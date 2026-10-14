@@ -6,7 +6,6 @@
 
 #include <qurt_thread.h>
 #include <qurt_futex.h>
-#include <qurt_hvx.h>
 
 #include <HAP_compute_res.h>
 
@@ -14,7 +13,7 @@
 
 #define QURT_LOWEST_PRIO (254)
 
-static inline void hmx_lock(hmx_queue_t q)
+static inline void hmx_lock(struct hmx_queue *q)
 {
     if (!q->hmx_locked) {
         HAP_compute_res_hmx_lock(q->hap_rctx);
@@ -22,7 +21,7 @@ static inline void hmx_lock(hmx_queue_t q)
     }
 }
 
-static inline void hmx_unlock(hmx_queue_t q)
+static inline void hmx_unlock(struct hmx_queue *q)
 {
     if (q->hmx_locked) {
         HAP_compute_res_hmx_unlock(q->hap_rctx);
@@ -30,7 +29,7 @@ static inline void hmx_unlock(hmx_queue_t q)
     }
 }
 
-static inline void hmx_queue_process(hmx_queue_t q, bool* killed) {
+static inline void hmx_queue_process(struct hmx_queue *q, bool* killed) {
     unsigned int ir = atomic_load(&q->idx_read);
 
     while (ir != atomic_load(&q->idx_write)) {
@@ -38,17 +37,14 @@ static inline void hmx_queue_process(hmx_queue_t q, bool* killed) {
         if (!d->done) {
             FARF(HIGH, "hmx-queue-process: ir %u func %p data %p", ir, d->func, d->data);
 
-            uintptr_t sig = (uintptr_t) d->func;
+            enum hmx_queue_signal sig = (enum hmx_queue_signal) (unsigned int) d->func;
             switch (sig) {
                 case HMX_QUEUE_NOOP:    /* noop */;     break;
                 case HMX_QUEUE_KILL:    *killed = true; break;
                 case HMX_QUEUE_SUSPEND: hmx_unlock(q);  break;
-                case HMX_QUEUE_WAKEUP:  hmx_lock(q);    break;
                 default:
                     hmx_lock(q);
-                    htp_trace_event_start(q->trace, HTP_TRACE_EVT_HMX_COMP, ir);
                     d->func(d->data);
-                    htp_trace_event_stop(q->trace, HTP_TRACE_EVT_HMX_COMP, ir);
                     break;
             }
 
@@ -61,7 +57,7 @@ static inline void hmx_queue_process(hmx_queue_t q, bool* killed) {
 }
 
 static void hmx_queue_thread(void * arg) {
-    hmx_queue_t q = (hmx_queue_t) arg;
+    struct hmx_queue * q = (struct hmx_queue *) arg;
 
     FARF(HIGH, "hmx-queue-thread: started");
 
@@ -72,14 +68,9 @@ static void hmx_queue_thread(void * arg) {
     while (!killed) {
         unsigned int seqn = atomic_load(&q->seqn);
         if (seqn == prev_seqn) {
-            // drop HVX context while spinning
-            if (poll_cnt > 1 && poll_cnt == HMX_QUEUE_POLL_COUNT) {
-                qurt_hvx_unlock();
-            }
             if (--poll_cnt) { hex_pause(); continue; }
             FARF(HIGH, "hmx-queue-thread: sleeping");
             qurt_futex_wait(&q->seqn, prev_seqn);
-            poll_cnt = HMX_QUEUE_POLL_COUNT;
             continue;
         }
         prev_seqn = seqn;
@@ -93,40 +84,33 @@ static void hmx_queue_thread(void * arg) {
     FARF(HIGH, "hmx-queue-thread: stopped");
 }
 
-size_t hmx_queue_sizeof(size_t capacity, uint32_t stack_size) {
+struct hmx_queue * hmx_queue_create(size_t capacity, uint32_t hap_rctx) {
     capacity = hex_ceil_pow2(capacity);
-    size_t size_q = hex_align_up(sizeof(struct hmx_queue_s), HEX_L2_LINE_SIZE);
-    size_t size_desc = hex_align_up(capacity * sizeof(struct hmx_queue_desc), HEX_L2_LINE_SIZE);
-    size_t size_stack = stack_size;
-    return size_q + size_desc + size_stack;
-}
 
-size_t hmx_queue_alignof(void) {
-    return HEX_L2_LINE_SIZE;
-}
-
-hmx_queue_t hmx_queue_init(void * ptr, size_t capacity, uint32_t stack_size, uint32_t hap_rctx, struct htp_thread_trace * trace) {
-    capacity = hex_ceil_pow2(capacity);
-    size_t size_q = hex_align_up(sizeof(struct hmx_queue_s), HEX_L2_LINE_SIZE);
-    size_t size_desc = hex_align_up(capacity * sizeof(struct hmx_queue_desc), HEX_L2_LINE_SIZE);
-
-    uint8_t * block = (uint8_t *) ptr;
-
-    hmx_queue_t q = (hmx_queue_t) block; block += size_q;
-    memset(q, 0, sizeof(struct hmx_queue_s));
-
+    struct hmx_queue * q = (struct hmx_queue *) memalign(32, sizeof(struct hmx_queue));
+    if (q == NULL) {
+        FARF(ERROR, "%s: failed to allocate DMA queue\n", __FUNCTION__);
+        return NULL;
+    }
+    memset(q, 0, sizeof(struct hmx_queue));
     q->capacity = capacity;
     q->idx_mask = capacity - 1;
     q->hap_rctx = hap_rctx;
-    q->external_mem = true;
 
-    q->desc = (struct hmx_queue_desc *) block; block += size_desc;
+    q->desc = (struct hmx_queue_desc *) memalign(64, capacity * sizeof(struct hmx_queue_desc));
+    if (!q->desc) {
+        FARF(ERROR, "hmx-queue: failed to allocate HMX queue descriptors\n");
+        return NULL;
+    }
     memset(q->desc, 0, capacity * sizeof(struct hmx_queue_desc));
 
-    q->stack = block;
+    const size_t stack_size = HMX_QUEUE_THREAD_STACK_SIZE;
+    q->stack = (unsigned char *) memalign(64, stack_size);
+    if (!q->stack) {
+        FARF(ERROR, "hmx-queue: thread stack allocation failed (%zu bytes)", stack_size);
+        return NULL;
+    }
     memset(q->stack, 0, stack_size);
-
-    q->trace = trace;
 
     // Match caller thread priority (same pattern as worker-pool.c).
     int prio = qurt_thread_get_priority(qurt_thread_get_id());
@@ -155,7 +139,7 @@ hmx_queue_t hmx_queue_init(void * ptr, size_t capacity, uint32_t stack_size, uin
     return q;
 }
 
-void hmx_queue_free(hmx_queue_t q) {
+void hmx_queue_delete(struct hmx_queue * q) {
     if (!q) {
         return;
     }
@@ -167,4 +151,8 @@ void hmx_queue_free(hmx_queue_t q) {
 
     int status;
     qurt_thread_join(q->thread, &status);
+
+    free(q->desc);
+    free(q->stack);
+    free(q);
 }

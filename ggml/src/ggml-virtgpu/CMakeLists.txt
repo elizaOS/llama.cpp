@@ -54,7 +54,7 @@ if (NOT GGML_VIRTGPU_BACKEND STREQUAL "ONLY")
     target_include_directories(ggml-virtgpu PUBLIC ${DRM_INCLUDE_DIRS})
     target_compile_options(ggml-virtgpu PUBLIC ${DRM_CFLAGS_OTHER})
 
-    target_include_directories(ggml-virtgpu PUBLIC ./include)
+    target_include_directories(ggml-virtgpu PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
     target_include_directories(ggml-virtgpu PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
     # Ensure venus_hw.h is downloaded before building ggml-virtgpu

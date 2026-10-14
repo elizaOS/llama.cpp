@@ -95,10 +95,11 @@ struct q5_1 {
 };
 #endif
 
+
 #ifdef Q8_1_T
 struct q8_1 {
     d: f16,
-    s: f16, // d * sum(qs[i])
+    m: f16,
     qs: array<u32, 8>
 };
 #endif
@@ -896,23 +897,9 @@ const kvalues_iq4nl = array<i32, 16>(
 
 #endif
 
-#if defined(MXFP4_LUT) || defined(NVFP4_LUT)
+#ifdef MXFP4_LUT
 const kvalues_mxfp4 = array<i32, 16>(
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12
 );
-#endif // MXFP4_LUT || NVFP4_LUT
+#endif
 
-#ifdef NVFP4_LUT
-fn ue4m3_to_fp32(u: u32) -> f32 {
-    if (u == 0u || u == 127u) {
-        return 0.0;
-    }
-    let exp = (u >> 3u) & 15u;
-    let man = u & 7u;
-    if (exp == 0u) {
-        return f32(man) * (1.0 / 512.0);
-    }
-    let bits = ((exp + 120u) << 23u) | (man << 20u);
-    return bitcast<f32>(bits);
-}
-#endif // NVFP4_LUT
