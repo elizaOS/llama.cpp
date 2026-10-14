@@ -59,6 +59,23 @@ if (NOT GATE_ESPEAK_DATA AND MISAKI_ESPEAK_LIBRARY)
     endif()
 endif()
 
+# misaki and Kokoro phonemizing concurrently through the shared libespeak-ng
+# owner (tools/espeak-shared). Needs kokoro_lib, which is configured before
+# this directory in the llama.cpp tree; skips (77) without libespeak-ng.
+if (TARGET kokoro_lib)
+    find_package(Threads REQUIRED)
+    add_executable(test-espeak-shared test_espeak_shared.cpp)
+    target_link_libraries(test-espeak-shared PRIVATE misaki_g2p kokoro_lib Threads::Threads)
+    if (GATE_ESPEAK_DATA)
+        set(_espeak_shared_args ${GATE_ESPEAK_DATA})
+    else()
+        set(_espeak_shared_args "")
+    endif()
+    add_test(NAME misaki_g2p_espeak_shared COMMAND test-espeak-shared ${MINI_LEX} ${_espeak_shared_args})
+    set_tests_properties(misaki_g2p_espeak_shared PROPERTIES
+        FIXTURES_REQUIRED misaki_mini_lex SKIP_RETURN_CODE 77 TIMEOUT 300)
+endif()
+
 foreach(gate agreement agent)
     if (gate STREQUAL "agreement")
         set(fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/reference.txt)

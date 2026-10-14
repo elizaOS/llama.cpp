@@ -8,7 +8,8 @@
  *
  * Thread safety: a misaki_g2p handle may be used from one thread at a time.
  * Separate handles may run concurrently; calls into eSpeak NG are serialised
- * internally because libespeak-ng is process-global.
+ * internally because libespeak-ng is process-global, under the same lock
+ * Kokoro uses (tools/espeak-shared/eliza-espeak-shared.h).
  */
 #ifndef MISAKI_G2P_H
 #define MISAKI_G2P_H
