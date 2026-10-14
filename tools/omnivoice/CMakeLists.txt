@@ -232,7 +232,28 @@ endif()
 # (the fused build links mtmd anyway), opt out with -DELIZA_ENABLE_VISION=OFF.
 option(ELIZA_ENABLE_VISION "Build the fused mmproj vision-describe ABI (v9)" ON)
 
+# Paradee-8M TTS + native misaki G2P (ABI v17). Folded in only when BOTH
+# paradee_lib and misaki_g2p exist (tools/paradee, tools/misaki-g2p; they must
+# be added before this directory, like kokoro_lib). PRIVATE: the
+# eliza_paradee:: / eliza_misaki:: C++ APIs stay behind the
+# eliza_inference_paradee_* surface.
+function(eliza_inference_fold_paradee target)
+    if(TARGET paradee_lib AND TARGET misaki_g2p)
+        target_link_libraries(${target} PRIVATE paradee_lib misaki_g2p)
+        target_include_directories(${target} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../paradee/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/../misaki-g2p/include)
+        target_compile_definitions(${target} PRIVATE ELIZA_ENABLE_PARADEE)
+    endif()
+endfunction()
+
 if(TARGET mtmd)
+    if(TARGET paradee_lib AND TARGET misaki_g2p)
+        message(STATUS "elizainference: Paradee TTS + misaki G2P enabled (ABI v17)")
+    elseif(TARGET paradee_lib OR TARGET misaki_g2p)
+        message(WARNING "elizainference: Paradee needs both paradee_lib and misaki_g2p; "
+                        "building without Paradee (paradee_supported() == 0)")
+    endif()
     add_library(elizainference SHARED
         ${OMNIVOICE_CORE_SOURCES}
         ${OMNIVOICE_FFI_SOURCES})
@@ -283,6 +304,7 @@ if(TARGET mtmd)
             ${CMAKE_CURRENT_SOURCE_DIR}/../kokoro/include)
         target_compile_definitions(elizainference PRIVATE ELIZA_ENABLE_KOKORO)
     endif()
+    eliza_inference_fold_paradee(elizainference)
     set_target_properties(elizainference PROPERTIES
         OUTPUT_NAME              elizainference
         POSITION_INDEPENDENT_CODE ON
@@ -337,6 +359,7 @@ if(TARGET mtmd)
             ${CMAKE_CURRENT_SOURCE_DIR}/../kokoro/include)
         target_compile_definitions(elizainference_static PRIVATE ELIZA_ENABLE_KOKORO)
     endif()
+    eliza_inference_fold_paradee(elizainference_static)
     set_target_properties(elizainference_static PROPERTIES
         OUTPUT_NAME              elizainference
         POSITION_INDEPENDENT_CODE ON)
@@ -345,6 +368,63 @@ if(TARGET mtmd)
         set_target_properties(elizainference_static PROPERTIES OUTPUT_NAME elizainference_static)
     endif()
     add_dependencies(elizainference_static omnivoice-version)
+
+    # FFI tests (ABI v17).
+    #   eliza-inference-test-abi      links the real libelizainference: ABI
+    #                                 string, probes, cancel/evict no-ops, and
+    #                                 (opt-in, ELIZA_TEST_ASR_DIR) a real-model
+    #                                 ASR cancel during prefill.
+    #   eliza-inference-test-paradee-asr  compiles the FFI bridge into the test
+    #                                 (ELIZA_INFERENCE_TEST_HOOKS) against the
+    #                                 scripted Paradee/misaki doubles in
+    #                                 tests/paradee-contract/: load/synth/cancel
+    #                                 race, chunking, evict -> reload, ASR cancel
+    #                                 during prefill and decode.
+    option(ELIZA_INFERENCE_BUILD_FFI_TESTS "Build the libelizainference FFI tests" ${LLAMA_BUILD_TESTS})
+    if(ELIZA_INFERENCE_BUILD_FFI_TESTS)
+        if(NOT WIN32)   # POSIX threads / mkdtemp
+            add_executable(eliza-inference-test-abi tests/ffi-abi.c)
+            set_target_properties(eliza-inference-test-abi PROPERTIES
+                C_STANDARD 11
+                C_STANDARD_REQUIRED ON)
+            target_include_directories(eliza-inference-test-abi PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/include)
+            find_package(Threads REQUIRED)
+            target_link_libraries(eliza-inference-test-abi PRIVATE elizainference Threads::Threads)
+            if(TARGET paradee_lib AND TARGET misaki_g2p)
+                target_compile_definitions(eliza-inference-test-abi PRIVATE ELIZA_TEST_EXPECT_PARADEE=1)
+            endif()
+            if(BUILD_TESTING)
+                add_test(NAME eliza-inference-test-abi COMMAND eliza-inference-test-abi)
+            endif()
+        endif()
+
+        add_executable(eliza-inference-test-paradee-asr
+            tests/ffi-paradee-asr.cpp
+            tests/paradee-contract/fake-paradee.cpp)
+        target_compile_features(eliza-inference-test-paradee-asr PRIVATE cxx_std_17)
+        target_compile_definitions(eliza-inference-test-paradee-asr PRIVATE
+            ${OMNIVOICE_COMPILE_DEFINITIONS}
+            ELIZA_ENABLE_PARADEE ELIZA_INFERENCE_TEST_HOOKS)
+        # The contract doubles come first so "paradee.h" / "misaki-g2p.h"
+        # resolve to them even when the real libraries are also configured.
+        target_include_directories(eliza-inference-test-paradee-asr BEFORE PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/paradee-contract)
+        target_include_directories(eliza-inference-test-paradee-asr PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ${OMNIVOICE_LLAMA_PRIVATE_INCLUDE_DIRS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../mtmd
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../common)
+        target_link_libraries(eliza-inference-test-paradee-asr PRIVATE
+            omnivoice_lib llama mtmd eliza_voice_classifiers llama-common)
+
+        if(BUILD_TESTING)
+            add_test(NAME eliza-inference-test-paradee-asr COMMAND eliza-inference-test-paradee-asr)
+        endif()
+    endif()
 endif()
 
 # llama-server wiring — mount the OmniVoice POST /v1/audio/speech route
