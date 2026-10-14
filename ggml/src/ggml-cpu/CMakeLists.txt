@@ -184,7 +184,15 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         endif()
     endif()
 
-    if (GGML_OPENMP)
+    if (GGML_OPENMP AND EMSCRIPTEN)
+        # Let the Emscripten driver select its matching threaded system libraries.
+        # FindOpenMP records probe-time libc archives, which can conflict with
+        # the final executable's optimization, exception and threading settings.
+        target_compile_options(${GGML_CPU_NAME} PRIVATE -fopenmp)
+        target_link_options(${GGML_CPU_NAME} PUBLIC -fopenmp)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_OPENMP)
+        set(GGML_OPENMP_ENABLED "ON" CACHE INTERNAL "")
+    elseif (GGML_OPENMP)
         find_package(OpenMP)
         if (OpenMP_FOUND)
             set(GGML_OPENMP_ENABLED "ON" CACHE INTERNAL "")
