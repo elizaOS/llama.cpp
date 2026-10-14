@@ -100,6 +100,10 @@ static void test_numbers() {
     check_eq(to_utf8(number_float("10.05")), "ten point zero five", "float 10.05");
     check_eq(to_utf8(number_float("3.0")), "three", "float 3.0");
     CHECK(number_fits(std::string(42, '9')) && !number_fits(std::string(43, '9')));
+    // past the named scales cardinal() reads digit by digit instead of indexing out of bounds
+    check_eq(to_utf8(number_cardinal(std::string(43, '1'))).substr(0, 11), "one one one", "cardinal 43 digits");
+    check_eq(to_utf8(number_ordinal("1" + std::string(59, '0'))).substr(0, 9), "one zero ", "ordinal 60 digits");
+    check_eq(to_utf8(number_float(std::string(60, '9') + ".5")).substr(0, 9), "nine nine", "float 60 digits");
 }
 
 static void test_tables(const std::string & data) {
@@ -211,7 +215,10 @@ static void test_api(const std::string & lex) {
     {
         std::string a(20000, 'a'), dots(5000, '.'), hy;
         for (int i = 0; i < 3000; i++) hy += "a-";
-        for (const std::string & s : {a, dots, hy, std::string(3000, '9'), std::string(1000, '@') + "x.com"}) {
+        const std::string d60(60, '9');
+        for (const std::string & s : {a, dots, hy, std::string(3000, '9'), std::string(1000, '@') + "x.com",
+                                      "It is " + d60 + ".5 units.", "Pay $" + d60 + " now.", "The " + d60 + "th one.",
+                                      "It is 1.1" + std::string(59, '0') + ".5 units.", "Pay $1." + d60 + " now."}) {
             int rc = 0;
             phonemize(g, s, &rc);
             CHECK(rc == 0);

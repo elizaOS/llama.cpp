@@ -49,6 +49,16 @@ std::string cardinal(const std::string & digits) {
         long start = end - 3 < 0 ? 0 : end - 3;
         groups.push_back(std::stoi(d.substr((size_t) start, (size_t) (end - start))));
     }
+    if (groups.size() > kMaxGroups) {
+        // Beyond the named scales (num2words raises here). Callers gate on
+        // number_fits(); this keeps cardinal() itself in bounds regardless.
+        std::string out;
+        for (char c : d) {
+            if (!out.empty()) out += ' ';
+            out += kOnes[c - '0'];
+        }
+        return out;
+    }
     std::string out;
     int last = groups[0];
     bool higher = false;

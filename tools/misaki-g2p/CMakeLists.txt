@@ -69,6 +69,9 @@ if (MISAKI_G2P_ESPEAK)
     endif()
     if (MISAKI_G2P_HAS_ESPEAK)
         target_compile_definitions(misaki_g2p PRIVATE MISAKI_G2P_USE_ESPEAK)
+        # One lock + init owner for the process-global libespeak-ng, shared
+        # with tools/kokoro (header-only; see tools/espeak-shared).
+        target_include_directories(misaki_g2p PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../espeak-shared)
         message(STATUS "misaki-g2p: libespeak-ng linked (GPL-3.0-or-later): eSpeak + E2M fallback, as in Paradee training")
     else()
         message(STATUS "misaki-g2p: libespeak-ng not found: out-of-lexicon words are spelled out (fallback kind 0)")

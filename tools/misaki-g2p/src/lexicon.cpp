@@ -2,6 +2,7 @@
 // Reader for misaki-en-us.lex (written by convert_misaki_lexicon.py).
 #include "misaki-internal.h"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 
