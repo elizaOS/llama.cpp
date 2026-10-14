@@ -341,7 +341,9 @@ if (TARGET cpp-httplib)
     endif()
 endif()
 
-if (TARGET ggml-metal)
+# The test calls ggml-metal internals, so it needs ggml-metal linked in, not
+# loaded as a dynamic backend module.
+if (TARGET ggml-metal AND NOT GGML_BACKEND_DL)
     add_executable(test-metal-library-layout test-metal-library-layout.cpp)
     target_include_directories(test-metal-library-layout PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
     target_link_libraries(test-metal-library-layout PRIVATE ggml-metal ggml-base)
