@@ -131,6 +131,12 @@ option(OMNIVOICE_SHARED      "Build libomnivoice for ABI consumers" OFF)
 # Kokoro is a first-class voice surface in the eliza-1 stack.
 option(LLAMA_BUILD_KOKORO    "Build the Kokoro-82M TTS subtree (tools/kokoro/)" ON)
 
+# Parakeet-TDT ASR (FastConformer + TDT) for FermionResearch/Phonon-2, the
+# five-value re-quantisation of nvidia/parakeet-tdt-0.6b-v3 (weights
+# CC-BY-4.0). Produces parakeet_lib + parakeet-cli/parakeet-bench; the fused
+# `elizainference` target folds parakeet_lib in with `if(TARGET ...)`.
+option(LLAMA_BUILD_PARAKEET  "Build the Parakeet-TDT ASR subtree (tools/parakeet/)" ON)
+
 # W3-3 deprecation: ELIZA_FUSE_OMNIVOICE=ON is the pre-W3-3 flag for the
 # fork-root `omnivoice/` graft. The graft is gone (see the deprecation
 # block below); turn the flag into a redirect now so the option ON state
@@ -279,6 +285,12 @@ if (LLAMA_BUILD_KOKORO AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
             "Verify the fork is at the Kokoro-J2 tag or later.")
     endif()
     add_subdirectory(tools/kokoro)
+endif()
+
+# Parakeet-TDT ASR — embed-as-library hook (mirrors kokoro above); precedes
+# tools/omnivoice so the fused target can fold parakeet_lib in.
+if (LLAMA_BUILD_PARAKEET AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
+    add_subdirectory(tools/parakeet)
 endif()
 
 if (LLAMA_BUILD_OMNIVOICE)

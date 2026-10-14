@@ -128,6 +128,10 @@ struct EliVoicePreset {
     bool empty_payload = true;
 };
 
+#ifdef ELIZA_ENABLE_PARAKEET
+struct EliParakeetAsr;
+#endif
+
 struct EliInferenceContext {
     std::string bundle_dir;
     std::string tts_model_path;
@@ -155,6 +159,11 @@ struct EliInferenceContext {
     std::atomic<bool> asr_cancel{false};
     std::mutex tts_mutex;
     std::mutex asr_mutex;
+#ifdef ELIZA_ENABLE_PARAKEET
+    /* Parakeet-TDT ASR backend (eliza-asr-parakeet.inc), owned under
+     * asr_mutex. When loaded it serves every asr_* call on this ctx. */
+    EliParakeetAsr * parakeet = nullptr;
+#endif
     /* Streaming-LLM text model, loaded lazily on the first
      * eliza_inference_llm_stream_open and shared (read-only weights) across
      * sessions. Each session owns its own llama_context (private KV) over
@@ -923,7 +932,14 @@ static bool eliza_tts_stream_chunk(const float * samples, int n_samples, void * 
     return !(state->ctx && state->ctx->tts_cancel.load(std::memory_order_acquire));
 }
 
+#ifdef ELIZA_ENABLE_PARAKEET
+#include "eliza-asr-parakeet.inc"
+#endif
+
 static void eliza_free_asr(EliInferenceContext * ctx) {
+#ifdef ELIZA_ENABLE_PARAKEET
+    eliza_parakeet_free_locked(ctx);
+#endif
     if (!ctx) return;
     if (ctx->asr_sampler) {
         llama_sampler_free(ctx->asr_sampler);
@@ -1000,6 +1016,13 @@ static int eliza_load_asr(EliInferenceContext * ctx, char ** out_error) {
         return ELIZA_ERR_INVALID_ARG;
     }
     std::lock_guard<std::mutex> lock(ctx->asr_mutex);
+#ifdef ELIZA_ENABLE_PARAKEET
+    {
+        const int pk = eliza_parakeet_load_locked(ctx, out_error);
+        if (pk < 0) return pk;
+        if (pk == 1) return ELIZA_OK;
+    }
+#endif
     if (ctx->asr_model && ctx->asr_lctx && ctx->asr_mtmd && ctx->asr_sampler) {
         return ELIZA_OK;
     }
@@ -2876,6 +2899,12 @@ static int eliza_asr_decode_core(
     /* Cleared only once this call owns the ASR region: a cancel issued while
      * this call waited for the mutex was aimed at the call that held it. */
     ctx->asr_cancel.store(false, std::memory_order_release);
+#ifdef ELIZA_ENABLE_PARAKEET
+    if (eliza_parakeet_active_locked(ctx)) {
+        (void) max_text_bytes;
+        return eliza_parakeet_transcribe_locked(ctx, pcm, n_samples, sample_rate_hz, out_transcript, nullptr, nullptr, out_error);
+    }
+#endif
     if (!ctx->asr_model || !ctx->asr_lctx || !ctx->asr_mtmd || !ctx->asr_sampler) {
         eliza_set_error(out_error, "[libelizainference] asr_transcribe: ASR region is not acquired; call mmap_acquire(\"asr\") after arming voice input");
         return ELIZA_ERR_INVALID_ARG;
@@ -3019,6 +3048,36 @@ int eliza_inference_asr_transcribe_timed(
     const size_t word_cap = *io_n_words;
     *io_n_words = 0;
 
+#ifdef ELIZA_ENABLE_PARAKEET
+    {
+        /* Parakeet: real TDT token frames (80 ms) give the word times. */
+        std::unique_lock<std::mutex> lock(ctx->asr_mutex);
+        if (eliza_parakeet_active_locked(ctx)) {
+            ctx->asr_cancel.store(false, std::memory_order_release);
+            std::string text;
+            std::vector<int> ws, we;
+            if (n_samples > 0) {
+                const int prc = eliza_parakeet_transcribe_locked(ctx, pcm, n_samples, sample_rate_hz, text, &ws, &we, out_error);
+                if (prc < 0) return prc;
+            }
+            lock.unlock();
+            if (text.size() + 1 > max_text_bytes) {
+                eliza_set_error(out_error, "[libelizainference] asr_transcribe_timed: output buffer too small");
+                return ELIZA_ERR_INVALID_ARG;
+            }
+            std::memcpy(out_text, text.data(), text.size());
+            out_text[text.size()] = '\0';
+            const size_t n = std::min(word_cap, ws.size());
+            for (size_t i = 0; i < n; ++i) {
+                out_word_start_ms[i] = ws[i];
+                out_word_end_ms[i] = we[i];
+            }
+            *io_n_words = n;
+            return (int) text.size();
+        }
+    }
+#endif
+
     std::string transcript;
     int rc = eliza_asr_decode_core(ctx, pcm, n_samples, sample_rate_hz, max_text_bytes, transcript, out_error);
     if (rc < 0) {
@@ -3081,6 +3140,126 @@ int eliza_inference_asr_transcribe_timed(
  * version check (ffi-bindings.ts expects v3) succeeds.
  */
 
+#ifdef ELIZA_ENABLE_PARAKEET
+/* Parakeet backend (eliza-asr-parakeet.inc): 1 while some context has it
+ * loaded (mmap_acquire("asr") on a bundle with a parakeet-tdt GGUF). Before
+ * that, and for the Qwen3-ASR backend, it stays 0 so callers keep the batch
+ * adapter. */
+int eliza_inference_asr_stream_supported(void) {
+    return g_eliza_parakeet_loaded.load() > 0 ? 1 : 0;
+}
+
+EliAsrStream * eliza_inference_asr_stream_open(
+    EliInferenceContext * ctx,
+    int sample_rate_hz,
+    char ** out_error) {
+    if (!ctx || sample_rate_hz <= 0) {
+        eliza_set_error(out_error, "[libelizainference] asr_stream_open: invalid arguments");
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(ctx->asr_mutex);
+    if (!eliza_parakeet_active_locked(ctx)) {
+        eliza_set_error(out_error,
+            "[libelizainference] asr_stream_open: streaming needs the parakeet-tdt ASR backend; "
+            "call mmap_acquire(\"asr\") on a bundle with asr/<parakeet>.gguf, or use the batch path");
+        return nullptr;
+    }
+    auto * s = new (std::nothrow) EliAsrStream();
+    if (!s) {
+        eliza_set_error(out_error, "[libelizainference] asr_stream_open: out of memory");
+        return nullptr;
+    }
+    s->ctx = ctx;
+    s->in_rate = sample_rate_hz;
+    s->generation = ctx->parakeet->generation;
+    pk_stream_params sp = pk_stream_default_params();
+    sp.right_context_ms = eliza_int_env_or_default("ELIZA_ASR_STREAM_RIGHT_MS", sp.right_context_ms);
+    sp.min_hop_ms = eliza_int_env_or_default("ELIZA_ASR_STREAM_HOP_MS", sp.min_hop_ms);
+    sp.max_window_ms = eliza_int_env_or_default("ELIZA_ASR_STREAM_MAX_WINDOW_MS", sp.max_window_ms);
+    s->st = pk_stream_open(ctx->parakeet->model, sp);
+    if (!s->st) {
+        delete s;
+        eliza_set_error(out_error, "[libelizainference] asr_stream_open: parakeet stream open failed");
+        return nullptr;
+    }
+    return s;
+}
+
+int eliza_inference_asr_stream_feed(
+    EliAsrStream * stream,
+    const float * pcm,
+    size_t n_samples,
+    char ** out_error) {
+    if (!stream || (!pcm && n_samples)) {
+        eliza_set_error(out_error, "[libelizainference] asr_stream_feed: invalid arguments");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    std::vector<float> a;
+    eliza_parakeet_stream_resample(stream, pcm, n_samples, a);
+    const int rc = pk_stream_feed(stream->st, a.data(), a.size());
+    if (rc < 0) {
+        eliza_set_error(out_error, "[libelizainference] asr_stream_feed: stream already finished");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    return (int) n_samples;
+}
+
+static int eliza_parakeet_stream_text(EliAsrStream * stream, bool finish, char * out_text, size_t max_text_bytes,
+                                      size_t * io_n_tokens, char ** out_error) {
+    if (io_n_tokens) *io_n_tokens = 0;  /* Parakeet's vocabulary is not the text model's */
+    if (!stream || !out_text || max_text_bytes == 0) {
+        eliza_set_error(out_error, "[libelizainference] asr_stream: invalid arguments");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    EliInferenceContext * ctx = stream->ctx;
+    std::lock_guard<std::mutex> lock(ctx->asr_mutex);
+    if (!eliza_parakeet_active_locked(ctx) || ctx->parakeet->generation != stream->generation) {
+        eliza_set_error(out_error, "[libelizainference] asr_stream: the ASR region was evicted; open a new stream");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    ctx->asr_cancel.store(false, std::memory_order_release);
+    const int rc = finish
+        ? pk_stream_finish(stream->st, out_text, max_text_bytes, eliza_parakeet_cancel_cb, ctx)
+        : pk_stream_partial(stream->st, out_text, max_text_bytes, eliza_parakeet_cancel_cb, ctx);
+    if (rc == PK_E_CANCELLED) {
+        eliza_set_error(out_error, "[libelizainference] asr_stream: cancelled");
+        return ELIZA_ERR_CANCELLED;
+    }
+    if (rc < 0) {
+        eliza_set_error(out_error, "[libelizainference] asr_stream: parakeet decode failed rc=" + std::to_string(rc));
+        return ELIZA_ERR_FFI_FAULT;
+    }
+    return rc;
+}
+
+int eliza_inference_asr_stream_partial(
+    EliAsrStream * stream,
+    char * out_text,
+    size_t max_text_bytes,
+    int * out_tokens,
+    size_t * io_n_tokens,
+    char ** out_error) {
+    (void) out_tokens;
+    return eliza_parakeet_stream_text(stream, false, out_text, max_text_bytes, io_n_tokens, out_error);
+}
+
+int eliza_inference_asr_stream_finish(
+    EliAsrStream * stream,
+    char * out_text,
+    size_t max_text_bytes,
+    int * out_tokens,
+    size_t * io_n_tokens,
+    char ** out_error) {
+    (void) out_tokens;
+    return eliza_parakeet_stream_text(stream, true, out_text, max_text_bytes, io_n_tokens, out_error);
+}
+
+void eliza_inference_asr_stream_close(EliAsrStream * stream) {
+    if (!stream) return;
+    pk_stream_close(stream->st);
+    delete stream;
+}
+#else
 int eliza_inference_asr_stream_supported(void) {
     return 0;
 }
@@ -3144,6 +3323,7 @@ int eliza_inference_asr_stream_finish(
 void eliza_inference_asr_stream_close(EliAsrStream * stream) {
     (void) stream;
 }
+#endif
 
 /* ---- Streaming TTS + DFlash verifier callback (ABI v2) ------------- *
  *

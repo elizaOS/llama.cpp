@@ -1,0 +1,67 @@
+{
+  "model": {
+    "repo": "FermionResearch/Phonon-2",
+    "revision": "7e153e4054c0a10db6d47d6fff5c062d4c77c154",
+    "base_model": "nvidia/parakeet-tdt-0.6b-v3",
+    "license": "CC-BY-4.0",
+    "license_note": "Weights: CC-BY-4.0 (derived from NVIDIA parakeet-tdt-0.6b-v3, CC-BY-4.0). Attribution and the NOTICE text must ship with the model. NOTICE lists training audio from CHiME-6 (CC-BY-SA-4.0) and SPGISpeech (Kensho terms). Fermion code (fermion_container.py, reference_transformers.py) is Apache-2.0. Flagged for review, not a build blocker.",
+    "language": "en"
+  },
+  "files": {
+    "phonon-2.bps.tar.zst": {
+      "size": 163515201,
+      "sha256": "98125795b6dda72f5c6eee9ba33d19815df65dcb18b50a357bf9f73c9935309e"
+    },
+    "config.json": {
+      "size": 759,
+      "sha256": "422379e411f14dde97174554deead106ec1e4816e14dd78a1bf99517c6dcc663"
+    },
+    "packed_manifest.json": {
+      "size": 225,
+      "sha256": "399e9397cf7415130a0d612b221bc8a37b91c29caafe5e0b20c515d317ffb308"
+    },
+    "NOTICE": {
+      "size": 2741,
+      "sha256": "00624a5043e7ce74029317b024132ca5286116d6fbf3191d226374bc8273789f"
+    },
+    "fermion_container.py": {
+      "size": 3915,
+      "sha256": "5cf172e8cf6b313e951c4ef588ca913c7285b0aa3b92de413c3d7ec2b939c0e4"
+    },
+    "reference_transformers.py": {
+      "size": 6823,
+      "sha256": "8481cfc11537e6dc1e40a8296c93aa15f9b7437b1514564caf647f8773c0dcb3"
+    },
+    "LICENSE-WEIGHTS-CC-BY-4.0.txt": {
+      "size": 18657,
+      "sha256": "9ba9550ad48438d0836ddab3da480b3b69ffa0aac7b7878b5a0039e7ab429411"
+    }
+  },
+  "archive_members": {
+    "model.fermion": {
+      "size": 177438361,
+      "sha256": "4b6bfa3a12cc3c4e0a54f2ab3ec4ca7a842b09e5c7ecfc8e7ca0ac6cc8c11468",
+      "format": "fermion-five-value-parakeet-v1"
+    },
+    "config.json": {
+      "size": 277493,
+      "sha256": "d0daad3b2a182893844f4abdc11e4f5b7083f7d42c8ad7e8203f71559785a31b",
+      "note": "full NeMo config; 'labels' holds the 8192 SentencePiece pieces"
+    },
+    "packed_manifest.json": {
+      "size": 821,
+      "sha256": "3c1874501a1efb6ef569eab082aa68d91b93ec6e4d2fb00dbef7851edf2ae510"
+    }
+  },
+  "reference_env": {
+    "note": "Environment used to produce tests/fixtures from reference_transformers.py (dense fp32 ParakeetForTDT) and the base repo's processor (nvidia/parakeet-tdt-0.6b-v3).",
+    "python": "3.12",
+    "torch": "2.14.1",
+    "transformers": "5.17.0",
+    "numpy": "2.5.4",
+    "librosa": "1.0.0"
+  },
+  "gguf": {
+    "file": "phonon-2-fv5.gguf"
+  }
+}

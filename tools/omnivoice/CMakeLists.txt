@@ -247,7 +247,22 @@ function(eliza_inference_fold_paradee target)
     endif()
 endfunction()
 
+# Parakeet-TDT ASR (tools/parakeet, FermionResearch/Phonon-2 five-value
+# weights). Folded in when parakeet_lib exists (added before this directory);
+# it then serves eliza_inference_asr_* for bundles with a parakeet-tdt GGUF
+# under asr/ (see src/eliza-asr-parakeet.inc). PRIVATE like kokoro/paradee.
+function(eliza_inference_fold_parakeet target)
+    if(TARGET parakeet_lib)
+        target_link_libraries(${target} PRIVATE parakeet_lib)
+        target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../parakeet/include)
+        target_compile_definitions(${target} PRIVATE ELIZA_ENABLE_PARAKEET)
+    endif()
+endfunction()
+
 if(TARGET mtmd)
+    if(TARGET parakeet_lib)
+        message(STATUS "elizainference: Parakeet-TDT ASR enabled (streaming via asr_stream_*)")
+    endif()
     if(TARGET paradee_lib AND TARGET misaki_g2p)
         message(STATUS "elizainference: Paradee TTS + misaki G2P enabled (ABI v17)")
     elseif(TARGET paradee_lib OR TARGET misaki_g2p)
@@ -305,6 +320,7 @@ if(TARGET mtmd)
         target_compile_definitions(elizainference PRIVATE ELIZA_ENABLE_KOKORO)
     endif()
     eliza_inference_fold_paradee(elizainference)
+    eliza_inference_fold_parakeet(elizainference)
     set_target_properties(elizainference PROPERTIES
         OUTPUT_NAME              elizainference
         POSITION_INDEPENDENT_CODE ON
@@ -360,6 +376,7 @@ if(TARGET mtmd)
         target_compile_definitions(elizainference_static PRIVATE ELIZA_ENABLE_KOKORO)
     endif()
     eliza_inference_fold_paradee(elizainference_static)
+    eliza_inference_fold_parakeet(elizainference_static)
     set_target_properties(elizainference_static PROPERTIES
         OUTPUT_NAME              elizainference
         POSITION_INDEPENDENT_CODE ON)
@@ -399,6 +416,20 @@ if(TARGET mtmd)
                 # "main" is the label CI runs (ctest -L main); unlabelled
                 # tests are built but never executed there.
                 set_property(TEST eliza-inference-test-abi PROPERTY LABELS main)
+            endif()
+        endif()
+
+        if(TARGET parakeet_lib)
+            # Parakeet-TDT ASR through the real library. Skips (passes) unless
+            # ELIZA_TEST_PARAKEET_BUNDLE / ELIZA_TEST_PARAKEET_PCM are set.
+            add_executable(eliza-inference-test-parakeet-asr tests/ffi-parakeet-asr.cpp)
+            target_compile_features(eliza-inference-test-parakeet-asr PRIVATE cxx_std_17)
+            target_include_directories(eliza-inference-test-parakeet-asr PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+            find_package(Threads REQUIRED)
+            target_link_libraries(eliza-inference-test-parakeet-asr PRIVATE elizainference Threads::Threads)
+            if(BUILD_TESTING)
+                add_test(NAME eliza-inference-test-parakeet-asr COMMAND eliza-inference-test-parakeet-asr)
+                set_property(TEST eliza-inference-test-parakeet-asr PROPERTY LABELS main)
             endif()
         endif()
 

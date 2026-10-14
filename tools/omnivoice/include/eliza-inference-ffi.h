@@ -160,6 +160,23 @@ extern "C" {
  *           files, as it already skipped `tts/kokoro/`.
  *       Streaming ASR (`asr_stream_*`) is unchanged and still reports
  *       `asr_stream_supported() == 0`.
+ *       Parakeet-TDT backend (same ABI v17 symbols, no new entry points):
+ *       builds that fold tools/parakeet (`ELIZA_ENABLE_PARAKEET`) serve the
+ *       ASR surface from a parakeet-tdt GGUF under `<bundle>/asr/` (e.g.
+ *       FermionResearch/Phonon-2, CC-BY-4.0) when `mmap_acquire("asr")`
+ *       finds one; `ELIZA_ASR_BACKEND=qwen3|parakeet` overrides. With it:
+ *         - `asr_transcribe_timed` returns TDT token-frame word times (80 ms
+ *           resolution) instead of duration-proportional ones;
+ *         - `asr_stream_supported()` returns 1 while at least one context has
+ *           the parakeet backend loaded (0 before `mmap_acquire("asr")`, after
+ *           `mmap_evict("asr")`, and for the Qwen3-ASR backend), and the
+ *           `asr_stream_*` session decodes pause-delimited windows with local
+ *           agreement. `stream_open` fails cleanly without the backend;
+ *           partial/finish on a stream whose region was evicted return
+ *           ELIZA_ERR_INVALID_ARG;
+ *         - stream `out_tokens` are never written (`*io_n_tokens = 0`):
+ *           Parakeet's SentencePiece vocabulary is not the text model's;
+ *         - `asr_cancel` is polled between encoder layers and decode steps.
  *   v16: context-local text-model GPU selection
  *       (`eliza_inference_create_with_options`).
  *   v15: Kokoro synthesis can return an exact-size, library-owned PCM buffer
