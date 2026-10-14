@@ -24,6 +24,8 @@ include = [
     # only in that pinned env (see tools/misaki-g2p/README.md), not under CI.
     "./tools/misaki-g2p/scripts/**",
     "./tools/misaki-g2p/tests/**",
+    # Paradee reference tools run in their pinned Python environment.
+    "./tools/paradee/tools/**",
     # conversion/* defines mixins (e.g. _Qwen35MtpMixin) whose super()
     # chains resolve to attributes provided by the composed Model
     # subclasses in convert_hf_to_gguf.py. ty cannot see that
