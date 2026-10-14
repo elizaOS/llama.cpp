@@ -24,7 +24,8 @@
 
 #if defined(KOKORO_USE_ESPEAK)
 #include <espeak-ng/speak_lib.h>
-#include <mutex>
+// one lock + init owner shared with tools/misaki-g2p (libespeak-ng is process-global)
+#include "eliza-espeak-shared.h"
 #endif
 
 namespace eliza_kokoro {
@@ -113,31 +114,21 @@ char32_t next_codepoint(const std::string & s, size_t & i) noexcept {
 
 #if defined(KOKORO_USE_ESPEAK)
 
-// espeak-ng is process-global and not thread-safe; serialize init + calls.
-std::mutex & espeak_mutex() {
-    static std::mutex m;
-    return m;
-}
-
-bool ensure_espeak_init() {
-    static bool ok = [] {
-        // AUDIO_OUTPUT_SYNCHRONOUS so no audio device is opened.
-        const int rate = espeak_Initialize(AUDIO_OUTPUT_SYNCHRONOUS, 0, nullptr, 0);
-        if (rate < 0) {
-            return false;
-        }
-        return espeak_SetVoiceByName("en-us") == EE_OK;
-    }();
-    return ok;
-}
+// espeak-ng is process-global and not thread-safe: every call goes through
+// the shared lock, and the voice is re-selected under it on each use because
+// misaki-g2p (same process, fused library) selects its own. Kokoro uses
+// libespeak-ng's default data path, or the explicit one misaki was opened
+// with when that happened first (see eliza-espeak-shared.h).
+constexpr const char * kVoice = "en-us";
 
 // Run espeak over text, accumulating IPA across all clauses. espeak returns
 // one clause per call (stopping at sentence/comma punctuation) and advances
 // the text pointer; we join clauses with a single space to match the
 // `espeak-ng -q --ipa` binary output the reference was derived from.
 std::string espeak_text_to_ipa(const std::string & text) {
-    std::lock_guard<std::mutex> lock(espeak_mutex());
-    if (!ensure_espeak_init()) {
+    auto lock = eliza_espeak_shared::lock();
+    std::string err;
+    if (!eliza_espeak_shared::prepare(lock, std::string(), kVoice, err)) {
         return std::string();
     }
     const void * inptr = static_cast<const void *>(text.c_str());
@@ -231,8 +222,9 @@ std::vector<int32_t> phonemize_to_input_ids(const std::string & text) {
 
 bool espeak_available() noexcept {
 #if defined(KOKORO_USE_ESPEAK)
-    std::lock_guard<std::mutex> lock(espeak_mutex());
-    return ensure_espeak_init();
+    auto lock = eliza_espeak_shared::lock();
+    std::string err;
+    return eliza_espeak_shared::prepare(lock, std::string(), kVoice, err);
 #else
     return false;
 #endif

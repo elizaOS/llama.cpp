@@ -62,6 +62,12 @@ else()
             message(STATUS "LLAMA_BUILD_PARADEE: skipped because LLAMA_BUILD_KOKORO=OFF")
         endif()
     endif()
+    if (LLAMA_BUILD_PARAKEET)
+        # Parakeet-TDT ASR (Phonon-2 five-value weights). Like kokoro it
+        # precedes omnivoice so the fused `elizainference` target can fold
+        # parakeet_lib in.
+        add_subdirectory(parakeet)
+    endif()
     if (LLAMA_BUILD_OMNIVOICE)
         # The merged omnivoice subtree lives under tools/omnivoice/. The
         # top-level CMakeLists.txt has a parallel add_subdirectory hook for

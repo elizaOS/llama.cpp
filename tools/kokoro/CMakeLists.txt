@@ -95,6 +95,9 @@ if(KOKORO_ENABLE_ESPEAK)
         target_include_directories(kokoro_lib PRIVATE ${ESPEAK_NG_INCLUDE_DIR})
         target_link_libraries(kokoro_lib PRIVATE ${ESPEAK_NG_LIBRARY})
         target_compile_definitions(kokoro_lib PRIVATE KOKORO_USE_ESPEAK)
+        # One lock + init owner for the process-global libespeak-ng, shared
+        # with tools/misaki-g2p (header-only; see tools/espeak-shared).
+        target_include_directories(kokoro_lib PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../espeak-shared)
         message(STATUS "Kokoro G2P: libespeak-ng found (${ESPEAK_NG_LIBRARY}) — real IPA path enabled")
     else()
         message(STATUS "Kokoro G2P: libespeak-ng not found — ASCII grapheme fallback; g2p_kind() reports ASCII so the TS layer feeds IPA via kokoro_synthesize_ipa (#11776)")

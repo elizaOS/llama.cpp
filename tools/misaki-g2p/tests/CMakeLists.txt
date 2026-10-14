@@ -39,6 +39,9 @@ set_tests_properties(misaki_g2p_mini_lexicon PROPERTIES FIXTURES_SETUP misaki_mi
 
 add_test(NAME misaki_g2p_unit COMMAND test-misaki-g2p ${MINI_LEX} ${MISAKI_TEST_DATA})
 set_tests_properties(misaki_g2p_unit PROPERTIES FIXTURES_REQUIRED misaki_mini_lex)
+# "main" is the label CI runs (ctest -L main): both are offline (committed
+# mini lexicon data) and need neither eSpeak nor model weights.
+set_tests_properties(misaki_g2p_mini_lexicon misaki_g2p_unit PROPERTIES LABELS main)
 
 if (MISAKI_G2P_LEXICON)
     set(FULL_LEX ${MISAKI_G2P_LEXICON})
@@ -57,6 +60,34 @@ if (NOT GATE_ESPEAK_DATA AND MISAKI_ESPEAK_LIBRARY)
     if (EXISTS ${_espeak_libdir}/../share/espeak-ng-data/phontab)
         get_filename_component(GATE_ESPEAK_DATA ${_espeak_libdir}/../share/espeak-ng-data ABSOLUTE)
     endif()
+endif()
+
+# misaki and Kokoro phonemizing concurrently through the shared libespeak-ng
+# owner (tools/espeak-shared). Needs kokoro_lib, which is configured before
+# this directory in the llama.cpp tree; skips (77) without libespeak-ng.
+if (TARGET kokoro_lib)
+    find_package(Threads REQUIRED)
+    add_executable(test-espeak-shared test_espeak_shared.cpp)
+    target_link_libraries(test-espeak-shared PRIVATE misaki_g2p kokoro_lib Threads::Threads)
+    if (GATE_ESPEAK_DATA)
+        set(_espeak_shared_args ${GATE_ESPEAK_DATA})
+    else()
+        set(_espeak_shared_args "")
+    endif()
+    add_test(NAME misaki_g2p_espeak_shared COMMAND test-espeak-shared ${MINI_LEX} ${_espeak_shared_args})
+    set_tests_properties(misaki_g2p_espeak_shared PROPERTIES
+        FIXTURES_REQUIRED misaki_mini_lex SKIP_RETURN_CODE 77 TIMEOUT 300)
+endif()
+
+# eSpeak NG data-path handling: missing directory, paths longer than the
+# linked libespeak-ng's N_PATH_HOME, recovery afterwards. Skips (77) without
+# libespeak-ng or its data.
+add_executable(test-espeak-data-path test_espeak_data_path.cpp)
+target_link_libraries(test-espeak-data-path PRIVATE misaki_g2p)
+if (GATE_ESPEAK_DATA)
+    add_test(NAME misaki_g2p_espeak_data_path COMMAND test-espeak-data-path ${MINI_LEX} ${GATE_ESPEAK_DATA})
+    set_tests_properties(misaki_g2p_espeak_data_path PROPERTIES
+        FIXTURES_REQUIRED misaki_mini_lex SKIP_RETURN_CODE 77 TIMEOUT 120)
 endif()
 
 foreach(gate agreement agent)

@@ -6,11 +6,12 @@
 // then misaki espeak.EspeakFallback's eSpeak-to-misaki (E2M) table.
 #include "misaki-internal.h"
 
-#include <mutex>
 #include <stdexcept>
 
 #if defined(MISAKI_G2P_USE_ESPEAK)
 #    include <espeak-ng/speak_lib.h>
+// one lock + init owner shared with tools/kokoro (libespeak-ng is process-global)
+#    include "eliza-espeak-shared.h"
 #endif
 
 namespace misaki {
@@ -152,31 +153,8 @@ std::vector<u32> restore(std::vector<u32> text, std::vector<MarkIndex> marks) {
 }
 
 #if defined(MISAKI_G2P_USE_ESPEAK)
-std::mutex & espeak_mutex() {
-    static std::mutex m;
-    return m;
-}
-bool g_espeak_ready = false;
-std::string g_espeak_path;
-
-// Caller holds espeak_mutex(). (Re)initialises libespeak-ng for data_dir.
-bool ensure_espeak_locked(const std::string & data_dir, std::string & err) {
-    if (g_espeak_ready && g_espeak_path == data_dir) return true;
-    g_espeak_ready = false;
-    int rate = espeak_Initialize(AUDIO_OUTPUT_SYNCHRONOUS, 0, data_dir.empty() ? nullptr : data_dir.c_str(), 0);
-    if (rate <= 0) {
-        err = "espeak_Initialize failed for data dir '" + data_dir + "'";
-        return false;
-    }
-    // phonemizer selects the first voice whose language is en-us
-    if (espeak_SetVoiceByName("gmw/en-US") != EE_OK) {
-        err = "eSpeak NG voice gmw/en-US not found under '" + data_dir + "'";
-        return false;
-    }
-    g_espeak_ready = true;
-    g_espeak_path = data_dir;
-    return true;
-}
+// phonemizer selects the first voice whose language is en-us
+constexpr const char * kVoice = "gmw/en-US";
 #endif
 
 }  // namespace
@@ -229,14 +207,11 @@ u32 EspeakFallback::e2m(const u32 & in) {
 
 std::unique_ptr<EspeakFallback> EspeakFallback::open(const std::string & data_dir, std::string & err) {
 #if defined(MISAKI_G2P_USE_ESPEAK)
-    std::lock_guard<std::mutex> lock(espeak_mutex());
-    // espeak-ng keeps its data path in a 160-byte buffer (N_PATH_HOME) and
-    // fails on longer ones with a misleading "No such file" error.
-    if (data_dir.size() + sizeof("/espeak-ng-data/phontab") > 160) {
-        err = "eSpeak NG data path is too long for libespeak-ng (max ~135 bytes): " + data_dir;
-        return nullptr;
-    }
-    if (!ensure_espeak_locked(data_dir, err)) return nullptr;
+    auto lock = eliza_espeak_shared::lock();
+    // prepare() rejects a path longer than the linked libespeak-ng's
+    // N_PATH_HOME buffer with an error naming the limit (no fixed size here:
+    // the Android builds raise it).
+    if (!eliza_espeak_shared::prepare(lock, data_dir, kVoice, err)) return nullptr;
     return std::unique_ptr<EspeakFallback>(new EspeakFallback(data_dir));
 #else
     (void) data_dir;
@@ -249,9 +224,11 @@ EspeakFallback::~EspeakFallback() = default;
 
 u32 EspeakFallback::phonemize_line(const u32 & text) {
 #if defined(MISAKI_G2P_USE_ESPEAK)
-    std::lock_guard<std::mutex> lock(espeak_mutex());
+    // Re-applies this component's voice under the shared lock: Kokoro may
+    // have selected its own since the last call.
+    auto lock = eliza_espeak_shared::lock();
     std::string init_err;
-    if (!ensure_espeak_locked(data_dir_, init_err)) throw std::runtime_error(init_err);
+    if (!eliza_espeak_shared::prepare(lock, data_dir_, kVoice, init_err)) throw std::runtime_error(init_err);
     std::string utf8 = to_utf8(text);
     const void * ptr = utf8.c_str();
     // EspeakWrapper.text_to_phonemes(text, tie=True)
@@ -290,6 +267,7 @@ u32 EspeakFallback::phonemize_line(const u32 & text) {
     return out;
 #else
     (void) text;
+    (void) data_dir_;
     return u32();
 #endif
 }
