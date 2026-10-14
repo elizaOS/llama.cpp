@@ -63,6 +63,15 @@ extern "C" {
 #include "kokoro.h"
 #endif
 
+#ifdef ELIZA_ENABLE_PARADEE
+/* Paradee-8M TTS + native misaki G2P (ABI v17). Both are C++ APIs
+ * (namespaces eliza_paradee / eliza_misaki) linked from paradee_lib and
+ * misaki_g2p; the omnivoice CMakeLists adds their include dirs and this
+ * define only when both targets exist. */
+#include "paradee.h"
+#include "misaki-g2p.h"
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -133,6 +142,17 @@ struct EliInferenceContext {
     int asr_sample_rate = 0;
     int asr_n_batch = 512;
     std::atomic<bool> tts_cancel{false};
+    /* Per-engine cancel flags (ABI v17). eliza_inference_cancel_tts sets all
+     * three; each engine clears only its own flag when a call starts, so an
+     * OmniVoice call starting on another thread cannot clear a pending
+     * Paradee cancel (and the reverse). */
+    std::atomic<bool> kokoro_cancel{false};
+    std::atomic<bool> paradee_cancel{false};
+    /* ASR cancel (ABI v17). Written by eliza_inference_asr_cancel without
+     * taking asr_mutex; read by the decode loop, by the llama abort callback
+     * on asr_lctx (prefill + decode graphs), and between mtmd chunks. Cleared
+     * at the start of each transcription, after asr_mutex is held. */
+    std::atomic<bool> asr_cancel{false};
     std::mutex tts_mutex;
     std::mutex asr_mutex;
     /* Streaming-LLM text model, loaded lazily on the first
@@ -186,7 +206,25 @@ struct EliInferenceContext {
      * clauses per reply and must not reload per clause. */
     std::string kokoro_gguf_path;
     std::string kokoro_voice_path;
+    int kokoro_style_dim = 256;
+    int kokoro_rate = 0;   /* sample rate of the last successful load */
     std::mutex kokoro_mutex;
+#endif
+#ifdef ELIZA_ENABLE_PARADEE
+    /* Paradee TTS + misaki lexicon (ABI v17), owned by the ctx and protected
+     * by paradee_mutex. The paths are kept after mmap_evict("tts") frees the
+     * model and lexicon, so the next synth / mmap_acquire("tts") reloads
+     * them. paradee_configured is true once a load has succeeded. */
+    eliza_paradee::paradee_model_ptr paradee_model;
+    int paradee_rate = 0;            /* sample rate of the last successful load */
+    int paradee_g2p_kind = -1;       /* ELIZA_PARADEE_G2P_* of the last load */
+    eliza_misaki::misaki_lexicon_ptr paradee_lexicon;
+    std::string paradee_gguf_path;
+    std::string paradee_lexicon_path;
+    std::string paradee_espeak_dir;
+    bool paradee_has_espeak_dir = false;
+    bool paradee_configured = false;
+    std::mutex paradee_mutex;
 #endif
 };
 
@@ -454,10 +492,19 @@ static std::string eliza_lower_ascii(std::string value) {
 // before "omnivoice-*") mis-select it as the OmniVoice LM — ov_init then aborts
 // with "tensor 'llm.embed_tokens.weight' not found" on every tier that bundles
 // both backends (0_8b/2b/4b/9b). Drop any candidate under a kokoro/ subdir.
+/* Kokoro and Paradee (ABI v17) GGUFs live under tts/kokoro/ and
+ * tts/paradee/; they are separate TTS heads and must never be picked as the
+ * OmniVoice model or codec. */
 static void eliza_drop_kokoro_ggufs(std::vector<std::string> & ggufs) {
     ggufs.erase(
         std::remove_if(ggufs.begin(), ggufs.end(), [](const std::string & p) {
-            return p.find("/kokoro/") != std::string::npos;
+            if (p.find("/kokoro/") != std::string::npos ||
+                p.find("/paradee/") != std::string::npos) {
+                return true;
+            }
+            const std::string name =
+                eliza_lower_ascii(std::filesystem::path(p).filename().string());
+            return name.rfind("paradee", 0) == 0;
         }),
         ggufs.end());
 }
@@ -830,6 +877,15 @@ static int eliza_map_ov_status(ov_status rc) {
     return ELIZA_ERR_FFI_FAULT;
 }
 
+/* ASR cancel (ABI v17). Installed as the llama abort callback on asr_lctx, so
+ * a cancel stops the prefill and decode graphs at the next node boundary
+ * (llama_decode then returns 2). Also polled between mtmd chunks and before
+ * every decode token. */
+static bool eliza_asr_cancel_requested(void * user_data) {
+    EliInferenceContext * ctx = (EliInferenceContext *) user_data;
+    return ctx && ctx->asr_cancel.load(std::memory_order_acquire);
+}
+
 static bool eliza_tts_cancel_requested(void * user_data) {
     EliInferenceContext * ctx = (EliInferenceContext *) user_data;
     return ctx && ctx->tts_cancel.load(std::memory_order_acquire);
@@ -987,6 +1043,8 @@ static int eliza_load_asr(EliInferenceContext * ctx, char ** out_error) {
         eliza_set_error(out_error, "[libelizainference] failed to initialize ASR llama context");
         return ELIZA_ERR_FFI_FAULT;
     }
+    /* ABI v17: eliza_inference_asr_cancel aborts prefill / decode graphs. */
+    llama_set_abort_callback(ctx->asr_lctx, eliza_asr_cancel_requested, ctx);
     eliza_asr_debug_log("initialized ASR llama context; loading audio mmproj");
 
     mtmd_context_params aparams = mtmd_context_params_default();
@@ -1715,6 +1773,14 @@ void eliza_inference_destroy(EliInferenceContext * ctx) {
         ctx->kokoro_loaded = false;
     }
 #endif
+#ifdef ELIZA_ENABLE_PARADEE
+    {
+        std::lock_guard<std::mutex> lock(ctx->paradee_mutex);
+        ctx->paradee_model.reset();
+        ctx->paradee_lexicon.reset();
+        ctx->paradee_configured = false;
+    }
+#endif
     delete ctx;
 }
 
@@ -1723,6 +1789,68 @@ void eliza_inference_destroy(EliInferenceContext * ctx) {
  * (forbidden on iOS / Google Play). kokoro_lib is a distinct TTS pipeline
  * with its own GGUF reader; loaded once per ctx, owned by the ctx.
  * ===================================================================== */
+
+#ifdef ELIZA_ENABLE_KOKORO
+/* Load the Kokoro model + voice into ctx. Caller holds kokoro_mutex. On
+ * failure the previous model (if any) stays loaded. */
+static int eliza_kokoro_load_locked(
+    EliInferenceContext * ctx,
+    const std::string & gguf_path,
+    const std::string & voice_bin_path,
+    int style_dim,
+    char ** out_error) {
+    std::string err;
+    eliza_kokoro::kokoro_model_ptr model =
+        eliza_kokoro::kokoro_load_model(gguf_path, err);
+    if (!model) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] kokoro_load_model failed: ") + err);
+        return ELIZA_ERR_BUNDLE_INVALID;
+    }
+    eliza_kokoro::kokoro_voice_preset voice;
+    eliza_kokoro::kokoro_status st =
+        eliza_kokoro::kokoro_load_voice_preset(voice_bin_path, style_dim, voice, err);
+    if (st != eliza_kokoro::KOKORO_OK) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] kokoro_load_voice_preset failed: ") + err);
+        return ELIZA_ERR_BUNDLE_INVALID;
+    }
+    ctx->kokoro_rate = eliza_kokoro::kokoro_sample_rate(model.get());
+    ctx->kokoro_model = std::move(model);
+    ctx->kokoro_voice = std::move(voice);
+    ctx->kokoro_gguf_path = gguf_path;
+    ctx->kokoro_voice_path = voice_bin_path;
+    ctx->kokoro_style_dim = style_dim;
+    ctx->kokoro_loaded = true;
+    return ELIZA_OK;
+}
+
+/* Reload a Kokoro model that mmap_evict("tts") freed. Caller holds
+ * kokoro_mutex. Returns ELIZA_ERR_INVALID_ARG when kokoro_load never
+ * succeeded on this ctx. */
+static int eliza_kokoro_ensure_loaded_locked(
+    EliInferenceContext * ctx, const char * operation, char ** out_error) {
+    if (ctx->kokoro_loaded && ctx->kokoro_model) return ELIZA_OK;
+    if (ctx->kokoro_gguf_path.empty()) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] ") + operation +
+            ": no model loaded (call kokoro_load first)");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    /* Copies: eliza_kokoro_load_locked reassigns the members. */
+    const std::string gguf = ctx->kokoro_gguf_path;
+    const std::string voice = ctx->kokoro_voice_path;
+    return eliza_kokoro_load_locked(ctx, gguf, voice, ctx->kokoro_style_dim, out_error);
+}
+
+/* Free the Kokoro weights + voice but keep their paths (mmap_evict("tts")). */
+static void eliza_kokoro_evict(EliInferenceContext * ctx) {
+    std::lock_guard<std::mutex> lock(ctx->kokoro_mutex);
+    ctx->kokoro_model.reset();
+    ctx->kokoro_voice = eliza_kokoro::kokoro_voice_preset{};
+    ctx->kokoro_loaded = false;
+}
+#endif
 
 int eliza_inference_kokoro_supported(void) {
 #ifdef ELIZA_ENABLE_KOKORO
@@ -1748,31 +1876,11 @@ int eliza_inference_kokoro_load(
     /* Idempotent: already loaded with these exact paths → reuse, no reload. */
     if (ctx->kokoro_loaded && ctx->kokoro_model &&
         ctx->kokoro_gguf_path == gguf_path &&
-        ctx->kokoro_voice_path == voice_bin_path) {
+        ctx->kokoro_voice_path == voice_bin_path &&
+        ctx->kokoro_style_dim == style_dim) {
         return ELIZA_OK;
     }
-    std::string err;
-    eliza_kokoro::kokoro_model_ptr model =
-        eliza_kokoro::kokoro_load_model(gguf_path, err);
-    if (!model) {
-        eliza_set_error(out_error,
-            std::string("[libelizainference] kokoro_load_model failed: ") + err);
-        return ELIZA_ERR_BUNDLE_INVALID;
-    }
-    eliza_kokoro::kokoro_voice_preset voice;
-    eliza_kokoro::kokoro_status st =
-        eliza_kokoro::kokoro_load_voice_preset(voice_bin_path, style_dim, voice, err);
-    if (st != eliza_kokoro::KOKORO_OK) {
-        eliza_set_error(out_error,
-            std::string("[libelizainference] kokoro_load_voice_preset failed: ") + err);
-        return ELIZA_ERR_BUNDLE_INVALID;
-    }
-    ctx->kokoro_model = std::move(model);
-    ctx->kokoro_voice = std::move(voice);
-    ctx->kokoro_gguf_path = gguf_path;
-    ctx->kokoro_voice_path = voice_bin_path;
-    ctx->kokoro_loaded = true;
-    return ELIZA_OK;
+    return eliza_kokoro_load_locked(ctx, gguf_path, voice_bin_path, style_dim, out_error);
 #else
     (void) ctx; (void) gguf_path; (void) voice_bin_path; (void) style_dim;
     eliza_set_error(out_error,
@@ -1799,11 +1907,18 @@ static int eliza_kokoro_synthesize_audio(
         return ELIZA_ERR_INVALID_ARG;
     }
     std::lock_guard<std::mutex> lock(ctx->kokoro_mutex);
-    if (!ctx->kokoro_loaded || !ctx->kokoro_model) {
+    /* A cancel_tts issued before this call held the lock targets an earlier
+     * call; start this one clean. kokoro_lib has no in-graph cancel hook, so
+     * the flag is checked after the (possibly lazy) reload and after the
+     * forward pass: a cancelled call discards its audio and reports
+     * ELIZA_ERR_CANCELLED. */
+    ctx->kokoro_cancel.store(false, std::memory_order_release);
+    const int load_rc = eliza_kokoro_ensure_loaded_locked(ctx, operation, out_error);
+    if (load_rc != ELIZA_OK) return load_rc;
+    if (ctx->kokoro_cancel.load(std::memory_order_acquire)) {
         eliza_set_error(out_error,
-            std::string("[libelizainference] ") + operation +
-            ": no model loaded (call kokoro_load first)");
-        return ELIZA_ERR_INVALID_ARG;
+            std::string("[libelizainference] ") + operation + ": cancelled");
+        return ELIZA_ERR_CANCELLED;
     }
     if (speed <= 0.0f) speed = 1.0f;
     const std::string in(input, input_len ? input_len : std::strlen(input));
@@ -1813,6 +1928,12 @@ static int eliza_kokoro_synthesize_audio(
               ctx->kokoro_model.get(), ctx->kokoro_voice, in, speed, audio, err)
         : eliza_kokoro::kokoro_synthesize(
               ctx->kokoro_model.get(), ctx->kokoro_voice, in, speed, audio, err);
+    if (ctx->kokoro_cancel.exchange(false, std::memory_order_acq_rel)) {
+        audio.samples.clear();
+        eliza_set_error(out_error,
+            std::string("[libelizainference] ") + operation + ": cancelled");
+        return ELIZA_ERR_CANCELLED;
+    }
     if (st != eliza_kokoro::KOKORO_OK) {
         eliza_set_error(out_error,
             std::string("[libelizainference] ") + operation + " failed: " + err);
@@ -1898,8 +2019,12 @@ int eliza_inference_kokoro_sample_rate(EliInferenceContext * ctx) {
 #ifdef ELIZA_ENABLE_KOKORO
     if (!ctx) return ELIZA_ERR_INVALID_ARG;
     std::lock_guard<std::mutex> lock(ctx->kokoro_mutex);
-    if (!ctx->kokoro_loaded || !ctx->kokoro_model) return ELIZA_ERR_INVALID_ARG;
-    return eliza_kokoro::kokoro_sample_rate(ctx->kokoro_model.get());
+    if (ctx->kokoro_loaded && ctx->kokoro_model) {
+        return eliza_kokoro::kokoro_sample_rate(ctx->kokoro_model.get());
+    }
+    /* Evicted by mmap_evict("tts"): report the rate of the last load. */
+    if (!ctx->kokoro_gguf_path.empty() && ctx->kokoro_rate > 0) return ctx->kokoro_rate;
+    return ELIZA_ERR_INVALID_ARG;
 #else
     (void) ctx;
     return ELIZA_ERR_NOT_IMPLEMENTED;
@@ -2009,8 +2134,458 @@ int eliza_inference_kokoro_synthesize_ipa_alloc(
 #endif
 }
 
+/* ===================================================================== *
+ * Paradee-8M TTS + native misaki G2P (ABI v17). Paradee is a single-voice
+ * (af_heart) 24 kHz model distilled from Kokoro-82M. Its input is misaki
+ * phoneme ids with a 0 pad token at each end, at most 512 ids, plus a speed
+ * scalar. Text goes through the native misaki lexicon (misaki_g2p), the
+ * phoneme string is split into model-sized chunks at sentence, clause and
+ * word boundaries, each chunk runs one forward pass, and the PCM is
+ * concatenated. Model + lexicon are owned by the ctx under paradee_mutex.
+ * ===================================================================== */
+
+#ifdef ELIZA_ENABLE_PARADEE
+static bool eliza_paradee_cancel_requested(void * user_data) {
+    EliInferenceContext * ctx = (EliInferenceContext *) user_data;
+    return ctx && ctx->paradee_cancel.load(std::memory_order_acquire);
+}
+
+static int eliza_paradee_map_g2p_kind(eliza_misaki::misaki_fallback_kind kind) {
+    switch (kind) {
+        case eliza_misaki::MISAKI_FALLBACK_ESPEAK: return ELIZA_PARADEE_G2P_ESPEAK;
+        case eliza_misaki::MISAKI_FALLBACK_RULES:  return ELIZA_PARADEE_G2P_RULES;
+        default:                                   return ELIZA_PARADEE_G2P_LEXICON_ONLY;
+    }
+}
+
+/* Load model + lexicon into ctx. Caller holds paradee_mutex. On failure the
+ * previously loaded model and lexicon (if any) stay in place. */
+static int eliza_paradee_load_locked(
+    EliInferenceContext * ctx,
+    const std::string & gguf_path,
+    const std::string & lexicon_path,
+    const char * espeak_dir,
+    char ** out_error) {
+    std::string err;
+    eliza_paradee::paradee_model_ptr model = eliza_paradee::paradee_load_model(gguf_path, err);
+    if (!model) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] paradee_load_model failed: ") + err);
+        return ELIZA_ERR_BUNDLE_INVALID;
+    }
+    err.clear();
+    eliza_misaki::misaki_lexicon_ptr lexicon =
+        eliza_misaki::misaki_load_lexicon(lexicon_path, espeak_dir, err);
+    if (!lexicon) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] misaki_load_lexicon failed: ") + err);
+        return ELIZA_ERR_BUNDLE_INVALID;
+    }
+    ctx->paradee_rate = eliza_paradee::paradee_sample_rate(model.get());
+    ctx->paradee_g2p_kind =
+        eliza_paradee_map_g2p_kind(eliza_misaki::misaki_get_fallback_kind(lexicon.get()));
+    ctx->paradee_model = std::move(model);
+    ctx->paradee_lexicon = std::move(lexicon);
+    ctx->paradee_gguf_path = gguf_path;
+    ctx->paradee_lexicon_path = lexicon_path;
+    ctx->paradee_has_espeak_dir = espeak_dir != nullptr;
+    ctx->paradee_espeak_dir = espeak_dir ? std::string(espeak_dir) : std::string();
+    ctx->paradee_configured = true;
+    return ELIZA_OK;
+}
+
+/* Reload what mmap_evict("tts") freed. Caller holds paradee_mutex. */
+static int eliza_paradee_ensure_loaded_locked(
+    EliInferenceContext * ctx, const char * operation, char ** out_error) {
+    if (ctx->paradee_model && ctx->paradee_lexicon) return ELIZA_OK;
+    if (!ctx->paradee_configured) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] ") + operation +
+            ": no model loaded (call paradee_load first)");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    const std::string gguf = ctx->paradee_gguf_path;
+    const std::string lexicon = ctx->paradee_lexicon_path;
+    const std::string espeak = ctx->paradee_espeak_dir;
+    return eliza_paradee_load_locked(
+        ctx, gguf, lexicon, ctx->paradee_has_espeak_dir ? espeak.c_str() : nullptr, out_error);
+}
+
+static void eliza_paradee_evict(EliInferenceContext * ctx) {
+    std::lock_guard<std::mutex> lock(ctx->paradee_mutex);
+    ctx->paradee_model.reset();
+    ctx->paradee_lexicon.reset();
+}
+
+/* Split `text` after any of `boundaries`, keeping the boundary and the spaces
+ * after it in the left piece. Concatenating the pieces gives `text` back. */
+static std::vector<std::string> eliza_split_after(
+    const std::string & text, const std::vector<std::string> & boundaries) {
+    std::vector<std::string> pieces;
+    size_t start = 0;
+    size_t i = 0;
+    while (i < text.size()) {
+        size_t matched = 0;
+        for (const std::string & b : boundaries) {
+            if (!b.empty() && text.compare(i, b.size(), b) == 0) {
+                matched = b.size();
+                break;
+            }
+        }
+        if (matched == 0) {
+            ++i;
+            continue;
+        }
+        i += matched;
+        while (i < text.size() && text[i] == ' ') ++i;
+        pieces.push_back(text.substr(start, i - start));
+        start = i;
+    }
+    if (start < text.size()) pieces.push_back(text.substr(start));
+    return pieces;
+}
+
+/* Pack the misaki phoneme string into chunks of at most `max_ids` vocab ids.
+ * Splits at sentence ends first, then clause punctuation, then spaces, and
+ * slices a single over-long word as a last resort. Vocab mapping is per
+ * character, so the ids of a concatenation are the concatenation of ids. */
+static int eliza_paradee_chunk(
+    const eliza_paradee::paradee_model * model,
+    const std::string & phonemes,
+    size_t max_ids,
+    int level,
+    std::vector<std::vector<int32_t>> & chunks,
+    std::string & err) {
+    static const std::vector<std::vector<std::string>> kLevels = {
+        { ".", "!", "?", "\xE2\x80\xA6" /* … */ },
+        { ",", ";", ":", "\xE2\x80\x94" /* — */ },
+        { " " },
+    };
+    std::vector<int32_t> ids;
+    if (eliza_paradee::paradee_phonemes_to_ids(model, phonemes, ids, err) != eliza_paradee::PARADEE_OK) {
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    if (ids.empty()) return ELIZA_OK;
+    auto append_fit = [&](std::vector<int32_t> piece) {
+        if (!chunks.empty() && chunks.back().size() + piece.size() <= max_ids) {
+            chunks.back().insert(chunks.back().end(), piece.begin(), piece.end());
+        } else {
+            chunks.push_back(std::move(piece));
+        }
+    };
+    if (ids.size() <= max_ids) {
+        append_fit(std::move(ids));
+        return ELIZA_OK;
+    }
+    if (level >= (int) kLevels.size()) {
+        for (size_t off = 0; off < ids.size(); off += max_ids) {
+            const size_t end = std::min(ids.size(), off + max_ids);
+            chunks.emplace_back(ids.begin() + (std::ptrdiff_t) off, ids.begin() + (std::ptrdiff_t) end);
+        }
+        return ELIZA_OK;
+    }
+    const std::vector<std::string> pieces = eliza_split_after(phonemes, kLevels[(size_t) level]);
+    if (pieces.size() <= 1) {
+        return eliza_paradee_chunk(model, phonemes, max_ids, level + 1, chunks, err);
+    }
+    for (const std::string & piece : pieces) {
+        const int rc = eliza_paradee_chunk(model, piece, max_ids, level, chunks, err);
+        if (rc != ELIZA_OK) return rc;
+    }
+    return ELIZA_OK;
+}
+
+static int eliza_paradee_synthesize_owned(
+    EliInferenceContext * ctx,
+    const char * input,
+    size_t input_len,
+    bool phoneme_input,
+    float speed,
+    float ** out_pcm,
+    size_t * out_samples,
+    char ** out_error) {
+    const char * operation = phoneme_input
+        ? "paradee_synthesize_phonemes_alloc"
+        : "paradee_synthesize_alloc";
+    if (!out_pcm || !out_samples) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] ") + operation + ": null output argument");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    *out_pcm = nullptr;
+    *out_samples = 0;
+    if (!ctx || !input) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] ") + operation + ": null argument");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    if (!(speed > 0.0f) || !std::isfinite(speed)) speed = 1.0f;
+    const std::string in(input, input_len ? input_len : std::strlen(input));
+
+    std::lock_guard<std::mutex> lock(ctx->paradee_mutex);
+    /* Start clean: a cancel issued before this call held the lock was aimed
+     * at an earlier call. */
+    ctx->paradee_cancel.store(false, std::memory_order_release);
+    const int load_rc = eliza_paradee_ensure_loaded_locked(ctx, operation, out_error);
+    if (load_rc != ELIZA_OK) return load_rc;
+    auto cancelled = [&]() {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] ") + operation + ": cancelled");
+        return ELIZA_ERR_CANCELLED;
+    };
+    if (ctx->paradee_cancel.load(std::memory_order_acquire)) return cancelled();
+
+    std::string phonemes;
+    std::string err;
+    if (phoneme_input) {
+        phonemes = in;
+    } else if (!eliza_misaki::misaki_phonemize(ctx->paradee_lexicon.get(), in, phonemes, err)) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] ") + operation + ": misaki_phonemize failed: " + err);
+        return ELIZA_ERR_FFI_FAULT;
+    }
+
+    std::vector<std::vector<int32_t>> chunks;
+    const size_t max_ids = (size_t) eliza_paradee::PARADEE_MAX_INPUT_IDS - 2;
+    if (eliza_paradee_chunk(ctx->paradee_model.get(), phonemes, max_ids, 0, chunks, err) != ELIZA_OK) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] ") + operation + ": phoneme mapping failed: " + err);
+        return ELIZA_ERR_INVALID_ARG;
+    }
+
+    eliza_paradee::paradee_synth_options opts;
+    opts.speed = speed;
+    opts.cancel = eliza_paradee_cancel_requested;
+    opts.cancel_user_data = ctx;
+    std::vector<float> pcm;
+    std::vector<int32_t> input_ids;
+    for (const std::vector<int32_t> & chunk : chunks) {
+        if (ctx->paradee_cancel.load(std::memory_order_acquire)) return cancelled();
+        input_ids.clear();
+        input_ids.reserve(chunk.size() + 2);
+        input_ids.push_back(0);
+        input_ids.insert(input_ids.end(), chunk.begin(), chunk.end());
+        input_ids.push_back(0);
+        eliza_paradee::paradee_audio audio;
+        err.clear();
+        const eliza_paradee::paradee_status st =
+            eliza_paradee::paradee_synthesize(ctx->paradee_model.get(), input_ids, opts, audio, err);
+        if (st == eliza_paradee::PARADEE_E_CANCELLED) return cancelled();
+        if (st != eliza_paradee::PARADEE_OK) {
+            eliza_set_error(out_error,
+                std::string("[libelizainference] ") + operation + ": paradee_synthesize failed: " + err);
+            return st == eliza_paradee::PARADEE_E_OOM ? ELIZA_ERR_OOM : ELIZA_ERR_FFI_FAULT;
+        }
+        pcm.insert(pcm.end(), audio.samples.begin(), audio.samples.end());
+    }
+    if (ctx->paradee_cancel.exchange(false, std::memory_order_acq_rel)) return cancelled();
+    if (pcm.empty()) return ELIZA_OK;
+
+    float * owned = static_cast<float *>(std::malloc(pcm.size() * sizeof(float)));
+    if (!owned) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] ") + operation + ": PCM allocation failed");
+        return ELIZA_ERR_OOM;
+    }
+    std::memcpy(owned, pcm.data(), pcm.size() * sizeof(float));
+    *out_pcm = owned;
+    *out_samples = pcm.size();
+    return ELIZA_OK;
+}
+#endif
+
+#define ELIZA_PARADEE_NOT_BUILT(out_error) \
+    do { \
+        eliza_set_error((out_error), \
+            "[libelizainference] paradee not built (ELIZA_ENABLE_PARADEE off)"); \
+        return ELIZA_ERR_NOT_IMPLEMENTED; \
+    } while (0)
+
+int eliza_inference_paradee_supported(void) {
+#ifdef ELIZA_ENABLE_PARADEE
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int eliza_inference_paradee_load(
+    EliInferenceContext * ctx,
+    const char * gguf_path,
+    const char * lexicon_path,
+    const char * espeak_data_dir,
+    char ** out_error) {
+#ifdef ELIZA_ENABLE_PARADEE
+    if (!ctx || !gguf_path || !lexicon_path || !gguf_path[0] || !lexicon_path[0]) {
+        eliza_set_error(out_error, "[libelizainference] paradee_load: null argument");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    if (espeak_data_dir && !espeak_data_dir[0]) espeak_data_dir = nullptr;
+    std::lock_guard<std::mutex> lock(ctx->paradee_mutex);
+    if (ctx->paradee_model && ctx->paradee_lexicon &&
+        ctx->paradee_gguf_path == gguf_path &&
+        ctx->paradee_lexicon_path == lexicon_path &&
+        ctx->paradee_has_espeak_dir == (espeak_data_dir != nullptr) &&
+        (!espeak_data_dir || ctx->paradee_espeak_dir == espeak_data_dir)) {
+        return ELIZA_OK;
+    }
+    return eliza_paradee_load_locked(ctx, gguf_path, lexicon_path, espeak_data_dir, out_error);
+#else
+    (void) ctx; (void) gguf_path; (void) lexicon_path; (void) espeak_data_dir;
+    ELIZA_PARADEE_NOT_BUILT(out_error);
+#endif
+}
+
+int eliza_inference_paradee_sample_rate(EliInferenceContext * ctx) {
+#ifdef ELIZA_ENABLE_PARADEE
+    if (!ctx) return ELIZA_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lock(ctx->paradee_mutex);
+    if (!ctx->paradee_configured || ctx->paradee_rate <= 0) return ELIZA_ERR_INVALID_ARG;
+    return ctx->paradee_rate;
+#else
+    (void) ctx;
+    return ELIZA_ERR_NOT_IMPLEMENTED;
+#endif
+}
+
+int eliza_inference_paradee_g2p_kind(EliInferenceContext * ctx) {
+#ifdef ELIZA_ENABLE_PARADEE
+    if (!ctx) return ELIZA_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lock(ctx->paradee_mutex);
+    if (!ctx->paradee_configured || ctx->paradee_g2p_kind < 0) return ELIZA_ERR_INVALID_ARG;
+    return ctx->paradee_g2p_kind;
+#else
+    (void) ctx;
+    return ELIZA_ERR_NOT_IMPLEMENTED;
+#endif
+}
+
+int eliza_inference_paradee_phonemize(
+    EliInferenceContext * ctx,
+    const char * text,
+    size_t text_len,
+    char ** out_utf8,
+    char ** out_error) {
+#ifdef ELIZA_ENABLE_PARADEE
+    if (!out_utf8) {
+        eliza_set_error(out_error, "[libelizainference] paradee_phonemize: null output argument");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    *out_utf8 = nullptr;
+    if (!ctx || !text) {
+        eliza_set_error(out_error, "[libelizainference] paradee_phonemize: null argument");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    const std::string in(text, text_len ? text_len : std::strlen(text));
+    std::lock_guard<std::mutex> lock(ctx->paradee_mutex);
+    const int load_rc = eliza_paradee_ensure_loaded_locked(ctx, "paradee_phonemize", out_error);
+    if (load_rc != ELIZA_OK) return load_rc;
+    std::string phonemes;
+    std::string err;
+    if (!eliza_misaki::misaki_phonemize(ctx->paradee_lexicon.get(), in, phonemes, err)) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] paradee_phonemize: misaki_phonemize failed: ") + err);
+        return ELIZA_ERR_FFI_FAULT;
+    }
+    if (phonemes.size() > (size_t) INT32_MAX) {
+        eliza_set_error(out_error, "[libelizainference] paradee_phonemize: output too large");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    char * owned = eliza_strdup(phonemes);
+    if (!owned) {
+        eliza_set_error(out_error, "[libelizainference] paradee_phonemize: allocation failed");
+        return ELIZA_ERR_OOM;
+    }
+    *out_utf8 = owned;
+    return (int) phonemes.size();
+#else
+    (void) ctx; (void) text; (void) text_len;
+    if (out_utf8) *out_utf8 = nullptr;
+    ELIZA_PARADEE_NOT_BUILT(out_error);
+#endif
+}
+
+int eliza_inference_paradee_synthesize_alloc(
+    EliInferenceContext * ctx,
+    const char * text,
+    size_t text_len,
+    float speed,
+    float ** out_pcm,
+    size_t * out_samples,
+    char ** out_error) {
+#ifdef ELIZA_ENABLE_PARADEE
+    return eliza_paradee_synthesize_owned(
+        ctx, text, text_len, false, speed, out_pcm, out_samples, out_error);
+#else
+    (void) ctx; (void) text; (void) text_len; (void) speed;
+    if (out_pcm) *out_pcm = nullptr;
+    if (out_samples) *out_samples = 0;
+    ELIZA_PARADEE_NOT_BUILT(out_error);
+#endif
+}
+
+int eliza_inference_paradee_synthesize_phonemes_alloc(
+    EliInferenceContext * ctx,
+    const char * misaki_phonemes,
+    size_t phonemes_len,
+    float speed,
+    float ** out_pcm,
+    size_t * out_samples,
+    char ** out_error) {
+#ifdef ELIZA_ENABLE_PARADEE
+    return eliza_paradee_synthesize_owned(
+        ctx, misaki_phonemes, phonemes_len, true, speed, out_pcm, out_samples, out_error);
+#else
+    (void) ctx; (void) misaki_phonemes; (void) phonemes_len; (void) speed;
+    if (out_pcm) *out_pcm = nullptr;
+    if (out_samples) *out_samples = 0;
+    ELIZA_PARADEE_NOT_BUILT(out_error);
+#endif
+}
+
 void eliza_inference_free_pcm(float * pcm) {
     std::free(pcm);
+}
+
+/* mmap_acquire("tts"): reload any Kokoro / Paradee head that a previous
+ * mmap_evict("tts") freed, then load OmniVoice. A bundle with no OmniVoice
+ * GGUF is fine when a Kokoro or Paradee head is configured on this ctx: the
+ * region is then those heads only, and the OmniVoice entries keep reporting
+ * "TTS region is not acquired". */
+static int eliza_acquire_tts_region(EliInferenceContext * ctx, char ** out_error) {
+    bool other_head = false;
+#ifdef ELIZA_ENABLE_KOKORO
+    {
+        std::lock_guard<std::mutex> lock(ctx->kokoro_mutex);
+        if (!ctx->kokoro_gguf_path.empty()) {
+            other_head = true;
+            const int rc = eliza_kokoro_ensure_loaded_locked(ctx, "mmap_acquire(tts)", out_error);
+            if (rc != ELIZA_OK) return rc;
+        }
+    }
+#endif
+#ifdef ELIZA_ENABLE_PARADEE
+    {
+        std::lock_guard<std::mutex> lock(ctx->paradee_mutex);
+        if (ctx->paradee_configured) {
+            other_head = true;
+            const int rc = eliza_paradee_ensure_loaded_locked(ctx, "mmap_acquire(tts)", out_error);
+            if (rc != ELIZA_OK) return rc;
+        }
+    }
+#endif
+    if (other_head) {
+        std::string tts_path;
+        std::string codec_path;
+        bool have_omnivoice = false;
+        {
+            std::lock_guard<std::mutex> lock(ctx->tts_mutex);
+            have_omnivoice = ctx->ov != nullptr || !ctx->tts_model_path.empty() ||
+                eliza_pick_voice_files(std::filesystem::path(ctx->bundle_dir), tts_path, codec_path);
+        }
+        if (!have_omnivoice) return ELIZA_OK;
+    }
+    return eliza_load_tts(ctx, out_error);
 }
 
 int eliza_inference_mmap_acquire(
@@ -2026,7 +2601,7 @@ int eliza_inference_mmap_acquire(
         return ELIZA_ERR_INVALID_ARG;
     }
     if (std::strcmp(region_name, "tts") == 0) {
-        return eliza_load_tts(ctx, out_error);
+        return eliza_acquire_tts_region(ctx, out_error);
     }
     if (std::strcmp(region_name, "asr") == 0) {
         return eliza_load_asr(ctx, out_error);
@@ -2047,11 +2622,24 @@ int eliza_inference_mmap_evict(
         return ELIZA_ERR_INVALID_ARG;
     }
     if (std::strcmp(region_name, "tts") == 0) {
-        std::lock_guard<std::mutex> lock(ctx->tts_mutex);
-        if (ctx->ov) {
-            ov_free(ctx->ov);
-            ctx->ov = nullptr;
+        /* The "tts" region is every TTS head on the ctx: OmniVoice, Kokoro,
+         * and Paradee + its misaki lexicon. Each is freed under its own mutex
+         * (an in-flight synth on that engine finishes first). Kokoro and
+         * Paradee keep their paths so the next synth or
+         * mmap_acquire("tts") reloads them. */
+        {
+            std::lock_guard<std::mutex> lock(ctx->tts_mutex);
+            if (ctx->ov) {
+                ov_free(ctx->ov);
+                ctx->ov = nullptr;
+            }
         }
+#ifdef ELIZA_ENABLE_KOKORO
+        eliza_kokoro_evict(ctx);
+#endif
+#ifdef ELIZA_ENABLE_PARADEE
+        eliza_paradee_evict(ctx);
+#endif
     }
     if (std::strcmp(region_name, "asr") == 0) {
         std::lock_guard<std::mutex> lock(ctx->asr_mutex);
@@ -2132,10 +2720,145 @@ int eliza_inference_tts_synthesize(
     return written;
 }
 
+/* The model-facing half of one transcription. The real implementation wraps
+ * mtmd + llama on the ctx's ASR region; the FFI unit test (built with
+ * ELIZA_INFERENCE_TEST_HOOKS) substitutes a scripted one so the cancel paths
+ * in eliza_asr_run_engine are tested without model weights. */
+struct EliAsrEngine {
+    virtual ~EliAsrEngine() = default;
+    virtual size_t n_chunks() = 0;
+    /* Evaluate prompt chunk `i` (text or audio). 0 on success. */
+    virtual int32_t eval_chunk(size_t i, bool logits_last) = 0;
+    virtual llama_token sample() = 0;
+    virtual bool is_eog(llama_token token) = 0;
+    virtual std::string piece(llama_token token) = 0;
+    virtual void accept(llama_token token) = 0;
+    /* Feed one sampled token back. 0 on success. */
+    virtual int32_t decode(llama_token token) = 0;
+};
+
+struct EliAsrMtmdEngine final : EliAsrEngine {
+    EliInferenceContext * ctx;
+    mtmd_input_chunks * chunks;
+    const llama_vocab * vocab;
+    llama_pos n_past = 0;
+
+    EliAsrMtmdEngine(EliInferenceContext * c, mtmd_input_chunks * ch)
+        : ctx(c), chunks(ch), vocab(llama_model_get_vocab(c->asr_model)) {}
+
+    size_t n_chunks() override { return mtmd_input_chunks_size(chunks); }
+    int32_t eval_chunk(size_t i, bool logits_last) override {
+        /* mtmd_helper_eval_chunk_single = one iteration of
+         * mtmd_helper_eval_chunks. Its llama_decode calls honour the abort
+         * callback; the audio encoder (mtmd_encode_chunk) has no abort hook,
+         * so cancel lands at the end of the encoder pass at the latest. */
+        return mtmd_helper_eval_chunk_single(
+            ctx->asr_mtmd, ctx->asr_lctx, mtmd_input_chunks_get(chunks, i),
+            n_past, 0, ctx->asr_n_batch, logits_last, &n_past);
+    }
+    llama_token sample() override { return llama_sampler_sample(ctx->asr_sampler, ctx->asr_lctx, -1); }
+    bool is_eog(llama_token token) override { return llama_vocab_is_eog(vocab, token); }
+    std::string piece(llama_token token) override { return eliza_llama_token_piece(vocab, token); }
+    void accept(llama_token token) override { llama_sampler_accept(ctx->asr_sampler, token); }
+    int32_t decode(llama_token token) override {
+        llama_batch batch = llama_batch_get_one(&token, 1);
+        return llama_decode(ctx->asr_lctx, batch);
+    }
+};
+
+static int eliza_asr_cancelled(char ** out_error) {
+    eliza_set_error(out_error, "[libelizainference] asr_transcribe: cancelled");
+    return ELIZA_ERR_CANCELLED;
+}
+
+/* Prefill + greedy decode over `engine`. Caller holds asr_mutex and has
+ * cleared ctx->asr_cancel. Returns 0 or a negative ELIZA_* code. */
+static int eliza_asr_run_engine(
+    EliInferenceContext * ctx,
+    EliAsrEngine & engine,
+    int max_decode_tokens,
+    size_t max_text_bytes,
+    std::string & out_transcript,
+    char ** out_error) {
+    const size_t n_chunks = engine.n_chunks();
+    for (size_t i = 0; i < n_chunks; ++i) {
+        if (eliza_asr_cancel_requested(ctx)) return eliza_asr_cancelled(out_error);
+        const int32_t eval_rc = engine.eval_chunk(i, i + 1 == n_chunks);
+        if (eval_rc != 0) {
+            if (eliza_asr_cancel_requested(ctx)) return eliza_asr_cancelled(out_error);
+            eliza_set_error(out_error, "[libelizainference] asr_transcribe: mtmd_helper_eval_chunks failed rc=" + std::to_string(eval_rc));
+            return ELIZA_ERR_FFI_FAULT;
+        }
+    }
+
+    std::string transcript;
+    transcript.reserve(std::min<size_t>(max_text_bytes, 256));
+    bool completed = false;
+    for (int i = 0; i < max_decode_tokens; ++i) {
+        if (eliza_asr_cancel_requested(ctx)) return eliza_asr_cancelled(out_error);
+        llama_token token = engine.sample();
+        if (engine.is_eog(token)) {
+            completed = true;
+            break;
+        }
+        std::string piece = engine.piece(token);
+        if (!piece.empty()) {
+            if (transcript.size() + piece.size() + 1 > max_text_bytes) {
+                eliza_set_error(out_error, "[libelizainference] asr_transcribe: output buffer too small");
+                return ELIZA_ERR_INVALID_ARG;
+            }
+            transcript += piece;
+            std::string cleaned_partial = eliza_clean_asr_transcript(transcript);
+            if (eliza_asr_has_text_payload(cleaned_partial)) {
+                // Stop only on a real end-of-turn marker — NOT on the first
+                // sentence-final '.'/'?'/'!'. Sentence-final early-stop truncated
+                // any multi-sentence utterance after its first clause (e.g.
+                // "Hello there. How are you?" -> "Hello there."). Qwen3-ASR emits
+                // an EOG / <|im_end|> at the true end of the transcript, which the
+                // EOG check above and the sentinels here already catch.
+                if (piece.find('\n') != std::string::npos ||
+                    transcript.find("<|im_end|>") != std::string::npos ||
+                    transcript.find("<|endoftext|>") != std::string::npos ||
+                    transcript.find("</s>") != std::string::npos) {
+                    completed = true;
+                    break;
+                }
+            }
+        }
+        engine.accept(token);
+        int32_t decode_rc = engine.decode(token);
+        if (decode_rc != 0) {
+            if (eliza_asr_cancel_requested(ctx)) return eliza_asr_cancelled(out_error);
+            eliza_set_error(out_error, "[libelizainference] asr_transcribe: llama_decode failed rc=" + std::to_string(decode_rc));
+            return ELIZA_ERR_FFI_FAULT;
+        }
+    }
+    if (eliza_asr_cancel_requested(ctx)) return eliza_asr_cancelled(out_error);
+    if (!completed) {
+        // Decode hit the token cap without an explicit end marker. The old
+        // behaviour hard-failed here, which surfaced as a spurious transcription
+        // error on long or unusually-tokenized audio (the cap is sized for
+        // typical speech). Return the best-effort transcript instead so the
+        // caller gets a usable result; only an EMPTY decode stays an error so a
+        // genuine failure is still visible.
+        std::string best = eliza_clean_asr_transcript(transcript);
+        if (best.empty()) {
+            eliza_set_error(out_error,
+                "[libelizainference] asr_transcribe: decode produced no text before the token cap");
+            return ELIZA_ERR_FFI_FAULT;
+        }
+        out_transcript = best;
+        return 0;
+    }
+    out_transcript = eliza_clean_asr_transcript(transcript);
+    return 0;
+}
+
 /* Shared ASR decode core. Takes the asr_mutex, runs the audio-in/text-out
  * decode, and yields the cleaned transcript. Both eliza_inference_asr_transcribe
  * and eliza_inference_asr_transcribe_timed call this so the decode lives in
- * exactly one place. Returns 0 on success or a negative ELIZA_* code. */
+ * exactly one place. Returns 0 on success or a negative ELIZA_* code
+ * (ELIZA_ERR_CANCELLED after eliza_inference_asr_cancel). */
 static int eliza_asr_decode_core(
     EliInferenceContext * ctx,
     const float * pcm,
@@ -2150,6 +2873,9 @@ static int eliza_asr_decode_core(
     }
 
     std::lock_guard<std::mutex> lock(ctx->asr_mutex);
+    /* Cleared only once this call owns the ASR region: a cancel issued while
+     * this call waited for the mutex was aimed at the call that held it. */
+    ctx->asr_cancel.store(false, std::memory_order_release);
     if (!ctx->asr_model || !ctx->asr_lctx || !ctx->asr_mtmd || !ctx->asr_sampler) {
         eliza_set_error(out_error, "[libelizainference] asr_transcribe: ASR region is not acquired; call mmap_acquire(\"asr\") after arming voice input");
         return ELIZA_ERR_INVALID_ARG;
@@ -2183,87 +2909,14 @@ static int eliza_asr_decode_core(
     llama_memory_clear(llama_get_memory(ctx->asr_lctx), true);
     llama_sampler_reset(ctx->asr_sampler);
 
-    llama_pos n_past = 0;
-    int32_t eval_rc = mtmd_helper_eval_chunks(
-        ctx->asr_mtmd,
-        ctx->asr_lctx,
-        chunks.get(),
-        n_past,
-        0,
-        ctx->asr_n_batch,
-        true,
-        &n_past);
-    if (eval_rc != 0) {
-        eliza_set_error(out_error, "[libelizainference] asr_transcribe: mtmd_helper_eval_chunks failed rc=" + std::to_string(eval_rc));
-        return ELIZA_ERR_FFI_FAULT;
-    }
-
-    const llama_vocab * vocab = llama_model_get_vocab(ctx->asr_model);
-    std::string transcript;
-    transcript.reserve(std::min<size_t>(max_text_bytes, 256));
     const int max_decode_tokens = std::min<int>(
         4096,
         std::max<int>(
             192,
             64 + (int) (((audio.size() + (size_t) ctx->asr_sample_rate - 1) /
                          (size_t) ctx->asr_sample_rate) * 32)));
-    bool completed = false;
-    for (int i = 0; i < max_decode_tokens; ++i) {
-        llama_token token = llama_sampler_sample(ctx->asr_sampler, ctx->asr_lctx, -1);
-        if (llama_vocab_is_eog(vocab, token)) {
-            completed = true;
-            break;
-        }
-        std::string piece = eliza_llama_token_piece(vocab, token);
-        if (!piece.empty()) {
-            if (transcript.size() + piece.size() + 1 > max_text_bytes) {
-                eliza_set_error(out_error, "[libelizainference] asr_transcribe: output buffer too small");
-                return ELIZA_ERR_INVALID_ARG;
-            }
-            transcript += piece;
-            std::string cleaned_partial = eliza_clean_asr_transcript(transcript);
-            if (eliza_asr_has_text_payload(cleaned_partial)) {
-                // Stop only on a real end-of-turn marker — NOT on the first
-                // sentence-final '.'/'?'/'!'. Sentence-final early-stop truncated
-                // any multi-sentence utterance after its first clause (e.g.
-                // "Hello there. How are you?" -> "Hello there."). Qwen3-ASR emits
-                // an EOG / <|im_end|> at the true end of the transcript, which the
-                // EOG check above and the sentinels here already catch.
-                if (piece.find('\n') != std::string::npos ||
-                    transcript.find("<|im_end|>") != std::string::npos ||
-                    transcript.find("<|endoftext|>") != std::string::npos ||
-                    transcript.find("</s>") != std::string::npos) {
-                    completed = true;
-                    break;
-                }
-            }
-        }
-        llama_sampler_accept(ctx->asr_sampler, token);
-        llama_batch batch = llama_batch_get_one(&token, 1);
-        int32_t decode_rc = llama_decode(ctx->asr_lctx, batch);
-        if (decode_rc != 0) {
-            eliza_set_error(out_error, "[libelizainference] asr_transcribe: llama_decode failed rc=" + std::to_string(decode_rc));
-            return ELIZA_ERR_FFI_FAULT;
-        }
-    }
-    if (!completed) {
-        // Decode hit the token cap without an explicit end marker. The old
-        // behaviour hard-failed here, which surfaced as a spurious transcription
-        // error on long or unusually-tokenized audio (the cap is sized for
-        // typical speech). Return the best-effort transcript instead so the
-        // caller gets a usable result; only an EMPTY decode stays an error so a
-        // genuine failure is still visible.
-        std::string best = eliza_clean_asr_transcript(transcript);
-        if (best.empty()) {
-            eliza_set_error(out_error,
-                "[libelizainference] asr_transcribe: decode produced no text before the token cap");
-            return ELIZA_ERR_FFI_FAULT;
-        }
-        out_transcript = best;
-        return 0;
-    }
-    out_transcript = eliza_clean_asr_transcript(transcript);
-    return 0;
+    EliAsrMtmdEngine engine(ctx, chunks.get());
+    return eliza_asr_run_engine(ctx, engine, max_decode_tokens, max_text_bytes, out_transcript, out_error);
 }
 
 int eliza_inference_asr_transcribe(
@@ -2291,6 +2944,57 @@ int eliza_inference_asr_transcribe(
     out_text[transcript.size()] = '\0';
     return (int) transcript.size();
 }
+
+/* ABI v17. elizainference is only built when the mtmd target exists (see
+ * tools/omnivoice/CMakeLists.txt), and mtmd carries the audio encoder, so any
+ * build of this file has the batch ASR path. Whether a bundle has ASR weights
+ * is a separate, runtime question answered by mmap_acquire("asr"). */
+int eliza_inference_asr_supported(void) {
+    return 1;
+}
+
+int eliza_inference_asr_cancel(
+    EliInferenceContext * ctx,
+    char ** out_error) {
+    if (!ctx) {
+        eliza_set_error(out_error, "[libelizainference] asr_cancel: ctx is NULL");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    /* No asr_mutex: the in-flight transcription holds it. */
+    ctx->asr_cancel.store(true, std::memory_order_release);
+    return ELIZA_OK;
+}
+
+#ifdef ELIZA_INFERENCE_TEST_HOOKS
+/* Test-only (tests/ffi-paradee-asr.cpp #includes this file with
+ * ELIZA_INFERENCE_TEST_HOOKS defined; no shipped target defines it): run the
+ * shared prefill/decode control flow over a scripted engine, with the same
+ * mutex + cancel reset as eliza_asr_decode_core. */
+static int eliza_test_asr_run_engine(
+    EliInferenceContext * ctx,
+    EliAsrEngine * engine,
+    int max_decode_tokens,
+    char * out_text,
+    size_t max_text_bytes,
+    char ** out_error) {
+    if (!ctx || !engine || !out_text || max_text_bytes == 0) return ELIZA_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lock(ctx->asr_mutex);
+    ctx->asr_cancel.store(false, std::memory_order_release);
+    std::string transcript;
+    const int rc = eliza_asr_run_engine(ctx, *engine, max_decode_tokens, max_text_bytes, transcript, out_error);
+    if (rc < 0) return rc;
+    if (transcript.size() + 1 > max_text_bytes) return ELIZA_ERR_INVALID_ARG;
+    std::memcpy(out_text, transcript.data(), transcript.size());
+    out_text[transcript.size()] = '\0';
+    return (int) transcript.size();
+}
+
+/* The abort callback installed on asr_lctx, so a scripted engine can poll it
+ * exactly the way llama_decode does. */
+static bool eliza_test_asr_abort_requested(EliInferenceContext * ctx) {
+    return eliza_asr_cancel_requested(ctx);
+}
+#endif
 
 int eliza_inference_asr_timestamps_supported(void) {
     return 1;
@@ -2536,7 +3240,12 @@ int eliza_inference_cancel_tts(
     char ** out_error) {
     (void) out_error;
     if (ctx) {
+        /* One flag per TTS engine (OmniVoice, Kokoro, Paradee). Each engine
+         * clears its own flag when a call starts, so a set flag only ever
+         * stops the call in flight on that engine. */
         ctx->tts_cancel.store(true, std::memory_order_release);
+        ctx->kokoro_cancel.store(true, std::memory_order_release);
+        ctx->paradee_cancel.store(true, std::memory_order_release);
     }
     // Cancelling nothing is not an error.
     return ELIZA_OK;
