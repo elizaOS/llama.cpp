@@ -341,7 +341,7 @@ static std::vector<float> get_logits(
     }
     if (target_ctx) {
         llama_memory_clear(llama_get_memory(target_source), true);
-        llama_set_embeddings_pre_norm(target_source, true);
+        llama_set_embeddings_nextn(target_source, true, false);
         get_logits(llama_get_model(target_source), target_source, tokens);
         if (target_source != target_ctx) {
             std::vector<uint8_t> state(llama_state_get_size(target_source));
@@ -366,10 +366,10 @@ static std::vector<float> get_logits(
         batch.token = static_cast<llama_token *>(std::malloc(n_ctx * sizeof(llama_token)));
         GGML_ASSERT(batch.token);
         // Match MTP prefill: first row has no prior state; later rows consume
-        // the real target's preceding pre-normalization hidden state.
+        // the real target's preceding NextN hidden state.
         std::memset(batch.embd, 0, n_embd * sizeof(float));
         for (uint32_t i = 1; i < n_tokens; ++i) {
-            const float * hidden = llama_get_embeddings_pre_norm_ith(target_source, i - 1);
+            const float * hidden = llama_get_embeddings_nextn_ith(target_source, i - 1);
             GGML_ASSERT(hidden);
             std::memcpy(batch.embd + i * n_embd, hidden, n_embd * sizeof(float));
         }
