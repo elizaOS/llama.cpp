@@ -385,6 +385,154 @@ inline void kokoro_axpy_f32(float a, const float * x, float * y, int n) {
 #endif // KOKORO_USE_PORTABLE_FAST
 
 // =================================================================
+// Opt-in layer strategies. Kokoro-82M never sets them, so its arithmetic is
+// unchanged; Paradee enables them for its synthesis calls.
+//   tap_gemm_conv: stride-1 Conv1d on Accelerate as one SGEMM per kernel
+//                  tap over a zero-padded input, instead of im2col (whose
+//                  column matrix is Cin*K*T floats, ~70 MB for a 32-channel,
+//                  K=11, 10 s generator stage). On the portable path,
+//                  register-tiled Conv1d / ConvTranspose1d kernels instead of
+//                  per-tap AXPY loops.
+//   fast_snake:    Snake1D with a polynomial sin^2 (|error| < 5e-7) that
+//                  vectorises, instead of one libm sin call per element.
+// =================================================================
+namespace detail {
+struct KokoroLayerOptions {
+    bool tap_gemm_conv = false;
+    bool fast_snake = false;
+};
+inline KokoroLayerOptions & kokoro_layer_options() {
+    static thread_local KokoroLayerOptions options;
+    return options;
+}
+
+class KokoroLayerOptionsScope {
+public:
+    explicit KokoroLayerOptionsScope(const KokoroLayerOptions & o) : previous_(kokoro_layer_options()) {
+        kokoro_layer_options() = o;
+    }
+    ~KokoroLayerOptionsScope() { kokoro_layer_options() = previous_; }
+    KokoroLayerOptionsScope(const KokoroLayerOptionsScope &) = delete;
+    KokoroLayerOptionsScope & operator=(const KokoroLayerOptionsScope &) = delete;
+private:
+    KokoroLayerOptions previous_;
+};
+
+// sin(y)^2 for float y: reduction by pi in double (sin^2 has period pi; a
+// float reduction loses ~1e-7 per 100 rad), then an odd degree-11
+// polynomial for sin on [-pi/2, pi/2] in float.
+inline float fast_sin2(float y) {
+    const double n = std::nearbyint((double) y * 0.318309886183790671538);
+    const float r = (float) ((double) y - n * 3.14159265358979323846);
+    const float r2 = r * r;
+    float p = -2.50521083854417187751e-08f;
+    p = p * r2 + 2.75573192239858906526e-06f;
+    p = p * r2 - 1.98412698412698412526e-04f;
+    p = p * r2 + 8.33333333333333321769e-03f;
+    p = p * r2 - 1.66666666666666657415e-01f;
+    const float sn = r + r * r2 * p;
+    return sn * sn;
+}
+
+#if defined(KOKORO_USE_PORTABLE_FAST) && defined(KOKORO_USE_NEON)
+#define KOKORO_HAVE_TILED_KERNELS 1
+// Register-tiled NEON kernels for the portable path (tap_gemm_conv). A tile
+// is 4 output rows x 16 time steps held in 16 q-register accumulators across
+// the whole reduction, with the 4 weights of each (ci, k) packed into one
+// vector, so each 16-float input load feeds 64 FMAs (the AXPY path does one
+// load, one FMA and one store per 4 MACs). Tiles run on the layer pool.
+constexpr int KT_MR = 4;
+constexpr int KT_NR = 16;
+
+// a: KT_MR-wide packed A columns (a[p*4 + r]), b: B rows (b + p*ldb), Kd steps.
+inline void kt_micro(const float * a, const float * b, size_t ldb, int Kd, float32x4_t acc[KT_MR][4]) {
+    for (int p = 0; p < Kd; ++p) {
+        const float * bp = b + (size_t) p * ldb;
+        const float32x4_t x0 = vld1q_f32(bp), x1 = vld1q_f32(bp + 4), x2 = vld1q_f32(bp + 8), x3 = vld1q_f32(bp + 12);
+        const float32x4_t w = vld1q_f32(a + (size_t) p * KT_MR);
+#define KT_ROW(r) \
+        acc[r][0] = vfmaq_laneq_f32(acc[r][0], x0, w, r); acc[r][1] = vfmaq_laneq_f32(acc[r][1], x1, w, r); \
+        acc[r][2] = vfmaq_laneq_f32(acc[r][2], x2, w, r); acc[r][3] = vfmaq_laneq_f32(acc[r][3], x3, w, r);
+        KT_ROW(0) KT_ROW(1) KT_ROW(2) KT_ROW(3)
+#undef KT_ROW
+    }
+}
+
+inline void kt_store(float32x4_t acc[KT_MR][4], float * c, size_t ldc, int mr, int nr) {
+    for (int r = 0; r < mr; ++r) {
+        float tmp[KT_NR];
+        vst1q_f32(tmp, acc[r][0]); vst1q_f32(tmp + 4, acc[r][1]);
+        vst1q_f32(tmp + 8, acc[r][2]); vst1q_f32(tmp + 12, acc[r][3]);
+        std::memcpy(c + (size_t) r * ldc, tmp, sizeof(float) * (size_t) nr);
+    }
+}
+
+// y[Cout, T_out] = b + sum_{ci,k} W[co, ci, k] * xp[ci, to + k*dil]
+// xp: [Cin, ldx] zero-padded input, readable up to to + (K-1)*dil + KT_NR.
+inline void conv1d_s1_tiled(const float * xp, int ldx, int Cin,
+                            const float * W, const float * b, int Cout, int K, int dil,
+                            float * y, int T_out) {
+    const int n_mb = (Cout + KT_MR - 1) / KT_MR;
+    const int n_nb = (T_out + KT_NR - 1) / KT_NR;
+    // Pack weights per row block: wp[mb][ci][k][r].
+    std::vector<float> wp((size_t) n_mb * Cin * K * KT_MR, 0.0f);
+    for (int co = 0; co < Cout; ++co)
+        for (int ci = 0; ci < Cin; ++ci)
+            for (int k = 0; k < K; ++k)
+                wp[(((size_t) (co / KT_MR) * Cin + ci) * K + k) * KT_MR + co % KT_MR] =
+                    W[((size_t) co * Cin + ci) * K + k];
+    const size_t total_macs = (size_t) Cout * T_out * Cin * K;
+    kokoro_parallel_for(total_macs, n_mb * n_nb, [&](int tile) {
+        const int mb = tile / n_nb;
+        const int co0 = mb * KT_MR;
+        const int t0 = (tile % n_nb) * KT_NR;
+        const int mr = std::min(KT_MR, Cout - co0);
+        const int nr = std::min(KT_NR, T_out - t0);
+        float32x4_t acc[KT_MR][4];
+        for (int r = 0; r < KT_MR; ++r) {
+            const float32x4_t bv = vdupq_n_f32((b && r < mr) ? b[co0 + r] : 0.0f);
+            acc[r][0] = acc[r][1] = acc[r][2] = acc[r][3] = bv;
+        }
+        const float * wb = wp.data() + (size_t) mb * Cin * K * KT_MR;
+        for (int ci = 0; ci < Cin; ++ci) {
+            const float * xr = xp + (size_t) ci * ldx + t0;
+            if (dil == 1) {
+                // taps k are consecutive rows of a Hankel view: ldb = 1
+                kt_micro(wb + (size_t) ci * K * KT_MR, xr, 1, K, acc);
+            } else {
+                kt_micro(wb + (size_t) ci * K * KT_MR, xr, (size_t) dil, K, acc);
+            }
+        }
+        kt_store(acc, y + (size_t) co0 * T_out + t0, (size_t) T_out, mr, nr);
+    });
+}
+
+// C[M, N] = A[M, Kd] (row-major, lda) * B[Kd, N] (row-major, ldb, readable
+// to N rounded up to KT_NR).
+inline void sgemm_tiled(int M, int N, int Kd, const float * A, int lda, const float * B, int ldb,
+                        float * C, int ldc) {
+    const int n_mb = (M + KT_MR - 1) / KT_MR;
+    const int n_nb = (N + KT_NR - 1) / KT_NR;
+    std::vector<float> ap((size_t) n_mb * Kd * KT_MR, 0.0f);
+    for (int i = 0; i < M; ++i)
+        for (int p = 0; p < Kd; ++p)
+            ap[((size_t) (i / KT_MR) * Kd + p) * KT_MR + i % KT_MR] = A[(size_t) i * lda + p];
+    kokoro_parallel_for((size_t) M * N * Kd, n_mb * n_nb, [&](int tile) {
+        const int mb = tile / n_nb;
+        const int i0 = mb * KT_MR;
+        const int j0 = (tile % n_nb) * KT_NR;
+        const int mr = std::min(KT_MR, M - i0);
+        const int nr = std::min(KT_NR, N - j0);
+        float32x4_t acc[KT_MR][4];
+        for (int r = 0; r < KT_MR; ++r) acc[r][0] = acc[r][1] = acc[r][2] = acc[r][3] = vdupq_n_f32(0.0f);
+        kt_micro(ap.data() + (size_t) mb * Kd * KT_MR, B + j0, (size_t) ldb, Kd, acc);
+        kt_store(acc, C + (size_t) i0 * ldc + j0, (size_t) ldc, mr, nr);
+    });
+}
+#endif
+} // namespace detail
+
+// =================================================================
 // Tensor (lightweight host tensor — view or owned)
 // =================================================================
 struct Tensor1D {                  // [C]
@@ -452,6 +600,33 @@ inline void conv1d_forward(
     }
 #endif
 #if defined(KOKORO_USE_ACCELERATE)
+    if (detail::kokoro_layer_options().tap_gemm_conv && stride == 1 && K > 1) {
+        // y = sum_k W[:, :, k] · x_pad[:, k*dil : k*dil + T_out]
+        const int Tp = T + 2 * pad;
+        std::vector<float> xp((size_t) Cin * Tp, 0.0f);
+        for (int ci = 0; ci < Cin; ++ci) {
+            std::memcpy(xp.data() + (size_t) ci * Tp + pad, x + (size_t) ci * T, sizeof(float) * (size_t) T);
+        }
+        std::vector<float> wk((size_t) K * Cout * Cin);
+        for (int co = 0; co < Cout; ++co)
+            for (int ci = 0; ci < Cin; ++ci)
+                for (int k = 0; k < K; ++k)
+                    wk[((size_t) k * Cout + co) * Cin + ci] = W[((size_t) co * Cin + ci) * K + k];
+        if (b) {
+            for (int co = 0; co < Cout; ++co) {
+                float * yc = y + (size_t) co * T_out;
+                for (int to = 0; to < T_out; ++to) yc[to] = b[co];
+            }
+        }
+        for (int k = 0; k < K; ++k) {
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        Cout, T_out, Cin,
+                        1.0f, wk.data() + (size_t) k * Cout * Cin, Cin,
+                        xp.data() + (size_t) k * dilation, Tp,
+                        (b || k > 0) ? 1.0f : 0.0f, y, T_out);
+        }
+        return;
+    }
     // im2col + one SGEMM. The PyTorch weight layout [Cout, Cin, K] is already
     // a row-major [Cout, Cin*K] GEMM operand; the column matrix is
     // [Cin*K, T_out] with zero padding baked in, so
@@ -491,6 +666,40 @@ inline void conv1d_forward(
                 1.0f, W, Cin * K, cols.data(), T_out,
                 beta, y, T_out);
 #elif defined(KOKORO_USE_PORTABLE_FAST)
+#if defined(KOKORO_HAVE_TILED_KERNELS)
+    if (detail::kokoro_layer_options().tap_gemm_conv && stride == 1) {
+        const int ldx = T + 2 * pad + detail::KT_NR;
+        std::vector<float> xp((size_t) Cin * ldx, 0.0f);
+        for (int ci = 0; ci < Cin; ++ci) {
+            std::memcpy(xp.data() + (size_t) ci * ldx + pad, x + (size_t) ci * T, sizeof(float) * (size_t) T);
+        }
+        detail::conv1d_s1_tiled(xp.data(), ldx, Cin, W, b, Cout, K, dilation, y, T_out);
+        return;
+    }
+    if (detail::kokoro_layer_options().tap_gemm_conv && stride > 1) {
+        // Strided: im2col [Cin*K, T_out] (small for these shapes) + tiled GEMM.
+        const int ldc = T_out + detail::KT_NR;
+        std::vector<float> cols((size_t) Cin * K * ldc, 0.0f);
+        for (int ci = 0; ci < Cin; ++ci) {
+            const float * xi = x + (size_t) ci * T;
+            for (int k = 0; k < K; ++k) {
+                float * col = cols.data() + ((size_t) ci * K + k) * ldc;
+                for (int to = 0; to < T_out; ++to) {
+                    const int ti = to * stride + k * dilation - pad;
+                    if (ti >= 0 && ti < T) col[to] = xi[ti];
+                }
+            }
+        }
+        detail::sgemm_tiled(Cout, T_out, Cin * K, W, Cin * K, cols.data(), ldc, y, T_out);
+        if (b) {
+            for (int co = 0; co < Cout; ++co) {
+                float * yc = y + (size_t) co * T_out;
+                for (int to = 0; to < T_out; ++to) yc[to] += b[co];
+            }
+        }
+        return;
+    }
+#endif
     // Parallel over output channels (each thread owns disjoint y rows), and
     // per (ci, k) tap a branch-free AXPY over the valid `to` range — the
     // per-element bounds check of the reference loop is hoisted into the
@@ -640,6 +849,32 @@ inline void convtranspose1d_forward(
         }
     }
 #elif defined(KOKORO_USE_PORTABLE_FAST)
+#if defined(KOKORO_HAVE_TILED_KERNELS)
+    if (detail::kokoro_layer_options().tap_gemm_conv) {
+        // tmp[Cout*K, T] = W^T x, then col2im (as the Accelerate path).
+        std::vector<float> wt((size_t) Cout * K * Cin);
+        for (int ci = 0; ci < Cin; ++ci)
+            for (int j = 0; j < Cout * K; ++j)
+                wt[(size_t) j * Cin + ci] = W[(size_t) ci * Cout * K + j];
+        const int ldb = T + detail::KT_NR;
+        std::vector<float> xb((size_t) Cin * ldb, 0.0f);
+        for (int ci = 0; ci < Cin; ++ci) std::memcpy(xb.data() + (size_t) ci * ldb, x + (size_t) ci * T, sizeof(float) * (size_t) T);
+        std::vector<float> tmp((size_t) Cout * K * T);
+        detail::sgemm_tiled(Cout * K, T, Cin, wt.data(), Cin, xb.data(), ldb, tmp.data(), T);
+        for (int co = 0; co < Cout; ++co) {
+            float * yc = y + (size_t) co * T_out;
+            for (int k = 0; k < K; ++k) {
+                const float * row = tmp.data() + ((size_t) co * K + k) * T;
+                const int t_off = k - pad;
+                for (int t_in = 0; t_in < T; ++t_in) {
+                    const int to = t_in * stride + t_off;
+                    if (to >= 0 && to < T_out) yc[to] += row[t_in];
+                }
+            }
+        }
+        return;
+    }
+#endif
     // Parallel over output channels (each thread scatters into disjoint y
     // rows — no races). Two branch-free AXPY shapes, valid ranges hoisted
     // out of the inner loop:
@@ -888,7 +1123,9 @@ inline void bilstm_forward(
 inline void adain1d_forward(
         float * x, int C, int T,
         const float * s, int Sdim,
-        const float * fc_W /* [2C, Sdim] */, const float * fc_b /* [2C] */) {
+        const float * fc_W /* [2C, Sdim] */, const float * fc_b /* [2C] */,
+        const float * norm_W = nullptr /* [C], InstanceNorm affine weight */,
+        const float * norm_b = nullptr /* [C], InstanceNorm affine bias */) {
     std::vector<float> h(2 * C);
     linear_forward(s, Sdim, fc_W, fc_b, 2 * C, h.data());
     // gamma = h[0..C], beta = h[C..2C]
@@ -905,7 +1142,11 @@ inline void adain1d_forward(
     // saved state_dict shows no norm.weight key under norm1/norm2 of
     // AdainResBlk1d, only fc.weight/fc.bias. The default-affine
     // weight=1/bias=0 is correct then.
-    instance_norm1d_forward(x, C, T, 1e-5f, nullptr, nullptr);
+    //
+    // Models trained with the affine parameters live (Paradee's students)
+    // pass them as norm_W / norm_b; Kokoro-82M passes nullptr and keeps the
+    // identity affine, so its arithmetic is unchanged.
+    instance_norm1d_forward(x, C, T, 1e-5f, norm_W, norm_b);
     for (int c = 0; c < C; ++c) {
         const float gamma = h[c];
         const float beta  = h[C + c];
@@ -992,6 +1233,15 @@ struct AdainResBlk1dWeights {
 // Snake1D activation: x = x + (1/a) * sin(a*x)^2
 // =================================================================
 inline void snake1d_forward(float * x, int C, int T, const float * a /* [C] */) {
+    if (detail::kokoro_layer_options().fast_snake) {
+        for (int c = 0; c < C; ++c) {
+            const float av = std::abs(a[c]) > 1e-8f ? a[c] : 1e-8f;
+            const float inv_a = 1.0f / av;
+            float * xc = x + (size_t)c * T;
+            for (int t = 0; t < T; ++t) xc[t] = xc[t] + inv_a * detail::fast_sin2(av * xc[t]);
+        }
+        return;
+    }
     for (int c = 0; c < C; ++c) {
         const float av = std::abs(a[c]) > 1e-8f ? a[c] : 1e-8f;
         const float inv_a = 1.0f / av;
