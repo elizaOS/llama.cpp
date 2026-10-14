@@ -41,6 +41,26 @@ else()
         # this ordering for the embed-as-library (LLAMA_BUILD_TOOLS=OFF) case.
         add_subdirectory(kokoro)
     endif()
+    if (LLAMA_BUILD_MISAKI_G2P)
+        # Native misaki G2P (the phoneme spelling Paradee and Kokoro were
+        # trained on). Added when the subtree is present.
+        if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/misaki-g2p/CMakeLists.txt")
+            add_subdirectory(misaki-g2p)
+        else()
+            message(STATUS "LLAMA_BUILD_MISAKI_G2P: tools/misaki-g2p/ is not in this checkout; skipped")
+        endif()
+    endif()
+    if (LLAMA_BUILD_PARADEE)
+        # Paradee-8M (width-scaled Kokoro student, single voice). Needs
+        # kokoro_lib; like kokoro it precedes omnivoice so the fused
+        # `elizainference` target can fold paradee_lib in.
+        # A build with Kokoro off skips Paradee rather than failing.
+        if (LLAMA_BUILD_KOKORO)
+            add_subdirectory(paradee)
+        else()
+            message(STATUS "LLAMA_BUILD_PARADEE: skipped because LLAMA_BUILD_KOKORO=OFF")
+        endif()
+    endif()
     if (LLAMA_BUILD_PARAKEET)
         # Parakeet-TDT ASR (Phonon-2 five-value weights). Like kokoro it
         # precedes omnivoice so the fused `elizainference` target can fold

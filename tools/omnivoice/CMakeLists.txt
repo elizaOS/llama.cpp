@@ -386,7 +386,7 @@ if(TARGET mtmd)
     endif()
     add_dependencies(elizainference_static omnivoice-version)
 
-    # FFI tests (ABI v17).
+    # FFI tests (ABI v18).
     #   eliza-inference-test-abi      links the real libelizainference: ABI
     #                                 string, probes, cancel/evict no-ops, and
     #                                 (opt-in, ELIZA_TEST_ASR_DIR) a real-model

@@ -1,0 +1,23 @@
+LICENCE FLAG (not a blocker): eSpeak NG is GPL-3.0-or-later.
+
+When MISAKI_G2P_ESPEAK is ON and libespeak-ng is found, misaki_g2p links
+eSpeak NG 1.52.0 (https://github.com/espeak-ng/espeak-ng, tarball sha256
+bb4338102ff3b49a81423da8a1a158b420124b055b60fa76cfb4b18677130a23) and reads its
+English data (phontab, phonindex, phondata, intonations, en_dict, lang/gmw/en,
+lang/gmw/en-US). A binary that links libespeak-ng is a combined work under the
+GPL-3.0-or-later: distributing it requires the corresponding source and the GPL
+terms for the whole work. eSpeak NG is used only for words outside misaki's
+lexicon, exactly as misaki's EspeakFallback did when Paradee's training data
+was made.
+
+Built with MISAKI_G2P_ESPEAK=OFF (or without libespeak-ng present), no GPL code
+is linked; misaki_g2p_fallback_kind() then returns 0 and unknown words are
+spelled out with the lexicon's letter pronunciations. Output for those words
+then differs from what Paradee was trained on.
+
+Other flags:
+- tests/corpus/wikitext_heldout_200.txt: the first 200 sentences of
+  paradee training/data/wikitext_sents.json (WikiText-103, from Wikipedia,
+  CC-BY-SA-3.0, share-alike). Test data only.
+- num2words (LGPL-2.1) is used only by tests/compare_misaki.py to run the
+  Python reference; no num2words code is copied.

@@ -1913,6 +1913,13 @@ int eliza_inference_kokoro_load(
 }
 
 #ifdef ELIZA_ENABLE_KOKORO
+/* Passed to kokoro_lib as its cancel callback. Reads only the Kokoro flag, so
+ * an OmniVoice or Paradee call starting on another thread cannot clear it. */
+static bool eliza_kokoro_cancel_requested(void * user_data) {
+    EliInferenceContext * ctx = (EliInferenceContext *) user_data;
+    return ctx && ctx->kokoro_cancel.load(std::memory_order_acquire);
+}
+
 static int eliza_kokoro_synthesize_audio(
     EliInferenceContext * ctx,
     const char * input,
@@ -1931,10 +1938,11 @@ static int eliza_kokoro_synthesize_audio(
     }
     std::lock_guard<std::mutex> lock(ctx->kokoro_mutex);
     /* A cancel_tts issued before this call held the lock targets an earlier
-     * call; start this one clean. kokoro_lib has no in-graph cancel hook, so
-     * the flag is checked after the (possibly lazy) reload and after the
-     * forward pass: a cancelled call discards its audio and reports
-     * ELIZA_ERR_CANCELLED. */
+     * call; start this one clean. The flag is checked after the (possibly
+     * lazy) reload, by kokoro_lib between its stages (predictor, decoder
+     * front, generator), and after the forward pass. The exchange below
+     * clears it on the way out. A cancelled call discards its audio and
+     * reports ELIZA_ERR_CANCELLED. */
     ctx->kokoro_cancel.store(false, std::memory_order_release);
     const int load_rc = eliza_kokoro_ensure_loaded_locked(ctx, operation, out_error);
     if (load_rc != ELIZA_OK) return load_rc;
@@ -1948,10 +1956,13 @@ static int eliza_kokoro_synthesize_audio(
     std::string err;
     const eliza_kokoro::kokoro_status st = ipa_input
         ? eliza_kokoro::kokoro_synthesize_ipa(
-              ctx->kokoro_model.get(), ctx->kokoro_voice, in, speed, audio, err)
+              ctx->kokoro_model.get(), ctx->kokoro_voice, in, speed, audio, err,
+              eliza_kokoro_cancel_requested, ctx)
         : eliza_kokoro::kokoro_synthesize(
-              ctx->kokoro_model.get(), ctx->kokoro_voice, in, speed, audio, err);
-    if (ctx->kokoro_cancel.exchange(false, std::memory_order_acq_rel)) {
+              ctx->kokoro_model.get(), ctx->kokoro_voice, in, speed, audio, err,
+              eliza_kokoro_cancel_requested, ctx);
+    if (ctx->kokoro_cancel.exchange(false, std::memory_order_acq_rel) ||
+        st == eliza_kokoro::KOKORO_E_CANCELLED) {
         audio.samples.clear();
         eliza_set_error(out_error,
             std::string("[libelizainference] ") + operation + ": cancelled");
@@ -2284,8 +2295,13 @@ static int eliza_paradee_chunk(
         { ",", ";", ":", "\xE2\x80\x94" /* — */ },
         { " " },
     };
+    /* Unpadded and unlimited: chunks are padded below, and the ABI drops
+     * characters outside the vocab (paradee_phonemes_to_ids would add pads,
+     * reject more than 510 symbols and reject unknown symbols). */
     std::vector<int32_t> ids;
-    if (eliza_paradee::paradee_phonemes_to_ids(model, phonemes, ids, err) != eliza_paradee::PARADEE_OK) {
+    size_t n_dropped = 0;
+    if (eliza_paradee::paradee_phonemes_to_symbol_ids_lenient(model, phonemes, ids, n_dropped, err) !=
+        eliza_paradee::PARADEE_OK) {
         return ELIZA_ERR_INVALID_ARG;
     }
     if (ids.empty()) return ELIZA_OK;
@@ -2343,6 +2359,7 @@ static int eliza_paradee_synthesize_owned(
         return ELIZA_ERR_INVALID_ARG;
     }
     if (!(speed > 0.0f) || !std::isfinite(speed)) speed = 1.0f;
+    speed = std::min(std::max(speed, eliza_paradee::PARADEE_MIN_SPEED), eliza_paradee::PARADEE_MAX_SPEED);
     const std::string in(input, input_len ? input_len : std::strlen(input));
 
     std::lock_guard<std::mutex> lock(ctx->paradee_mutex);
@@ -3976,6 +3993,40 @@ int eliza_inference_llm_kv_quant_supported(void) {
     return 1;
 }
 
+static int eliza_llm_context_capacity(
+    const llama_model * model, int32_t requested_context) {
+    const int n_ctx_train = llama_model_n_ctx_train(model);
+    int n_ctx = requested_context > 0
+        ? requested_context
+        : eliza_int_env_or_default("ELIZA_LLM_N_CTX", 8192);
+    if (n_ctx_train > 0 && n_ctx > n_ctx_train) n_ctx = n_ctx_train;
+    return n_ctx;
+}
+
+int eliza_inference_llm_context_capacity(
+    EliInferenceContext * ctx,
+    int32_t requested_context,
+    int32_t n_gpu_layers,
+    int32_t * out_capacity,
+    char ** out_error) {
+    if (!ctx || !out_capacity) {
+        eliza_set_error(out_error,
+            "[libelizainference] llm_context_capacity: ctx and out_capacity are required");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::mutex> lock(ctx->llm_mutex);
+    const int rc = eliza_load_llm_model_locked(ctx, n_gpu_layers, out_error);
+    if (rc != ELIZA_OK) return rc;
+    const int capacity = eliza_llm_context_capacity(ctx->llm_model, requested_context);
+    if (capacity <= 0) {
+        eliza_set_error(out_error,
+            "[libelizainference] llm_context_capacity: context capacity must be positive");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    *out_capacity = capacity;
+    return ELIZA_OK;
+}
+
 EliLlmStream * eliza_inference_llm_stream_open(
     EliInferenceContext * ctx,
     const eliza_llm_stream_config_t * cfg,
@@ -4007,11 +4058,13 @@ EliLlmStream * eliza_inference_llm_stream_open(
      * MTP engine's target context so both decode identically (same n_ctx /
      * batch / threads / flash-attn / KV-quant). */
     llama_context_params cparams = llama_context_default_params();
-    const int n_ctx_train = llama_model_n_ctx_train(model);
-    int n_ctx = cfg->context_size > 0
-        ? cfg->context_size
-        : eliza_int_env_or_default("ELIZA_LLM_N_CTX", 8192);
-    if (n_ctx_train > 0 && n_ctx > n_ctx_train) n_ctx = n_ctx_train;
+    const int n_ctx = eliza_llm_context_capacity(model, cfg->context_size);
+    if (n_ctx <= 0) {
+        eliza_set_error(out_error,
+            "[libelizainference] llm_stream_open: context capacity must be positive");
+        delete stream;
+        return nullptr;
+    }
     cparams.n_ctx = (uint32_t) n_ctx;
     cparams.n_batch = (uint32_t) eliza_int_env_or_default("ELIZA_LLM_N_BATCH", 512);
     cparams.n_ubatch = cparams.n_batch;

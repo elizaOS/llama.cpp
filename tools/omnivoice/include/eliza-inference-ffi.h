@@ -1,5 +1,5 @@
 /*
- * libelizainference FFI ABI v17.
+ * libelizainference FFI ABI v18.
  *
  * (Banner tracks ELIZA_INFERENCE_ABI_VERSION below; the per-version history is
  * at the end of this header preamble, newest first.)
@@ -134,6 +134,34 @@ extern "C" {
  * load and refuses to bind if they disagree.
  *
  * Changelog:
+ *   v18: text-model context capacity resolved before stream admission.
+ *         - `eliza_inference_llm_context_capacity(ctx, requested_context,
+ *           n_gpu_layers, &out_capacity, &err)` loads the resident text model
+ *           (if needed) and returns the context size `llm_stream_open` would
+ *           use: `requested_context`, else ELIZA_LLM_N_CTX, else 8192, clamped
+ *           to the GGUF training context. No decode context is allocated.
+ *         - `llm_stream_open` now shares that resolution and rejects a
+ *           non-positive capacity instead of creating a zero-sized context.
+ *       Additive symbol; no existing signature changes. A v17 library lacks
+ *       the symbol, so loaders must treat it as absent.
+ *       Parakeet-TDT ASR backend (additive behaviour, no new symbols, no
+ *       version bump):
+ *       builds that fold tools/parakeet (`ELIZA_ENABLE_PARAKEET`) serve the
+ *       ASR surface from a parakeet-tdt GGUF under `<bundle>/asr/` (e.g.
+ *       FermionResearch/Phonon-2, CC-BY-4.0) when `mmap_acquire("asr")`
+ *       finds one; `ELIZA_ASR_BACKEND=qwen3|parakeet` overrides. With it:
+ *         - `asr_transcribe_timed` returns TDT token-frame word times (80 ms
+ *           resolution) instead of duration-proportional ones;
+ *         - `asr_stream_supported()` returns 1 while at least one context has
+ *           the parakeet backend loaded (0 before `mmap_acquire("asr")`, after
+ *           `mmap_evict("asr")`, and for the Qwen3-ASR backend), and the
+ *           `asr_stream_*` session decodes pause-delimited windows with local
+ *           agreement. `stream_open` fails cleanly without the backend;
+ *           partial/finish on a stream whose region was evicted return
+ *           ELIZA_ERR_INVALID_ARG;
+ *         - stream `out_tokens` are never written (`*io_n_tokens = 0`):
+ *           Parakeet's SentencePiece vocabulary is not the text model's;
+ *         - `asr_cancel` is polled between encoder layers and decode steps.
  *   v17: Paradee-8M TTS with native misaki G2P, plus cancellation and
  *       eviction for every TTS head and for ASR. All additions are new
  *       symbols; no existing signature changes.
@@ -160,23 +188,6 @@ extern "C" {
  *           files, as it already skipped `tts/kokoro/`.
  *       Streaming ASR (`asr_stream_*`) is unchanged and still reports
  *       `asr_stream_supported() == 0`.
- *       Parakeet-TDT backend (same ABI v17 symbols, no new entry points):
- *       builds that fold tools/parakeet (`ELIZA_ENABLE_PARAKEET`) serve the
- *       ASR surface from a parakeet-tdt GGUF under `<bundle>/asr/` (e.g.
- *       FermionResearch/Phonon-2, CC-BY-4.0) when `mmap_acquire("asr")`
- *       finds one; `ELIZA_ASR_BACKEND=qwen3|parakeet` overrides. With it:
- *         - `asr_transcribe_timed` returns TDT token-frame word times (80 ms
- *           resolution) instead of duration-proportional ones;
- *         - `asr_stream_supported()` returns 1 while at least one context has
- *           the parakeet backend loaded (0 before `mmap_acquire("asr")`, after
- *           `mmap_evict("asr")`, and for the Qwen3-ASR backend), and the
- *           `asr_stream_*` session decodes pause-delimited windows with local
- *           agreement. `stream_open` fails cleanly without the backend;
- *           partial/finish on a stream whose region was evicted return
- *           ELIZA_ERR_INVALID_ARG;
- *         - stream `out_tokens` are never written (`*io_n_tokens = 0`):
- *           Parakeet's SentencePiece vocabulary is not the text model's;
- *         - `asr_cancel` is polled between encoder layers and decode steps.
  *   v16: context-local text-model GPU selection
  *       (`eliza_inference_create_with_options`).
  *   v15: Kokoro synthesis can return an exact-size, library-owned PCM buffer
@@ -271,9 +282,9 @@ extern "C" {
  *   v7: real Silero VAD (same symbol surface as v6).
  *   v6: fused wake-word, speaker, diarizer.
  */
-#define ELIZA_INFERENCE_ABI_VERSION 17
+#define ELIZA_INFERENCE_ABI_VERSION 18
 
-/* Returns a static, NUL-terminated string of the form "17" matching
+/* Returns a static, NUL-terminated string of the form "18" matching
  * ELIZA_INFERENCE_ABI_VERSION at the time the library was built. The
  * pointer is owned by the library — do NOT free. */
 const char * eliza_inference_abi_version(void);
@@ -634,7 +645,8 @@ int eliza_inference_paradee_phonemize(
 /* Text -> PCM. Native misaki G2P, then the phoneme string is split into
  * <= 510-id chunks (sentence ends, then clause punctuation, then spaces),
  * each chunk is padded and synthesized, and the PCM is concatenated. `speed`
- * scales the speaking rate (1.0 = native; <= 0 or non-finite means 1.0).
+ * scales the speaking rate (1.0 = native; <= 0 or non-finite means 1.0;
+ * other values are clamped to [0.25, 4]).
  * On success `*out_pcm` is a malloc-owned buffer of `*out_samples` floats at
  * `paradee_sample_rate` (NULL only when `*out_samples == 0`); release it with
  * `eliza_inference_free_pcm`. Returns ELIZA_OK, ELIZA_ERR_CANCELLED after
@@ -1168,6 +1180,19 @@ typedef struct {
 
 /* Opaque streaming-LLM session. One per active generation. */
 typedef struct EliLlmStream EliLlmStream;
+
+/* Resolve the streaming context capacity against the resident text model
+ * before token admission (ABI v18). Loads the model with n_gpu_layers when
+ * necessary. requested_context <=0 uses ELIZA_LLM_N_CTX or 8192; the result
+ * is clamped to the GGUF training context exactly as stream_open does.
+ * On success, pass *out_capacity explicitly to stream_open to preserve this
+ * decision even if the environment changes. No decode context is allocated. */
+int eliza_inference_llm_context_capacity(
+    EliInferenceContext * ctx,
+    int32_t requested_context,
+    int32_t n_gpu_layers,
+    int32_t * out_capacity,
+    char ** out_error);
 
 /* Open a session anchored to `ctx`. Loads the bundle's text GGUF on first
  * open and reuses it across sessions. Returns NULL on failure with

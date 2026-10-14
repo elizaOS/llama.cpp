@@ -1,0 +1,93 @@
+{
+  "model": {
+    "repo": "sahilmahendrakar/Paradee-8M-v1.0",
+    "revision": "c7f83f86c04e84d0ae94cbe1aad7618e0544f80a",
+    "tag": "v1.0",
+    "tag_commit": "8f34b01ef8adcb0bec470b89bf2fd62a7b2369e6",
+    "tag_note": "The v1.0 tag (8f34b01e) and the pinned main revision (c7f83f86) differ only in README.md; every model, config, tokenizer and sample blob is identical.",
+    "license": "Apache-2.0",
+    "params": 8070000
+  },
+  "files": {
+    "pytorch/text_side.pt": {
+      "size": 16998347,
+      "sha256": "0995bee746043e4f06f72be68fb8634530b95d6467b4a141759e721122648062"
+    },
+    "pytorch/decoder.pt": {
+      "size": 15564135,
+      "sha256": "f231b9765ffdddd30df798530af0c557c06cb9cf029a475b8bfdca7b051b9d6c"
+    },
+    "config.json": {
+      "size": 1774,
+      "sha256": "f24046974a3a8c747affefb45c7c504263a99d5081787908b16abe8f5ac94fcd"
+    },
+    "tokenizer.json": {
+      "size": 3497,
+      "sha256": "77a02c8e164413299b4b4c403b14f8e0e1c1b727db4d46a09d6327b861060a34"
+    },
+    "samples/sentences.txt": {
+      "size": 621,
+      "sha256": "2d411facb6b0429ad05f6ea3abf9c6a79ba6613990cadf54e2213e11a8c9fd1b"
+    },
+    "samples/1_paradee.wav": {
+      "size": 468044,
+      "sha256": "5b4bf9265c0cb108d1d9c631c26a0c785aa1dd9672565fa680393fbb37133d7e"
+    },
+    "samples/2_paradee.wav": {
+      "size": 283244,
+      "sha256": "2e40a0504a06f417d32761009eac1882fb122beb8e4a05e0b3e7374fb87d4fc1"
+    },
+    "samples/3_paradee.wav": {
+      "size": 361244,
+      "sha256": "4aaf75652796ba650b9eb0b324a9f4c7e311ee5c74a888deda9ac0b90edf81d8"
+    },
+    "samples/4_paradee.wav": {
+      "size": 457244,
+      "sha256": "374596ff98b2a61713c5521861edf6a2a65e460aebccfd9934029ceb9c1888df"
+    },
+    "samples/5_paradee.wav": {
+      "size": 512444,
+      "sha256": "9164e9e329bf227cccc0bc75ec5f309c6295748ed799ea4775444ee66b940b1b"
+    }
+  },
+  "source": {
+    "repo": "https://github.com/sahilmahendrakar/paradee",
+    "commit": "9c8b4d7504cbee7e64de2d0341bb690f0b0ab708",
+    "license": "Apache-2.0",
+    "files": {
+      "training/scripts/student.py": "90456f28ac3d6dd06e76ad8f253f9bcadd9060cdecb6880268651e0ff8ba0f8b",
+      "training/scripts/student_decoder.py": "2443f14fe8ff27be5702d88dc80f8c566e92c03273b6216825fa7787cd66b97c",
+      "training/scripts/phase_lock.py": "d502744ccb2ede9fc10f56d481020b368a414d4f35b964ffbace14bcd37bbe86",
+      "training/scripts/export_paradee.py": "5656e4eb725fdd97bb46fc00cbe824a1e9adac4bc4b46440ba27a5b8f326a4db",
+      "training/scripts/common.py": "76faab4b54f633c1dfee28bfb08c981d4adb3f4ee99b42271cf80a3fc0e9fc9c"
+    }
+  },
+  "reference_env": {
+    "note": "training/uv.lock pins kokoro 0.9.4, misaki 0.9.4 and torch 2.14.0. spaCy, en_core_web_sm and espeak-ng are the versions used to generate tests/fixtures/sentences.misaki.json.",
+    "python": "3.12",
+    "torch": "2.14.0",
+    "kokoro": "0.9.4",
+    "misaki": "0.9.4",
+    "spacy": "3.8.16",
+    "en_core_web_sm": "3.8.0",
+    "espeak-ng": "1.52.0"
+  },
+  "gguf": {
+    "f32": {
+      "file": "paradee-8m-v1.0-f32.gguf",
+      "size": 32072768,
+      "sha256": "9a18ae710211fab04129e00bc0cde04484c0cf8d80bb19e51df7e331ae83a254",
+      "note": "convert_paradee_pt_to_gguf.py --outtype f32 output; byte-reproducible (check with --check-output). Changes whenever the converter changes, because its git blob sha is in the metadata."
+    }
+  },
+  "fixtures": {
+    "tests/fixtures/sentences.misaki.json": {
+      "sha256": "30ab9f9cd034b6bf8650e13af4728e658a7e57ccd75ff412c62a41bc4e42bc9d",
+      "made_by": "tools/dump_paradee_reference.py phonemes"
+    },
+    "tests/fixtures/phase_lock_synthetic.f32": {
+      "sha256": "691b032dd084e0c9c28f363acef8fb3029880041c9e5a282452626733ef3ee34",
+      "made_by": "tools/dump_paradee_reference.py lock-fixture"
+    }
+  }
+}

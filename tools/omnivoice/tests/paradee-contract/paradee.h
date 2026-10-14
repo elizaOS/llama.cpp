@@ -10,6 +10,7 @@
 // header changes a signature used by the bridge, change this copy too.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -19,6 +20,8 @@ namespace eliza_paradee {
 
 // Model input limit, including the 0 pad token at each end.
 constexpr int PARADEE_MAX_INPUT_IDS = 512;
+constexpr float PARADEE_MIN_SPEED = 0.25f;
+constexpr float PARADEE_MAX_SPEED = 4.0f;
 
 struct paradee_model;
 struct paradee_model_deleter { void operator()(paradee_model *) const noexcept; };
@@ -30,12 +33,14 @@ struct paradee_audio {
 };
 
 enum paradee_status {
-    PARADEE_OK            = 0,
-    PARADEE_E_INVALID_ARG = 1,
-    PARADEE_E_LOAD_FAIL   = 2,
-    PARADEE_E_OOM         = 3,
-    PARADEE_E_CANCELLED   = 4,
-    PARADEE_E_RUNTIME     = 5,
+    PARADEE_OK               = 0,
+    PARADEE_E_INVALID_ARG    = 1,
+    PARADEE_E_UNKNOWN_SYMBOL = 2,
+    PARADEE_E_TOO_LONG       = 3,
+    PARADEE_E_RUNTIME        = 4,
+    PARADEE_CANCELLED        = 5,
+    PARADEE_E_OOM            = 6,
+    PARADEE_E_CANCELLED      = PARADEE_CANCELLED,
 };
 
 // Polled by the synthesis graph between stages. Returning true stops the
@@ -52,12 +57,14 @@ paradee_model_ptr paradee_load_model(const std::string & gguf_path, std::string 
 
 int paradee_sample_rate(const paradee_model * model) noexcept;
 
-// Map a misaki phoneme string to model vocab ids (no pad tokens added).
-// Characters outside the vocab are dropped, as kokoro/misaki do.
-paradee_status paradee_phonemes_to_ids(
+// Map a misaki phoneme string to model vocab ids (no pad tokens added, no
+// length limit). Characters outside the vocab are dropped and counted, as
+// kokoro/misaki do; empty input gives no ids and PARADEE_OK.
+paradee_status paradee_phonemes_to_symbol_ids_lenient(
     const paradee_model * model,
     const std::string & misaki_phonemes,
     std::vector<int32_t> & ids_out,
+    size_t & n_dropped,
     std::string & err_out) noexcept;
 
 // Run one forward pass. `input_ids` is the full model input including the
