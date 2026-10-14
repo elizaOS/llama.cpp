@@ -721,11 +721,24 @@ void ensure_rpos_cache(pk_model * m, int need) {
     const int D = m->hp.d_model, n = 2 * P + 1;
     std::vector<float> pe, r((size_t) n * D);
     rel_pos_embed_P(P, D, pe);
-    qact q;
+    // Two-pass (residual) int8 quantisation: pe ~ s1*q1 + s2*q2, so the
+    // cached keys carry ~14-bit activations. The keys feed every attention
+    // logit, and the cache is built once, so the second pass is free.
+    qact q, q2;
     quantize_acts(*m->pool, pe.data(), n, D, D, q);
+    std::vector<float> res(pe.size());
+    for (int t = 0; t < n; ++t) {
+        for (int k = 0; k < D; ++k) {
+            const int c = k / 8, j = k % 8;
+            const int8_t v = q.buf[(size_t) (t / 2) * q.pair_stride() + (size_t) c * 16 + (t & 1) * 8 + j];
+            res[(size_t) t * D + k] = pe[(size_t) t * D + k] - (float) v * q.scale[t];
+        }
+    }
+    quantize_acts(*m->pool, res.data(), n, D, D, q2);
     m->rcache.resize(m->hp.n_layers);
     for (int l = 0; l < m->hp.n_layers; ++l) {
         gemm_q8(*m->pool, *m->kt, m->layers[l].pos, q, r.data(), D, epi::store);
+        gemm_q8(*m->pool, *m->kt, m->layers[l].pos, q2, r.data(), D, epi::add, 1.0f);
         auto & c = m->rcache[l];
         c.resize((size_t) n * D);
         m->pool->parallel_for(n, 16, [&](int b, int e) {

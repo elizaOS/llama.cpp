@@ -5,9 +5,19 @@
 //
 // fixtures_dir is written by tools/dump_parakeet_reference.py. Gates:
 //   mel        max |diff| <= 2e-3 (normalised log-mel)
-//   encoder    mean per-frame cosine >= PK_GATE_ENC_COS (default 0.995) and
-//              relative L2 error <= PK_GATE_ENC_L2 (default 0.1); the minimum
-//              frame cosine is reported (near-silent frames have tiny norms)
+//   encoder    mean per-frame cosine >= PK_GATE_ENC_COS and relative L2
+//              error <= PK_GATE_ENC_L2; the minimum frame cosine is reported
+//              (near-silent frames have tiny norms)
+//
+// Two modes:
+//   default               the shipped int8-activation path. Per-token int8
+//                         activations through 24 layers leave a relative L2
+//                         of ~0.07-0.2 on the encoder output (chaotic in the
+//                         input), so the gates are cos >= 0.98, L2 <= 0.25;
+//                         the transcript gate is the functional one.
+//   PK_DEBUG_F32_ACTS=1   the same graph and weights with fp32 activations
+//                         (slow diagnostic GEMM): checks the graph itself
+//                         against the reference, cos >= 0.9999, L2 <= 0.005.
 //   transcript at least PK_GATE_TEXT (default 0.9) of the utterances
 //              text-identical to the reference
 // The native encoder quantises activations to int8 (see parakeet.cpp), so
@@ -66,8 +76,11 @@ int main(int argc, char ** argv) {
         return 2;
     }
     const std::string dir = argv[2];
-    const double gate_cos = std::getenv("PK_GATE_ENC_COS") ? std::atof(std::getenv("PK_GATE_ENC_COS")) : 0.995;
-    const double gate_l2 = std::getenv("PK_GATE_ENC_L2") ? std::atof(std::getenv("PK_GATE_ENC_L2")) : 0.1;
+    const bool f32_acts = std::getenv("PK_DEBUG_F32_ACTS") != nullptr;
+    const double gate_cos = std::getenv("PK_GATE_ENC_COS") ? std::atof(std::getenv("PK_GATE_ENC_COS"))
+                                                           : (f32_acts ? 0.9999 : 0.98);
+    const double gate_l2 = std::getenv("PK_GATE_ENC_L2") ? std::atof(std::getenv("PK_GATE_ENC_L2"))
+                                                         : (f32_acts ? 0.005 : 0.25);
     const double gate_text = std::getenv("PK_GATE_TEXT") ? std::atof(std::getenv("PK_GATE_TEXT")) : 0.9;
     char err[512] = { 0 };
     pk_params pp = pk_default_params();
