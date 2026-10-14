@@ -1,0 +1,16 @@
+misaki-g2p ports hexgrad/misaki (https://github.com/hexgrad/misaki), commit
+fba1236595f2d2bf21d414ba6e57d25256afada3 (the misaki 0.9.4 release), to C++:
+misaki/en.py (Lexicon, G2P, token merging, stress, stemming), misaki/espeak.py
+(EspeakFallback's eSpeak-to-misaki table) and the American English lexicon
+misaki/data/us_gold.json and us_silver.json, which convert_misaki_lexicon.py
+turns into misaki-en-us.lex.
+
+misaki is Copyright hexgrad and contributors, licensed under the Apache
+License 2.0 (misaki-Apache-2.0.txt in this directory). The ported sources in
+src/ keep that licence; changes from the original are the C++ translation,
+the replacement of spaCy's statistical tagger with rules (src/tagger.cpp), and
+the replacement of num2words with independent English number rules
+(src/numbers.cpp).
+
+The eSpeak-to-misaki table is also cross-checked against web/misaki.js of
+sahilmahendrakar/paradee (Apache-2.0) at 9c8b4d7504cbee7e64de2d0341bb690f0b0ab708.
