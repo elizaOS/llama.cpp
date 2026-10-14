@@ -68,6 +68,48 @@ MISAKI_G2P_API void misaki_g2p_close(misaki_g2p * g);
 
 #ifdef __cplusplus
 }
+
+/* C++ interface used by libelizainference (tools/omnivoice, ABI v17). Same
+ * engine as the C API above; declarations match
+ * tools/omnivoice/tests/paradee-contract/misaki-g2p.h. */
+#    include <memory>
+#    include <string>
+#    include <vector>
+
+namespace eliza_misaki {
+
+/* How words missing from the lexicon are phonemized. */
+enum misaki_fallback_kind {
+    MISAKI_FALLBACK_NONE   = 0, /* no eSpeak: unknown words are spelled out with lexicon letters */
+    MISAKI_FALLBACK_RULES  = 1, /* not produced by this implementation */
+    MISAKI_FALLBACK_ESPEAK = 2, /* eSpeak NG output converted to misaki spelling (as in training) */
+};
+
+struct misaki_lexicon;
+struct misaki_lexicon_deleter {
+    void operator()(misaki_lexicon *) const noexcept;
+};
+using misaki_lexicon_ptr = std::unique_ptr<misaki_lexicon, misaki_lexicon_deleter>;
+
+/* `espeak_data_dir` may be nullptr: unknown words are then spelled out. */
+misaki_lexicon_ptr misaki_load_lexicon(const std::string & lexicon_path, const char * espeak_data_dir,
+                                       std::string & err_out) noexcept;
+
+misaki_fallback_kind misaki_get_fallback_kind(const misaki_lexicon * lexicon) noexcept;
+
+/* English text -> misaki phonemes. The result is paradee's chunks (each at
+ * most 510 symbols, one sentence or less) joined by single spaces, so a
+ * chunker that splits after sentence-final punctuation recovers them.
+ * Returns false and sets `err_out` on failure. */
+bool misaki_phonemize(const misaki_lexicon * lexicon, const std::string & text, std::string & phonemes_out,
+                      std::string & err_out) noexcept;
+
+/* The same, as separate chunks: paradee/tts.py synthesizes each one in its
+ * own forward pass. */
+bool misaki_phonemize_chunks(const misaki_lexicon * lexicon, const std::string & text,
+                             std::vector<std::string> & chunks_out, std::string & err_out) noexcept;
+
+}  // namespace eliza_misaki
 #endif
 
 #endif /* MISAKI_G2P_H */

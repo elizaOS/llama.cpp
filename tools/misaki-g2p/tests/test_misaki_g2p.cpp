@@ -234,6 +234,23 @@ static void test_api(const std::string & lex) {
     }
 }
 
+static void test_cpp_api(const std::string & lex) {
+    std::string err;
+    CHECK(!eliza_misaki::misaki_load_lexicon("/nonexistent.lex", nullptr, err) && !err.empty());
+    auto l = eliza_misaki::misaki_load_lexicon(lex, nullptr, err);
+    CHECK(l != nullptr);
+    if (!l) return;
+    CHECK(eliza_misaki::misaki_get_fallback_kind(l.get()) == eliza_misaki::MISAKI_FALLBACK_NONE);
+    std::string ps;
+    CHECK(eliza_misaki::misaki_phonemize(l.get(), "Hello, world! This is a test.", ps, err));
+    check_eq(ps, "həlˈO, wˈɜɹld! ðˌɪs ɪz ɐ tˈɛst.", "C++ misaki_phonemize");
+    std::vector<std::string> chunks;
+    CHECK(eliza_misaki::misaki_phonemize_chunks(l.get(), "Hello, world! This is a test.", chunks, err));
+    CHECK(chunks.size() == 2);
+    CHECK(eliza_misaki::misaki_phonemize_chunks(l.get(), "", chunks, err) && chunks.empty());
+    CHECK(!eliza_misaki::misaki_phonemize(nullptr, "x", ps, err));
+}
+
 static void test_bad_lexicon(const std::string & data) {
     std::string err;
     CHECK(LexFile::open(data + "/mini_gold.json", err) == nullptr && err.find("magic") != std::string::npos);
@@ -248,6 +265,7 @@ int main(int argc, char ** argv) {
     test_numbers();
     test_tables(argv[2]);
     test_api(argv[1]);
+    test_cpp_api(argv[1]);
     test_bad_lexicon(argv[2]);
     std::printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <new>
 #include <string>
 
 struct misaki_g2p {
@@ -128,3 +129,90 @@ void misaki_g2p_free(char * s) { std::free(s); }
 void misaki_g2p_close(misaki_g2p * g) { delete g; }
 
 }  // extern "C"
+
+// ------------------------------------------------------------ C++ interface
+struct eliza_misaki::misaki_lexicon {
+    misaki_g2p * g = nullptr;
+};
+
+void eliza_misaki::misaki_lexicon_deleter::operator()(misaki_lexicon * l) const noexcept {
+    if (l) {
+        misaki_g2p_close(l->g);
+        delete l;
+    }
+}
+
+eliza_misaki::misaki_lexicon_ptr eliza_misaki::misaki_load_lexicon(const std::string & lexicon_path,
+                                                                   const char * espeak_data_dir,
+                                                                   std::string & err_out) noexcept {
+    char * err = nullptr;
+    misaki_g2p * g = misaki_g2p_open(lexicon_path.c_str(), espeak_data_dir, &err);
+    if (!g) {
+        try {
+            err_out = err ? err : "misaki_g2p_open failed";
+        } catch (...) {
+        }
+        misaki_g2p_free(err);
+        return nullptr;
+    }
+    misaki_lexicon * l = new (std::nothrow) misaki_lexicon();
+    if (!l) {
+        misaki_g2p_close(g);
+        return nullptr;
+    }
+    l->g = g;
+    return misaki_lexicon_ptr(l);
+}
+
+eliza_misaki::misaki_fallback_kind eliza_misaki::misaki_get_fallback_kind(const misaki_lexicon * l) noexcept {
+    return (l && misaki_g2p_fallback_kind(l->g) == MISAKI_G2P_FALLBACK_ESPEAK) ? MISAKI_FALLBACK_ESPEAK
+                                                                               : MISAKI_FALLBACK_NONE;
+}
+
+bool eliza_misaki::misaki_phonemize_chunks(const misaki_lexicon * l, const std::string & text,
+                                           std::vector<std::string> & chunks_out, std::string & err_out) noexcept {
+    try {
+        chunks_out.clear();
+        if (!l) {
+            err_out = "misaki_phonemize: no lexicon";
+            return false;
+        }
+        char * out = nullptr;
+        char * err = nullptr;
+        if (misaki_g2p_phonemize(l->g, text.data(), text.size(), &out, &err) != 0) {
+            err_out = err ? err : "misaki_g2p_phonemize failed";
+            misaki_g2p_free(err);
+            return false;
+        }
+        std::string all = out;
+        misaki_g2p_free(out);
+        size_t a = 0;
+        while (a <= all.size() && !all.empty()) {
+            size_t b = all.find('\n', a);
+            chunks_out.push_back(all.substr(a, b == std::string::npos ? std::string::npos : b - a));
+            if (b == std::string::npos) break;
+            a = b + 1;
+        }
+        return true;
+    } catch (const std::exception & e) {
+        err_out = e.what();
+        return false;
+    }
+}
+
+bool eliza_misaki::misaki_phonemize(const misaki_lexicon * l, const std::string & text, std::string & phonemes_out,
+                                    std::string & err_out) noexcept {
+    std::vector<std::string> chunks;
+    if (!misaki_phonemize_chunks(l, text, chunks, err_out)) return false;
+    try {
+        phonemes_out.clear();
+        for (size_t i = 0; i < chunks.size(); i++) {
+            if (i) phonemes_out += ' ';
+            phonemes_out += chunks[i];
+        }
+        return true;
+    } catch (const std::exception & e) {
+        err_out = e.what();
+        return false;
+    }
+}
