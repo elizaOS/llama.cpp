@@ -188,10 +188,23 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         # Let the Emscripten driver select its matching threaded system libraries.
         # FindOpenMP records probe-time libc archives, which can conflict with
         # the final executable's optimization, exception and threading settings.
-        target_compile_options(${GGML_CPU_NAME} PRIVATE -fopenmp)
-        target_link_options(${GGML_CPU_NAME} PUBLIC -fopenmp)
-        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_OPENMP)
-        set(GGML_OPENMP_ENABLED "ON" CACHE INTERNAL "")
+        include(CheckCXXSourceCompiles)
+        include(CMakePushCheckState)
+        cmake_push_check_state(RESET)
+        set(CMAKE_REQUIRED_FLAGS "-fopenmp")
+        check_cxx_source_compiles("#include <omp.h>
+int main() { return omp_get_max_threads(); }"
+                                  GGML_EMSCRIPTEN_OPENMP)
+        cmake_pop_check_state()
+        if (GGML_EMSCRIPTEN_OPENMP)
+            target_compile_options(${GGML_CPU_NAME} PRIVATE -fopenmp)
+            target_link_options(${GGML_CPU_NAME} PUBLIC -fopenmp)
+            target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_OPENMP)
+            set(GGML_OPENMP_ENABLED "ON" CACHE INTERNAL "")
+        else()
+            set(GGML_OPENMP_ENABLED "OFF" CACHE INTERNAL "")
+            message(WARNING "OpenMP not found")
+        endif()
     elseif (GGML_OPENMP)
         find_package(OpenMP)
         if (OpenMP_FOUND)
