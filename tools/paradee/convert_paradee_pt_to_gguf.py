@@ -42,6 +42,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -57,7 +58,7 @@ NS = "paradee"
 # Architecture of Paradee-8M v1.0, read from the checkpoint shapes and from
 # training/scripts/{student.py, student_decoder.py} at the pinned source
 # commit. The converter checks every tensor against these values.
-HPARAMS = {
+HPARAMS: dict[str, Any] = {
     # CustomAlbert (transformers AlbertConfig, num_hidden_groups=1).
     "text.n_layer": 6,
     "text.n_head": 4,
