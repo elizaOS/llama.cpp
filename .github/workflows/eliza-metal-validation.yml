@@ -32,6 +32,8 @@ on:
       - 'ggml/include/**'
       - 'src/**'
       - 'tests/test-backend-ops.cpp'
+      - 'tests/test-metal-matmul-support.cpp'
+      - 'tests/CMakeLists.txt'
       - 'tests/test-quantize-fns.cpp'
 
 concurrency:
@@ -108,7 +110,10 @@ jobs:
         run: |
           cmake --build build-metal -j $(sysctl -n hw.ncpu) \
             --target llama-cli llama-completion \
-                     test-backend-ops test-quantize-fns
+                     test-backend-ops test-quantize-fns test-metal-matmul-support
+
+      - name: Verify Metal matmul capability routing
+        run: ./build-metal/bin/test-metal-matmul-support --require-metal
 
       - name: test-quantize-fns (CPU; smoke for Eliza custom quants)
         shell: bash
