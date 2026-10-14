@@ -54,11 +54,12 @@ else()
         # Paradee-8M (width-scaled Kokoro student, single voice). Needs
         # kokoro_lib; like kokoro it precedes omnivoice so the fused
         # `elizainference` target can fold paradee_lib in.
-        if (NOT LLAMA_BUILD_KOKORO)
-            message(FATAL_ERROR "LLAMA_BUILD_PARADEE=ON needs LLAMA_BUILD_KOKORO=ON (Paradee runs on "
-                                "the tools/kokoro layers); pass -DLLAMA_BUILD_PARADEE=OFF to build without it.")
+        # A build with Kokoro off skips Paradee rather than failing.
+        if (LLAMA_BUILD_KOKORO)
+            add_subdirectory(paradee)
+        else()
+            message(STATUS "LLAMA_BUILD_PARADEE: skipped because LLAMA_BUILD_KOKORO=OFF")
         endif()
-        add_subdirectory(paradee)
     endif()
     if (LLAMA_BUILD_OMNIVOICE)
         # The merged omnivoice subtree lives under tools/omnivoice/. The

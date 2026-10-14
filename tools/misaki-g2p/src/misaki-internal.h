@@ -152,8 +152,11 @@ class EspeakFallback {
     // The E2M mapping alone, on phonemizer-style output (tests).
     static u32 e2m(const u32 & espeak_tied_ipa);
   private:
-    EspeakFallback() = default;
+    explicit EspeakFallback(std::string data_dir) : data_dir_(std::move(data_dir)) {}
     u32 phonemize_line(const u32 & text);
+    // libespeak-ng is process-global: another handle may have re-initialised
+    // it with a different data directory since this one was opened.
+    [[maybe_unused]] std::string data_dir_;
 };
 bool espeak_linked();
 

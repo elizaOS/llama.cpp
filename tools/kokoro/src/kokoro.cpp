@@ -70,6 +70,7 @@ const char * kokoro_status_str(kokoro_status st) noexcept {
         case KOKORO_E_OOM:             return "out of memory";
         case KOKORO_E_NOT_IMPLEMENTED: return "feature not implemented";
         case KOKORO_E_RUNTIME:         return "runtime error";
+        case KOKORO_E_CANCELLED:       return "cancelled";
     }
     return "unknown";
 }
@@ -615,8 +616,23 @@ static kokoro_status kokoro_synthesize_from_input_ids(
         std::vector<int32_t> phonemes,
         float speed_mult,
         kokoro_audio & out,
-        std::string & err_out) noexcept {
+        std::string & err_out,
+        kokoro_cancel_callback cancel,
+        void * cancel_user_data) noexcept {
     std::lock_guard<std::mutex> lk(const_cast<kokoro_model *>(model)->mu);
+    const auto cancelled = [&]() {
+        if (!cancel || !cancel(cancel_user_data)) return false;
+        err_out = "cancelled";
+        out.samples.clear();
+        return true;
+    };
+    // Polled at stage boundaries: before the predictor, between the predictor
+    // and the decoder, between the decoder front and the iSTFTNet generator
+    // (inside kokoro_decoder_forward), and after the generator. There is no
+    // hook inside a GGML graph: a failed conv graph falls back to the CPU
+    // loops in kokoro-layers.h, so a backend abort callback would not stop
+    // the work.
+    if (cancelled()) return KOKORO_E_CANCELLED;
 
     out.sample_rate = model->hparams.sample_rate;
 
@@ -659,6 +675,7 @@ static kokoro_status kokoro_synthesize_from_input_ids(
                 return KOKORO_E_RUNTIME;
             }
         }
+        if (cancelled()) return KOKORO_E_CANCELLED;
         const int T = pred.T_frame;
         const int A = pred.asr_dim;   // 512 for Kokoro-82M (the text encoder width)
         if (T <= 0 || A <= 0 || pred.asr.size() != (size_t) T * (size_t) A) {
@@ -679,11 +696,14 @@ static kokoro_status kokoro_synthesize_from_input_ids(
             kokoro_phase_timer t("decoder forward");
             if (!kokoro_decoder_forward(model, asr_ct.data(), T,
                                         pred.F0_pred.data(), pred.N_pred.data(),
-                                        ref_s, out.samples, err_out)) {
+                                        ref_s, out.samples, err_out,
+                                        cancel, cancel_user_data)) {
+                if (cancelled()) return KOKORO_E_CANCELLED;
                 if (err_out.empty()) err_out = "decoder forward failed";
                 return KOKORO_E_RUNTIME;
             }
         }
+        if (cancelled()) return KOKORO_E_CANCELLED;
         return KOKORO_OK;
     }
 
@@ -711,7 +731,9 @@ kokoro_status kokoro_synthesize(
         const std::string & text,
         float speed_mult,
         kokoro_audio & out,
-        std::string & err_out) noexcept {
+        std::string & err_out,
+        kokoro_cancel_callback cancel,
+        void * cancel_user_data) noexcept {
     err_out.clear();
     out.samples.clear();
     out.sample_rate = 24000;
@@ -725,7 +747,8 @@ kokoro_status kokoro_synthesize(
 
     // 1. Phonemize (espeak-ng IPA when linked, else lossy ASCII grapheme map).
     return kokoro_synthesize_from_input_ids(
-        model, voice, kokoro_phonemize(text), speed_mult, out, err_out);
+        model, voice, kokoro_phonemize(text), speed_mult, out, err_out,
+        cancel, cancel_user_data);
 }
 
 kokoro_status kokoro_synthesize_ipa(
@@ -734,7 +757,9 @@ kokoro_status kokoro_synthesize_ipa(
         const std::string & ipa,
         float speed_mult,
         kokoro_audio & out,
-        std::string & err_out) noexcept {
+        std::string & err_out,
+        kokoro_cancel_callback cancel,
+        void * cancel_user_data) noexcept {
     err_out.clear();
     out.samples.clear();
     out.sample_rate = 24000;
@@ -750,7 +775,7 @@ kokoro_status kokoro_synthesize_ipa(
     //    wrapped as the model input_ids [PAD, *ids, PAD] — no internal G2P.
     return kokoro_synthesize_from_input_ids(
         model, voice, wrap_input_ids(ipa_to_token_ids(ipa)), speed_mult, out,
-        err_out);
+        err_out, cancel, cancel_user_data);
 }
 
 int kokoro_sample_rate(const kokoro_model * model) noexcept {

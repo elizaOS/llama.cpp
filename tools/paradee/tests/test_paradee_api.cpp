@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace eliza_paradee;
@@ -81,6 +82,20 @@ int main() {
               sym.size() == 2000, "symbol ids must not be length-limited");
         CHECK(paradee_phonemes_to_symbol_ids(model.get(), "a#", sym, err) == PARADEE_E_UNKNOWN_SYMBOL && sym.empty(),
               "symbol ids must reject unknown symbols");
+
+        // Lenient form (the libelizainference contract): unknown symbols are
+        // dropped and counted, empty input is OK, bad UTF-8 is still rejected.
+        size_t dropped = 99;
+        CHECK(paradee_phonemes_to_symbol_ids_lenient(model.get(), "h#əlˈO g", sym, dropped, err) == PARADEE_OK &&
+              dropped == 2 && sym.size() == 6, "lenient drop: %zu ids, %zu dropped", sym.size(), dropped);
+        CHECK(paradee_phonemes_to_symbol_ids_lenient(model.get(), "", sym, dropped, err) == PARADEE_OK &&
+              sym.empty() && dropped == 0, "lenient empty");
+        CHECK(paradee_phonemes_to_symbol_ids_lenient(model.get(), "##", sym, dropped, err) == PARADEE_OK &&
+              sym.empty() && dropped == 2, "lenient all dropped");
+        CHECK(paradee_phonemes_to_symbol_ids_lenient(model.get(), std::string("a\xC3", 2), sym, dropped, err) ==
+              PARADEE_E_INVALID_ARG && sym.empty(), "lenient truncated UTF-8 accepted");
+        CHECK(paradee_phonemes_to_symbol_ids_lenient(nullptr, "a", sym, dropped, err) == PARADEE_E_INVALID_ARG,
+              "lenient null model");
     }
 
     // Synthesis input validation.
@@ -103,6 +118,12 @@ int main() {
               PARADEE_E_INVALID_ARG, "speed 0 accepted");
         CHECK(paradee_synthesize_ids(model.get(), ids.data(), ids.size(), NAN, nullptr, nullptr, pcm, err) ==
               PARADEE_E_INVALID_ARG, "speed NaN accepted");
+        CHECK(paradee_synthesize_ids(model.get(), ids.data(), ids.size(), PARADEE_MIN_SPEED * 0.5f, nullptr, nullptr,
+                                     pcm, err) == PARADEE_E_INVALID_ARG, "speed below the minimum accepted");
+        CHECK(paradee_synthesize_ids(model.get(), ids.data(), ids.size(), PARADEE_MAX_SPEED * 2.0f, nullptr, nullptr,
+                                     pcm, err) == PARADEE_E_INVALID_ARG, "speed above the maximum accepted");
+        CHECK(paradee_synthesize_ids(model.get(), ids.data(), ids.size(), INFINITY, nullptr, nullptr, pcm, err) ==
+              PARADEE_E_INVALID_ARG, "speed inf accepted");
         CHECK(paradee_synthesize_ids(nullptr, ids.data(), ids.size(), 1.0f, nullptr, nullptr, pcm, err) ==
               PARADEE_E_INVALID_ARG, "null model");
     }
@@ -128,6 +149,18 @@ int main() {
         paradee_audio audio;
         CHECK(paradee_synthesize(model.get(), ids, opts, audio, err) == PARADEE_OK && audio.samples == a &&
               audio.sample_rate == 24000, "paradee_synthesize differs");
+    }
+
+    // Concurrent calls on one model are serialised and give the same audio.
+    {
+        std::vector<float> t1, t2;
+        paradee_status s1 = PARADEE_E_RUNTIME, s2 = PARADEE_E_RUNTIME;
+        std::string e1, e2;
+        std::thread th1([&] { s1 = paradee_synthesize_ids(model.get(), ids.data(), ids.size(), 1.0f, nullptr, nullptr, t1, e1); });
+        std::thread th2([&] { s2 = paradee_synthesize_ids(model.get(), ids.data(), ids.size(), 1.0f, nullptr, nullptr, t2, e2); });
+        th1.join();
+        th2.join();
+        CHECK(s1 == PARADEE_OK && s2 == PARADEE_OK && t1 == a && t2 == a, "concurrent synthesis differs");
     }
 
     // Cancellation: before the call, after the text side, inside the generator.

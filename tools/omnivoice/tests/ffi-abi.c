@@ -1,7 +1,8 @@
 /* tools/omnivoice/tests/ffi-abi.c
  *
- * C11 test against the real libelizainference (ABI v17). Always runs:
- *   - ABI string "17" and the v17 capability probes
+ * C11 test against the real libelizainference (ABI v18). Always runs:
+ *   - ABI string "18" and the v17 capability probes
+ *   - v18 llm_context_capacity argument validation and the no-text-GGUF error
  *   - cancel_tts / asr_cancel are no-ops with nothing in flight
  *   - mmap_evict / mmap_acquire("tts") on a bundle with no TTS weights
  *   - Paradee entries before any load (or NOT_IMPLEMENTED when not built)
@@ -49,7 +50,7 @@ static double now_ms(void) {
 
 static void test_probes_and_noops(void) {
     char * err = NULL;
-    CHECK(strcmp(eliza_inference_abi_version(), "17") == 0);
+    CHECK(strcmp(eliza_inference_abi_version(), "18") == 0);
     CHECK_RC(eliza_inference_asr_supported(), 1);
 #if defined(ELIZA_TEST_EXPECT_PARADEE)
     CHECK_RC(eliza_inference_paradee_supported(), 1);
@@ -72,6 +73,18 @@ static void test_probes_and_noops(void) {
     clear_err(&err);
     CHECK_RC(eliza_inference_mmap_evict(ctx, "tts", &err), ELIZA_OK);
     CHECK_RC(eliza_inference_mmap_evict(ctx, "asr", &err), ELIZA_OK);
+    /* v18: capacity resolution validates its arguments and reports a bundle
+     * without a text GGUF instead of returning a capacity. */
+    int32_t capacity = -12345;
+    CHECK_RC(eliza_inference_llm_context_capacity(NULL, 0, 0, &capacity, &err), ELIZA_ERR_INVALID_ARG);
+    CHECK(capacity == -12345);
+    clear_err(&err);
+    CHECK_RC(eliza_inference_llm_context_capacity(ctx, 0, 0, NULL, &err), ELIZA_ERR_INVALID_ARG);
+    clear_err(&err);
+    CHECK_RC(eliza_inference_llm_context_capacity(ctx, 4096, 0, &capacity, &err), ELIZA_ERR_BUNDLE_INVALID);
+    CHECK(capacity == -12345);
+    CHECK(err != NULL);
+    clear_err(&err);
     /* No TTS weights and no configured Kokoro/Paradee head. */
     CHECK_RC(eliza_inference_mmap_acquire(ctx, "tts", &err), ELIZA_ERR_BUNDLE_INVALID);
     clear_err(&err);

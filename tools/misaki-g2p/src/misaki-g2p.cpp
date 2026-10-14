@@ -4,6 +4,7 @@
 
 #include "misaki-internal.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -76,6 +77,9 @@ misaki_g2p * misaki_g2p_open(const char * lex_path, const char * espeak_data_dir
     } catch (const std::exception & ex) {
         set_err(err, std::string("misaki_g2p_open: ") + ex.what());
         return nullptr;
+    } catch (...) {
+        set_err(err, "misaki_g2p_open: unknown error");
+        return nullptr;
     }
 }
 
@@ -98,8 +102,12 @@ int misaki_g2p_phonemize(misaki_g2p * g, const char * utf8, size_t len, char ** 
             }
             for (char32_t ch : c) {
                 if (!misaki::in_paradee_vocab(ch)) {
-                    set_err(err, "misaki_g2p_phonemize: symbol U+" + std::to_string((unsigned) ch) +
-                                     " is not in the Paradee vocabulary (chunk: " + misaki::to_utf8(c) + ")");
+                    // The chunk itself is derived from the caller's text: keep it
+                    // out of the error, which callers may log.
+                    char hex[16];
+                    std::snprintf(hex, sizeof hex, "%04X", (unsigned) ch);
+                    set_err(err, std::string("misaki_g2p_phonemize: symbol U+") + hex +
+                                     " is not in the Paradee vocabulary");
                     return -3;
                 }
             }
@@ -114,6 +122,9 @@ int misaki_g2p_phonemize(misaki_g2p * g, const char * utf8, size_t len, char ** 
         return 0;
     } catch (const std::exception & ex) {
         set_err(err, std::string("misaki_g2p_phonemize: ") + ex.what());
+        return -5;
+    } catch (...) {
+        set_err(err, "misaki_g2p_phonemize: unknown error");
         return -5;
     }
 }
@@ -158,6 +169,10 @@ eliza_misaki::misaki_lexicon_ptr eliza_misaki::misaki_load_lexicon(const std::st
     misaki_lexicon * l = new (std::nothrow) misaki_lexicon();
     if (!l) {
         misaki_g2p_close(g);
+        try {
+            err_out = "misaki_load_lexicon: out of memory";
+        } catch (...) {
+        }
         return nullptr;
     }
     l->g = g;
@@ -197,6 +212,8 @@ bool eliza_misaki::misaki_phonemize_chunks(const misaki_lexicon * l, const std::
     } catch (const std::exception & e) {
         err_out = e.what();
         return false;
+    } catch (...) {
+        return false;
     }
 }
 
@@ -211,8 +228,11 @@ bool eliza_misaki::misaki_phonemize(const misaki_lexicon * l, const std::string 
             phonemes_out += chunks[i];
         }
         return true;
-    } catch (const std::exception & e) {
-        err_out = e.what();
+    } catch (...) {
+        try {
+            err_out = "misaki_phonemize: out of memory";
+        } catch (...) {
+        }
         return false;
     }
 }

@@ -9,7 +9,7 @@
 //   - eliza_inference_asr_cancel during prefill and during decode, over a
 //     scripted ASR engine that polls the same abort callback llama_decode
 //     uses
-//   - ABI string "17"
+//   - ABI string "18"
 //
 // The bridge is compiled into this TU (ELIZA_INFERENCE_TEST_HOOKS) against
 // the Paradee / misaki doubles in tests/paradee-contract/, so no weights are
@@ -86,7 +86,7 @@ static int synth_text(EliInferenceContext * ctx, const std::string & text, size_
 }
 
 static void test_abi_and_probes() {
-    CHECK(std::string(eliza_inference_abi_version()) == "17");
+    CHECK(std::string(eliza_inference_abi_version()) == "18");
     CHECK_RC(eliza_inference_paradee_supported(), 1);
     CHECK_RC(eliza_inference_asr_supported(), 1);
     CHECK_RC(eliza_inference_asr_stream_supported(), 0);
@@ -170,6 +170,13 @@ static void test_paradee_load_and_synth() {
         CHECK_RC(eliza_inference_paradee_synthesize_phonemes_alloc(ctx, phon.c_str(), phon.size(), 1.2f, &pcm, &n, &err), ELIZA_OK);
         CHECK_RC((int) n, 5 * FAKE_PARADEE_SAMPLES_PER_ID);
         CHECK(pcm != nullptr && pcm[0] == (float) (43 + ('h' - 'a')) / 1000.0f);
+        eliza_inference_free_pcm(pcm);
+    }
+    // Out-of-range speeds are clamped to the library's range, not rejected.
+    for (float speed : { 0.01f, 100.0f }) {
+        float * pcm = nullptr;
+        CHECK_RC(eliza_inference_paradee_synthesize_alloc(ctx, "hi", 2, speed, &pcm, &n, &err), ELIZA_OK);
+        CHECK_RC((int) n, 2 * FAKE_PARADEE_SAMPLES_PER_ID);
         eliza_inference_free_pcm(pcm);
     }
     CHECK_RC(eliza_inference_paradee_synthesize_alloc(ctx, "x", 1, 1.0f, nullptr, &n, &err), ELIZA_ERR_INVALID_ARG);

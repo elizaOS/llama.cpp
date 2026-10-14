@@ -94,9 +94,11 @@ bool paradee_phase_lock(
         std::vector<float> & out,
         paradee_cancel_fn cancel, void * user) {
     const size_t k = std::min(ns, nsrc);
+    out.clear();
+    if (!s) return false;
     out.assign(s, s + k);
     const int N = p.n_fft, hop = p.hop, L = p.smooth_frames;
-    if (!s || !src || !f0 || nf0 == 0 || N < 4 || (N & (N - 1)) != 0 || hop <= 0 ||
+    if (!src || !f0 || nf0 == 0 || N < 4 || N > (1 << 16) || (N & (N - 1)) != 0 || hop <= 0 ||
         L < 1 || p.f0_hop <= 0 || p.sample_rate <= 0) {
         return false;
     }
