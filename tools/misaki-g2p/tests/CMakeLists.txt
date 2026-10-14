@@ -79,6 +79,17 @@ if (TARGET kokoro_lib)
         FIXTURES_REQUIRED misaki_mini_lex SKIP_RETURN_CODE 77 TIMEOUT 300)
 endif()
 
+# eSpeak NG data-path handling: missing directory, paths longer than the
+# linked libespeak-ng's N_PATH_HOME, recovery afterwards. Skips (77) without
+# libespeak-ng or its data.
+add_executable(test-espeak-data-path test_espeak_data_path.cpp)
+target_link_libraries(test-espeak-data-path PRIVATE misaki_g2p)
+if (GATE_ESPEAK_DATA)
+    add_test(NAME misaki_g2p_espeak_data_path COMMAND test-espeak-data-path ${MINI_LEX} ${GATE_ESPEAK_DATA})
+    set_tests_properties(misaki_g2p_espeak_data_path PROPERTIES
+        FIXTURES_REQUIRED misaki_mini_lex SKIP_RETURN_CODE 77 TIMEOUT 120)
+endif()
+
 foreach(gate agreement agent)
     if (gate STREQUAL "agreement")
         set(fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/reference.txt)

@@ -26,6 +26,20 @@
 // from the current one libespeak-ng is re-initialised with it, and later
 // default-path callers keep using it.
 //
+// Initialisation never ends the process. espeak_Initialize() calls exit(1)
+// when the data cannot be loaded unless espeakINITIALIZE_DONT_EXIT is set,
+// and even then reports success through the sample rate. prepare() uses the
+// espeak_ng_* calls instead, which return a status.
+//
+// Path length: libespeak-ng copies the data path into a fixed buffer
+// (N_PATH_HOME: 160 bytes on POSIX unless the library was built with a larger
+// -DN_PATH_HOME) and silently truncates a longer one, then falls back to its
+// compiled-in default directory. prepare() reads the path libespeak-ng kept
+// (espeak_Info) and fails when it is not the requested one, so a long path is
+// an error naming the limit instead of a quiet load of other data. The Android
+// builds of libespeak-ng use a larger N_PATH_HOME; see the eliza
+// stage-elizavoice-lib script.
+//
 // Header-only on purpose: the state lives in a C++17 inline function's
 // static, which the linker folds into one instance per program or shared
 // library, so kokoro_lib and misaki_g2p share it without a CMake target
@@ -34,8 +48,10 @@
 // Include it only when the component links libespeak-ng.
 #pragma once
 
+#include <cstdio>
+#include <espeak-ng/espeak_ng.h>
 #include <espeak-ng/speak_lib.h>
-
+#include <filesystem>
 #include <mutex>
 #include <string>
 
@@ -58,6 +74,20 @@ inline std::unique_lock<std::mutex> lock() {
     return std::unique_lock<std::mutex>(state().mutex);
 }
 
+// True when libespeak-ng kept the directory it should use for `data_dir`
+// whole after espeak_ng_InitializePath(data_dir): `data_dir`/espeak-ng-data
+// when that exists (libespeak-ng prefers it), else `data_dir` itself. A
+// truncated `data_dir`/espeak-ng-data makes libespeak-ng fall back to
+// `data_dir`, which this also catches.
+inline bool path_kept(const std::string & data_dir) {
+    const char * kept = nullptr;
+    espeak_Info(&kept);
+    if (!kept) return false;
+    const std::string child = data_dir + "/espeak-ng-data";
+    std::error_code   ec;
+    return std::string(kept) == (std::filesystem::is_directory(child, ec) ? child : data_dir);
+}
+
 // With `held` from lock(): make libespeak-ng ready for `data_dir` (see the
 // data-path rule above) and select `voice`. On failure sets `err`.
 inline bool prepare(const std::unique_lock<std::mutex> & held, const std::string & data_dir, const char * voice,
@@ -70,10 +100,33 @@ inline bool prepare(const std::unique_lock<std::mutex> & held, const std::string
     if (!s.initialized || (!data_dir.empty() && data_dir != s.data_dir)) {
         s.initialized = false;
         s.voice.clear();
-        // AUDIO_OUTPUT_SYNCHRONOUS: no audio device is opened.
-        const int rate = espeak_Initialize(AUDIO_OUTPUT_SYNCHRONOUS, 0, data_dir.empty() ? nullptr : data_dir.c_str(), 0);
-        if (rate <= 0) {
-            err = "espeak_Initialize failed for data dir '" + data_dir + "'";
+        if (!data_dir.empty()) {
+            std::error_code ec;
+            if (!std::filesystem::is_directory(data_dir, ec)) {
+                err = "eSpeak NG data directory not found: '" + data_dir + "'";
+                return false;
+            }
+        }
+        espeak_ng_InitializePath(data_dir.empty() ? nullptr : data_dir.c_str());
+        if (!data_dir.empty() && !path_kept(data_dir)) {
+            err = "eSpeak NG data path is " + std::to_string(data_dir.size()) +
+                  " bytes, longer than this libespeak-ng build accepts (its N_PATH_HOME buffer); "
+                  "use a shorter path or a libespeak-ng built with a larger -DN_PATH_HOME: '" +
+                  data_dir + "'";
+            return false;
+        }
+        espeak_ng_ERROR_CONTEXT context = nullptr;
+        espeak_ng_STATUS        status  = espeak_ng_Initialize(&context);
+        espeak_ng_ClearErrorContext(&context);
+        if (status == ENS_OK) {
+            // Synchronous mode: no audio device is opened.
+            status = espeak_ng_InitializeOutput(ENOUTPUT_MODE_SYNCHRONOUS, 0, nullptr);
+        }
+        if (status != ENS_OK) {
+            char message[256] = {};
+            espeak_ng_GetStatusCodeMessage(status, message, sizeof(message));
+            err = "eSpeak NG initialisation failed for data dir '" +
+                  (data_dir.empty() ? std::string("<default>") : data_dir) + "': " + message;
             return false;
         }
         s.initialized = true;

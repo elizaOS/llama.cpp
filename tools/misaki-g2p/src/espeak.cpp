@@ -208,12 +208,9 @@ u32 EspeakFallback::e2m(const u32 & in) {
 std::unique_ptr<EspeakFallback> EspeakFallback::open(const std::string & data_dir, std::string & err) {
 #if defined(MISAKI_G2P_USE_ESPEAK)
     auto lock = eliza_espeak_shared::lock();
-    // espeak-ng keeps its data path in a 160-byte buffer (N_PATH_HOME) and
-    // fails on longer ones with a misleading "No such file" error.
-    if (data_dir.size() + sizeof("/espeak-ng-data/phontab") > 160) {
-        err = "eSpeak NG data path is too long for libespeak-ng (max ~135 bytes): " + data_dir;
-        return nullptr;
-    }
+    // prepare() rejects a path longer than the linked libespeak-ng's
+    // N_PATH_HOME buffer with an error naming the limit (no fixed size here:
+    // the Android builds raise it).
     if (!eliza_espeak_shared::prepare(lock, data_dir, kVoice, err)) return nullptr;
     return std::unique_ptr<EspeakFallback>(new EspeakFallback(data_dir));
 #else
