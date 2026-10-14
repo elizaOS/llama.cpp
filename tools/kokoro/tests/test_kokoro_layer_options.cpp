@@ -102,10 +102,19 @@ int main() {
             detail::KokoroLayerOptionsScope s(opts(true));
             snake1d_forward(x1.data(), 4, 1000, a.data());
         }
+        // Both paths round the final x + sin^2(a x) / a to float, so each
+        // can be up to half an ulp of the output away from the exact value.
+        // Subtract that one-ulp allowance, then scale by |a| so the result
+        // is in sin^2 units and comparable to the fast_sin2 bound.
         double e = 0;
         for (int c = 0; c < 4; ++c)
-            for (int t = 0; t < 1000; ++t)
-                e = std::max(e, std::fabs((double) x[c * 1000 + t] - x1[c * 1000 + t]) * std::fabs(a[c]));
+            for (int t = 0; t < 1000; ++t) {
+                const float r = x[c * 1000 + t];
+                const double ulp = (double) std::nextafter(std::fabs(r), INFINITY) - std::fabs(r);
+                const double d = std::fabs((double) r - x1[c * 1000 + t]);
+                e = std::max(e, std::max(0.0, d - ulp) * std::fabs(a[c]));
+            }
+        std::printf("snake1d fast vs libm: max excess over output rounding %.3g\n", e);
         CHECK(e < 1e-6, "snake mismatch %.3g", e);
     }
 

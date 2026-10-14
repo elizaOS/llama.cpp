@@ -425,12 +425,20 @@ class Lexicon {
                 }
             }
         };
+        // Numbers past the named scales are not read (as the guarded cardinal
+        // branch below): misaki's num2words raises there.
+        bool too_long = false;
         auto extend_num = [&](const u32 & num, bool first) {
             std::string d = to_utf8(num);
+            if (!number_fits(d)) {
+                too_long = true;
+                return;
+            }
             extend_words(number_cardinal(d), first);
         };
         const bool digits = is_ascii_digits(word);
         if (digits && is_ordinal_suffix()) {
+            if (!number_fits(to_utf8(word))) return {};
             extend_words(number_ordinal(to_utf8(word)), true);
         } else if (result.empty() && word.size() == 4 && !(currency && (*currency == U"$" || *currency == U"£" || *currency == U"€")) && digits) {
             extend_words(number_year(to_utf8(word)), true);
@@ -514,12 +522,13 @@ class Lexicon {
                     words = U"point";
                     for (size_t i = 1; i < w2.size(); i++) words += U" " + number_cardinal(to_utf8(u32(1, w2[i])));
                 } else {
+                    if (!number_fits(to_utf8(w2.substr(0, w2.find('.'))))) return {};
                     words = number_float(to_utf8(w2));
                 }
             }
             extend_words(words, true);
         }
-        if (result.empty()) return {};
+        if (too_long || result.empty()) return {};
         u32 joined;
         int rating = 99;
         for (size_t i = 0; i < result.size(); i++) {

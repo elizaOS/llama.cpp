@@ -9,6 +9,7 @@
 // so the rules aim at those decisions, not at full tagging accuracy.
 #include "misaki-internal.h"
 
+#include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
 

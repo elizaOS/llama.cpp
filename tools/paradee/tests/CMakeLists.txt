@@ -44,3 +44,7 @@ foreach(t test-paradee-api test-paradee-parity)
     endif()
 endforeach()
 set_tests_properties(test-paradee-parity PROPERTIES TIMEOUT 900)
+
+# "main" is the label CI runs (ctest -L main); unlabelled tests are built but
+# never executed there. Only the self-contained, weight-free, offline tests.
+set_tests_properties(test-paradee-phase-lock PROPERTIES LABELS main)
