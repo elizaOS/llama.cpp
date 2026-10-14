@@ -1,7 +1,7 @@
 // tools/parakeet/tools/parakeet-cli.cpp - transcribe WAV files with a
 // parakeet-tdt GGUF.
 //
-//   parakeet-cli -m phonon-2-fv5.gguf [-t N] [--kernel scalar|dotprod|i8mm]
+//   parakeet-cli -m phonon-2-fv5.gguf [-t N] [--kernel scalar|dotprod|i8mm|avx2]
 //                [--stream] [--chunk-ms 80] [--words] file.wav...
 #include "parakeet.h"
 #include "pk-wav.h"
@@ -25,7 +25,7 @@ int main(int argc, char ** argv) {
         else if ((a == "-t" || a == "--threads") && i + 1 < argc) pp.n_threads = std::atoi(argv[++i]);
         else if (a == "--kernel" && i + 1 < argc) {
             const std::string k = argv[++i];
-            pp.kernel = k == "scalar" ? 1 : k == "dotprod" ? 2 : k == "i8mm" ? 3 : 0;
+            pp.kernel = k == "scalar" ? 1 : k == "dotprod" ? 2 : k == "i8mm" ? 3 : k == "avx2" ? 4 : 0;
         } else if (a == "--stream") stream = true;
         else if (a == "--words") words = true;
         else if (a == "--chunk-ms" && i + 1 < argc) chunk_ms = std::atoi(argv[++i]);

@@ -70,7 +70,7 @@ int main(int argc, char ** argv) {
         auto next = [&]() -> const char * { return i + 1 < argc ? argv[++i] : ""; };
         if (a == "-m") model = next();
         else if (a == "-t") pp.n_threads = std::atoi(next());
-        else if (a == "--kernel") { const std::string k = next(); pp.kernel = k == "scalar" ? 1 : k == "dotprod" ? 2 : k == "i8mm" ? 3 : 0; }
+        else if (a == "--kernel") { const std::string k = next(); pp.kernel = k == "scalar" ? 1 : k == "dotprod" ? 2 : k == "i8mm" ? 3 : k == "avx2" ? 4 : 0; }
         else if (a == "--no-pin") pp.pin_threads = 0;
         else if (a == "--list") list = next();
         else if (a == "--prefix-ms") prefix_ms = std::atoi(next());

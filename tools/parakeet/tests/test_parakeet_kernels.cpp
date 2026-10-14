@@ -6,6 +6,7 @@
 #include "pk-ops.h"
 #include "pk-pool.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -50,6 +51,9 @@ int main() {
 #if PK_HAVE_ARM_EXT
     if (cpu_has_dotprod()) tiers.push_back(&kernels_dotprod());
     if (cpu_has_i8mm()) tiers.push_back(&kernels_i8mm());
+#endif
+#if PK_HAVE_X86_EXT
+    if (cpu_has_avx2()) tiers.push_back(&kernels_avx2());
 #endif
     std::printf("tiers under test: scalar");
     for (auto * t : tiers) std::printf(", %s", t->name);
@@ -139,6 +143,48 @@ int main() {
             t->matvec(mw.data(), 37, K, mx.data(), m1.data());
             CHECK(m0 == m1, "%s matvec differs", t->name);
         }
+    }
+    // Random full-range operands (every int8 value, -128 included, which the
+    // model never produces): each tier's tile and matvec must still equal the
+    // scalar reference exactly, for every K and token-pair count.
+    {
+        std::uniform_int_distribution<int> any8(-128, 127);
+        int cases = 0;
+        for (int it = 0; it < 200; ++it) {
+            const int K = 16 * (1 + (int) (rng() % 96));
+            const int np = 1 + (int) (rng() % 4);
+            const size_t xs = (size_t) 2 * K + 16 * (rng() % 3);  // padded pair stride
+            std::vector<int8_t> pan((size_t) 8 * K), xb(xs * 4);
+            for (auto & v : pan) v = (int8_t) any8(rng);
+            for (auto & v : xb) v = (int8_t) any8(rng);
+            if (it == 0) {  // the extreme corner: every product is (-128)*(-128)
+                std::fill(pan.begin(), pan.end(), (int8_t) -128);
+                std::fill(xb.begin(), xb.end(), (int8_t) -128);
+            }
+            int32_t a[64], b[64];
+            ref.tile(pan.data(), xb.data(), xs, K, np, a);
+            for (auto * t : tiers) {
+                std::memset(b, 0x5a, sizeof(b));
+                t->tile(pan.data(), xb.data(), xs, K, np, b);
+                CHECK(std::memcmp(a, b, (size_t) 2 * np * 8 * 4) == 0, "%s random tile differs (K=%d np=%d)", t->name, K, np);
+            }
+            const int O = 1 + (int) (rng() % 23);
+            std::vector<int8_t> mw((size_t) O * K), mx(K);
+            for (auto & v : mw) v = (int8_t) any8(rng);
+            for (auto & v : mx) v = (int8_t) any8(rng);
+            if (it == 0) {
+                std::fill(mw.begin(), mw.end(), (int8_t) -128);
+                std::fill(mx.begin(), mx.end(), (int8_t) -128);
+            }
+            std::vector<int32_t> m0(O), m1(O);
+            ref.matvec(mw.data(), O, K, mx.data(), m0.data());
+            for (auto * t : tiers) {
+                t->matvec(mw.data(), O, K, mx.data(), m1.data());
+                CHECK(m0 == m1, "%s random matvec differs (K=%d O=%d)", t->name, K, O);
+            }
+            ++cases;
+        }
+        std::printf("random full-range int8: %d tile + matvec cases vs scalar\n", cases);
     }
     std::printf(fails ? "FAILED (%d)\n" : "all kernel checks passed\n", fails);
     return fails ? 1 : 0;
