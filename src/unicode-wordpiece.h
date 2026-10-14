@@ -3,4 +3,5 @@
 #include <cstdint>
 #include <vector>
 
-std::vector<uint32_t> unicode_wordpiece_normalize(const std::vector<uint32_t> & input);
+std::vector<uint32_t> unicode_wordpiece_normalize(const std::vector<uint32_t> & input,
+    bool lowercase = true, bool strip_accents = true);

@@ -820,12 +820,8 @@ struct llm_tokenizer_wpm_session {
 
     // TODO: reduce string copies by using cpts_offs array
     static std::vector<std::string> preprocess(const std::string & text, const llama_vocab::normalizer_options & normalizer_opts)  {
-        std::vector<uint32_t> cpts = unicode_cpts_from_utf8(text);
-        if (normalizer_opts.lowercase && normalizer_opts.strip_accents) {
-            cpts = unicode_wordpiece_normalize(cpts);
-        } else if (normalizer_opts.strip_accents) {
-            cpts = unicode_cpts_normalize_nfd(cpts);
-        }
+        const auto cpts = unicode_wordpiece_normalize(unicode_cpts_from_utf8(text),
+                normalizer_opts.lowercase, normalizer_opts.strip_accents);
         std::vector<std::string> words(1, "");
 
         for (const uint32_t cpt : cpts) {
@@ -843,11 +839,7 @@ struct llm_tokenizer_wpm_session {
                 continue;
             }
 
-            if (normalizer_opts.strip_accents && flags.is_accent_mark) {
-                continue;
-            }
-
-            const std::string s = unicode_cpt_to_utf8(normalizer_opts.lowercase ? unicode_tolower(cpt) : cpt);
+            const std::string s = unicode_cpt_to_utf8(cpt);
             if (flags.is_punctuation || ( cpt < 0x7F && flags.is_symbol ) || is_chinese_char(cpt)) {
                 if (words.back().size()) {  // finish previous word if any
                     words.emplace_back();

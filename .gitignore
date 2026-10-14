@@ -153,3 +153,6 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# Generated dependencies from the retired web UI checkout
+/tools/server/webui/node_modules/

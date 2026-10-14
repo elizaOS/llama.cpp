@@ -29,7 +29,7 @@ bool nonspacing(uint32_t cp) {
 }
 }
 
-std::vector<uint32_t> unicode_wordpiece_normalize(const std::vector<uint32_t> & input) {
+std::vector<uint32_t> unicode_wordpiece_normalize(const std::vector<uint32_t> & input, bool lowercase, bool strip_accents) {
     using namespace wordpiece_unicode_data;
     std::vector<uint32_t> cleaned;
     cleaned.reserve(input.size());
@@ -48,7 +48,7 @@ std::vector<uint32_t> unicode_wordpiece_normalize(const std::vector<uint32_t> & 
     std::vector<uint32_t> result;
     result.reserve(cleaned.size());
     for (const uint32_t cp : cleaned) {
-        if (cp < 0x80) {
+        if (!strip_accents || cp < 0x80) {
             result.push_back(cp);
             continue;
         }
@@ -71,15 +71,18 @@ std::vector<uint32_t> unicode_wordpiece_normalize(const std::vector<uint32_t> & 
     // Sort non-starter runs before deleting Mn: a removed mark with class zero
     // remains an ordering boundary during NFD. Stable sorting avoids quadratic
     // insertion behavior for adversarial runs of combining characters.
-    size_t start = 0;
-    for (size_t i = 0; i <= result.size(); ++i) {
-        if (i == result.size() || combining(result[i]) == 0) {
-            std::stable_sort(result.begin() + start, result.begin() + i,
-                [](uint32_t a, uint32_t b) { return combining(a) < combining(b); });
-            start = i + 1;
+    if (strip_accents) {
+        size_t start = 0;
+        for (size_t i = 0; i <= result.size(); ++i) {
+            if (i == result.size() || combining(result[i]) == 0) {
+                std::stable_sort(result.begin() + start, result.begin() + i,
+                    [](uint32_t a, uint32_t b) { return combining(a) < combining(b); });
+                start = i + 1;
+            }
         }
+        result.erase(std::remove_if(result.begin(), result.end(), nonspacing), result.end());
     }
-    result.erase(std::remove_if(result.begin(), result.end(), nonspacing), result.end());
+    if (!lowercase) return result;
     // Hugging Face NormalizedString::lowercase maps each scalar separately.
     // Whole-string Final_Sigma casing changes BGE token IDs and vector space.
     std::vector<uint32_t> lowered;

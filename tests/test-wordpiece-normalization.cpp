@@ -57,6 +57,12 @@ int main(int argc, char ** argv) {
         check(normalize(U"AΣ\u0301A") == normalize(U"aσa"), "Case-ignorable Mn ended casing context");
         check(normalize(U"A\u0301Σ") == normalize(U"aσ"), "Mn changed scalar lowercase");
 
+        check(unicode_wordpiece_normalize({0x00C9, 0x0903}, false, true) ==
+              std::vector<uint32_t>({'E', 0x0903}), "Cased accent stripping lost case or Mc");
+        check(unicode_wordpiece_normalize({0x00C9}, true, false) ==
+              std::vector<uint32_t>({0x00E9}), "Lowercase-only mode stripped an accent");
+        check(unicode_wordpiece_normalize({0x00C9}, false, false) ==
+              std::vector<uint32_t>({0x00C9}), "Disabled normalization changed a letter");
         const llama_vocab * vocab = llama_model_get_vocab(model);
         const auto cafe = tokenize(vocab, "cafe");
         check(cafe == std::vector<llama_token>({101,7668,102}), "Unexpected BGE vocabulary");
