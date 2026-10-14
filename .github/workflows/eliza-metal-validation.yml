@@ -16,9 +16,7 @@ name: Eliza Metal Validation
 #
 # Any "FAIL" line for ATTN_SCORE_QJL / FUSED_ATTN_QJL_TBQ or for the
 # GET_ROWS/CPY/MUL_MAT custom-quant cases fails the job. ATTN_SCORE_TBQ
-# and ATTN_SCORE_POLAR are tracked but not (yet) gated — their CPU
-# oracle is new (4ab3e26f6) and the first matrix surfaced Metal
-# divergence that we want visible without breaking the pipeline.
+# and ATTN_SCORE_POLAR are also gated against their CPU oracle.
 # "not supported" is the expected baseline for the un-kerneled
 # GET_ROWS/CPY/MUL_MAT custom-quant kernels.
 
@@ -157,13 +155,8 @@ jobs:
           # CPU has reference implementations. Real parity runs; PASS
           # is required.
           #
-          # ATTN_SCORE_TBQ / ATTN_SCORE_POLAR: CPU reference landed at
-          # 4ab3e26f6 (ggml-cpu/attn-score-tbq-polar.c). Real parity
-          # runs against Metal kernels. ATTN_SCORE_POLAR passes; the
-          # initial ATTN_SCORE_TBQ matrix surfaced TBQ3_0/TBQ4_0
-          # divergence vs. the CPU oracle on the wave-15 hardware run,
-          # so the matrix is tracked but not (yet) gated until the
-          # Metal kernel is reconciled.
+          # ATTN_SCORE_TBQ / ATTN_SCORE_POLAR: real parity against
+          # ggml-cpu/attn-score-tbq-polar.c, with failures hard-gated.
           #
           # We do NOT fail the job on "not supported" lines (expected
           # for the un-kerneled GET_ROWS/CPY/MUL_MAT custom-quant cases).
@@ -180,9 +173,9 @@ jobs:
           done
           echo "=== Eliza custom-quant summary ==="
           for t in q1_0_g32 q1_0_g128 tbq3_0 tbq4_0 tbq3_k tbq4_k qjl1_256 q4_polar tbq3_tcq; do
-            n_skip=$(grep -c "type=$t.*not supported" /tmp/eliza-custom-quants.log || true)
-            n_fail=$(grep -c "type=$t.*FAIL"          /tmp/eliza-custom-quants.log || true)
-            n_pass=$(grep -c "type=$t.*OK"            /tmp/eliza-custom-quants.log || true)
+            n_skip=$(grep -Ec "type(_a)?=$t[,)].*not supported" /tmp/eliza-custom-quants.log || true)
+            n_fail=$(grep -Ec "type(_a)?=$t[,)].*FAIL"          /tmp/eliza-custom-quants.log || true)
+            n_pass=$(grep -Ec "type(_a)?=$t[,)].*OK"            /tmp/eliza-custom-quants.log || true)
             echo "  $t: skip=$n_skip pass=$n_pass fail=$n_fail"
             if [ "$n_fail" -gt 0 ]; then
               echo "::error::Metal kernel divergence for type=$t (see /tmp/eliza-custom-quants.log)"
