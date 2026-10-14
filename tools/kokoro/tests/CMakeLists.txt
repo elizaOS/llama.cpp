@@ -44,3 +44,9 @@ add_test(NAME test-kokoro-backend COMMAND test-kokoro-backend)
 add_executable(test-kokoro-layer-options test_kokoro_layer_options.cpp)
 target_link_libraries(test-kokoro-layer-options PRIVATE kokoro_lib)
 add_test(NAME test-kokoro-layer-options COMMAND test-kokoro-layer-options)
+
+# Synthesis cancellation. Weight-free checks always run; set KOKORO_TEST_MODEL
+# and KOKORO_TEST_VOICE to also cancel a real synthesis at every stage boundary.
+add_executable(test-kokoro-cancel test_kokoro_cancel.cpp)
+target_link_libraries(test-kokoro-cancel PRIVATE kokoro_lib)
+add_test(NAME test-kokoro-cancel COMMAND test-kokoro-cancel)

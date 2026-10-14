@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include "kokoro.h"
+
 #include <string>
 #include <vector>
 
@@ -53,12 +55,17 @@ bool decoder_forward(
 //   F0, N    : [2*T_frame]    (PredictorOut.F0_pred / N_pred — the up-2x curves)
 //   ref_s_dec: [128]          decoder-half style (ref_s[:128])
 // Output: audio (24 kHz mono), resized to (2*T_frame)*300.
+// `cancel` (optional) is polled between the decoder front and the generator;
+// when it returns true the call stops early, returns false with err
+// "cancelled", and leaves `audio` empty.
 bool kokoro_decoder_forward(
         const kokoro_model * model,
         const float * asr_ct, int T_frame,
         const float * F0, const float * N,
         const float * ref_s_dec,
         std::vector<float> & audio,
-        std::string & err);
+        std::string & err,
+        kokoro_cancel_callback cancel = nullptr,
+        void * cancel_user_data = nullptr);
 
 } // namespace eliza_kokoro

@@ -9,7 +9,7 @@
 //   - eliza_inference_asr_cancel during prefill and during decode, over a
 //     scripted ASR engine that polls the same abort callback llama_decode
 //     uses
-//   - ABI string "17"
+//   - ABI string "18"
 //
 // The bridge is compiled into this TU (ELIZA_INFERENCE_TEST_HOOKS) against
 // the Paradee / misaki doubles in tests/paradee-contract/, so no weights are
@@ -86,7 +86,7 @@ static int synth_text(EliInferenceContext * ctx, const std::string & text, size_
 }
 
 static void test_abi_and_probes() {
-    CHECK(std::string(eliza_inference_abi_version()) == "17");
+    CHECK(std::string(eliza_inference_abi_version()) == "18");
     CHECK_RC(eliza_inference_paradee_supported(), 1);
     CHECK_RC(eliza_inference_asr_supported(), 1);
     CHECK_RC(eliza_inference_asr_stream_supported(), 0);

@@ -33,6 +33,7 @@ struct llama_cparams {
     bool offload_kqv;
     bool flash_attn;
     bool auto_fa;
+    bool fa_dequant_kv;      // Eliza: dequantize TBQ3_0/TBQ4_0/Q4_POLAR K/V before FA (KV device lacks native FA for the cache types)
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
     bool fused_gdn_ch;       // use fused gated delta net (chunked)
     bool auto_fgdn;

@@ -179,3 +179,69 @@ kernel void kernel_turbo3_dot_multi(
         }
     }
 }
+
+// GGML's TBQ3_0 contract uses the CPU quantizer's packing and
+// sign/Hadamard preconditioner. Keep the legacy turbo kernel ABI above for
+// callers that supply already-rotated queries and legacy packed keys.
+struct block_ggml_tbq3_0 {
+    half norm;
+    uint8_t qs[12];
+};
+
+constant float GGML_TBQ3_CODEBOOK[8] = {
+    -2.1519457f, -1.3439093f, -0.7560053f, -0.2450942f,
+     0.2450942f,  0.7560053f,  1.3439093f,  2.1519457f,
+};
+
+constant int GGML_TBQ3_SIGNS[32] = {
+     1, -1,  1,  1, -1,  1, -1, -1,
+     1,  1, -1,  1, -1, -1,  1, -1,
+    -1,  1,  1, -1,  1, -1, -1,  1,
+     1, -1,  1, -1, -1,  1, -1,  1,
+};
+
+kernel void kernel_ggml_tbq3_dot_multi(
+        device const float * q [[buffer(0)]],
+        device const block_ggml_tbq3_0 * k_blocks [[buffer(1)]],
+        device float * scores [[buffer(2)]],
+        constant turbo_dot_multi_args & args [[buffer(3)]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint tg_idx [[threadgroup_position_in_grid]]) {
+    // One SIMD group owns four 32-element blocks. Transform the query once:
+    // dot(q, sign * H(decoded)) = dot(H(q * sign), decoded).
+    float qt[4];
+    for (uint j = 0; j < 4; ++j) {
+        float v = q[args.q_head * args.head_dim + j * 32u + tid] * float(GGML_TBQ3_SIGNS[tid]);
+        for (uint mask = 1; mask < 32; mask <<= 1) {
+            const float other = simd_shuffle_xor(v, mask);
+            v = (tid & mask) ? other - v : v + other;
+        }
+        qt[j] = v * 0.1767766952966369f;
+    }
+
+    for (uint b = 0; b < args.blocks_per_threadgroup; ++b) {
+        const uint kv_idx = tg_idx * args.blocks_per_threadgroup + b;
+        if (kv_idx >= args.n_kv) {
+            return;
+        }
+        device const block_ggml_tbq3_0 * row =
+            (device const block_ggml_tbq3_0 *) ((device const uchar *) k_blocks + args.head_offset_bytes)
+            + kv_idx * args.kv_stride_blocks;
+        float acc = 0.0f;
+        for (uint j = 0; j < 4; ++j) {
+            device const block_ggml_tbq3_0 & blk = row[j];
+            const uint bit = tid * 3u;
+            const uint byte = bit >> 3u;
+            const uint shift = bit & 7u;
+            uint code = uint(blk.qs[byte]) >> shift;
+            if (shift > 5u && byte + 1u < 12u) {
+                code |= uint(blk.qs[byte + 1u]) << (8u - shift);
+            }
+            acc += qt[j] * GGML_TBQ3_CODEBOOK[code & 7u] * float(blk.norm);
+        }
+        const float sum = simd_sum(acc);
+        if (tid == 0) {
+            scores[args.q_head * args.n_kv + kv_idx] = sum;
+        }
+    }
+}

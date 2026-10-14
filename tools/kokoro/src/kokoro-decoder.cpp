@@ -232,7 +232,9 @@ bool kokoro_decoder_forward(
         const float * F0, const float * N,
         const float * ref_s_dec,
         std::vector<float> & audio,
-        std::string & err) {
+        std::string & err,
+        kokoro_cancel_callback cancel,
+        void * cancel_user_data) {
     audio.clear();
     if (!model) { err = "null model"; return false; }
     DecoderConfig cfg;   // Kokoro-82M: namespace "kokoro", identity InstanceNorm affine, shipped source STFT
@@ -240,6 +242,8 @@ bool kokoro_decoder_forward(
     // asr width from asr_res.weight [64, asr_dim, 1] (512 for Kokoro-82M).
     ggml_tensor * asr_res = kokoro_find_tensor_compat(ctx, "kokoro.decoder.asr_res.weight");
     if (!asr_res) { err = "missing decoder weights (is the GGUF a full kokoro model?)"; return false; }
+    cfg.cancel = cancel;
+    cfg.cancel_user = cancel_user_data;
     return decoder_forward(ctx, cfg, asr_ct, (int) asr_res->ne[1], T_frame,
                            F0, N, ref_s_dec, audio, err);
 }
