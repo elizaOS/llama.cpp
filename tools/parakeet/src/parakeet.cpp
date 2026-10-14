@@ -31,12 +31,14 @@
 #include <unistd.h>
 #endif
 
-#if defined(__ARM_NEON) || defined(__aarch64__)
+#if (defined(__ARM_NEON) || defined(__aarch64__)) && !defined(_MSC_VER)
 #include <arm_neon.h>
 #define PK_NEON 1
 #endif
 
 using clk = std::chrono::steady_clock;
+
+static constexpr double PK_PI = 3.14159265358979323846;
 
 // PK_PROFILE=1: per-stage wall time of the encoder, printed at exit
 namespace {
@@ -240,7 +242,7 @@ void setup_frontend(pk_model * m) {
     m->window.assign(hp.n_fft, 0.0f);
     const int off = (hp.n_fft - hp.win_length) / 2;
     for (int i = 0; i < hp.win_length; ++i) {
-        m->window[off + i] = (float) (0.5 - 0.5 * std::cos(2.0 * M_PI * i / (hp.win_length - 1)));
+        m->window[off + i] = (float) (0.5 - 0.5 * std::cos(2.0 * PK_PI * i / (hp.win_length - 1)));
     }
 }
 
@@ -536,7 +538,7 @@ bool pk::compute_mel(pk_model * m, const float * pcm, size_t n, std::vector<floa
     mel.assign((size_t) n_frames * nm, 0.0f);
     std::vector<std::complex<double>> tw(nfft / 2);
     for (int k = 0; k < nfft / 2; ++k) {
-        tw[k] = std::polar(1.0, -2.0 * M_PI * k / nfft);
+        tw[k] = std::polar(1.0, -2.0 * PK_PI * k / nfft);
     }
     auto frames = [&](int b, int e) {
         std::vector<std::complex<double>> buf(nfft);

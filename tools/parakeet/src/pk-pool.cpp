@@ -15,7 +15,14 @@
 #include <sys/qos.h>
 #include <sys/sysctl.h>
 #endif
-#if defined(__aarch64__)
+#if defined(_MSC_VER)
+#include <intrin.h>
+#if defined(_M_ARM64)
+#define PK_RELAX() __yield()
+#else
+#define PK_RELAX() _mm_pause()
+#endif
+#elif defined(__aarch64__)
 #define PK_RELAX() __asm__ __volatile__("yield" ::: "memory")
 #elif defined(__x86_64__) || defined(__i386__)
 #define PK_RELAX() __builtin_ia32_pause()

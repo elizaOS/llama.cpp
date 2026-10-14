@@ -12,6 +12,8 @@
 
 namespace pkwav {
 
+constexpr double kPi = 3.14159265358979323846;
+
 inline bool read_wav(const std::string & path, std::vector<float> & out, int & sr, std::string & err) {
     FILE * f = std::fopen(path.c_str(), "rb");
     if (!f) {
@@ -83,9 +85,9 @@ inline std::vector<float> resample(const std::vector<float> & x, int sr_in, int 
         for (long k = c - half / cutoff; k <= c + half / cutoff; ++k) {
             if (k < 0 || k >= (long) x.size()) continue;
             const double u = (t - k) * cutoff;
-            const double sinc = u == 0.0 ? 1.0 : std::sin(M_PI * u) / (M_PI * u);
+            const double sinc = u == 0.0 ? 1.0 : std::sin(kPi * u) / (kPi * u);
             const double r = u / half;
-            const double w = std::fabs(r) >= 1.0 ? 0.0 : 0.5 + 0.5 * std::cos(M_PI * r);
+            const double w = std::fabs(r) >= 1.0 ? 0.0 : 0.5 + 0.5 * std::cos(kPi * r);
             acc += x[k] * sinc * w * cutoff;
             wsum += sinc * w * cutoff;
         }

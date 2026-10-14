@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -78,6 +79,21 @@ extern "C" int pk_stream_feed(pk_stream * s, const float * pcm, size_t n) {
     return (int) n;
 }
 
+// token identity for re-decode matching: the piece without its word-start
+// space, lower-cased (a segment's first word is often re-decoded capitalised)
+static bool same_piece(const pk_model * m, int a, int b) {
+    if (a == b) return true;
+    const std::string & x = m->pieces[a];
+    const std::string & y = m->pieces[b];
+    size_t i = x.find_first_not_of(' '), j = y.find_first_not_of(' ');
+    if (i == std::string::npos || j == std::string::npos) return false;
+    if (x.size() - i != y.size() - j) return false;
+    for (; i < x.size(); ++i, ++j) {
+        if (std::tolower((unsigned char) x[i]) != std::tolower((unsigned char) y[j])) return false;
+    }
+    return true;
+}
+
 static size_t ms_to_samples(const pk_stream * s, int ms) {
     return (size_t) ((long long) std::max(0, ms) * s->m->hp.sample_rate / 1000);
 }
@@ -97,9 +113,20 @@ static std::vector<float> frame_energy(const pk_stream * s, size_t a, size_t b) 
     return e;
 }
 
+// true when sample x falls in no committed token's span [frame, frame + dur)
+static bool between_tokens(const pk_stream * s, size_t x, size_t fs) {
+    for (auto it = s->committed.rbegin(); it != s->committed.rend(); ++it) {
+        const size_t b = (size_t) it->frame * fs;
+        const size_t e = (size_t) (it->frame + std::max(1, it->duration)) * fs;
+        if (e <= x) return true;   // tokens are in time order
+        if (b <= x) return false;  // x inside this token
+    }
+    return true;
+}
+
 // Latest pause midpoint in [lo, hi): >= 15 consecutive 10 ms frames below
-// 5% (amplitude) of the segment's loud level (90th percentile energy).
-// 0 when there is none.
+// 5% (amplitude) of the segment's loud level (90th percentile energy), and
+// not inside a committed token. 0 when there is none.
 static size_t find_pause(const pk_stream * s, size_t lo, size_t hi) {
     if (hi <= lo + 3200) return 0;
     const std::vector<float> seg = frame_energy(s, s->seg_start, std::min(hi, s->total));
@@ -115,7 +142,9 @@ static size_t find_pause(const pk_stream * s, size_t lo, size_t hi) {
         if (run >= 15) {
             const size_t x = s->seg_start + (i + 1) * 160;  // end of the run so far
             const size_t mid = x - run * 80;
-            if (mid >= lo && mid < hi) best = mid;
+            const size_t fs = (size_t) s->m->hp.hop_length * 8;
+            const size_t cut = (mid / fs) * fs;  // where the segment would start
+            if (mid >= lo && mid < hi && between_tokens(s, cut, fs)) best = mid;
         }
     }
     return best;
@@ -178,7 +207,7 @@ static int decode_window(pk_stream * s, bool final, pk_cancel_cb cancel, void * 
     {
         const size_t c0 = s->committed.size() - seg_committed;
         bool same = toks.size() >= seg_committed;
-        for (size_t i = 0; same && i < seg_committed; ++i) same = toks[i].id == s->committed[c0 + i].id;
+        for (size_t i = 0; same && i < seg_committed; ++i) same = same_piece(m, toks[i].id, s->committed[c0 + i].id);
         size_t start = 0;
         if (same) {
             start = seg_committed;
@@ -195,7 +224,7 @@ static int decode_window(pk_stream * s, bool final, pk_cancel_cb cancel, void * 
                 bool ok = true;
                 for (size_t i = 0; i < kk && ok; ++i) {
                     const pk_token & c = s->committed[s->committed.size() - kk + i];
-                    ok = c.id == toks[start + i].id && std::abs(c.frame - toks[start + i].frame) <= 3;
+                    ok = same_piece(m, c.id, toks[start + i].id) && std::abs(c.frame - toks[start + i].frame) <= 3;
                 }
                 if (ok) drop = kk;
             }

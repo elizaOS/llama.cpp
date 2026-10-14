@@ -62,9 +62,11 @@ if (NOT CMAKE_SYSTEM_NAME STREQUAL "iOS" AND NOT CMAKE_SYSTEM_NAME STREQUAL "And
     target_include_directories(parakeet-cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tools)
     install(TARGETS parakeet-cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
-    add_executable(parakeet-bench tools/parakeet-bench.cpp)
-    target_link_libraries(parakeet-bench PRIVATE parakeet_lib)
-    target_include_directories(parakeet-bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tools)
+    if (NOT WIN32)  # getrusage / getloadavg
+        add_executable(parakeet-bench tools/parakeet-bench.cpp)
+        target_link_libraries(parakeet-bench PRIVATE parakeet_lib)
+        target_include_directories(parakeet-bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tools)
+    endif()
 endif()
 
 if (LLAMA_BUILD_TESTS OR PARAKEET_BUILD_TESTS)

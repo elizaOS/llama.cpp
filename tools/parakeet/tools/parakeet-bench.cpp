@@ -67,7 +67,7 @@ int main(int argc, char ** argv) {
     pk_stream_params sp = pk_stream_default_params();
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
-        auto next = [&]() { return i + 1 < argc ? argv[++i] : (char *) ""; };
+        auto next = [&]() -> const char * { return i + 1 < argc ? argv[++i] : ""; };
         if (a == "-m") model = next();
         else if (a == "-t") pp.n_threads = std::atoi(next());
         else if (a == "--kernel") { const std::string k = next(); pp.kernel = k == "scalar" ? 1 : k == "dotprod" ? 2 : k == "i8mm" ? 3 : 0; }

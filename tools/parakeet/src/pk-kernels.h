@@ -52,7 +52,7 @@ bool cpu_has_i8mm();
 
 // per-tier tables (defined in their own translation units)
 const kernel_table & kernels_scalar();
-#if defined(__aarch64__) && !defined(PK_NO_ARM_EXT)
+#if defined(__aarch64__) && !defined(PK_NO_ARM_EXT) && !defined(_MSC_VER)
 #define PK_HAVE_ARM_EXT 1
 const kernel_table & kernels_dotprod();
 const kernel_table & kernels_i8mm();

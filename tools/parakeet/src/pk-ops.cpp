@@ -6,7 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#if defined(__ARM_NEON) || defined(__aarch64__)
+#if (defined(__ARM_NEON) || defined(__aarch64__)) && !defined(_MSC_VER)
 #include <arm_neon.h>
 #define PK_NEON 1
 #endif
