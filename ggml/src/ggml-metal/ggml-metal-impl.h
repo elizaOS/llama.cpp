@@ -24,9 +24,8 @@
 #define N_R0_Q1_0 8
 #define N_SG_Q1_0 2
 
-#define N_R0_Q1_0_g128 4
-#define N_SG_Q1_0_g128 2
-
+#define N_R0_Q2_0 8
+#define N_SG_Q2_0 2
 
 #define N_R0_Q4_0 4
 #define N_SG_Q4_0 2
@@ -45,9 +44,6 @@
 
 #define N_R0_MXFP4 2
 #define N_SG_MXFP4 2
-
-#define N_R0_NVFP4 2
-#define N_SG_NVFP4 2
 
 #define N_R0_Q2_K 4
 #define N_SG_Q2_K 2
@@ -111,7 +107,6 @@
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
-#define OP_FLASH_ATTN_EXT_NQPSG_16 16
 #define OP_FLASH_ATTN_EXT_NCPSG 64
 
 #define OP_FLASH_ATTN_EXT_VEC_NQPSG 1
@@ -612,6 +607,21 @@ typedef struct {
 } ggml_metal_kargs_conv_transpose_1d;
 
 typedef struct {
+    int32_t  T_in;
+    int32_t  T_out;
+    int32_t  OC;
+    int32_t  K;
+    int32_t  K_OC;
+    int32_t  s0;
+    int32_t  p0;
+} ggml_metal_kargs_col2im_1d;
+
+typedef struct {
+    int32_t T;
+    int32_t C;
+} ggml_metal_kargs_snake;
+
+typedef struct {
     int32_t  IC;
     int32_t  IH;
     int32_t  IW;
@@ -1094,17 +1104,6 @@ typedef struct {
     int      dim;
     int      max_period;
 } ggml_metal_kargs_timestep_embedding;
-
-// # ELIZA-ISTFT-DISPATCH-V1 — kargs for GGML_OP_ISTFT (must mirror IstftParams
-// in eliza-shipped/istft.metal).
-typedef struct {
-    uint32_t n_fft;
-    uint32_t hop_length;
-    uint32_t win_length;
-    uint32_t T;
-    uint32_t n_out;
-    uint32_t use_window;
-} ggml_metal_kargs_istft;
 
 typedef struct {
     int32_t  ne00;

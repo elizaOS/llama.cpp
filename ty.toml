@@ -14,17 +14,7 @@ exclude = [
 include = [
     "./tools/server/tests/**",
     "./scripts/snapdragon/qdc/**",
-    # tools/kokoro tooling imports the upstream `kokoro` Python package
-    # for reference-activation dumping; that package isn't in CI, so the
-    # type-checker can't resolve it. It runs only against an installed
-    # kokoro env, not under CI.
-    "./tools/kokoro/tools/**",
-    # conversion/* defines mixins (e.g. _Qwen35MtpMixin) whose super()
-    # chains resolve to attributes provided by the composed Model
-    # subclasses in convert_hf_to_gguf.py. ty cannot see that
-    # composition at the mixin level, so the super() calls and
-    # base-class attributes (ftype, metadata) appear unresolved.
-    "./conversion/**",
+    "./tools/mtmd/tests/**",
 ]
 
 [overrides.rules]

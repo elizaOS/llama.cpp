@@ -13,6 +13,10 @@
 #include <stdlib.h> // for qsort
 #include <stdio.h>  // for GGML_ASSERT
 
+#ifdef GGML_USE_OPENMP
+#include <omp.h>
+#endif
+
 #define GROUP_MAX_EPS 1e-15f
 #define GROUP_MAX_EPS_IQ3_XXS 1e-8f
 #define GROUP_MAX_EPS_IQ2_S 1e-8f
@@ -30,347 +34,6 @@ static inline int best_index_int8(int n, const int8_t * val, float x) {
         if (x < val[mav]) mu = mav; else ml = mav;
     }
     return x - val[mu-1] < val[mu] - x ? mu-1 : mu;
-}
-
-static const float k_tbq3_codebook[8] = {
-    -2.1519457f, -1.3439093f, -0.7560053f, -0.2450942f,
-     0.2450942f,  0.7560053f,  1.3439093f,  2.1519457f,
-};
-
-static const float k_tbq4_codebook[16] = {
-    -2.7321365f, -2.0685055f, -1.6175243f, -1.2557391f,
-    -0.9419147f, -0.6564307f, -0.3878412f, -0.1283243f,
-     0.1283243f,  0.3878412f,  0.6564307f,  0.9419147f,
-     1.2557391f,  1.6175243f,  2.0685055f,  2.7321365f,
-};
-
-static const float k_tbq3_boundaries[7] = {
-    -1.7480f, -1.0500f, -0.5006f, 0.0000f,
-     0.5006f,  1.0500f,  1.7480f,
-};
-
-static const float k_tbq4_boundaries[15] = {
-    -2.4008f, -1.8435f, -1.4371f, -1.0993f,
-    -0.7996f, -0.5225f, -0.2583f,  0.0000f,
-     0.2583f,  0.5225f,  0.7996f,  1.0993f,
-     1.4371f,  1.8435f,  2.4008f,
-};
-
-static const int8_t k_tbq_signs[QK_TBQ] = {
-     1, -1,  1,  1, -1,  1, -1, -1,
-     1,  1, -1,  1, -1, -1,  1, -1,
-    -1,  1,  1, -1,  1, -1, -1,  1,
-     1, -1,  1, -1, -1,  1, -1,  1,
-};
-
-static inline uint8_t tbq3_get_code(const uint8_t * qs, int idx) {
-    const int bit = idx * 3;
-    const int byte = bit >> 3;
-    const int shift = bit & 7;
-
-    uint32_t bits = qs[byte] >> shift;
-    if (shift > 5 && byte + 1 < (int) (QK_TBQ * 3 / 8)) {
-        bits |= (uint32_t) qs[byte + 1] << (8 - shift);
-    }
-
-    return bits & 0x7u;
-}
-
-static inline void tbq3_set_code(uint8_t * qs, int idx, uint8_t code) {
-    const int bit = idx * 3;
-    const int byte = bit >> 3;
-    const int shift = bit & 7;
-
-    qs[byte] = (uint8_t) (qs[byte] | ((code & 0x7u) << shift));
-    if (shift > 5 && byte + 1 < (int) (QK_TBQ * 3 / 8)) {
-        qs[byte + 1] = (uint8_t) (qs[byte + 1] | ((code & 0x7u) >> (8 - shift)));
-    }
-}
-
-static inline uint8_t tbq4_get_code(const uint8_t * qs, int idx) {
-    const int j = idx % (QK_TBQ/2);
-    return idx < QK_TBQ/2 ? (qs[j] & 0x0F) : (qs[j] >> 4);
-}
-
-static inline void tbq4_set_code(uint8_t * qs, int idx, uint8_t code) {
-    const int j = idx % (QK_TBQ/2);
-    if (idx < QK_TBQ/2) {
-        qs[j] = (uint8_t) ((qs[j] & 0xF0) | (code & 0x0F));
-    } else {
-        qs[j] = (uint8_t) ((qs[j] & 0x0F) | ((code & 0x0F) << 4));
-    }
-}
-
-static inline void tbq_hadamard32(float * x) {
-    for (int len = 1; len < QK_TBQ; len <<= 1) {
-        for (int i = 0; i < QK_TBQ; i += 2 * len) {
-            for (int j = 0; j < len; ++j) {
-                const float a = x[i + j];
-                const float b = x[i + j + len];
-                x[i + j]       = a + b;
-                x[i + j + len] = a - b;
-            }
-        }
-    }
-
-    const float norm = 0.1767766952966369f;
-    for (int i = 0; i < QK_TBQ; ++i) {
-        x[i] *= norm;
-    }
-}
-
-static inline void tbq_precondition_block(const float * x, float * y) {
-    for (int i = 0; i < QK_TBQ; ++i) {
-        y[i] = x[i] * (float) k_tbq_signs[i];
-    }
-    tbq_hadamard32(y);
-}
-
-static inline void tbq_uncondition_block(float * x) {
-    tbq_hadamard32(x);
-    for (int i = 0; i < QK_TBQ; ++i) {
-        x[i] *= (float) k_tbq_signs[i];
-    }
-}
-
-static inline uint8_t tbq_best_index(int n, const float * codebook, float x) {
-    if (x <= codebook[0]) {
-        return 0;
-    }
-    if (x >= codebook[n - 1]) {
-        return (uint8_t) (n - 1);
-    }
-
-    int lo = 0;
-    int hi = n - 1;
-    while (hi - lo > 1) {
-        const int mid = (lo + hi) / 2;
-        if (x < codebook[mid]) {
-            hi = mid;
-        } else {
-            lo = mid;
-        }
-    }
-
-    return (uint8_t) ((x - codebook[lo] <= codebook[hi] - x) ? lo : hi);
-}
-
-static inline uint8_t tbq_boundary_index(int n, const float * boundaries, float x) {
-    for (int i = 0; i < n - 1; ++i) {
-        if (x < boundaries[i]) {
-            return (uint8_t) i;
-        }
-    }
-    return (uint8_t) (n - 1);
-}
-
-#if defined(_MSC_VER)
-#define TBQK_TLS __declspec(thread)
-#elif defined(__GNUC__) || defined(__clang__)
-#define TBQK_TLS __thread
-#else
-#define TBQK_TLS
-#endif
-
-static inline uint64_t tbqk_splitmix64_next(uint64_t * state) {
-    uint64_t z = (*state += 0x9e3779b97f4a7c15ULL);
-    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-    return z ^ (z >> 31);
-}
-
-static void tbqk_generate_gaussian(float * out, int64_t n, uint64_t seed) {
-    uint64_t state = seed;
-    int64_t i = 0;
-    for (; i + 1 < n; i += 2) {
-        const double u1 = ((double)(tbqk_splitmix64_next(&state) >> 11) + 0.5) / (double)(1ULL << 53);
-        const double u2 = ((double)(tbqk_splitmix64_next(&state) >> 11) + 0.5) / (double)(1ULL << 53);
-        const double r  = sqrt(-2.0 * log(u1));
-        const double th = 2.0 * 3.14159265358979323846 * u2;
-        out[i + 0] = (float)(r * cos(th));
-        out[i + 1] = (float)(r * sin(th));
-    }
-    if (i < n) {
-        const double u1 = ((double)(tbqk_splitmix64_next(&state) >> 11) + 0.5) / (double)(1ULL << 53);
-        const double u2 = ((double)(tbqk_splitmix64_next(&state) >> 11) + 0.5) / (double)(1ULL << 53);
-        const double r  = sqrt(-2.0 * log(u1));
-        const double th = 2.0 * 3.14159265358979323846 * u2;
-        out[i] = (float)(r * cos(th));
-    }
-}
-
-static void tbqk_householder_qr(float * a, float * q, int64_t d) {
-    float * tau = (float *) malloc(d * sizeof(float));
-    float * r_sign = (float *) malloc(d * sizeof(float));
-    GGML_ASSERT(tau != NULL && r_sign != NULL);
-
-    for (int64_t k = 0; k < d; ++k) {
-        float norm_sq = 0.0f;
-        for (int64_t i = k; i < d; ++i) {
-            const float v = a[i + k*d];
-            norm_sq += v*v;
-        }
-
-        const float norm = sqrtf(norm_sq);
-        const float alpha = a[k + k*d];
-        const float sign_alpha = alpha >= 0.0f ? 1.0f : -1.0f;
-        const float u1 = alpha + sign_alpha*norm;
-
-        r_sign[k] = -sign_alpha;
-
-        const float vtv = u1*u1 + (norm_sq - alpha*alpha);
-        if (vtv < 1e-30f) {
-            tau[k] = 0.0f;
-            continue;
-        }
-        tau[k] = 2.0f / vtv;
-        a[k + k*d] = u1;
-
-        for (int64_t j = k + 1; j < d; ++j) {
-            float dot = u1 * a[k + j*d];
-            for (int64_t i = k + 1; i < d; ++i) {
-                dot += a[i + k*d] * a[i + j*d];
-            }
-            dot *= tau[k];
-            a[k + j*d] -= dot*u1;
-            for (int64_t i = k + 1; i < d; ++i) {
-                a[i + j*d] -= dot*a[i + k*d];
-            }
-        }
-    }
-
-    memset(q, 0, d*d*sizeof(float));
-    for (int64_t i = 0; i < d; ++i) {
-        q[i + i*d] = 1.0f;
-    }
-
-    for (int64_t k = d - 1; k >= 0; --k) {
-        if (tau[k] == 0.0f) {
-            continue;
-        }
-        const float u1 = a[k + k*d];
-        for (int64_t j = 0; j < d; ++j) {
-            float dot = u1 * q[k + j*d];
-            for (int64_t i = k + 1; i < d; ++i) {
-                dot += a[i + k*d] * q[i + j*d];
-            }
-            dot *= tau[k];
-            q[k + j*d] -= dot*u1;
-            for (int64_t i = k + 1; i < d; ++i) {
-                q[i + j*d] -= dot*a[i + k*d];
-            }
-        }
-    }
-
-    for (int64_t j = 0; j < d; ++j) {
-        if (r_sign[j] < 0.0f) {
-            for (int64_t i = 0; i < d; ++i) {
-                q[i + j*d] = -q[i + j*d];
-            }
-        }
-    }
-
-    free(tau);
-    free(r_sign);
-}
-
-static TBQK_TLS float * tbqk_q_col = NULL;
-static TBQK_TLS float * tbqk_q_row = NULL;
-static TBQK_TLS int64_t tbqk_q_dim = 0;
-
-static const float * tbqk_get_q_col(int64_t d) {
-    if (tbqk_q_col != NULL && tbqk_q_dim == d) {
-        return tbqk_q_col;
-    }
-
-    free(tbqk_q_col);
-    free(tbqk_q_row);
-    tbqk_q_col = (float *) malloc(d*d*sizeof(float));
-    tbqk_q_row = (float *) malloc(d*d*sizeof(float));
-    float * a = (float *) malloc(d*d*sizeof(float));
-    GGML_ASSERT(tbqk_q_col != NULL && tbqk_q_row != NULL && a != NULL);
-
-    tbqk_generate_gaussian(a, d*d, 0x517cc1b727220a95ULL);
-    tbqk_householder_qr(a, tbqk_q_col, d);
-    for (int64_t i = 0; i < d; ++i) {
-        for (int64_t j = 0; j < d; ++j) {
-            tbqk_q_row[i*d + j] = tbqk_q_col[i + j*d];
-        }
-    }
-
-    tbqk_q_dim = d;
-    free(a);
-    return tbqk_q_col;
-}
-
-static const float * tbqk_get_q_row(int64_t d) {
-    tbqk_get_q_col(d);
-    return tbqk_q_row;
-}
-
-static void tbqk_matvec_row(float * y, const float * m, const float * x, int64_t d) {
-    for (int64_t i = 0; i < d; ++i) {
-        const float * row = m + i*d;
-        float sum = 0.0f;
-        for (int64_t j = 0; j < d; ++j) {
-            sum += row[j] * x[j];
-        }
-        y[i] = sum;
-    }
-}
-
-static void tbqk_matvec_t(float * y, const float * m, const float * x, int64_t d) {
-    for (int64_t j = 0; j < d; ++j) {
-        const float * col = m + j*d;
-        float sum = 0.0f;
-        for (int64_t i = 0; i < d; ++i) {
-            sum += col[i] * x[i];
-        }
-        y[j] = sum;
-    }
-}
-
-static inline void tbqk_pack_3bit(uint8_t * dst, const uint8_t * idx, int64_t n) {
-    for (int64_t g = 0; g < n/8; ++g) {
-        uint32_t bits = 0;
-        for (int j = 0; j < 8; ++j) {
-            bits |= ((uint32_t)(idx[g*8 + j] & 0x7)) << (j*3);
-        }
-        dst[g*3 + 0] = (uint8_t)(bits & 0xff);
-        dst[g*3 + 1] = (uint8_t)((bits >> 8) & 0xff);
-        dst[g*3 + 2] = (uint8_t)((bits >> 16) & 0xff);
-    }
-}
-
-static inline void tbqk_unpack_3bit(uint8_t * idx, const uint8_t * src, int64_t n) {
-    for (int64_t g = 0; g < n/8; ++g) {
-        const uint32_t bits = (uint32_t) src[g*3 + 0] | ((uint32_t) src[g*3 + 1] << 8) | ((uint32_t) src[g*3 + 2] << 16);
-        for (int j = 0; j < 8; ++j) {
-            idx[g*8 + j] = (uint8_t)((bits >> (j*3)) & 0x7);
-        }
-    }
-}
-
-static inline void tbq_decode_rotated_3(const block_tbq3_0 * x, float * y) {
-    const float d = GGML_FP16_TO_FP32(x->d);
-    if (d == 0.0f) {
-        memset(y, 0, QK_TBQ * sizeof(float));
-        return;
-    }
-    for (int i = 0; i < QK_TBQ; ++i) {
-        y[i] = d * k_tbq3_codebook[tbq3_get_code(x->qs, i)];
-    }
-}
-
-static inline void tbq_decode_rotated_4(const block_tbq4_0 * x, float * y) {
-    const float d = GGML_FP16_TO_FP32(x->d);
-    if (d == 0.0f) {
-        memset(y, 0, QK_TBQ * sizeof(float));
-        return;
-    }
-    for (int i = 0; i < QK_TBQ; ++i) {
-        y[i] = d * k_tbq4_codebook[tbq4_get_code(x->qs, i)];
-    }
 }
 
 // reference implementation for deterministic creation of model files
@@ -408,76 +71,40 @@ void quantize_row_q1_0_ref(const float * GGML_RESTRICT x, block_q1_0 * GGML_REST
     }
 }
 
-// Sister to quantize_row_q1_0_ref / _g128_ref. Identical body, only the
-// block type and QK constant differ. The 79079c25e upstream/master merge
-// dropped this definition while leaving the declaration in
-// `ggml-quants.h:18` and three call sites (`ggml.c:683`, `ggml-quants.c:2265`
-// + `2271`, `ggml-cpu/quants.c:30`); link fails with
-// `undefined reference to 'quantize_row_q1_0_g32_ref'`.
-void quantize_row_q1_0_g32_ref(const float * GGML_RESTRICT x, block_q1_0_g32 * GGML_RESTRICT y, int64_t k) {
-    static const int qk = QK1_0_g32;
+void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK2_0;
 
     assert(k % qk == 0);
 
     const int nb = k / qk;
 
     for (int i = 0; i < nb; i++) {
-        float sum_abs = 0.0f;
+        // Compute scale as max absolute value in the block
+        float amax = 0.0f;
         for (int j = 0; j < qk; j++) {
-            sum_abs += fabsf(x[i*qk + j]);
+            const float a = fabsf(x[i*qk + j]);
+            if (a > amax) amax = a;
         }
-        const float d = sum_abs / qk;
+        const float d = amax;
+        const float id = d > 0.0f ? 1.0f / d : 0.0f;
 
         y[i].d = GGML_FP32_TO_FP16(d);
 
-        // Clear all bits first
-        for (int j = 0; j < qk / 8; ++j) {
+        // Clear quant bytes
+        for (int j = 0; j < qk / 4; ++j) {
             y[i].qs[j] = 0;
         }
 
-        // Just store sign of each weight directly (no normalization)
+        // Encode 2-bit values: round(w/d) clamped to [-1, 2], then add 1
+        // 00 (-1) = -scale, 01 (0) = 0, 10 (+1) = +scale, 11 (+2) = 2*scale
         for (int j = 0; j < qk; ++j) {
-            const int bit_index = j;
-            const int byte_index = bit_index / 8;
-            const int bit_offset = bit_index % 8;
-
-            if (x[i*qk + j] >= 0.0f) {
-                y[i].qs[byte_index] |= (1 << bit_offset);
-            }
-        }
-    }
-}
-
-void quantize_row_q1_0_g128_ref(const float * GGML_RESTRICT x, block_q1_0_g128 * GGML_RESTRICT y, int64_t k) {
-    static const int qk = QK1_0_g128;
-
-    assert(k % qk == 0);
-
-    const int nb = k / qk;
-
-    for (int i = 0; i < nb; i++) {
-        float sum_abs = 0.0f;
-        for (int j = 0; j < qk; j++) {
-            sum_abs += fabsf(x[i*qk + j]);
-        }
-        const float d = sum_abs / qk;
-
-        y[i].d = GGML_FP32_TO_FP16(d);
-
-        // Clear all bits first
-        for (int j = 0; j < qk / 8; ++j) {
-            y[i].qs[j] = 0;
-        }
-
-        // Just store sign of each weight directly (no normalization)
-        for (int j = 0; j < qk; ++j) {
-            const int bit_index = j;
-            const int byte_index = bit_index / 8;
-            const int bit_offset = bit_index % 8;
-
-            if (x[i*qk + j] >= 0.0f) {
-                y[i].qs[byte_index] |= (1 << bit_offset);
-            }
+            const float w = x[i*qk + j];
+            int q = (int)roundf(w * id) + 1;
+            if (q < 0) q = 0;
+            if (q > 3) q = 3;
+            const int byte_index = j / 4;
+            const int bit_offset = (j % 4) * 2;
+            y[i].qs[byte_index] |= ((uint8_t)q << bit_offset);
         }
     }
 }
@@ -789,7 +416,6 @@ void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RE
     }
 }
 
-
 void dequantize_row_q1_0(const block_q1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK1_0;
 
@@ -810,9 +436,8 @@ void dequantize_row_q1_0(const block_q1_0 * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
-// milady custom: Q1_0_g32 (32-token group, enum=200)
-void dequantize_row_q1_0_g32(const block_q1_0_g32 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    static const int qk = QK1_0_g32;
+void dequantize_row_q2_0(const block_q2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK2_0;
 
     assert(k % qk == 0);
 
@@ -820,38 +445,16 @@ void dequantize_row_q1_0_g32(const block_q1_0_g32 * GGML_RESTRICT x, float * GGM
 
     for (int i = 0; i < nb; i++) {
         const float d = GGML_FP16_TO_FP32(x[i].d);
-        const float neg_d = -d;
 
         for (int j = 0; j < qk; ++j) {
-            const int byte_index = j / 8;
-            const int bit_offset = j % 8;
-            const uint8_t bit = (x[i].qs[byte_index] >> bit_offset) & 1;
-            y[i*qk + j] = bit ? d : neg_d;
+            const int byte_index = j / 4;
+            const int bit_offset = (j % 4) * 2;
+            const uint8_t q = (x[i].qs[byte_index] >> bit_offset) & 0x03;
+            // 00=-1, 01=0, 10=+1, 11=+2
+            y[i*qk + j] = ((int)q - 1) * d;
         }
     }
 }
-
-// milady custom: Q1_0_g128 (128-token group, enum=201)
-void dequantize_row_q1_0_g128(const block_q1_0_g128 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    static const int qk = QK1_0_g128;
-
-    assert(k % qk == 0);
-
-    const int nb = k / qk;
-
-    for (int i = 0; i < nb; i++) {
-        const float d = GGML_FP16_TO_FP32(x[i].d);
-        const float neg_d = -d;
-
-        for (int j = 0; j < qk; ++j) {
-            const int byte_index = j / 8;
-            const int bit_offset = j % 8;
-            const uint8_t bit = (x[i].qs[byte_index] >> bit_offset) & 1;
-            y[i*qk + j] = bit ? d : neg_d;
-        }
-    }
-}
-
 
 void dequantize_row_q4_0(const block_q4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK4_0;
@@ -954,31 +557,13 @@ void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRI
 
     const int nb = k / qk;
 
-    #if defined(__ARM_FEATURE_SVE)
-        svbool_t pg = svptrue_b32();
-        const svfloat32_t inactive1 = svdup_n_f32(0.0f);
-        const int ggml_f32_epr = svcntw();
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
 
-        for (int i = 0; i < nb; i+=1) {
-            const float d1 = GGML_FP16_TO_FP32(x[i].d); // d:0
-
-            const int8_t *x_data1 = x[i].qs;
-            float *y_base = y + i * qk;
-            for (int j = 0; j < qk; j+=ggml_f32_epr) {
-                svint32_t vec0 = svld1sb_s32(pg, x_data1 + j);
-                svfloat32_t fvec0 = svmul_n_f32_m(pg, svcvt_f32_s32_m(inactive1, pg, vec0), d1); // Convert to float and scale
-                svst1_f32(pg, y_base + j, fvec0);
-            }
+        for (int j = 0; j < qk; ++j) {
+            y[i*qk + j] = x[i].qs[j]*d;
         }
-    #else
-        for (int i = 0; i < nb; i++) {
-            const float d = GGML_FP16_TO_FP32(x[i].d);
-
-            for (int j = 0; j < qk; ++j) {
-                y[i*qk + j] = x[i].qs[j]*d;
-            }
-        }
-    #endif
+    }
 }
 
 void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
@@ -2525,39 +2110,20 @@ size_t quantize_q1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     return nrow * row_size;
 }
 
-// milady custom: quantize_q1_0_g32 (enum=200)
-size_t quantize_q1_0_g32(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+size_t quantize_q2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     if (!quant_weights) {
-        quantize_row_q1_0_g32_ref(src, dst, (int64_t)nrow*n_per_row);
-        return nrow * ggml_row_size(GGML_TYPE_Q1_0_g32, n_per_row);
+        quantize_row_q2_0_ref(src, dst, (int64_t)nrow*n_per_row);
+        return nrow * ggml_row_size(GGML_TYPE_Q2_0, n_per_row);
     }
-    size_t row_size = ggml_row_size(GGML_TYPE_Q1_0_g32, n_per_row);
+    size_t row_size = ggml_row_size(GGML_TYPE_Q2_0, n_per_row);
     char * qrow = (char *)dst;
     for (int64_t row = 0; row < nrow; ++row) {
-        quantize_row_q1_0_g32_ref(src, (block_q1_0_g32*)qrow, n_per_row);
+        quantize_row_q2_0_ref(src, (block_q2_0*)qrow, n_per_row);
         src += n_per_row;
         qrow += row_size;
     }
     return nrow * row_size;
 }
-
-// milady custom: quantize_q1_0_g128 (enum=201)
-size_t quantize_q1_0_g128(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
-    if (!quant_weights) {
-        quantize_row_q1_0_g128_ref(src, dst, (int64_t)nrow*n_per_row);
-        return nrow * ggml_row_size(GGML_TYPE_Q1_0_g128, n_per_row);
-    }
-    size_t row_size = ggml_row_size(GGML_TYPE_Q1_0_g128, n_per_row);
-    char * qrow = (char *)dst;
-    for (int64_t row = 0; row < nrow; ++row) {
-        quantize_row_q1_0_g128_ref(src, (block_q1_0_g128*)qrow, n_per_row);
-        src += n_per_row;
-        qrow += row_size;
-    }
-    return nrow * row_size;
-}
-
-
 
 size_t quantize_q4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     if (!quant_weights) {
@@ -2845,140 +2411,6 @@ void quantize_row_tq2_0_ref(const float * GGML_RESTRICT x, block_tq2_0 * GGML_RE
     }
 }
 
-void quantize_row_tbq3_0_ref(const float * GGML_RESTRICT x, block_tbq3_0 * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_TBQ == 0);
-    const int64_t nb = k / QK_TBQ;
-
-    for (int64_t i = 0; i < nb; ++i) {
-        float rotated[QK_TBQ];
-        tbq_precondition_block(x + i*QK_TBQ, rotated);
-
-        float sumsq = 0.0f;
-        for (int j = 0; j < QK_TBQ; ++j) {
-            sumsq += rotated[j] * rotated[j];
-        }
-
-        const float d = sqrtf(sumsq / QK_TBQ);
-        y[i].d = GGML_FP32_TO_FP16(d);
-        memset(y[i].qs, 0, sizeof(y[i].qs));
-
-        if (d == 0.0f) {
-            continue;
-        }
-
-        const float id = 1.0f / d;
-        for (int j = 0; j < QK_TBQ; ++j) {
-            tbq3_set_code(y[i].qs, j, tbq_best_index(8, k_tbq3_codebook, rotated[j] * id));
-        }
-    }
-}
-
-void quantize_row_tbq4_0_ref(const float * GGML_RESTRICT x, block_tbq4_0 * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_TBQ == 0);
-    const int64_t nb = k / QK_TBQ;
-
-    for (int64_t i = 0; i < nb; ++i) {
-        float rotated[QK_TBQ];
-        tbq_precondition_block(x + i*QK_TBQ, rotated);
-
-        float sumsq = 0.0f;
-        for (int j = 0; j < QK_TBQ; ++j) {
-            sumsq += rotated[j] * rotated[j];
-        }
-
-        const float d = sqrtf(sumsq / QK_TBQ);
-        y[i].d = GGML_FP32_TO_FP16(d);
-        memset(y[i].qs, 0, sizeof(y[i].qs));
-
-        if (d == 0.0f) {
-            continue;
-        }
-
-        const float id = 1.0f / d;
-        for (int j = 0; j < QK_TBQ; ++j) {
-            tbq4_set_code(y[i].qs, j, tbq_best_index(16, k_tbq4_codebook, rotated[j] * id));
-        }
-    }
-}
-
-void quantize_row_tbq3_k_ref(const float * GGML_RESTRICT x, block_tbq3_k * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_K == 0);
-    const int64_t nb = k / QK_K;
-    float unit[QK_K];
-    float rotated[QK_K];
-    uint8_t idx[QK_K];
-    const float * q = tbqk_get_q_row(128);
-    const float scale = sqrtf((float) QK_K);
-
-    for (int64_t i = 0; i < nb; ++i) {
-        const float * xb = x + i*QK_K;
-        float norm_sq = 0.0f;
-        for (int j = 0; j < QK_K; ++j) {
-            norm_sq += xb[j]*xb[j];
-        }
-
-        float norm = sqrtf(norm_sq);
-        if (norm < 1e-10f) {
-            norm = 1e-10f;
-        }
-
-        const float inv_norm = 1.0f / norm;
-        for (int j = 0; j < QK_K; ++j) {
-            unit[j] = xb[j] * inv_norm;
-        }
-        for (int j = 0; j < QK_K; j += 128) {
-            tbqk_matvec_row(rotated + j, q, unit + j, 128);
-        }
-        for (int j = 0; j < QK_K; ++j) {
-            idx[j] = tbq_boundary_index(8, k_tbq3_boundaries, rotated[j] * scale);
-        }
-
-        tbqk_pack_3bit(y[i].qs, idx, QK_K);
-        y[i].d = GGML_FP32_TO_FP16(norm);
-    }
-}
-
-void quantize_row_tbq4_k_ref(const float * GGML_RESTRICT x, block_tbq4_k * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_K == 0);
-    const int64_t nb = k / QK_K;
-    float unit[QK_K];
-    float rotated[QK_K];
-    const float * q = tbqk_get_q_row(128);
-    const float scale = sqrtf((float) QK_K);
-
-    for (int64_t i = 0; i < nb; ++i) {
-        const float * xb = x + i*QK_K;
-        float norm_sq = 0.0f;
-        for (int j = 0; j < QK_K; ++j) {
-            norm_sq += xb[j]*xb[j];
-        }
-
-        float norm = sqrtf(norm_sq);
-        if (norm < 1e-10f) {
-            norm = 1e-10f;
-        }
-
-        const float inv_norm = 1.0f / norm;
-        for (int j = 0; j < QK_K; ++j) {
-            unit[j] = xb[j] * inv_norm;
-        }
-        for (int j = 0; j < QK_K; j += 128) {
-            tbqk_matvec_row(rotated + j, q, unit + j, 128);
-        }
-
-        memset(y[i].qs, 0, sizeof(y[i].qs));
-        for (int j = 0; j < QK_K; ++j) {
-            const uint8_t code = tbq_boundary_index(16, k_tbq4_boundaries, rotated[j] * scale);
-            if ((j & 1) == 0) {
-                y[i].qs[j/2] = code;
-            } else {
-                y[i].qs[j/2] |= (uint8_t)(code << 4);
-            }
-        }
-        y[i].d = GGML_FP32_TO_FP16(norm);
-    }
-}
-
 size_t quantize_tq1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     (void)quant_weights; // not used
     const size_t row_size = ggml_row_size(GGML_TYPE_TQ1_0, n_per_row);
@@ -2990,34 +2422,6 @@ size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     (void)quant_weights; // not used
     const size_t row_size = ggml_row_size(GGML_TYPE_TQ2_0, n_per_row);
     quantize_row_tq2_0_ref(src, dst, (int64_t)nrow*n_per_row);
-    return nrow * row_size;
-}
-
-size_t quantize_tbq3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
-    (void) quant_weights;
-    const size_t row_size = ggml_row_size(GGML_TYPE_TBQ3_0, n_per_row);
-    quantize_row_tbq3_0_ref(src, dst, (int64_t) nrow*n_per_row);
-    return nrow * row_size;
-}
-
-size_t quantize_tbq4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
-    (void) quant_weights;
-    const size_t row_size = ggml_row_size(GGML_TYPE_TBQ4_0, n_per_row);
-    quantize_row_tbq4_0_ref(src, dst, (int64_t) nrow*n_per_row);
-    return nrow * row_size;
-}
-
-size_t quantize_tbq3_k(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
-    (void) quant_weights;
-    const size_t row_size = ggml_row_size(GGML_TYPE_TBQ3_K, n_per_row);
-    quantize_row_tbq3_k_ref(src, dst, (int64_t) nrow*n_per_row);
-    return nrow * row_size;
-}
-
-size_t quantize_tbq4_k(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
-    (void) quant_weights;
-    const size_t row_size = ggml_row_size(GGML_TYPE_TBQ4_K, n_per_row);
-    quantize_row_tbq4_k_ref(src, dst, (int64_t) nrow*n_per_row);
     return nrow * row_size;
 }
 
@@ -3077,386 +2481,6 @@ void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_REST
             }
         }
     }
-}
-
-void dequantize_row_tbq3_0(const block_tbq3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_TBQ == 0);
-    const int64_t nb = k / QK_TBQ;
-
-    for (int64_t i = 0; i < nb; ++i) {
-        float rotated[QK_TBQ];
-        tbq_decode_rotated_3(&x[i], rotated);
-        tbq_uncondition_block(rotated);
-        memcpy(y + i*QK_TBQ, rotated, sizeof(rotated));
-    }
-}
-
-void dequantize_row_tbq4_0(const block_tbq4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_TBQ == 0);
-    const int64_t nb = k / QK_TBQ;
-
-    for (int64_t i = 0; i < nb; ++i) {
-        float rotated[QK_TBQ];
-        tbq_decode_rotated_4(&x[i], rotated);
-        tbq_uncondition_block(rotated);
-        memcpy(y + i*QK_TBQ, rotated, sizeof(rotated));
-    }
-}
-
-void dequantize_row_tbq3_k(const block_tbq3_k * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_K == 0);
-    const int64_t nb = k / QK_K;
-    float rotated[QK_K];
-    float unit[QK_K];
-    uint8_t idx[QK_K];
-    const float * q = tbqk_get_q_col(128);
-    const float scale = 1.0f / sqrtf((float) QK_K);
-
-    for (int64_t i = 0; i < nb; ++i) {
-        const float norm = GGML_FP16_TO_FP32(x[i].d);
-        tbqk_unpack_3bit(idx, x[i].qs, QK_K);
-        for (int j = 0; j < QK_K; ++j) {
-            rotated[j] = k_tbq3_codebook[idx[j]] * scale;
-        }
-        for (int j = 0; j < QK_K; j += 128) {
-            tbqk_matvec_t(unit + j, q, rotated + j, 128);
-        }
-        for (int j = 0; j < QK_K; ++j) {
-            y[i*QK_K + j] = unit[j] * norm;
-        }
-    }
-}
-
-void dequantize_row_tbq4_k(const block_tbq4_k * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_K == 0);
-    const int64_t nb = k / QK_K;
-    float rotated[QK_K];
-    float unit[QK_K];
-    const float * q = tbqk_get_q_col(128);
-    const float scale = 1.0f / sqrtf((float) QK_K);
-
-    for (int64_t i = 0; i < nb; ++i) {
-        const float norm = GGML_FP16_TO_FP32(x[i].d);
-        for (int j = 0; j < QK_K; ++j) {
-            const uint8_t code = (j & 1) == 0 ? (x[i].qs[j/2] & 0x0f) : ((x[i].qs[j/2] >> 4) & 0x0f);
-            rotated[j] = k_tbq4_codebook[code] * scale;
-        }
-        for (int j = 0; j < QK_K; j += 128) {
-            tbqk_matvec_t(unit + j, q, rotated + j, 128);
-        }
-        for (int j = 0; j < QK_K; ++j) {
-            y[i*QK_K + j] = unit[j] * norm;
-        }
-    }
-}
-
-// ====================== TurboQuant TCQ-3 (TBQ3_TCQ) reference kernels
-//
-// Trellis-coded 3-bit-per-element K-cache type, 128-element blocks. Mechanically
-// ported from packages/inference/reference/turbo_kernels.c
-// (eliza_quantize_turbo3_tcq_block / eliza_dequantize_turbo3_tcq_block) onto
-// ggml's in-tree block_tbq3_tcq. The CUDA decode kernel
-// (ggml-cuda/turbo-tcq.cu) and the Metal kernel are bit-identical to
-// dequantize_row_tbq3_tcq below; they index k_tbq3_tcq_codebook[state] directly.
-// The encoder rotates into the WHT basis (orthogonal — preserves L2 geometry,
-// which is what the attention score consumes), runs a 512-state Viterbi forward
-// pass + backtrack, then re-corrects the per-block norm against the codebook
-// reconstruction. Decode is a single sliding-9-bit-window lookup (no inverse
-// rotation — the codebook lives in the rotated basis; this matches the K-cache
-// score path which never needs the unrotated key vector).
-//
-// Block layout (locked, see ggml-common.h):
-//   ggml_half d;       // per-block L2 norm (Viterbi-corrected)
-//   uint8_t   qs[49];  // 6 prefix bits (initial_state >> 3) + 128*3 symbol bits,
-//                      // LSB-first within byte, byte-major across qs[]
-//   uint8_t   pad;     // alignment to 52 B (3.25 bpw)
-
-#include "ggml-tcq-codebook.h"
-
-static void tbq3_tcq_fwht_128(float * GGML_RESTRICT x) {
-    for (int h = 1; h < 128; h *= 2) {
-        for (int i = 0; i < 128; i += h * 2) {
-            for (int j = i; j < i + h; j++) {
-                const float a = x[j];
-                const float b = x[j + h];
-                x[j]     = a + b;
-                x[j + h] = a - b;
-            }
-        }
-    }
-    const float inv_sqrt_128 = 0.08838834764831845f;
-    for (int i = 0; i < 128; i++) x[i] *= inv_sqrt_128;
-}
-
-static void tbq3_tcq_rotate_forward(float * GGML_RESTRICT x) {
-    for (int i = 0; i < 128; i++) x[i] *= k_tbq3_tcq_wht_signs1[i];
-    tbq3_tcq_fwht_128(x);
-    for (int i = 0; i < 128; i++) x[i] *= k_tbq3_tcq_wht_signs2[i];
-}
-
-void quantize_row_tbq3_tcq_ref(const float * GGML_RESTRICT x, block_tbq3_tcq * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_TBQ3_TCQ == 0);
-    const int64_t nb = k / QK_TBQ3_TCQ;
-
-    for (int64_t i = 0; i < nb; ++i) {
-        float xb[128];
-        float norm_sq = 0.0f;
-        for (int j = 0; j < 128; j++) { xb[j] = x[i*128 + j]; norm_sq += xb[j] * xb[j]; }
-        const float grp_norm = sqrtf(norm_sq);
-        const float inv_norm = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
-        for (int j = 0; j < 128; j++) xb[j] *= inv_norm;
-        tbq3_tcq_rotate_forward(xb);
-
-        // Viterbi forward pass: 512-state right-shift trellis
-        // (state' = ((state & 0x3F) << 3) | out). Free initial state (cost 0).
-        float cost_a[512];
-        float cost_b[512];
-        uint8_t bt[128 * 64]; // best predecessor low-bits per low-6-bit group per step
-        for (int s = 0; s < 512; s++) cost_a[s] = 0.0f;
-        float * cur = cost_a;
-        float * nxt = cost_b;
-
-        for (int t = 0; t < 128; t++) {
-            float pred_min[64];
-            for (int low = 0; low < 64; low++) {
-                const int base_prev = low << 3;
-                float best = cur[base_prev];
-                int best_p = 0;
-                for (int p = 1; p < 8; p++) {
-                    const float c = cur[base_prev | p];
-                    if (c < best) { best = c; best_p = p; }
-                }
-                pred_min[low] = best;
-                bt[t * 64 + low] = (uint8_t) best_p;
-            }
-            for (int s = 0; s < 512; s++) {
-                const int pred_idx = s & 0x3F;
-                const float dist = xb[t] - k_tbq3_tcq_codebook[s];
-                nxt[s] = pred_min[pred_idx] + dist * dist;
-            }
-            float * tmp = cur; cur = nxt; nxt = tmp;
-        }
-
-        int final_state = 0;
-        float best_cost = cur[0];
-        for (int s = 1; s < 512; s++) {
-            if (cur[s] < best_cost) { best_cost = cur[s]; final_state = s; }
-        }
-
-        uint8_t outputs[128];
-        int state = final_state;
-        for (int t = 127; t >= 0; t--) {
-            outputs[t] = (uint8_t) ((state >> 6) & 0x7);
-            const int p = bt[t * 64 + (state & 0x3F)];
-            state = ((state & 0x3F) << 3) | p;
-        }
-        const int initial_state = state;
-
-        // Norm correction against the codebook reconstruction.
-        float recon_sq = 0.0f;
-        for (int t = 0; t < 128; t++) {
-            int s;
-            if (t < 2) {
-                s = initial_state;
-                for (int kk = 0; kk <= t; kk++) {
-                    s = (s >> 3) | (((int) outputs[kk]) << 6);
-                }
-            } else {
-                s = ((int) outputs[t - 2] & 0x7)
-                  | (((int) outputs[t - 1] & 0x7) << 3)
-                  | (((int) outputs[t]     & 0x7) << 6);
-            }
-            const float c = k_tbq3_tcq_codebook[s];
-            recon_sq += c * c;
-        }
-        const float recon_norm = sqrtf(recon_sq);
-        const float corrected = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
-        y[i].d = GGML_FP32_TO_FP16(corrected);
-
-        // Bitpack: 6 bits of (initial_state >> 3), then 128 * 3-bit symbols.
-        memset(y[i].qs, 0, sizeof(y[i].qs));
-        const int init_bits = (initial_state >> 3) & 0x3F;
-        for (int byte = 0; byte < 49; byte++) {
-            uint8_t packed = 0;
-            for (int bit = 0; bit < 8; bit++) {
-                const int pos = byte * 8 + bit;
-                int v = 0;
-                if (pos < 6) {
-                    v = (init_bits >> pos) & 1;
-                } else {
-                    const int sym_bit = pos - 6;
-                    const int sym_idx = sym_bit / 3;
-                    if (sym_idx < 128) v = (outputs[sym_idx] >> (sym_bit % 3)) & 1;
-                }
-                packed |= (uint8_t) (v << bit);
-            }
-            y[i].qs[byte] = packed;
-        }
-        y[i].pad = 0;
-    }
-}
-
-void dequantize_row_tbq3_tcq(const block_tbq3_tcq * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_TBQ3_TCQ == 0);
-    const int64_t nb = k / QK_TBQ3_TCQ;
-
-    for (int64_t i = 0; i < nb; ++i) {
-        const float n = GGML_FP16_TO_FP32(x[i].d);
-        for (int t = 0; t < 128; t++) {
-            const int bit_pos  = t * 3;
-            const int byte_idx = bit_pos / 8;
-            const int bit_off  = bit_pos % 8;
-            uint16_t raw = (uint16_t) x[i].qs[byte_idx];
-            if (byte_idx + 1 < 49) raw |= (uint16_t) x[i].qs[byte_idx + 1] << 8;
-            const int s = (raw >> bit_off) & 0x1FF;
-            y[i*128 + t] = k_tbq3_tcq_codebook[s] * n;
-        }
-    }
-}
-
-size_t quantize_tbq3_tcq(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
-    (void) quant_weights;
-    const size_t row_size = ggml_row_size(GGML_TYPE_TBQ3_TCQ, n_per_row);
-    quantize_row_tbq3_tcq_ref(src, dst, (int64_t) nrow*n_per_row);
-    return nrow * row_size;
-}
-
-// ====================== PolarQuant Q4 (Q4_POLAR) reference kernels
-
-#include <stdbool.h>
-
-// Runtime toggle, see ggml-quants.h. Default false: dequantize ignores
-// the on-disk QJL byte until the loader has verified PRNG parity with
-// the sidecar that produced it.
-static bool s_q4_polar_use_qjl = false;
-
-void ggml_q4_polar_set_use_qjl(bool use_qjl) { s_q4_polar_use_qjl = use_qjl; }
-bool ggml_q4_polar_get_use_qjl(void) { return s_q4_polar_use_qjl; }
-
-//
-// Mechanically ported from
-//   packages/native-plugins/polarquant-cpu/src/polar_{quantize,dequantize}_ref.c
-// onto ggml's in-tree block_q4_polar / block_q8_0 types.
-//
-// Block layout (locked, see ggml-common.h):
-//   ggml_half d;                          // per-block L2 norm
-//   uint8_t   qs[QK_POLAR/2];             // 4-bit Lloyd-Max indices, 2 per byte
-//   uint8_t   qjl[QJL_RESIDUAL_BYTES];    // optional 1-bit QJL residual sign
-//
-// 82 bytes/block. With qjl: 5.125 bpw. Without (qjl bytes zero on disk
-// and decoder skips correction): 4.125 bpw effective.
-
-#include "polar_centroids.h"
-
-void quantize_row_q4_polar_ref(const float * GGML_RESTRICT x, block_q4_polar * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_POLAR == 0);
-    const int64_t nb = k / QK_POLAR;
-
-    float qjl_signs[QK_POLAR];
-    polar_qjl_signs(qjl_signs);
-
-    for (int64_t b = 0; b < nb; b++) {
-        const float * src = x + b * QK_POLAR;
-        block_q4_polar * dst = y + b;
-
-        // 1. L2 norm
-        double sumsq = 0.0;
-        for (int i = 0; i < QK_POLAR; i++) {
-            sumsq += (double)src[i] * (double)src[i];
-        }
-        const float l2     = (float)sqrt(sumsq);
-        const float inv_l2 = (l2 > 1e-10f) ? (1.0f / l2) : 0.0f;
-        dst->d = GGML_FP32_TO_FP16(l2);
-
-        // 2. Normalize
-        float buf[QK_POLAR];
-        for (int i = 0; i < QK_POLAR; i++) {
-            buf[i] = src[i] * inv_l2;
-        }
-
-        // 3. Walsh-Hadamard rotation -> N(0,1) coordinates
-        polar_hadamard_inplace(buf);
-
-        // 4+5. Bucketize and pack 2 codes per byte (low nibble = even index)
-        uint8_t codes[QK_POLAR];
-        for (int i = 0; i < QK_POLAR; i++) {
-            codes[i] = polar_q4_bucketize(buf[i]);
-        }
-        for (int i = 0; i < QK_POLAR / 2; i++) {
-            const uint8_t lo = codes[2 * i];
-            const uint8_t hi = codes[2 * i + 1];
-            dst->qs[i] = (uint8_t)((hi << 4) | (lo & 0x0F));
-        }
-
-        // 6. Always emit one QJL residual sign bit. The on-disk size is
-        //    fixed; the GGUF metadata flag drives whether the decoder
-        //    consumes it. Reserved bytes 1..15 stay zero for forward-
-        //    compatible per-coord residuals without a layout change.
-        memset(dst->qjl, 0, QJL_RESIDUAL_BYTES);
-        float proj = 0.0f;
-        for (int i = 0; i < QK_POLAR; i++) {
-            const float c = POLAR_Q4_CENTROIDS[codes[i]];
-            proj += (buf[i] - c) * qjl_signs[i];
-        }
-        dst->qjl[0] = (proj >= 0.0f) ? 1u : 0u;
-    }
-}
-
-void dequantize_row_q4_polar(const block_q4_polar * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_POLAR == 0);
-    const int64_t nb = k / QK_POLAR;
-
-    float qjl_signs[QK_POLAR];
-    polar_qjl_signs(qjl_signs);
-
-    const float inv_d = 1.0f / (float)QK_POLAR;
-
-    for (int64_t b = 0; b < nb; b++) {
-        const block_q4_polar * src = x + b;
-        float * dst = y + b * QK_POLAR;
-
-        const float l2 = GGML_FP16_TO_FP32(src->d);
-
-        // 1+2. Unpack codes -> centroid values
-        float buf[QK_POLAR];
-        for (int i = 0; i < QK_POLAR / 2; i++) {
-            const uint8_t byte = src->qs[i];
-            const uint8_t lo = (uint8_t)(byte & 0x0Fu);
-            const uint8_t hi = (uint8_t)((byte >> 4) & 0x0Fu);
-            buf[2 * i]     = POLAR_Q4_CENTROIDS[lo];
-            buf[2 * i + 1] = POLAR_Q4_CENTROIDS[hi];
-        }
-
-        // 3. Optional QJL residual correction. Gated on the runtime flag
-        //    because the sign-vector PRNG isn't portable across encoder
-        //    implementations (see ggml_q4_polar_set_use_qjl docs).
-        if (s_q4_polar_use_qjl) {
-            const uint8_t bit = (uint8_t)(src->qjl[0] & 1u);
-            const float sign  = bit ? 1.0f : -1.0f;
-            const float mag   = POLAR_QJL_CORRECTION_MAGNITUDE / sqrtf((float)QK_POLAR);
-            for (int i = 0; i < QK_POLAR; i++) {
-                buf[i] += sign * mag * qjl_signs[i];
-            }
-        }
-
-        // 4. Inverse Hadamard + 1/QK_POLAR compensation for the butterfly's scale
-        polar_hadamard_inplace(buf);
-        for (int i = 0; i < QK_POLAR; i++) {
-            buf[i] *= inv_d;
-        }
-
-        // 5. Per-block L2 rescale
-        for (int i = 0; i < QK_POLAR; i++) {
-            dst[i] = buf[i] * l2;
-        }
-    }
-}
-
-size_t quantize_q4_polar(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
-    (void)quant_weights;
-    const size_t row_size = ggml_row_size(GGML_TYPE_Q4_POLAR, n_per_row);
-    quantize_row_q4_polar_ref(src, (block_q4_polar *)dst, (int64_t)nrow * n_per_row);
-    return nrow * row_size;
 }
 
 // ====================== "True" 2-bit (de)-quantization
@@ -4116,70 +3140,121 @@ void iq2xs_init_impl(enum ggml_type type) {
         }
         kmap_q2xs[index] = i;
     }
-    int8_t pos[8];
-    int * dist2 = (int *)malloc(2*grid_size*sizeof(int));
+    // The neighbour search runs in three passes:
+    //   1. Parallel: for each i, qsort and count its neighbours into n_per_i,
+    //      and reduce the totals (num_neighbors, num_not_in_map).
+    //   2. Serial: prefix-sum n_per_i into offsets[], so each i has a
+    //      pre-assigned slice of kneighbors_q2xs to write into.
+    //   3. Parallel: redo the qsort and write each i's neighbour list at
+    //      offsets[i].
+    int * n_per_i = (int *)malloc(kmap_size*sizeof(int));
+    GGML_ASSERT(n_per_i);
     int num_neighbors = 0, num_not_in_map = 0;
-    for (int i = 0; i < kmap_size; ++i) {
-        if (kmap_q2xs[i] >= 0) continue;
-        ++num_not_in_map;
-        for (int k = 0; k < 8; ++k) {
-            int l = (i >> 2*k) & 0x3;
-            pos[k] = 2*l + 1;
-        }
-        for (int j = 0; j < grid_size; ++j) {
-            const int8_t * pg = (const int8_t *)(kgrid_q2xs + j);
-            int d2 = 0;
-            for (int k = 0; k < 8; ++k) d2 += (pg[k] - pos[k])*(pg[k] - pos[k]);
-            dist2[2*j+0] = d2;
-            dist2[2*j+1] = j;
-        }
-        qsort(dist2, grid_size, 2*sizeof(int), iq2_compare_func);
-        int n = 0; int d2 = dist2[0];
-        int nhave = 1;
-        for (int j = 0; j < grid_size; ++j) {
-            if (dist2[2*j] > d2) {
-                if (nhave == nwant) break;
-                d2 = dist2[2*j];
-                ++nhave;
+#ifdef GGML_USE_OPENMP
+    #pragma omp parallel reduction(+:num_neighbors,num_not_in_map)
+#endif
+    {
+        int * dist2 = (int *)malloc(2*grid_size*sizeof(int));
+        GGML_ASSERT(dist2);
+        int8_t pos[8];
+        int i;
+#ifdef GGML_USE_OPENMP
+        #pragma omp for schedule(dynamic, 64)
+#endif
+        for (i = 0; i < kmap_size; ++i) {
+            if (kmap_q2xs[i] >= 0) {
+                n_per_i[i] = 0;
+                continue;
             }
-            ++n;
+            ++num_not_in_map;
+            for (int k = 0; k < 8; ++k) {
+                int l = (i >> 2*k) & 0x3;
+                pos[k] = 2*l + 1;
+            }
+            for (int j = 0; j < grid_size; ++j) {
+                const int8_t * pg = (const int8_t *)(kgrid_q2xs + j);
+                int d2 = 0;
+                for (int k = 0; k < 8; ++k) d2 += (pg[k] - pos[k])*(pg[k] - pos[k]);
+                dist2[2*j+0] = d2;
+                dist2[2*j+1] = j;
+            }
+            qsort(dist2, grid_size, 2*sizeof(int), iq2_compare_func);
+            int n = 0; int d2 = dist2[0];
+            int nhave = 1;
+            for (int j = 0; j < grid_size; ++j) {
+                if (dist2[2*j] > d2) {
+                    if (nhave == nwant) break;
+                    d2 = dist2[2*j];
+                    ++nhave;
+                }
+                ++n;
+            }
+            n_per_i[i] = n;
+            num_neighbors += n;
         }
-        num_neighbors += n;
+        free(dist2);
     }
     //printf("%s: %d neighbours in total\n", __func__, num_neighbors);
     kneighbors_q2xs = (uint16_t *)malloc((num_neighbors + num_not_in_map)*sizeof(uint16_t));
     iq2_data[gindex].neighbours = kneighbors_q2xs;
+
+    int * offsets = (int *)malloc(kmap_size*sizeof(int));
+    GGML_ASSERT(offsets);
     int counter = 0;
     for (int i = 0; i < kmap_size; ++i) {
-        if (kmap_q2xs[i] >= 0) continue;
-        for (int k = 0; k < 8; ++k) {
-            int l = (i >> 2*k) & 0x3;
-            pos[k] = 2*l + 1;
+        if (kmap_q2xs[i] >= 0) {
+            offsets[i] = -1;
+            continue;
         }
-        for (int j = 0; j < grid_size; ++j) {
-            const int8_t * pg = (const int8_t *)(kgrid_q2xs + j);
-            int d2 = 0;
-            for (int k = 0; k < 8; ++k) d2 += (pg[k] - pos[k])*(pg[k] - pos[k]);
-            dist2[2*j+0] = d2;
-            dist2[2*j+1] = j;
-        }
-        qsort(dist2, grid_size, 2*sizeof(int), iq2_compare_func);
-        kmap_q2xs[i] = -(counter + 1);
-        int d2 = dist2[0];
-        uint16_t * start = &kneighbors_q2xs[counter++];
-        int n = 0, nhave = 1;
-        for (int j = 0; j < grid_size; ++j) {
-            if (dist2[2*j] > d2) {
-                if (nhave == nwant) break;
-                d2 = dist2[2*j];
-                ++nhave;
-            }
-            kneighbors_q2xs[counter++] = dist2[2*j+1];
-            ++n;
-        }
-        *start = n;
+        offsets[i] = counter;
+        counter += 1 + n_per_i[i];
     }
-    free(dist2);
+
+#ifdef GGML_USE_OPENMP
+    #pragma omp parallel
+#endif
+    {
+        int * dist2 = (int *)malloc(2*grid_size*sizeof(int));
+        GGML_ASSERT(dist2);
+        int8_t pos[8];
+        int i;
+#ifdef GGML_USE_OPENMP
+        #pragma omp for schedule(dynamic, 64)
+#endif
+        for (i = 0; i < kmap_size; ++i) {
+            if (kmap_q2xs[i] >= 0) continue;
+            for (int k = 0; k < 8; ++k) {
+                int l = (i >> 2*k) & 0x3;
+                pos[k] = 2*l + 1;
+            }
+            for (int j = 0; j < grid_size; ++j) {
+                const int8_t * pg = (const int8_t *)(kgrid_q2xs + j);
+                int d2 = 0;
+                for (int k = 0; k < 8; ++k) d2 += (pg[k] - pos[k])*(pg[k] - pos[k]);
+                dist2[2*j+0] = d2;
+                dist2[2*j+1] = j;
+            }
+            qsort(dist2, grid_size, 2*sizeof(int), iq2_compare_func);
+            int local_counter = offsets[i];
+            kmap_q2xs[i] = -(local_counter + 1);
+            int d2 = dist2[0];
+            uint16_t * start = &kneighbors_q2xs[local_counter++];
+            int n = 0, nhave = 1;
+            for (int j = 0; j < grid_size; ++j) {
+                if (dist2[2*j] > d2) {
+                    if (nhave == nwant) break;
+                    d2 = dist2[2*j];
+                    ++nhave;
+                }
+                kneighbors_q2xs[local_counter++] = dist2[2*j+1];
+                ++n;
+            }
+            *start = n;
+        }
+        free(dist2);
+    }
+    free(offsets);
+    free(n_per_i);
 }
 
 void iq2xs_free_impl(enum ggml_type type) {
@@ -4715,70 +3790,115 @@ void iq3xs_init_impl(int grid_size) {
         }
         kmap_q3xs[index] = i;
     }
-    int8_t pos[4];
-    int * dist2 = (int *)malloc(2*grid_size*sizeof(int));
+    // See explanation of parallelism in iq2xs_init_impl
+    int * n_per_i = (int *)malloc(kmap_size*sizeof(int));
+    GGML_ASSERT(n_per_i);
     int num_neighbors = 0, num_not_in_map = 0;
-    for (int i = 0; i < kmap_size; ++i) {
-        if (kmap_q3xs[i] >= 0) continue;
-        ++num_not_in_map;
-        for (int k = 0; k < 4; ++k) {
-            int l = (i >> 3*k) & 0x7;
-            pos[k] = 2*l + 1;
-        }
-        for (int j = 0; j < grid_size; ++j) {
-            const int8_t * pg = (const int8_t *)(kgrid_q3xs + j);
-            int d2 = 0;
-            for (int k = 0; k < 4; ++k) d2 += (pg[k] - pos[k])*(pg[k] - pos[k]);
-            dist2[2*j+0] = d2;
-            dist2[2*j+1] = j;
-        }
-        qsort(dist2, grid_size, 2*sizeof(int), iq3_compare_func);
-        int n = 0; int d2 = dist2[0];
-        int nhave = 1;
-        for (int j = 0; j < grid_size; ++j) {
-            if (dist2[2*j] > d2) {
-                if (nhave == nwant) break;
-                d2 = dist2[2*j];
-                ++nhave;
+#ifdef GGML_USE_OPENMP
+    #pragma omp parallel reduction(+:num_neighbors,num_not_in_map)
+#endif
+    {
+        int * dist2 = (int *)malloc(2*grid_size*sizeof(int));
+        GGML_ASSERT(dist2);
+        int8_t pos[4];
+        int i;
+#ifdef GGML_USE_OPENMP
+        #pragma omp for schedule(dynamic, 64)
+#endif
+        for (i = 0; i < kmap_size; ++i) {
+            if (kmap_q3xs[i] >= 0) {
+                n_per_i[i] = 0;
+                continue;
             }
-            ++n;
+            ++num_not_in_map;
+            for (int k = 0; k < 4; ++k) {
+                int l = (i >> 3*k) & 0x7;
+                pos[k] = 2*l + 1;
+            }
+            for (int j = 0; j < grid_size; ++j) {
+                const int8_t * pg = (const int8_t *)(kgrid_q3xs + j);
+                int d2 = 0;
+                for (int k = 0; k < 4; ++k) d2 += (pg[k] - pos[k])*(pg[k] - pos[k]);
+                dist2[2*j+0] = d2;
+                dist2[2*j+1] = j;
+            }
+            qsort(dist2, grid_size, 2*sizeof(int), iq3_compare_func);
+            int n = 0; int d2 = dist2[0];
+            int nhave = 1;
+            for (int j = 0; j < grid_size; ++j) {
+                if (dist2[2*j] > d2) {
+                    if (nhave == nwant) break;
+                    d2 = dist2[2*j];
+                    ++nhave;
+                }
+                ++n;
+            }
+            n_per_i[i] = n;
+            num_neighbors += n;
         }
-        num_neighbors += n;
+        free(dist2);
     }
     //printf("%s: %d neighbours in total\n", __func__, num_neighbors);
     kneighbors_q3xs = (uint16_t *)malloc((num_neighbors + num_not_in_map)*sizeof(uint16_t));
     iq3_data[gindex].neighbours = kneighbors_q3xs;
+
+    int * offsets = (int *)malloc(kmap_size*sizeof(int));
+    GGML_ASSERT(offsets);
     int counter = 0;
     for (int i = 0; i < kmap_size; ++i) {
-        if (kmap_q3xs[i] >= 0) continue;
-        for (int k = 0; k < 4; ++k) {
-            int l = (i >> 3*k) & 0x7;
-            pos[k] = 2*l + 1;
+        if (kmap_q3xs[i] >= 0) {
+            offsets[i] = -1;
+            continue;
         }
-        for (int j = 0; j < grid_size; ++j) {
-            const int8_t * pg = (const int8_t *)(kgrid_q3xs + j);
-            int d2 = 0;
-            for (int k = 0; k < 4; ++k) d2 += (pg[k] - pos[k])*(pg[k] - pos[k]);
-            dist2[2*j+0] = d2;
-            dist2[2*j+1] = j;
-        }
-        qsort(dist2, grid_size, 2*sizeof(int), iq3_compare_func);
-        kmap_q3xs[i] = -(counter + 1);
-        int d2 = dist2[0];
-        uint16_t * start = &kneighbors_q3xs[counter++];
-        int n = 0, nhave = 1;
-        for (int j = 0; j < grid_size; ++j) {
-            if (dist2[2*j] > d2) {
-                if (nhave == nwant) break;
-                d2 = dist2[2*j];
-                ++nhave;
-            }
-            kneighbors_q3xs[counter++] = dist2[2*j+1];
-            ++n;
-        }
-        *start = n;
+        offsets[i] = counter;
+        counter += 1 + n_per_i[i];
     }
-    free(dist2);
+
+#ifdef GGML_USE_OPENMP
+    #pragma omp parallel
+#endif
+    {
+        int * dist2 = (int *)malloc(2*grid_size*sizeof(int));
+        GGML_ASSERT(dist2);
+        int8_t pos[4];
+        int i;
+#ifdef GGML_USE_OPENMP
+        #pragma omp for schedule(dynamic, 64)
+#endif
+        for (i = 0; i < kmap_size; ++i) {
+            if (kmap_q3xs[i] >= 0) continue;
+            for (int k = 0; k < 4; ++k) {
+                int l = (i >> 3*k) & 0x7;
+                pos[k] = 2*l + 1;
+            }
+            for (int j = 0; j < grid_size; ++j) {
+                const int8_t * pg = (const int8_t *)(kgrid_q3xs + j);
+                int d2 = 0;
+                for (int k = 0; k < 4; ++k) d2 += (pg[k] - pos[k])*(pg[k] - pos[k]);
+                dist2[2*j+0] = d2;
+                dist2[2*j+1] = j;
+            }
+            qsort(dist2, grid_size, 2*sizeof(int), iq3_compare_func);
+            int local_counter = offsets[i];
+            kmap_q3xs[i] = -(local_counter + 1);
+            int d2 = dist2[0];
+            uint16_t * start = &kneighbors_q3xs[local_counter++];
+            int n = 0, nhave = 1;
+            for (int j = 0; j < grid_size; ++j) {
+                if (dist2[2*j] > d2) {
+                    if (nhave == nwant) break;
+                    d2 = dist2[2*j];
+                    ++nhave;
+                }
+                kneighbors_q3xs[local_counter++] = dist2[2*j+1];
+                ++n;
+            }
+            *start = n;
+        }
+        free(dist2);
+    }
+    free(offsets);
+    free(n_per_i);
 }
 
 void iq3xs_free_impl(int grid_size) {
@@ -6413,13 +5533,9 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q1_0, data, nb);
             } break;
-        case GGML_TYPE_Q1_0_g32:
+        case GGML_TYPE_Q2_0:
             {
-                VALIDATE_ROW_DATA_D_F16_IMPL(block_q1_0_g32, data, nb);
-            } break;
-        case GGML_TYPE_Q1_0_g128:
-            {
-                VALIDATE_ROW_DATA_D_F16_IMPL(block_q1_0_g128, data, nb);
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_q2_0, data, nb);
             } break;
         case GGML_TYPE_Q4_0:
             {
@@ -6487,18 +5603,6 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_TQ2_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_tq2_0, data, nb);
-            } break;
-        case GGML_TYPE_TBQ3_0:
-            {
-                VALIDATE_ROW_DATA_D_F16_IMPL(block_tbq3_0, data, nb);
-            } break;
-        case GGML_TYPE_TBQ4_0:
-            {
-                VALIDATE_ROW_DATA_D_F16_IMPL(block_tbq4_0, data, nb);
-            } break;
-        case GGML_TYPE_TBQ3_TCQ:
-            {
-                VALIDATE_ROW_DATA_D_F16_IMPL(block_tbq3_tcq, data, nb);
             } break;
         case GGML_TYPE_IQ1_S:
             {

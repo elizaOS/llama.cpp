@@ -155,13 +155,13 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_MXFP4_MOE     = 38, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
-        // milady custom ftype values
-        LLAMA_FTYPE_MOSTLY_Q1_0_g32      = 100, // except 1d tensors
-        LLAMA_FTYPE_MOSTLY_Q1_0_g128     = 101, // except 1d tensors
-        LLAMA_FTYPE_MOSTLY_Q4_POLAR      = 102, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
+
+    // Get the model file type (quantization) as a string, e.g. "Q8_0" or "Q4_K - Medium"
+    LLAMA_API const char * llama_ftype_name(enum llama_ftype ftype);
 
     enum llama_rope_scaling_type {
         LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED = -1,
@@ -343,6 +343,7 @@ extern "C" {
         uint32_t n_ubatch;          // physical maximum batch size
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
         uint32_t n_rs_seq;          // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
+        uint32_t n_outputs_max;     // max outputs in a ubatch (0 = n_batch)
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing
 
@@ -385,7 +386,6 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
-        bool kv_dynamic;  // enable dynamic KV cache resizing (start small, grow on demand)
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -393,10 +393,8 @@ extern "C" {
         struct llama_sampler_seq_config * samplers;
         size_t                            n_samplers;
 
-        // sibling context whose model supplies shared inputs / KV cache.
-        // required for arches that read from another model (gemma4-assistant MTP
-        // drafter reads the target model's token embeddings and shares its KV).
-        // null for all other arches. (the caller keeps this context alive.)
+        // a source/target/parent context
+        // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
     };
 
@@ -557,22 +555,22 @@ extern "C" {
 
     DEPRECATED(LLAMA_API int32_t llama_n_vocab    (const struct llama_vocab * vocab), "use llama_vocab_n_tokens instead");
 
-    LLAMA_API const struct llama_model * llama_get_model    (const struct llama_context * ctx);
-    LLAMA_API       struct llama_context * llama_get_ctx_other(struct llama_context * ctx);
+    LLAMA_API const struct llama_model * llama_get_model   (const struct llama_context * ctx);
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
 
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
     LLAMA_API enum llama_rope_type       llama_model_rope_type(const struct llama_model * model);
 
-    LLAMA_API int32_t llama_model_n_ctx_train(const struct llama_model * model);
-    LLAMA_API int32_t llama_model_n_embd     (const struct llama_model * model);
-    LLAMA_API int32_t llama_model_n_embd_inp (const struct llama_model * model);
-    LLAMA_API int32_t llama_model_n_embd_out (const struct llama_model * model);
-    LLAMA_API int32_t llama_model_n_layer    (const struct llama_model * model);
-    LLAMA_API int32_t llama_model_n_head     (const struct llama_model * model);
-    LLAMA_API int32_t llama_model_n_head_kv  (const struct llama_model * model);
-    LLAMA_API int32_t llama_model_n_swa      (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_ctx_train  (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_embd       (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_embd_inp   (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
 
     // Get the model's RoPE frequency scaling factor
     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
@@ -611,6 +609,9 @@ extern "C" {
 
     // Get a string describing the model type
     LLAMA_API int32_t llama_model_desc(const struct llama_model * model, char * buf, size_t buf_size);
+
+    // Get the model file type (quantization), e.g. LLAMA_FTYPE_MOSTLY_Q8_0
+    LLAMA_API enum llama_ftype llama_model_ftype(const struct llama_model * model);
 
     // Returns the total size of all the tensors in the model in bytes
     LLAMA_API uint64_t llama_model_size(const struct llama_model * model);
@@ -760,7 +761,7 @@ extern "C" {
               llama_seq_id seq_id,
                  llama_pos p0,
                  llama_pos p1,
-                   int32_t d);
+                       int d);
 
     // Returns the smallest position present in the memory for the specified sequence
     // This is typically non-zero only for SWA caches
@@ -886,7 +887,8 @@ extern "C" {
 // work only with partial states, such as SWA KV cache or recurrent cache (e.g. Mamba)
 #define LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY 1
 
-// keeps the tensor data on device buffers (i.e. not accessible in host memory, but faster save/load)
+// Keeps the tensor data on device buffers (i.e. not accessible in host memory, but faster save/load).
+// Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
     typedef uint32_t llama_state_seq_flags;
@@ -986,7 +988,11 @@ extern "C" {
 
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
-    LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);
+    //
+    // note: using this can cause extra graph reallocations because it changes the graph topology with MoE models,
+    //       so it is generally not recommended to use in practice. will be removed in the future
+    DEPRECATED(LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup),
+            "user code should do warmup runs manually [TAG_LLAMA_GRAPH_NO_WARMUP]");
 
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
@@ -1310,7 +1316,7 @@ extern "C" {
     LLAMA_API struct llama_sampler * llama_sampler_chain_get(      struct llama_sampler * chain, int32_t i);
 
     // the total number of samplers in the chain
-    LLAMA_API int32_t                llama_sampler_chain_n  (const struct llama_sampler * chain);
+    LLAMA_API int                    llama_sampler_chain_n  (const struct llama_sampler * chain);
 
     // after removing a sampler, the chain will no longer own it, and it will not be freed when the chain is freed
     LLAMA_API struct llama_sampler * llama_sampler_chain_remove(   struct llama_sampler * chain, int32_t i);
@@ -1348,11 +1354,11 @@ extern "C" {
     LLAMA_API struct llama_sampler * llama_sampler_init_top_n_sigma(float   n);
 
     /// @details Mirostat 1.0 algorithm described in the paper https://arxiv.org/abs/2007.14966. Uses tokens instead of words.
-    /// @param n_vocab The number of tokens in the vocabulary
-    /// @param seed The sampler seed
+    /// @param candidates A vector of `llama_token_data` containing the candidate tokens, their probabilities (p), and log-odds (logit) for the current position in the generated text.
     /// @param tau  The target cross-entropy (or surprise) value you want to achieve for the generated text. A higher value corresponds to more surprising or less predictable text, while a lower value corresponds to less surprising or more predictable text.
     /// @param eta The learning rate used to update `mu` based on the error between the target and observed surprisal of the sampled word. A larger learning rate will cause `mu` to be updated more quickly, while a smaller learning rate will result in slower updates.
     /// @param m The number of tokens considered in the estimation of `s_hat`. This is an arbitrary value that is used to calculate `s_hat`, which in turn helps to calculate the value of `k`. In the paper, they use `m = 100`, but you can experiment with different values to see how it affects the performance of the algorithm.
+    /// @param mu Maximum cross-entropy. This value is initialized to be twice the target cross-entropy (`2 * tau`) and is updated in the algorithm based on the error between the target and observed surprisal.
     LLAMA_API struct llama_sampler * llama_sampler_init_mirostat(
                              int32_t   n_vocab,
                             uint32_t   seed,
@@ -1361,10 +1367,10 @@ extern "C" {
                              int32_t   m);
 
     /// @details Mirostat 2.0 algorithm described in the paper https://arxiv.org/abs/2007.14966. Uses tokens instead of words.
-    /// @param seed The sampler seed
     /// @param candidates A vector of `llama_token_data` containing the candidate tokens, their probabilities (p), and log-odds (logit) for the current position in the generated text.
     /// @param tau  The target cross-entropy (or surprise) value you want to achieve for the generated text. A higher value corresponds to more surprising or less predictable text, while a lower value corresponds to less surprising or more predictable text.
     /// @param eta The learning rate used to update `mu` based on the error between the target and observed surprisal of the sampled word. A larger learning rate will cause `mu` to be updated more quickly, while a smaller learning rate will result in slower updates.
+    /// @param mu Maximum cross-entropy. This value is initialized to be twice the target cross-entropy (`2 * tau`) and is updated in the algorithm based on the error between the target and observed surprisal.
     LLAMA_API struct llama_sampler * llama_sampler_init_mirostat_v2(
                             uint32_t   seed,
                                float   tau,
@@ -1420,24 +1426,6 @@ extern "C" {
                              int32_t    dry_penalty_last_n,
                           const char ** seq_breakers,
                               size_t    num_breakers);
-
-    /// repeat-line: segment-level loop detection.
-    ///
-    /// detects when the model repeats the same sentence/segment (which token-level repeat_penalty cannot catch).
-    /// when a repeated segment is detected, temperature is temporarily boosted.
-    ///
-    /// params:
-    ///   vocab       - vocabulary (for token decoding)
-    ///   window      - number of past segments to compare against (0 = disabled)
-    ///   min_length  - ignore segments shorter than this (default 10, avoids false positives like "Ok.")
-    ///   delimiters  - characters that end a segment (default "\n.!?:")
-    ///   temp_boost  - temperature boost applied when a loop is detected (default 0.3)
-    LLAMA_API struct llama_sampler * llama_sampler_init_repeat_line(
-            const struct llama_vocab * vocab,
-                             int32_t   window,
-                             int32_t   min_length,
-                          const char * delimiters,
-                               float   temp_boost);
 
     /// adaptive-p: select tokens near a configurable target probability over time.
     ///
@@ -1600,31 +1588,6 @@ extern "C" {
             int64_t                   idata_split,
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
-
-    //
-    // EAGLE3 speculative-decoding scaffolding (upstream PR #18039)
-    //
-    // These are stub declarations only. The full EAGLE3 port (graph
-    // builder, hparams, model loader wiring, drafter integration) is
-    // deferred — see /tmp/wave6-eagle3-real-journal.md.
-    //
-    // Both functions currently return failure / NULL with an
-    // explanatory log line, so callers wired up against the future
-    // API surface fail loudly instead of silently.
-    //
-
-    // Returns a pointer to the cached EAGLE3 "target features" tensor
-    // captured during the target model's last decode, or NULL if
-    // EAGLE3 is not active on this context.
-    LLAMA_API struct ggml_tensor * llama_get_eagle3_target_features(struct llama_context * ctx);
-
-    // Pushes target-model hidden-state embeddings into the EAGLE3
-    // drafter context. Returns 0 on success, -1 on failure.
-    LLAMA_API int32_t llama_set_eagle3_g_embeddings(
-            struct llama_context * ctx,
-            const float          * embd,
-            size_t                 n_embd,
-            size_t                 n_tokens);
 
 #ifdef __cplusplus
 }

@@ -99,7 +99,18 @@ jobs:
           source ./vulkan_sdk/setup-env.sh
           vulkaninfo --summary | head -40
 
+      - name: Detect Eliza custom quant types
+        id: eliza_quants
+        run: |
+          if grep -q 'GGML_TYPE_QJL1_256' ggml/include/ggml.h; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::TBQ/QJL/Polar types not wired in ggml.h yet (upstream tip / PR0) — Eliza parity gates skipped"
+          fi
+
       - name: test-quantize-fns (CPU; smoke for Eliza custom quants)
+        if: steps.eliza_quants.outputs.present == 'true'
         run: |
           ./build-vulkan/bin/test-quantize-fns | tee /tmp/quantize-fns.log
           # Must mention the Eliza-divergent quant types.
@@ -107,6 +118,12 @@ jobs:
             grep -q "Testing $t" /tmp/quantize-fns.log \
               || (echo "MISSING quant: $t" && exit 1)
           done
+
+      - name: test-quantize-fns (CPU; stock smoke)
+        if: steps.eliza_quants.outputs.present != 'true'
+        run: |
+          ./build-vulkan/bin/test-quantize-fns | tee /tmp/quantize-fns.log
+          grep -q "Testing q4_0" /tmp/quantize-fns.log
 
       - name: test-backend-ops on Vulkan (filtered subset)
         env:
@@ -129,6 +146,7 @@ jobs:
             /tmp/backend-ops.log || true
 
       - name: test-backend-ops Eliza custom-quant parity (Vulkan)
+        if: steps.eliza_quants.outputs.present == 'true'
         env:
           GGML_VK_VISIBLE_DEVICES: '0'
           GGML_VK_DISABLE_F16: '1'

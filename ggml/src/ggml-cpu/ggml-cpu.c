@@ -82,6 +82,9 @@ float ggml_table_f32_f16[1 << 16];
 // precomputed f32 table for e8m0 half (1 KB) (simd-mappings.h)
 float ggml_table_f32_e8m0_half[1 << 8];
 
+// precomputed f32 table for ue4m3 (1 KB) (simd-mappings.h)
+float ggml_table_f32_ue4m3[1 << 8];
+
 #if defined(__ARM_ARCH)
 struct ggml_arm_arch_features_type {
     int sve_cnt;
@@ -206,11 +209,6 @@ typedef pthread_t ggml_thread_t;
 #include <unistd.h>
 #include <mach/mach.h>
 #include <TargetConditionals.h>
-
-#if defined(__aarch64__) && TARGET_OS_MAC
-#include "macos-scheduling.h"
-#endif
-
 #endif
 
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
@@ -232,15 +230,9 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
-    [GGML_TYPE_Q1_0_g32] = {
-        .from_float               = quantize_row_q1_0_g32,
-        .vec_dot                  = ggml_vec_dot_q1_0_g32_q8_0,
-        .vec_dot_type             = GGML_TYPE_Q8_0,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_Q1_0_g128] = {
-        .from_float               = quantize_row_q1_0_g128,
-        .vec_dot                  = ggml_vec_dot_q1_0_g128_q8_0,
+    [GGML_TYPE_Q2_0] = {
+        .from_float               = quantize_row_q2_0,
+        .vec_dot                  = ggml_vec_dot_q2_0_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
@@ -415,49 +407,6 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_tq2_0,
         .vec_dot                  = ggml_vec_dot_tq2_0_q8_K,
         .vec_dot_type             = GGML_TYPE_Q8_K,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_TBQ3_0] = {
-        .from_float               = quantize_row_tbq3_0,
-        .vec_dot                  = ggml_vec_dot_tbq3_0_f32,
-        .vec_dot_type             = GGML_TYPE_F32,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_TBQ4_0] = {
-        .from_float               = quantize_row_tbq4_0,
-        .vec_dot                  = ggml_vec_dot_tbq4_0_f32,
-        .vec_dot_type             = GGML_TYPE_F32,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_TBQ3_K] = {
-        .from_float               = quantize_row_tbq3_k,
-        .vec_dot                  = ggml_vec_dot_tbq3_k_q8_K,
-        .vec_dot_type             = GGML_TYPE_Q8_K,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_TBQ4_K] = {
-        .from_float               = quantize_row_tbq4_k,
-        .vec_dot                  = ggml_vec_dot_tbq4_k_q8_K,
-        .vec_dot_type             = GGML_TYPE_Q8_K,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_TBQ3_TCQ] = {
-        // TCQ-3 is K-cache-only, like QJL: never a mul_mat operand. The
-        // attention path scores against the (WHT-rotated) cache directly.
-        // We only need from_float so ggml_cpy(K_cur -> K_view) can quantize.
-        .from_float               = quantize_row_tbq3_tcq,
-    },
-    [GGML_TYPE_QJL1_256] = {
-        // QJL is K-cache-only; it is never an operand to mul_mat. The
-        // attention path uses GGML_OP_ATTN_SCORE_QJL instead, which calls
-        // qjl_score_qk() directly and bypasses the vec_dot table. We only
-        // need from_float so ggml_cpy(K_cur -> K_view) can quantize.
-        .from_float               = quantize_row_qjl1_256,
-    },
-    [GGML_TYPE_Q4_POLAR] = {
-        .from_float               = quantize_row_q4_polar,
-        .vec_dot                  = ggml_vec_dot_q4_polar_q8_0,
-        .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
     [GGML_TYPE_I32] = {
@@ -1972,6 +1921,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_im2col_3d(params, tensor);
             } break;
+        case GGML_OP_COL2IM_1D:
+            {
+                ggml_compute_forward_col2im_1d(params, tensor);
+            } break;
         case GGML_OP_CONV_2D:
             {
                 ggml_compute_forward_conv_2d(params, tensor);
@@ -2048,27 +2001,6 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_flash_attn_ext(params, tensor);
             } break;
-        case GGML_OP_ATTN_SCORE_QJL:
-            {
-                ggml_compute_forward_attn_score_qjl(params, tensor);
-            } break;
-        case GGML_OP_ATTN_SCORE_TBQ:
-            {
-                // ELIZA-TBQ-POLAR-ATTN-DISPATCH-V1 (CPU reference)
-                // Scalar correctness oracle for the Metal kernel of the
-                // same name. Not perf-tuned; the production path is
-                // Metal. Lets test-backend-ops compare backend output
-                // against a CPU result. See attn-score-tbq-polar.c.
-                ggml_compute_forward_attn_score_tbq(params, tensor);
-            } break;
-        case GGML_OP_ATTN_SCORE_POLAR:
-            {
-                ggml_compute_forward_attn_score_polar(params, tensor);
-            } break;
-        case GGML_OP_FUSED_ATTN_QJL_TBQ:
-            {
-                ggml_compute_forward_fused_attn_qjl_tbq(params, tensor);
-            } break;
         case GGML_OP_FLASH_ATTN_BACK:
             {
                 int32_t t = ggml_get_op_params_i32(tensor, 0);
@@ -2100,10 +2032,6 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_glu(params, tensor);
             } break;
-        case GGML_OP_ISTFT:
-            {
-                ggml_compute_forward_istft(params, tensor);
-            } break;
         case GGML_OP_GET_REL_POS:
             {
                 ggml_compute_forward_get_rel_pos(params, tensor);
@@ -2131,6 +2059,22 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_GATED_DELTA_NET:
             {
                 ggml_compute_forward_gated_delta_net(params, tensor);
+            } break;
+        case GGML_OP_LIGHTNING_INDEXER:
+            {
+                ggml_compute_forward_lightning_indexer(params, tensor);
+            } break;
+        case GGML_OP_DSV4_HC_COMB:
+            {
+                ggml_compute_forward_dsv4_hc_comb(params, tensor);
+            } break;
+        case GGML_OP_DSV4_HC_PRE:
+            {
+                ggml_compute_forward_dsv4_hc_pre(params, tensor);
+            } break;
+        case GGML_OP_DSV4_HC_POST:
+            {
+                ggml_compute_forward_dsv4_hc_post(params, tensor);
             } break;
         case GGML_OP_MAP_CUSTOM1:
             {
@@ -2312,6 +2256,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_DSV4_HC_COMB:
+        case GGML_OP_DSV4_HC_PRE:
+        case GGML_OP_DSV4_HC_POST:
             {
                 n_tasks = n_threads;
             } break;
@@ -2428,6 +2375,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONV_2D:
         case GGML_OP_CONV_3D:
         case GGML_OP_CONV_2D_DW:
+        case GGML_OP_COL2IM_1D:
         case GGML_OP_CONV_TRANSPOSE_1D:
         case GGML_OP_CONV_TRANSPOSE_2D:
             {
@@ -2451,6 +2399,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
+        case GGML_OP_LIGHTNING_INDEXER:
             {
                 n_tasks = n_threads;
             } break;
@@ -2460,24 +2409,6 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             {
                 const int64_t n_heads = node->src[1]->ne[1];
                 n_tasks = MIN(n_threads, n_heads);
-            } break;
-        case GGML_OP_ATTN_SCORE_QJL:
-        case GGML_OP_ATTN_SCORE_TBQ:
-        case GGML_OP_ATTN_SCORE_POLAR:
-        case GGML_OP_FUSED_ATTN_QJL_TBQ:
-            {
-                // ELIZA-CPU-THREAD-PARALLELISM-V1
-                // QJL score forward, the fused QJL-K + TBQ-V kernel, and
-                // the TBQ / POLAR packed-K attention-score CPU references
-                // all split the flattened (ne3, n_batch, h_q) output
-                // space over ith/nth — each task owns disjoint score rows
-                // / head outputs, no shared scratch race (the fused op
-                // takes a per-task wdata slice; see the work-size case).
-                // TBQ / POLAR are correctness oracles for the Metal
-                // kernels (production path is Metal); they are listed
-                // here so they get full thread fan-out instead of falling
-                // through to the n_tasks default branch.
-                n_tasks = n_threads;
             } break;
         case GGML_OP_WIN_PART:
         case GGML_OP_WIN_UNPART:
@@ -2530,12 +2461,6 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
             {
-                n_tasks = n_threads;
-            } break;
-        case GGML_OP_ISTFT:
-            {
-                // iSTFT is parallelized per frame; n_tasks = n_threads capped
-                // by the number of output frames at runtime — set max here.
                 n_tasks = n_threads;
             } break;
         case GGML_OP_NONE:
@@ -2682,18 +2607,6 @@ static bool ggml_thread_apply_priority(int32_t prio) {
 
     return true;
 }
-
-#if defined(CLUSTER_SCHEDULING_AVAILABLE)
-/* if it's a secondary SME thread, call this as a hint to the OS. */
-static void ggml_thread_apply_sme_settings(int ith) {
-    int cnt = pthread_qos_max_parallelism(QOS_CLASS_USER_INTERACTIVE, PTHREAD_MAX_PARALLELISM_CLUSTER);
-    if (ith != 0 && ith <= cnt) {
-#if 0
-        pthread_prefer_alternate_amx_self();
-#endif
-    }
-}
-#endif
 
 #elif defined(__gnu_linux__)
 // TODO: this may not work on BSD, to be verified
@@ -2961,7 +2874,14 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_OUT_PROD:
                     {
-                        if (ggml_is_quantized(node->src[0]->type)) {
+                        if (ggml_is_quantized(node->src[0]->type) ||
+                            node->src[0]->type == GGML_TYPE_F16) {
+                            cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
+                        }
+                    } break;
+                case GGML_OP_SET_ROWS:
+                    {
+                        if (node->src[0]->type == GGML_TYPE_F16 && node->type != GGML_TYPE_F16) {
                             cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
                         }
                     } break;
@@ -3040,13 +2960,6 @@ struct ggml_cplan ggml_graph_plan(
 
                         cur += MAX(prefill, decode);
                     } break;
-                // ELIZA-CPU-THREAD-PARALLELISM-V1
-                case GGML_OP_FUSED_ATTN_QJL_TBQ:
-                    {
-                        // per-task softmax-weight scratch: n_kv_tokens fp32.
-                        // src[1] is the packed K cache, ne[1] = n_kv_tokens.
-                        cur += sizeof(float) * node->src[1]->ne[1] * n_tasks;
-                    } break;
                 case GGML_OP_FLASH_ATTN_BACK:
                     {
                         const int64_t    D = node->src[0]->ne[0];
@@ -3071,7 +2984,7 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_GATED_DELTA_NET:
                     {
                         const int64_t S_v = node->src[2]->ne[0];
-                        const int64_t K   = node->src[5]->ne[1];  // state is (D, K, n_seqs)
+                        const int64_t K   = ggml_get_op_params_i32(node, 0);
                         const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
                         cur = per_thread * sizeof(float) * n_tasks;
                     } break;
@@ -3079,6 +2992,12 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         GGML_ABORT("fatal error");
                     }
+                case GGML_OP_LIGHTNING_INDEXER:
+                    {
+                        // temp buffer for dequantizing lightning indexer keys
+                        const int64_t ne10 = node->src[1]->ne[0];
+                        cur += sizeof(float)*ne10*n_tasks;
+                    } break;
                 default:
                     break;
             }
@@ -3287,10 +3206,6 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
     if (ggml_thread_cpumask_is_valid(state->cpumask)) {
         ggml_thread_apply_affinity(state->cpumask);
     }
-
-#if defined(CLUSTER_SCHEDULING_AVAILABLE)
-    ggml_thread_apply_sme_settings(state->ith);
-#endif
 
     while (true) {
         // Check if we need to sleep
@@ -3892,6 +3807,14 @@ int ggml_cpu_has_sme(void) {
 #endif
 }
 
+int ggml_cpu_has_sme2(void) {
+#if defined(__ARM_ARCH) && defined(__ARM_FEATURE_SME2)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
 void ggml_cpu_init(void) {
     // needed to initialize ggml_time
     {
@@ -3923,6 +3846,11 @@ void ggml_cpu_init(void) {
             // initialize E8M0 half table (256 entries)
             for (int i = 0; i < (1 << 8); ++i) {
                 ggml_table_f32_e8m0_half[i] = GGML_E8M0_TO_FP32_HALF(i);
+            }
+
+            // initialize UE4M3 table (256 entries)
+            for (int i = 0; i < (1 << 8); ++i) {
+                ggml_table_f32_ue4m3[i] = ggml_ue4m3_to_fp32(i);
             }
 
             const uint64_t t_end = ggml_time_us(); UNUSED(t_end);

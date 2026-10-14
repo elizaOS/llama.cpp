@@ -96,11 +96,8 @@ typedef sycl::half2 ggml_half2;
 #define QI1_0 (QK1_0 / 32)
 #define QR1_0 1
 
-// milady custom Q1_0 variants
-#define QI1_0_g32  (QK1_0_g32 / 32)   // g32: 32-token group
-#define QR1_0_g32  1
-#define QI1_0_g128 (QK1_0_g128 / 32)  // g128: 128-token group
-#define QR1_0_g128 1
+#define QI2_0 (QK2_0 / 32)
+#define QR2_0 1
 
 
 #define QI4_0 (QK4_0 / (4 * QR4_0))
@@ -126,9 +123,6 @@ typedef sycl::half2 ggml_half2;
 
 #define QI8_1 (QK8_1 / (4 * QR8_1))
 #define QR8_1 1
-
-#define QR_TBQ3 2
-#define QR_TBQ4 2
 
 #define QI2_K (QK_K / (4*QR2_K))
 #define QR2_K 4
@@ -183,7 +177,6 @@ typedef sycl::half2 ggml_half2;
 #define GGML_EXTENSION __extension__
 #endif // _MSC_VER
 
-// upstream Q1_0: 128-token group block
 #define QK1_0 128
 typedef struct {
     ggml_half d;           // delta
@@ -191,21 +184,12 @@ typedef struct {
 } block_q1_0;
 static_assert(sizeof(block_q1_0) == sizeof(ggml_half) + QK1_0 / 8, "wrong q1_0 block size/padding");
 
-// milady custom Q1_0 variants (renumbered to 200-range enum IDs)
-#define QK1_0_g32 32  // MUST match QK8_0 for vec_dot computation
+#define QK2_0 64
 typedef struct {
-    ggml_half d;              // delta
-    uint8_t qs[QK1_0_g32 / 8]; // bits / quants
-} block_q1_0_g32;
-static_assert(sizeof(block_q1_0_g32) == sizeof(ggml_half) + QK1_0_g32 / 8, "wrong q1_0_g32 block size/padding");
-
-#define QK1_0_g128 128
-typedef struct {
-    ggml_half d;               // delta
-    uint8_t qs[QK1_0_g128 / 8]; // bits / quants
-} block_q1_0_g128;
-static_assert(sizeof(block_q1_0_g128) == sizeof(ggml_half) + QK1_0_g128 / 8, "wrong q1_0_g128 block size/padding");
-
+    ggml_half d;              // delta (scale)
+    uint8_t qs[QK2_0 / 4];   // 2 bits per element
+} block_q2_0;
+static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
 
 #define QK4_0 32
 typedef struct {
@@ -270,87 +254,6 @@ typedef struct {
     int8_t  qs[QK8_0]; // quants
 } block_q8_0;
 static_assert(sizeof(block_q8_0) == sizeof(ggml_half) + QK8_0, "wrong q8_0 block size/padding");
-
-#define QK_TBQ 32
-typedef struct {
-    ggml_half d;              // block RMS after TurboQuant preconditioning
-    uint8_t qs[QK_TBQ * 3/8]; // 3-bit codes, 3.5 bpw effective with the scale
-} block_tbq3_0;
-static_assert(sizeof(block_tbq3_0) == sizeof(ggml_half) + QK_TBQ * 3/8, "wrong tbq3_0 block size/padding");
-
-typedef struct {
-    ggml_half d;          // block RMS after TurboQuant preconditioning
-    uint8_t qs[QK_TBQ/2]; // 4-bit codes packed like q4_0
-} block_tbq4_0;
-static_assert(sizeof(block_tbq4_0) == sizeof(ggml_half) + QK_TBQ/2, "wrong tbq4_0 block size/padding");
-
-typedef struct {
-    uint8_t qs[QK_K * 3 / 8]; // upstream-style 3-bit codes over a QK_K block
-    ggml_half d;              // L2 norm before TurboQuant rotation
-} block_tbq3_k;
-static_assert(sizeof(block_tbq3_k) == sizeof(ggml_half) + QK_K * 3 / 8, "wrong tbq3_k block size/padding");
-
-typedef struct {
-    uint8_t qs[QK_K / 2]; // upstream-style 4-bit codes over a QK_K block
-    ggml_half d;          // L2 norm before TurboQuant rotation
-} block_tbq4_k;
-static_assert(sizeof(block_tbq4_k) == sizeof(ggml_half) + QK_K / 2, "wrong tbq4_k block size/padding");
-
-// QJL: 1-bit Quantized JL Transform K-cache compression. One block stores
-// the packed signs of Π·k for one cached key vector together with the bf16
-// L2 norm of the original key. Layout matches qjl_block_qjl1_256 in the
-// vendored kernel library at packages/native-plugins/qjl-cpu/include/qjl/qjl.h
-// and ggml-cpu/qjl/include/qjl/qjl.h: 32 bytes of packed signs first, then
-// the 16-bit bf16 norm. The companion attention-score path is
-// GGML_OP_ATTN_SCORE_QJL.
-//
-// `d` holds the raw bf16 bits as uint16_t (same on-cache footprint as
-// ggml_bf16_t, which is itself a `struct { uint16_t bits; }` wrapper).
-// Field order is signs-then-norm so the cast in
-// ggml-cpu/qjl/quants-qjl.c::quantize_row_qjl1_256
-//   `qjl_quantize_rows(x, prj, (qjl_block_qjl1_256 *)y, n_blocks)`
-// produces an on-cache block with bytewise-identical contents to what the
-// kernel library writes — verified by the parity test at
-// packages/native-plugins/qjl-cpu/test/qjl_fork_parity.c.
-#define QK_QJL 256  // projection_dim_per_head (= sketch dim, NOT head_dim)
-typedef struct {
-    uint8_t signs[QK_QJL/8];   // packed 1-bit signs of Π·k, 8 per byte LSB-first
-    uint16_t d;                // bf16 L2 norm of the original key vector
-} block_qjl1_256;
-static_assert(sizeof(block_qjl1_256) == 2 + QK_QJL/8, "wrong qjl1_256 block size/padding");
-
-// PolarQuant Q4: 128-element block.
-//   d        per-block L2 norm (fp16)
-//   qs       16 Lloyd-Max centroid indices, 2 per byte (low nibble even, high nibble odd)
-//   qjl      optional 1-bit QJL residual sign vector (bit 0 of byte 0 currently used; rest reserved)
-// Total 82 bytes/block. With qjl: 5.125 bpw. Without (qjl bytes zero on disk): 4.125 bpw effective.
-#define QK_POLAR 128
-#define QJL_RESIDUAL_BYTES (QK_POLAR / 8)
-typedef struct {
-    ggml_half d;                          // per-block L2 norm
-    uint8_t   qs[QK_POLAR / 2];           // 4-bit centroid indices (2 per byte)
-    uint8_t   qjl[QJL_RESIDUAL_BYTES];    // optional 1-bit QJL residual sign
-} block_q4_polar;
-static_assert(sizeof(block_q4_polar) == sizeof(ggml_half) + QK_POLAR / 2 + QJL_RESIDUAL_BYTES, "wrong q4_polar block size/padding");
-
-// TBQ3_TCQ — TurboQuant TCQ-3: trellis-coded 3-bit per element with a
-// 9-bit (3 most-recent symbols, 512-entry) sliding-window codebook lookup.
-// Per block (128 elements):
-//   norm      fp16 reconstruction-corrected L2 norm
-//   qs[49]    6 prefix bits (initial state >> 3) followed by 128*3 = 390
-//             symbol bits, LSB-first within byte, byte-major across qs[].
-//   pad       alignment to 52 bytes total.
-// Decode: for symbol t, read 9-bit window starting at bit position (t*3),
-// look up codebook[state] * norm. Encoder is host-side Viterbi; CUDA kernel
-// only handles decode + dot. Layout matches the reference at
-// packages/inference/reference/turbo_kernels.{h,c} (eliza_block_turbo3_tcq).
-#define QK_TBQ3_TCQ 128
-typedef struct {
-    ggml_half d;       // per-block L2 norm (Viterbi-corrected)
-    uint8_t   qs[49];  // 6 prefix bits + 128*3-bit symbol stream
-    uint8_t   pad;     // alignment
-} block_tbq3_tcq;
-static_assert(sizeof(block_tbq3_tcq) == sizeof(ggml_half) + 49 + 1, "wrong tbq3_tcq block size/padding");
 
 #define QK8_1 32
 typedef struct {
@@ -1218,11 +1121,12 @@ GGML_TABLE_BEGIN(int8_t, kvalues_iq4nl, 16)
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 GGML_TABLE_END()
 
-// e2m1 values (doubled)
+// e2m1 values (doubled), shared by MXFP4 and NVFP4
 // ref: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
-GGML_TABLE_BEGIN(int8_t, kvalues_mxfp4, 16)
+GGML_TABLE_BEGIN(int8_t, kvalues_fp4, 16)
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
 GGML_TABLE_END()
+#define kvalues_mxfp4 kvalues_fp4
 
 #define NGRID_IQ1S 2048
 #define IQ1S_DELTA 0.125f

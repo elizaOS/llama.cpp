@@ -104,48 +104,16 @@ option(LLAMA_SANITIZE_UNDEFINED "llama: enable undefined sanitizer" OFF)
 option(LLAMA_BUILD_COMMON "llama: build common utils library" ${LLAMA_STANDALONE})
 
 # extra artifacts
-option(LLAMA_BUILD_TESTS            "llama: build tests"                                                                            ${LLAMA_STANDALONE})
-option(LLAMA_BUILD_TOOLS            "llama: build tools"                                                                            ${LLAMA_STANDALONE})
-option(LLAMA_BUILD_EXAMPLES         "llama: build examples"                                                                         ${LLAMA_STANDALONE})
-option(LLAMA_BUILD_SERVER           "llama: build server example"                                                                   ${LLAMA_STANDALONE})
-option(LLAMA_BUILD_WEBUI            "llama: build the embedded Web UI for server"                                                   ON)
-option(LLAMA_USE_PREBUILT_WEBUI     "llama: use prebuilt WebUI from HF Bucket when available (requires LLAMA_BUILD_WEBUI=ON)"       ON)
-option(LLAMA_TOOLS_INSTALL          "llama: install tools"                                                                          ${LLAMA_TOOLS_INSTALL_DEFAULT})
-option(LLAMA_TESTS_INSTALL          "llama: install tests"                                                                          ON)
+option(LLAMA_BUILD_TESTS     "llama: build tests"                                                                ${LLAMA_STANDALONE})
+option(LLAMA_BUILD_TOOLS     "llama: build tools"                                                                ${LLAMA_STANDALONE})
+option(LLAMA_BUILD_EXAMPLES  "llama: build examples"                                                             ${LLAMA_STANDALONE})
+option(LLAMA_BUILD_SERVER    "llama: build server example"                                                       ${LLAMA_STANDALONE})
+option(LLAMA_BUILD_APP       "llama: build the unified binary"                                                   ${LLAMA_STANDALONE})
+option(LLAMA_BUILD_UI        "llama: build the embedded Web UI for server"                                       ON)
+option(LLAMA_USE_PREBUILT_UI "llama: use prebuilt UI from HF Bucket when available (requires LLAMA_BUILD_UI=ON)" ON)
 
-# omnivoice.cpp merged subtree. Compiled against the same GGML + backend
-# selection as the rest of llama.cpp, producing the libomnivoice shared
-# library (when OMNIVOICE_SHARED is also set) and the omnivoice-tts /
-# omnivoice-codec CLI tools. Default ON: the TTS GGUFs are staged in the
-# eliza-1 bundles and the runtime needs a loader for them. Stock
-# llama.cpp consumers that don't want the TTS subtree can opt out with
-# -DLLAMA_BUILD_OMNIVOICE=OFF.
-option(LLAMA_BUILD_OMNIVOICE "Build the merged omnivoice TTS subtree" ON)
-option(OMNIVOICE_SHARED      "Build libomnivoice for ABI consumers" OFF)
-
-# Kokoro-82M (StyleTTS-2 + iSTFTNet) standalone TTS subtree. Produces
-# kokoro_lib (static) + kokoro-tts (standalone CLI harness) + the
-# `/v1/audio/speech` server-mount handler. The arch tag LLM_ARCH_KOKORO
-# already lives in src/models/kokoro.cpp for the K-quant publish pipeline
-# (R8 §3.1); this option enables the actual inference path. Default ON:
-# Kokoro is a first-class voice surface in the eliza-1 stack.
-option(LLAMA_BUILD_KOKORO    "Build the Kokoro-82M TTS subtree (tools/kokoro/)" ON)
-
-# W3-3 deprecation: ELIZA_FUSE_OMNIVOICE=ON is the pre-W3-3 flag for the
-# fork-root `omnivoice/` graft. The graft is gone (see the deprecation
-# block below); turn the flag into a redirect now so the option ON state
-# is visible to add_subdirectory(tools) — which runs the merged tree's
-# CMakeLists at `tools/omnivoice/CMakeLists.txt`.
-if(ELIZA_FUSE_OMNIVOICE AND NOT LLAMA_BUILD_OMNIVOICE)
-    message(WARNING
-        "ELIZA_FUSE_OMNIVOICE=ON is deprecated as of W3-3 (OmniVoice → "
-        "llama.cpp literal merge). It now redirects to "
-        "LLAMA_BUILD_OMNIVOICE=ON which builds the merged tools/omnivoice/ "
-        "tree. Update your build flags to LLAMA_BUILD_OMNIVOICE=ON before "
-        "the next release.")
-    set(LLAMA_BUILD_OMNIVOICE ON CACHE BOOL
-        "Build the merged omnivoice TTS subtree" FORCE)
-endif()
+option(LLAMA_TOOLS_INSTALL "llama: install tools" ${LLAMA_TOOLS_INSTALL_DEFAULT})
+option(LLAMA_TESTS_INSTALL "llama: install tests" ON)
 
 # 3rd party libs
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
@@ -250,65 +218,18 @@ if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
     add_subdirectory(tools)
 endif()
 
-# Standalone libmtmd build (e.g. for Apple XCFramework packaging) without pulling
-# in the rest of the tools/ tree. When the full tools build is already enabled,
-# mtmd is built by the tools/ subdirectory above; this hook only fires when
-# LLAMA_BUILD_TOOLS is OFF to avoid double-adding the target.
-#
-# This MUST be added before tools/omnivoice below: the fused `elizainference`
-# target in tools/omnivoice/CMakeLists.txt is gated on `if(TARGET mtmd)`, so the
-# mtmd target has to exist by the time omnivoice configures. In the full
-# LLAMA_BUILD_TOOLS=ON path tools/CMakeLists.txt already orders mtmd before
-# omnivoice; this block mirrors that ordering for the embed-as-library case.
+if (LLAMA_BUILD_APP)
+    add_subdirectory(app)
+endif()
+
+# Standalone libmtmd build without pulling in the rest of the tools/ tree.
+# Useful when packaging just the mtmd library for language bindings (e.g. an
+# Apple XCFramework, or a WASM build). When the full tools build is enabled,
+# mtmd is already built by the tools/ subdirectory above; this hook only fires
+# when LLAMA_BUILD_TOOLS is OFF to avoid double-adding the target.
 option(LLAMA_BUILD_MTMD "llama: build tools/mtmd library standalone" OFF)
 if (LLAMA_BUILD_MTMD AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
     add_subdirectory(tools/mtmd)
-endif()
-
-# Kokoro-82M TTS (kokoro_lib) — embed-as-library hook (mirrors mtmd/omnivoice
-# above). MUST be added before tools/omnivoice: the fused `elizainference`
-# target folds kokoro in via `if(TARGET kokoro_lib)` (ABI v10), so kokoro_lib
-# has to exist by the time omnivoice configures. In the LLAMA_BUILD_TOOLS=ON
-# path tools/CMakeLists.txt orders kokoro before omnivoice; this mirrors it for
-# the embed-as-library (fused) case so libelizainference carries Kokoro on
-# desktop/Android/iOS without building the rest of the CLI tools.
-if (LLAMA_BUILD_KOKORO AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
-    if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/kokoro/CMakeLists.txt")
-        message(FATAL_ERROR
-            "LLAMA_BUILD_KOKORO=ON but tools/kokoro/CMakeLists.txt is missing. "
-            "Verify the fork is at the Kokoro-J2 tag or later.")
-    endif()
-    add_subdirectory(tools/kokoro)
-endif()
-
-if (LLAMA_BUILD_OMNIVOICE)
-    if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/omnivoice/CMakeLists.txt")
-        message(FATAL_ERROR
-            "LLAMA_BUILD_OMNIVOICE=ON but tools/omnivoice/CMakeLists.txt is missing. "
-            "The merged tree should be present in any v1.0.1-eliza+ checkout. "
-            "Verify the fork is at the v1.0.1-eliza tag or later.")
-    endif()
-    # When LLAMA_BUILD_TOOLS=ON the tools/ subdirectory above already
-    # adds omnivoice. Only add it directly from here for the
-    # embed-as-library case (LLAMA_BUILD_TOOLS=OFF), where the consumer
-    # wants the omnivoice library + ggml + llama but skips the rest of
-    # the CLI tools subset.
-    if (NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
-        add_subdirectory(tools/omnivoice)
-    endif()
-endif()
-
-# Automatically add all files from the 'licenses' directory
-file(GLOB EXTRA_LICENSES "${CMAKE_SOURCE_DIR}/licenses/LICENSE-*")
-
-foreach(FILE_PATH ${EXTRA_LICENSES})
-    get_filename_component(FILE_NAME "${FILE_PATH}" NAME)
-    string(REGEX REPLACE "^LICENSE-" "" NAME "${FILE_NAME}")
-    license_add_file("${NAME}" "${FILE_PATH}")
-endforeach()
-
-if (LLAMA_BUILD_COMMON)
-    license_generate(llama-common)
 endif()
 
 #
@@ -353,29 +274,9 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
               ${CMAKE_CURRENT_BINARY_DIR}/llama-version.cmake
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/llama)
 
-install(
-    FILES convert_hf_to_gguf.py
-    PERMISSIONS
-        OWNER_READ
-        OWNER_WRITE
-        OWNER_EXECUTE
-        GROUP_READ
-        GROUP_EXECUTE
-        WORLD_READ
-        WORLD_EXECUTE
-    DESTINATION ${CMAKE_INSTALL_BINDIR})
-
 configure_file(cmake/llama.pc.in
         "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
         @ONLY)
 
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
-
-
-# ELIZA-OMNIVOICE-FUSION-GRAFT-V1 (REMOVED — W3-3 merged path is canonical)
-# The pre-W3-3 legacy graft block lived here. The merged build is now
-# self-contained inside `tools/omnivoice/CMakeLists.txt`. The
-# `ELIZA_FUSE_OMNIVOICE` deprecation redirect lives near the top of
-# this file (next to the LLAMA_BUILD_OMNIVOICE option declaration) so
-# the option ON state is visible when add_subdirectory(tools) runs.

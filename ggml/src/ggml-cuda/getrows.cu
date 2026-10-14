@@ -11,6 +11,7 @@ static __global__ void k_get_rows(
         /*const size_t nb00,*/ const size_t nb01, const size_t nb02, const size_t nb03,
         const size_t s10, const size_t s11, const size_t s12/*, const size_t s13*/) {
 
+    ggml_cuda_pdl_sync();
     for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
         for (int64_t i00 = 2*(blockIdx.y*blockDim.x + threadIdx.x); i00 < ne00; i00 += gridDim.y*blockDim.x) {
             // The x and y dimensions of the grid are swapped because the maximum allowed grid size for x is higher.
@@ -41,13 +42,18 @@ static __global__ void k_get_rows(
 
 template<typename src0_t, typename dst_t>
 static __global__ void k_get_rows_float(
-        const src0_t * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
+        const src0_t * src0_ptr, const int32_t * src1_ptr, dst_t * dst_ptr,
         const int64_t ne00, /*const int64_t ne01, const int64_t ne02, const int64_t ne03,*/
         /*const int64_t ne10,*/ const int64_t ne11, const uint3 ne12_fdv, /*const int64_t ne13,*/
         /*const size_t s0,*/ const size_t s1, const size_t s2, const size_t s3,
         /*const size_t nb00,*/ const size_t nb01, const size_t nb02, const size_t nb03,
         const size_t s10, const size_t s11, const size_t s12/*, const size_t s13*/) {
 
+    ggml_cuda_pdl_lc();
+    const src0_t  * GGML_CUDA_RESTRICT src0 = src0_ptr;
+    const int32_t * GGML_CUDA_RESTRICT src1 = src1_ptr;
+    dst_t         * GGML_CUDA_RESTRICT dst  = dst_ptr;
+    ggml_cuda_pdl_sync();
     for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
         for (int64_t i00 = blockIdx.y*blockDim.x + threadIdx.x; i00 < ne00; i00 += gridDim.y*blockDim.x) {
             // The x and y dimensions of the grid are swapped because the maximum allowed grid size for x is higher.
@@ -72,25 +78,29 @@ static __global__ void k_get_rows_float(
 
 template<typename grad_t, typename dst_t>
 static __global__ void k_get_rows_back_float(
-        const grad_t * __restrict__ grad, const int32_t * __restrict__ rows, dst_t * __restrict__ dst, const int64_t ncols, const int64_t nrows_grad) {
+        const grad_t * __restrict__ grad, const int32_t * __restrict__ rows, dst_t * __restrict__ dst,
+        const int64_t ncols, const int64_t nrows_grad, const int64_t nrows_dst) {
     const int col = blockIdx.x*blockDim.x + threadIdx.x;
 
     if (col >= ncols) {
         return;
     }
 
-    const int dst_row = blockIdx.y*blockDim.y + threadIdx.y;
+    ggml_cuda_pdl_sync();
 
-    float sum = 0.0f;
+    // grid.y is clamped to the CUDA grid limit, so stride over the destination rows
+    for (int64_t dst_row = blockIdx.y; dst_row < nrows_dst; dst_row += gridDim.y) {
+        float sum = 0.0f;
 
-    for (int64_t i = 0; i < nrows_grad; ++i) {
-        if (rows[i] != dst_row) {
-            continue;
+        for (int64_t i = 0; i < nrows_grad; ++i) {
+            if (rows[i] != dst_row) {
+                continue;
+            }
+            sum += grad[i*ncols + col];
         }
-        sum += grad[i*ncols + col];
-    }
 
-    dst[dst_row*ncols + col] = sum;
+        dst[dst_row*ncols + col] = sum;
+    }
 }
 
 template<int qk, int qr, dequantize_kernel_t dq, typename dst_t>
@@ -156,7 +166,8 @@ static void get_rows_cuda_float(
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
 
-    k_get_rows_float<<<block_nums, block_dims, 0, stream>>>(
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
+    ggml_cuda_kernel_launch(k_get_rows_float<src0_t, dst_t>, launch_params,
         src0_d, src1_d, dst_d,
         ne00, /*ne01, ne02, ne03,*/
         /*ne10,*/ ne11, ne12_fdv, /*ne13,*/
@@ -211,14 +222,6 @@ static void ggml_cuda_get_rows_switch_src0_type(
             break;
         case GGML_TYPE_Q8_0:
             get_rows_cuda_q<QK8_0, QR8_0, dequantize_q8_0>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-            break;
-        case GGML_TYPE_TBQ3_0:
-            get_rows_cuda_q<QK_TBQ, QR_TBQ3, dequantize_tbq3_0>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-            break;
-        case GGML_TYPE_TBQ4_0:
-            get_rows_cuda_q<QK_TBQ, QR_TBQ4, dequantize_tbq4_0>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         default:
@@ -302,7 +305,7 @@ void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
     const dim3 block_dims(CUDA_GET_ROWS_BACK_BLOCK_SIZE, 1, 1);
     const int block_num_x = (ne00 + CUDA_GET_ROWS_BACK_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BACK_BLOCK_SIZE;
-    const dim3 block_nums(block_num_x, ne1, 1);
+    const dim3 block_nums(block_num_x, MIN(ne1, (int64_t)UINT16_MAX), 1);
 
-    k_get_rows_back_float<<<block_nums, block_dims, 0, stream>>>(src0_d, src1_d, dst_d, ne00, ne10);
+    k_get_rows_back_float<<<block_nums, block_dims, 0, stream>>>(src0_d, src1_d, dst_d, ne00, ne10, ne1);
 }
