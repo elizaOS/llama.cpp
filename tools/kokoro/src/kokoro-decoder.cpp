@@ -73,7 +73,9 @@ bool kokoro_decoder_forward(
         const float * F0, const float * N,
         const float * ref_s_dec,
         std::vector<float> & audio,
-        std::string & err) {
+        std::string & err,
+        kokoro_cancel_callback cancel,
+        void * cancel_user_data) {
     audio.clear();
     if (!model) { err = "null model"; return false; }
     if (T_frame <= 0) { err = "non-positive T_frame"; return false; }
@@ -134,6 +136,11 @@ bool kokoro_decoder_forward(
     const int T0 = 2 * T_frame;  // decoder_front upsamples T_frame -> 2*T_frame
     if ((int) (x.size() / 512) != T0) {
         err = "decoder_front output width mismatch";
+        return false;
+    }
+    // The generator is the most expensive stage; skip it when cancelled.
+    if (cancel && cancel(cancel_user_data)) {
+        err = "cancelled";
         return false;
     }
     {

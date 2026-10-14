@@ -91,6 +91,7 @@ enum kokoro_status {
     KOKORO_E_OOM             = 5,
     KOKORO_E_NOT_IMPLEMENTED = 6,
     KOKORO_E_RUNTIME         = 7,
+    KOKORO_E_CANCELLED       = 8,
 };
 
 const char * kokoro_status_str(kokoro_status st) noexcept;
@@ -131,6 +132,14 @@ enum kokoro_g2p_kind {
 };
 kokoro_g2p_kind kokoro_g2p_kind_of_build() noexcept;
 
+// Optional cancellation hook for the synthesis entries below. Return true to
+// stop the call. It is polled on the synthesizing thread at stage boundaries:
+// before the predictor, between the predictor and the decoder, between the
+// decoder front and the iSTFTNet generator, and after the generator. A stage
+// already running is not interrupted. A cancelled call returns
+// KOKORO_E_CANCELLED with `out.samples` empty.
+using kokoro_cancel_callback = bool (*)(void * user_data);
+
 // Synthesize a single utterance. `text` is the natural-language input,
 // `voice` is the loaded ref_s preset. Output PCM lands in `out`. The
 // `speed_mult` parameter scales the predicted durations (1.0 = native rate).
@@ -142,7 +151,9 @@ kokoro_status kokoro_synthesize(
     const std::string & text,
     float speed_mult,
     kokoro_audio & out,
-    std::string & err_out) noexcept;
+    std::string & err_out,
+    kokoro_cancel_callback cancel = nullptr,
+    void * cancel_user_data = nullptr) noexcept;
 
 // Synthesize from a precomputed espeak-ng IPA string (UTF-8) instead of raw
 // text. The IPA is mapped straight to Kokoro vocab ids via `ipa_to_token_ids`
@@ -156,7 +167,9 @@ kokoro_status kokoro_synthesize_ipa(
     const std::string & ipa,
     float speed_mult,
     kokoro_audio & out,
-    std::string & err_out) noexcept;
+    std::string & err_out,
+    kokoro_cancel_callback cancel = nullptr,
+    void * cancel_user_data = nullptr) noexcept;
 
 // Returns the model's audio sample rate (24000 for v1.0).
 int kokoro_sample_rate(const kokoro_model * model) noexcept;
