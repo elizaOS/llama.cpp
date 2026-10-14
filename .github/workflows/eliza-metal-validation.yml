@@ -16,9 +16,7 @@ name: Eliza Metal Validation
 #
 # Any "FAIL" line for ATTN_SCORE_QJL / FUSED_ATTN_QJL_TBQ or for the
 # GET_ROWS/CPY/MUL_MAT custom-quant cases fails the job. ATTN_SCORE_TBQ
-# and ATTN_SCORE_POLAR are tracked but not (yet) gated — their CPU
-# oracle is new (4ab3e26f6) and the first matrix surfaced Metal
-# divergence that we want visible without breaking the pipeline.
+# and ATTN_SCORE_POLAR are also gated against their CPU oracle.
 # "not supported" is the expected baseline for the un-kerneled
 # GET_ROWS/CPY/MUL_MAT custom-quant kernels.
 
@@ -32,6 +30,8 @@ on:
       - 'ggml/include/**'
       - 'src/**'
       - 'tests/test-backend-ops.cpp'
+      - 'tests/test-metal-matmul-support.cpp'
+      - 'tests/CMakeLists.txt'
       - 'tests/test-quantize-fns.cpp'
 
 concurrency:
@@ -61,6 +61,40 @@ jobs:
           evict-old-files: 1d
           save: ${{ github.event_name == 'push' }}
 
+      - name: Require bounded process execution and operation accounting
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v gtimeout >/dev/null; then
+            brew install coreutils
+          fi
+          command -v gtimeout
+          gtimeout --version
+          mkdir -p /tmp/metal-operation-logs
+          : > /tmp/metal-operation-ledger.jsonl
+          cat > /tmp/verify-metal-operation.py <<'PYTHON'
+          import json, re, sys
+          from pathlib import Path
+
+          group, op, filename = sys.argv[1:]
+          text = re.sub(r"\x1b\[[0-9;]*m", "", Path(filename).read_text())
+          results = re.findall(r"^  ([A-Z0-9_]+\(.*\)): (.*)$", text, re.M)
+          assert results, "No operation results"
+          assert all(name.startswith(op + "(") for name, _ in results), "Unexpected operation"
+          numeric = [name for name, status in results if status.strip() == "OK"]
+          unsupported = [name for name, status in results if status.startswith("not supported [")]
+          assert len(numeric) + len(unsupported) == len(results), "Failure or unaccounted operation status"
+          summary = re.findall(r"^  (\d+)/(\d+) tests passed$", text, re.M)
+          assert summary == [(str(len(numeric)), str(len(numeric)))], "Missing or inconsistent completion summary"
+          assert re.search(r"^  Backend MTL0: OK$", text, re.M), "Metal backend did not complete"
+          if group == "custom" and op in {"ATTN_SCORE_QJL", "FUSED_ATTN_QJL_TBQ", "ISTFT"}:
+              assert numeric and not unsupported, "Required numerical operation became unsupported"
+          record = {"group": group, "op": op, "numericalPasses": len(numeric), "explicitUnsupported": len(unsupported), "allUnsupported": not numeric}
+          with Path("/tmp/metal-operation-ledger.jsonl").open("a") as output:
+              output.write(json.dumps(record) + "\n")
+          print(json.dumps(record))
+          PYTHON
+
       - name: Configure
         run: |
           cmake -B build-metal \
@@ -74,10 +108,15 @@ jobs:
         run: |
           cmake --build build-metal -j $(sysctl -n hw.ncpu) \
             --target llama-cli llama-completion \
-                     test-backend-ops test-quantize-fns
+                     test-backend-ops test-quantize-fns test-metal-matmul-support
+
+      - name: Verify Metal matmul capability routing
+        run: ./build-metal/bin/test-metal-matmul-support --require-metal
 
       - name: test-quantize-fns (CPU; smoke for Eliza custom quants)
+        shell: bash
         run: |
+          set -euo pipefail
           ./build-metal/bin/test-quantize-fns | tee /tmp/quantize-fns.log
           # Must mention the Eliza-divergent quant types.
           for t in qjl1_256 q4_polar tbq3_0 tbq4_0 tbq3_tcq; do
@@ -86,20 +125,25 @@ jobs:
           done
 
       - name: test-backend-ops on Metal (filtered subset)
+        shell: bash
         run: |
+          set -euo pipefail
           # Filter to ops that matter most for inference correctness.
           for op in MUL_MAT MUL_MAT_ID ADD MUL SOFT_MAX RMS_NORM CPY ROPE FLASH_ATTN_EXT; do
             echo "=== $op ==="
-            timeout 600 ./build-metal/bin/test-backend-ops \
-              -b Metal -o "$op" \
-              2>&1 | tee -a /tmp/backend-ops.log || true
+            gtimeout 600 ./build-metal/bin/test-backend-ops \
+              -b MTL0 -o "$op" -t 1 \
+              2>"/tmp/metal-operation-logs/broad-$op.stderr" | tee "/tmp/metal-operation-logs/broad-$op.log" | tee -a /tmp/backend-ops.log
+            python3 /tmp/verify-metal-operation.py broad "$op" "/tmp/metal-operation-logs/broad-$op.log"
           done
           echo "=== FAIL SUMMARY ==="
-          grep -E "Backend Metal:.*FAIL|tests passed|Failing tests:" \
+          grep -E "Backend MTL0:.*FAIL|tests passed|Failing tests:" \
             /tmp/backend-ops.log || true
 
       - name: test-backend-ops Eliza custom-quant parity (Metal)
+        shell: bash
         run: |
+          set -euo pipefail
           # Eliza custom quants + custom attention ops on Metal.
           #
           # GET_ROWS / CPY / MUL_MAT: most custom-quant kernels are not
@@ -111,13 +155,8 @@ jobs:
           # CPU has reference implementations. Real parity runs; PASS
           # is required.
           #
-          # ATTN_SCORE_TBQ / ATTN_SCORE_POLAR: CPU reference landed at
-          # 4ab3e26f6 (ggml-cpu/attn-score-tbq-polar.c). Real parity
-          # runs against Metal kernels. ATTN_SCORE_POLAR passes; the
-          # initial ATTN_SCORE_TBQ matrix surfaced TBQ3_0/TBQ4_0
-          # divergence vs. the CPU oracle on the wave-15 hardware run,
-          # so the matrix is tracked but not (yet) gated until the
-          # Metal kernel is reconciled.
+          # ATTN_SCORE_TBQ / ATTN_SCORE_POLAR: real parity against
+          # ggml-cpu/attn-score-tbq-polar.c, with failures hard-gated.
           #
           # We do NOT fail the job on "not supported" lines (expected
           # for the un-kerneled GET_ROWS/CPY/MUL_MAT custom-quant cases).
@@ -127,15 +166,16 @@ jobs:
                     ATTN_SCORE_TBQ ATTN_SCORE_POLAR \
                     ISTFT; do
             echo "=== $op (Eliza custom quants) ==="
-            timeout 300 ./build-metal/bin/test-backend-ops \
-              -b Metal -o "$op" \
-              2>&1 | tee -a /tmp/eliza-custom-quants.log || true
+            gtimeout 300 ./build-metal/bin/test-backend-ops \
+              -b MTL0 -o "$op" -t 1 \
+              2>"/tmp/metal-operation-logs/custom-$op.stderr" | tee "/tmp/metal-operation-logs/custom-$op.log" | tee -a /tmp/eliza-custom-quants.log
+            python3 /tmp/verify-metal-operation.py custom "$op" "/tmp/metal-operation-logs/custom-$op.log"
           done
           echo "=== Eliza custom-quant summary ==="
           for t in q1_0_g32 q1_0_g128 tbq3_0 tbq4_0 tbq3_k tbq4_k qjl1_256 q4_polar tbq3_tcq; do
-            n_skip=$(grep -c "type=$t.*not supported" /tmp/eliza-custom-quants.log || true)
-            n_fail=$(grep -c "type=$t.*FAIL"          /tmp/eliza-custom-quants.log || true)
-            n_pass=$(grep -c "type=$t.*OK"            /tmp/eliza-custom-quants.log || true)
+            n_skip=$(grep -Ec "type(_a)?=$t[,)].*not supported" /tmp/eliza-custom-quants.log || true)
+            n_fail=$(grep -Ec "type(_a)?=$t[,)].*FAIL"          /tmp/eliza-custom-quants.log || true)
+            n_pass=$(grep -Ec "type(_a)?=$t[,)].*OK"            /tmp/eliza-custom-quants.log || true)
             echo "  $t: skip=$n_skip pass=$n_pass fail=$n_fail"
             if [ "$n_fail" -gt 0 ]; then
               echo "::error::Metal kernel divergence for type=$t (see /tmp/eliza-custom-quants.log)"
@@ -199,12 +239,29 @@ jobs:
             fi
           done
 
+      - name: Verify all selected operation invocations completed
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          import json
+          from collections import Counter
+          from pathlib import Path
+          rows = [json.loads(line) for line in Path('/tmp/metal-operation-ledger.jsonl').read_text().splitlines()]
+          expected = Counter(('broad', op) for op in 'MUL_MAT MUL_MAT_ID ADD MUL SOFT_MAX RMS_NORM CPY ROPE FLASH_ATTN_EXT'.split())
+          expected.update(('custom', op) for op in 'GET_ROWS CPY MUL_MAT ATTN_SCORE_QJL FUSED_ATTN_QJL_TBQ ATTN_SCORE_TBQ ATTN_SCORE_POLAR ISTFT'.split())
+          assert Counter((row['group'], row['op']) for row in rows) == expected, 'Missing or duplicate invocation'
+          print(json.dumps({'invocations': len(rows), 'numericalPasses': sum(row['numericalPasses'] for row in rows), 'explicitUnsupported': sum(row['explicitUnsupported'] for row in rows)}))
+          PYTHON
+
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: eliza-metal-validation-logs
           path: |
+            /tmp/metal-operation-logs/
+            /tmp/metal-operation-ledger.jsonl
             /tmp/quantize-fns.log
             /tmp/backend-ops.log
             /tmp/eliza-custom-quants.log

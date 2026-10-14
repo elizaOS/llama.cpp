@@ -8856,6 +8856,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type_a : eliza_custom_quant_types_mul_mat) {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 1, 256, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 4, 256, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 32, 32, 256, {1, 1}, {1, 1}));
+        for (int n : {1, 32}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 32, n, 256));
+        }
     }
 
     // Eliza custom-quant attention parity. The test harness compares
