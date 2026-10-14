@@ -17,6 +17,13 @@
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #endif
+#if PK_HAVE_X86_EXT
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <cpuid.h>
+#endif
+#endif
 
 namespace pk {
 
@@ -106,12 +113,50 @@ bool cpu_has_i8mm() {
 #endif
 }
 
+bool cpu_has_avx2() {
+#if PK_HAVE_X86_EXT
+    unsigned a = 0, b = 0, c = 0, d = 0;
+#if defined(_MSC_VER)
+    int r[4];
+    __cpuid(r, 0);
+    if (r[0] < 7) return false;
+    __cpuid(r, 1);
+    c = (unsigned) r[2];
+#else
+    if (__get_cpuid_max(0, nullptr) < 7) return false;
+    __cpuid(1, a, b, c, d);
+#endif
+    // OSXSAVE (ecx bit 27) and AVX (bit 28), then XCR0 must enable the XMM and
+    // YMM state (bits 1 and 2) or the OS does not preserve the upper halves.
+    if (!(c & (1u << 27)) || !(c & (1u << 28))) return false;
+#if defined(_MSC_VER)
+    const unsigned long long xcr0 = _xgetbv(0);
+#else
+    unsigned lo = 0, hi = 0;
+    __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+    const unsigned long long xcr0 = ((unsigned long long) hi << 32) | lo;
+#endif
+    if ((xcr0 & 0x6) != 0x6) return false;
+#if defined(_MSC_VER)
+    __cpuidex(r, 7, 0);
+    b = (unsigned) r[1];
+#else
+    __cpuid_count(7, 0, a, b, c, d);
+#endif
+    (void) a; (void) d;
+    return (b & (1u << 5)) != 0;  // AVX2
+#else
+    return false;
+#endif
+}
+
 const kernel_table & kernels_for(int want) {
     const char * env = std::getenv("PK_KERNEL");
     if (env && *env) {
         if (!std::strcmp(env, "scalar")) want = 1;
         else if (!std::strcmp(env, "dotprod")) want = 2;
         else if (!std::strcmp(env, "i8mm")) want = 3;
+        else if (!std::strcmp(env, "avx2")) want = 4;
     }
 #if PK_HAVE_ARM_EXT
     const bool dp = cpu_has_dotprod();
@@ -121,6 +166,9 @@ const kernel_table & kernels_for(int want) {
     if (want == 3 && mm) return kernels_i8mm();
     if (mm) return kernels_i8mm();
     if (dp) return kernels_dotprod();
+#elif PK_HAVE_X86_EXT
+    if (want == 1) return kernels_scalar();
+    if (cpu_has_avx2()) return kernels_avx2();
 #else
     (void) want;
 #endif

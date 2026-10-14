@@ -5,8 +5,8 @@
  *
  * Pure C ABI so the fused libelizainference FFI, the CLI tools and tests can
  * share it. Everything runs on the CPU: the 264 encoder linears use the
- * five-value int8 kernels in pk-kernels*.cpp (NEON i8mm / dotprod, scalar
- * reference), the rest is fp32. There is no ONNX, MLX or Core ML path.
+ * five-value int8 kernels in pk-kernels*.cpp (NEON i8mm / dotprod, x86_64
+ * AVX2, scalar reference), the rest is fp32. There is no ONNX, MLX or Core ML path.
  *
  * Threading: a model owns a worker pool sized at load (pk_params.n_threads).
  * Calls on one model are serialised by the caller (the FFI holds its ASR
@@ -35,7 +35,7 @@ enum pk_status {
 
 typedef struct pk_params {
     int n_threads;      /* <= 0: one per big core (Android) / performance core (Apple), capped at 4 */
-    int kernel;         /* 0 = best available, 1 = scalar reference, 2 = dotprod, 3 = i8mm */
+    int kernel;         /* 0 = best available, 1 = scalar reference, 2 = dotprod, 3 = i8mm, 4 = avx2 */
     int pin_threads;    /* 1 = pin workers to the fastest cores where the OS allows it (Linux/Android) */
     int use_mmap;       /* 1 = mmap the GGUF (clean, reclaimable pages); 0 = read it into private memory */
 } pk_params;
@@ -51,7 +51,7 @@ void pk_model_free(pk_model * model);
 /* 1 when the GGUF at `path` declares general.architecture = "parakeet-tdt". */
 int pk_gguf_is_parakeet(const char * path);
 
-/* Kernel tier actually in use: "i8mm", "dotprod" or "scalar". */
+/* Kernel tier actually in use: "i8mm", "dotprod", "avx2" or "scalar". */
 const char * pk_model_kernel_name(const pk_model * model);
 int pk_model_n_threads(const pk_model * model);
 int pk_model_sample_rate(const pk_model * model);   /* 16000 */

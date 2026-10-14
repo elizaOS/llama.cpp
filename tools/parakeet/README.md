@@ -48,11 +48,18 @@ decodes the codes into an int8 panel that stays in L1. The panel is then multipl
 |---|---|---|
 | `i8mm` | `SMMLA` 2x8·8x2, 8 rows × 8 tokens per tile | `HWCAP2_I8MM` (Linux/Android), `hw.optional.arm.FEAT_I8MM` (Apple) |
 | `dotprod` | `SDOT` on straight and half-swapped token pairs | `HWCAP_ASIMDDP`, `FEAT_DotProd` |
-| `scalar` | portable C++ (x86_64 emulator builds, old ARM) | always |
+| `avx2` | `VPMADDWD` on sign-extended straight and half-swapped token pairs (x86_64) | CPUID AVX2 + `XGETBV` YMM state |
+| `scalar` | portable C++ (old ARM, pre-AVX2 x86) | always |
 
-The dotprod and i8mm translation units are compiled with their own `-march`, so the library baseline stays
-armv8-a. All tiers produce bit-identical int32 results (`tests/test_parakeet_kernels.cpp`). `PK_KERNEL` set to
-`scalar`, `dotprod` or `i8mm` forces a tier.
+The dotprod and i8mm translation units are compiled with their own `-march`, and the avx2 one with `-mavx2`
+(`/arch:AVX2` on MSVC), so the library baseline stays armv8-a / x86-64. The avx2 tier widens int8 to int16
+before `VPMADDWD`, so it is exact for every int8 input (no `VPMADDUBSW` saturation). All tiers produce
+bit-identical int32 results (`tests/test_parakeet_kernels.cpp`, which also runs random full-range int8
+operands). `PK_KERNEL` set to `scalar`, `dotprod`, `i8mm` or `avx2` forces a tier.
+
+On an Apple silicon Mac the x86_64 build can be checked under Rosetta 2, which runs AVX2 but only reports it
+when asked: `arch -x86_64 -e ROSETTA_ADVERTISE_AVX=1 build-x64/bin/test-parakeet-kernels` (configure with
+`-DCMAKE_OSX_ARCHITECTURES=x86_64`). Rosetta timings are a sanity check, not x86 performance evidence.
 
 Threading uses a persistent pool (`src/pk-pool.cpp`) that spins briefly between jobs and then sleeps. By
 default it starts one thread per fast core, at most 4. On Linux/Android those are the cores whose
