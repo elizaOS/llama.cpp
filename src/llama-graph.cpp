@@ -1992,20 +1992,38 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
-        // Eliza fused-attn K/V cache types (QJL1_256, Q4_POLAR, TBQ3_TCQ) have
-        // no vec_dot in the CPU type-traits — they are stored cache types that
-        // require either the fused custom op (GGML_OP_FUSED_ATTN_QJL_TBQ) or a
-        // dequantize hop before ggml_flash_attn_ext. The graph builder does
-        // not yet route to the fused op, so dequantize via F32 -> F16 here.
-        // This is bit-exact w.r.t. the type's to_float (dequantize_row_*).
-        if (k->type == GGML_TYPE_QJL1_256 || k->type == GGML_TYPE_TBQ3_TCQ) {
-            ggml_tensor * k_f32 = ggml_cast(ctx0, k, GGML_TYPE_F32);
-            k = ggml_cast(ctx0, k_f32, GGML_TYPE_F16);
+        // Eliza custom cache types need either their fused attention op or a
+        // dequantize hop before stock flash attention.
+        //  - QJL1_256 / TBQ3_TCQ (K) and Q4_POLAR (V) have no CPU FA path
+        //    (no vec_dot / generic to_float), so they always dequantize.
+        //  - TBQ3_0 / TBQ4_0 / Q4_POLAR are scored natively by the CPU FA
+        //    kernel; they dequantize only when the KV device was probed at
+        //    context creation and lacks native FA for them (cparams.fa_dequant_kv,
+        //    e.g. Metal). This keeps CPU/Android free of a per-layer KV cast.
+        const bool fa_dequant_kv = cparams.fa_dequant_kv;
+        const auto needs_k_dequant = [fa_dequant_kv](ggml_type type) {
+            if (type == GGML_TYPE_QJL1_256 || type == GGML_TYPE_TBQ3_TCQ) {
+                return true;
+            }
+            return fa_dequant_kv && (type == GGML_TYPE_TBQ3_0 || type == GGML_TYPE_TBQ4_0 || type == GGML_TYPE_Q4_POLAR);
+        };
+        const auto needs_v_dequant = [fa_dequant_kv](ggml_type type) {
+            if (type == GGML_TYPE_Q4_POLAR) {
+                return true;
+            }
+            return fa_dequant_kv && (type == GGML_TYPE_TBQ3_0 || type == GGML_TYPE_TBQ4_0);
+        };
+        const auto dequant_to_f16 = [&](ggml_tensor * t) {
+            ggml_tensor * t_f32 = ggml_cast(ctx0, t, GGML_TYPE_F32);
+            return ggml_cast(ctx0, t_f32, GGML_TYPE_F16);
+        };
+
+        if (needs_k_dequant(k->type)) {
+            k = dequant_to_f16(k);
         }
 
-        if (v->type == GGML_TYPE_Q4_POLAR) {
-            ggml_tensor * v_f32 = ggml_cast(ctx0, v, GGML_TYPE_F32);
-            v = ggml_cast(ctx0, v_f32, GGML_TYPE_F16);
+        if (needs_v_dequant(v->type)) {
+            v = dequant_to_f16(v);
         }
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
