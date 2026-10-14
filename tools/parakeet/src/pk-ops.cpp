@@ -410,61 +410,61 @@ void gemm_q8(pool & P, const kernel_table & kt, const wmat & W, const qact & X, 
                 }
             }
             for (int tt = 0; tt < ntt; ++tt) {
-              for (int rb = rb0; rb < rb1; ++rb) {
-                const int8_t * panel = panels[rb - rb0];
-                const float * ws = W.ws.data() + rb * 8;
-                const float * bias = W.bias ? W.bias + rb * 8 : nullptr;
-                kt.tile(panel, X.buf.data() + (size_t) tt * 4 * ps, ps, K, std::min(4, npairs - tt * 4), acc);
-                const int tn = std::min(8, N - tt * 8);
-                for (int t = 0; t < tn; ++t) {
-                    const int tok = tt * 8 + t;
-                    const float xs = X.scale[tok];
-                    float * y = Y + (size_t) tok * ldy + rb * 8;
-                    const int32_t * a = acc + t * 8;
+                for (int rb = rb0; rb < rb1; ++rb) {
+                    const int8_t * panel = panels[rb - rb0];
+                    const float * ws = W.ws.data() + rb * 8;
+                    const float * bias = W.bias ? W.bias + rb * 8 : nullptr;
+                    kt.tile(panel, X.buf.data() + (size_t) tt * 4 * ps, ps, K, std::min(4, npairs - tt * 4), acc);
+                    const int tn = std::min(8, N - tt * 8);
+                    for (int t = 0; t < tn; ++t) {
+                        const int tok = tt * 8 + t;
+                        const float xs = X.scale[tok];
+                        float * y = Y + (size_t) tok * ldy + rb * 8;
+                        const int32_t * a = acc + t * 8;
 #if PK_NEON
-                    const float32x4_t xs4 = vdupq_n_f32(xs);
-                    float32x4_t v0 = vmulq_f32(vmulq_f32(vcvtq_f32_s32(vld1q_s32(a)), vld1q_f32(ws)), xs4);
-                    float32x4_t v1 = vmulq_f32(vmulq_f32(vcvtq_f32_s32(vld1q_s32(a + 4)), vld1q_f32(ws + 4)), xs4);
-                    if (bias) {
-                        v0 = vaddq_f32(v0, vld1q_f32(bias));
-                        v1 = vaddq_f32(v1, vld1q_f32(bias + 4));
-                    }
-                    switch (op) {
-                        case epi::store:
-                            break;
-                        case epi::silu:
-                            v0 = silu_ps(v0);
-                            v1 = silu_ps(v1);
-                            break;
-                        case epi::relu:
-                            v0 = vmaxq_f32(v0, vdupq_n_f32(0.0f));
-                            v1 = vmaxq_f32(v1, vdupq_n_f32(0.0f));
-                            break;
-                        case epi::add: {
-                            const float32x4_t al = vdupq_n_f32(alpha);
-                            v0 = vfmaq_f32(vld1q_f32(y), v0, al);
-                            v1 = vfmaq_f32(vld1q_f32(y + 4), v1, al);
-                            break;
-                        }
-                    }
-                    vst1q_f32(y, v0);
-                    vst1q_f32(y + 4, v1);
-#else
-                    for (int r = 0; r < 8; ++r) {
-                        float v = (float) a[r] * ws[r] * xs;
+                        const float32x4_t xs4 = vdupq_n_f32(xs);
+                        float32x4_t v0 = vmulq_f32(vmulq_f32(vcvtq_f32_s32(vld1q_s32(a)), vld1q_f32(ws)), xs4);
+                        float32x4_t v1 = vmulq_f32(vmulq_f32(vcvtq_f32_s32(vld1q_s32(a + 4)), vld1q_f32(ws + 4)), xs4);
                         if (bias) {
-                            v += bias[r];
+                            v0 = vaddq_f32(v0, vld1q_f32(bias));
+                            v1 = vaddq_f32(v1, vld1q_f32(bias + 4));
                         }
                         switch (op) {
-                            case epi::store: y[r] = v; break;
-                            case epi::silu: y[r] = v / (1.0f + std::exp(-v)); break;
-                            case epi::relu: y[r] = v > 0.0f ? v : 0.0f; break;
-                            case epi::add: y[r] += alpha * v; break;
+                            case epi::store:
+                                break;
+                            case epi::silu:
+                                v0 = silu_ps(v0);
+                                v1 = silu_ps(v1);
+                                break;
+                            case epi::relu:
+                                v0 = vmaxq_f32(v0, vdupq_n_f32(0.0f));
+                                v1 = vmaxq_f32(v1, vdupq_n_f32(0.0f));
+                                break;
+                            case epi::add: {
+                                const float32x4_t al = vdupq_n_f32(alpha);
+                                v0 = vfmaq_f32(vld1q_f32(y), v0, al);
+                                v1 = vfmaq_f32(vld1q_f32(y + 4), v1, al);
+                                break;
+                            }
                         }
-                    }
+                        vst1q_f32(y, v0);
+                        vst1q_f32(y + 4, v1);
+#else
+                        for (int r = 0; r < 8; ++r) {
+                            float v = (float) a[r] * ws[r] * xs;
+                            if (bias) {
+                                v += bias[r];
+                            }
+                            switch (op) {
+                                case epi::store: y[r] = v; break;
+                                case epi::silu: y[r] = v / (1.0f + std::exp(-v)); break;
+                                case epi::relu: y[r] = v > 0.0f ? v : 0.0f; break;
+                                case epi::add: y[r] += alpha * v; break;
+                            }
+                        }
 #endif
+                    }
                 }
-              }
             }
         }
     });
