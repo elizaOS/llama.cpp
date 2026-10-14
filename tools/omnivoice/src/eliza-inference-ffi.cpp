@@ -1890,6 +1890,13 @@ int eliza_inference_kokoro_load(
 }
 
 #ifdef ELIZA_ENABLE_KOKORO
+/* Passed to kokoro_lib as its cancel callback. Reads only the Kokoro flag, so
+ * an OmniVoice or Paradee call starting on another thread cannot clear it. */
+static bool eliza_kokoro_cancel_requested(void * user_data) {
+    EliInferenceContext * ctx = (EliInferenceContext *) user_data;
+    return ctx && ctx->kokoro_cancel.load(std::memory_order_acquire);
+}
+
 static int eliza_kokoro_synthesize_audio(
     EliInferenceContext * ctx,
     const char * input,
@@ -1908,10 +1915,11 @@ static int eliza_kokoro_synthesize_audio(
     }
     std::lock_guard<std::mutex> lock(ctx->kokoro_mutex);
     /* A cancel_tts issued before this call held the lock targets an earlier
-     * call; start this one clean. kokoro_lib has no in-graph cancel hook, so
-     * the flag is checked after the (possibly lazy) reload and after the
-     * forward pass: a cancelled call discards its audio and reports
-     * ELIZA_ERR_CANCELLED. */
+     * call; start this one clean. The flag is checked after the (possibly
+     * lazy) reload, by kokoro_lib between its stages (predictor, decoder
+     * front, generator), and after the forward pass. The exchange below
+     * clears it on the way out. A cancelled call discards its audio and
+     * reports ELIZA_ERR_CANCELLED. */
     ctx->kokoro_cancel.store(false, std::memory_order_release);
     const int load_rc = eliza_kokoro_ensure_loaded_locked(ctx, operation, out_error);
     if (load_rc != ELIZA_OK) return load_rc;
@@ -1925,10 +1933,13 @@ static int eliza_kokoro_synthesize_audio(
     std::string err;
     const eliza_kokoro::kokoro_status st = ipa_input
         ? eliza_kokoro::kokoro_synthesize_ipa(
-              ctx->kokoro_model.get(), ctx->kokoro_voice, in, speed, audio, err)
+              ctx->kokoro_model.get(), ctx->kokoro_voice, in, speed, audio, err,
+              eliza_kokoro_cancel_requested, ctx)
         : eliza_kokoro::kokoro_synthesize(
-              ctx->kokoro_model.get(), ctx->kokoro_voice, in, speed, audio, err);
-    if (ctx->kokoro_cancel.exchange(false, std::memory_order_acq_rel)) {
+              ctx->kokoro_model.get(), ctx->kokoro_voice, in, speed, audio, err,
+              eliza_kokoro_cancel_requested, ctx);
+    if (ctx->kokoro_cancel.exchange(false, std::memory_order_acq_rel) ||
+        st == eliza_kokoro::KOKORO_E_CANCELLED) {
         audio.samples.clear();
         eliza_set_error(out_error,
             std::string("[libelizainference] ") + operation + ": cancelled");
