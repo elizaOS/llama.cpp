@@ -131,6 +131,16 @@ option(OMNIVOICE_SHARED      "Build libomnivoice for ABI consumers" OFF)
 # Kokoro is a first-class voice surface in the eliza-1 stack.
 option(LLAMA_BUILD_KOKORO    "Build the Kokoro-82M TTS subtree (tools/kokoro/)" ON)
 
+# Paradee-8M v1.0 (single-voice distillation of Kokoro-82M, Apache-2.0).
+# Produces paradee_lib + paradee-tts. Runs on kokoro_lib's layers, so it is
+# built only together with LLAMA_BUILD_KOKORO. Default ON: Paradee is the
+# shipped mobile voice.
+option(LLAMA_BUILD_PARADEE   "Build the Paradee-8M TTS subtree (tools/paradee/)" ON)
+
+# Native misaki grapheme-to-phoneme (Paradee/Kokoro phoneme spelling). The
+# subtree lives in tools/misaki-g2p/ and is added when present.
+option(LLAMA_BUILD_MISAKI_G2P "Build the misaki G2P subtree (tools/misaki-g2p/)" ON)
+
 # W3-3 deprecation: ELIZA_FUSE_OMNIVOICE=ON is the pre-W3-3 flag for the
 # fork-root `omnivoice/` graft. The graft is gone (see the deprecation
 # block below); turn the flag into a redirect now so the option ON state
@@ -279,6 +289,27 @@ if (LLAMA_BUILD_KOKORO AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
             "Verify the fork is at the Kokoro-J2 tag or later.")
     endif()
     add_subdirectory(tools/kokoro)
+endif()
+
+# misaki G2P and Paradee — embed-as-library hooks (mirror kokoro above). Both
+# precede tools/omnivoice so the fused `elizainference` target can fold them
+# in with `if(TARGET ...)`.
+if (LLAMA_BUILD_MISAKI_G2P AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
+    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/misaki-g2p/CMakeLists.txt")
+        add_subdirectory(tools/misaki-g2p)
+    else()
+        message(STATUS "LLAMA_BUILD_MISAKI_G2P: tools/misaki-g2p/ is not in this checkout; skipped")
+    endif()
+endif()
+if (LLAMA_BUILD_PARADEE AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
+    # Paradee runs on the tools/kokoro layers. A build that turns Kokoro off
+    # (backend-only CI, for example) skips Paradee instead of failing; the
+    # fused library then reports paradee_supported() == 0.
+    if (LLAMA_BUILD_KOKORO)
+        add_subdirectory(tools/paradee)
+    else()
+        message(STATUS "LLAMA_BUILD_PARADEE: skipped because LLAMA_BUILD_KOKORO=OFF")
+    endif()
 endif()
 
 if (LLAMA_BUILD_OMNIVOICE)

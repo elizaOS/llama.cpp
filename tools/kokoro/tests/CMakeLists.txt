@@ -39,6 +39,12 @@ add_executable(test-kokoro-backend test_kokoro_backend.cpp)
 target_link_libraries(test-kokoro-backend PRIVATE kokoro_lib)
 add_test(NAME test-kokoro-backend COMMAND test-kokoro-backend)
 
+# Opt-in layer strategies (KokoroLayerOptions) against the default kernels.
+# Kokoro-82M never enables them; Paradee-8M does.
+add_executable(test-kokoro-layer-options test_kokoro_layer_options.cpp)
+target_link_libraries(test-kokoro-layer-options PRIVATE kokoro_lib)
+add_test(NAME test-kokoro-layer-options COMMAND test-kokoro-layer-options)
+
 # Synthesis cancellation. Weight-free checks always run; set KOKORO_TEST_MODEL
 # and KOKORO_TEST_VOICE to also cancel a real synthesis at every stage boundary.
 add_executable(test-kokoro-cancel test_kokoro_cancel.cpp)

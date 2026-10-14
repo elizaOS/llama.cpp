@@ -2272,8 +2272,13 @@ static int eliza_paradee_chunk(
         { ",", ";", ":", "\xE2\x80\x94" /* — */ },
         { " " },
     };
+    /* Unpadded and unlimited: chunks are padded below, and the ABI drops
+     * characters outside the vocab (paradee_phonemes_to_ids would add pads,
+     * reject more than 510 symbols and reject unknown symbols). */
     std::vector<int32_t> ids;
-    if (eliza_paradee::paradee_phonemes_to_ids(model, phonemes, ids, err) != eliza_paradee::PARADEE_OK) {
+    size_t n_dropped = 0;
+    if (eliza_paradee::paradee_phonemes_to_symbol_ids_lenient(model, phonemes, ids, n_dropped, err) !=
+        eliza_paradee::PARADEE_OK) {
         return ELIZA_ERR_INVALID_ARG;
     }
     if (ids.empty()) return ELIZA_OK;
@@ -2331,6 +2336,7 @@ static int eliza_paradee_synthesize_owned(
         return ELIZA_ERR_INVALID_ARG;
     }
     if (!(speed > 0.0f) || !std::isfinite(speed)) speed = 1.0f;
+    speed = std::min(std::max(speed, eliza_paradee::PARADEE_MIN_SPEED), eliza_paradee::PARADEE_MAX_SPEED);
     const std::string in(input, input_len ? input_len : std::strlen(input));
 
     std::lock_guard<std::mutex> lock(ctx->paradee_mutex);

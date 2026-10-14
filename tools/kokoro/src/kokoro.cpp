@@ -677,16 +677,17 @@ static kokoro_status kokoro_synthesize_from_input_ids(
         }
         if (cancelled()) return KOKORO_E_CANCELLED;
         const int T = pred.T_frame;
-        if (T <= 0 || (int) pred.asr.size() != T * 512) {
+        const int A = pred.asr_dim;   // 512 for Kokoro-82M (the text encoder width)
+        if (T <= 0 || A <= 0 || pred.asr.size() != (size_t) T * (size_t) A) {
             err_out = "predictor produced empty/invalid asr (T=" + std::to_string(T) + ")";
             return KOKORO_E_RUNTIME;
         }
 
-        // Transpose asr [T, 512] (T-major) → [512, T] (channel-major).
-        std::vector<float> asr_ct((size_t) 512 * (size_t) T);
+        // Transpose asr [T, A] (T-major) → [A, T] (channel-major).
+        std::vector<float> asr_ct((size_t) A * (size_t) T);
         for (int t = 0; t < T; ++t) {
-            const float * row = pred.asr.data() + (size_t) t * 512;
-            for (int c = 0; c < 512; ++c) {
+            const float * row = pred.asr.data() + (size_t) t * A;
+            for (int c = 0; c < A; ++c) {
                 asr_ct[(size_t) c * (size_t) T + t] = row[c];
             }
         }

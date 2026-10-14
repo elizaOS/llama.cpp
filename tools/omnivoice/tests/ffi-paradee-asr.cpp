@@ -172,6 +172,13 @@ static void test_paradee_load_and_synth() {
         CHECK(pcm != nullptr && pcm[0] == (float) (43 + ('h' - 'a')) / 1000.0f);
         eliza_inference_free_pcm(pcm);
     }
+    // Out-of-range speeds are clamped to the library's range, not rejected.
+    for (float speed : { 0.01f, 100.0f }) {
+        float * pcm = nullptr;
+        CHECK_RC(eliza_inference_paradee_synthesize_alloc(ctx, "hi", 2, speed, &pcm, &n, &err), ELIZA_OK);
+        CHECK_RC((int) n, 2 * FAKE_PARADEE_SAMPLES_PER_ID);
+        eliza_inference_free_pcm(pcm);
+    }
     CHECK_RC(eliza_inference_paradee_synthesize_alloc(ctx, "x", 1, 1.0f, nullptr, &n, &err), ELIZA_ERR_INVALID_ARG);
     clear_err(&err);
 
