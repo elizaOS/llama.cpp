@@ -3,6 +3,7 @@
 // windowed-sinc resampler to 16 kHz.
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
