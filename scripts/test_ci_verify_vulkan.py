@@ -49,9 +49,16 @@ class VulkanCompletionTests(unittest.TestCase):
                 verify(completed("ISTFT", statuses), "ISTFT")
 
 
-def shard_output(op, index, count, inventory):
-    rows = [f"Shard inventory {i}: {op}({params})" for i, params in enumerate(inventory)]
-    selected = inventory[index::count]
+def balanced(n, count):
+    # Not round-robin: the verifier must follow the printed assignment.
+    return [(count - 1 - i) % count for i in range(n)]
+
+
+def shard_output(op, index, count, inventory, assignment=None):
+    assignment = balanced(len(inventory), count) if assignment is None else assignment
+    rows = [f"Shard inventory {i} -> {owner}: {op}({params})"
+            for i, (params, owner) in enumerate(zip(inventory, assignment))]
+    selected = [params for params, owner in zip(inventory, assignment) if owner == index]
     rows += [f"  {op}({params}): OK" for params in selected]
     rows += [f"Shard {index}/{count}: {len(selected)} selected of {len(inventory)} matching cases",
              f"  {len(selected)}/{len(selected)} tests passed", "  Backend Vulkan0: OK", ""]
@@ -89,6 +96,7 @@ class ShardCoverageTests(unittest.TestCase):
             ("wrong-build", "buildSha256", "other"),
             ("wrong-inventory", "inventory", ["different"]),
             ("duplicate-index", "selectedIndices", [0, 0]),
+            ("different-assignment", "assignment", [0, 0, 0]),
             ("wrong-count", "shard", [0, 3]),
         ]:
             records = copy.deepcopy(original)
@@ -105,10 +113,15 @@ class ShardCoverageTests(unittest.TestCase):
 
     def test_rejects_missing_extra_or_reordered_occurrence_output(self):
         valid = shard_output("MUL_MAT", 0, 2, ["o=1", "o=1", "o=3"])
-        for text in [valid.replace("  MUL_MAT(o=3): OK\n", ""),
-                     valid.replace("  MUL_MAT(o=3): OK", "  MUL_MAT(o=1): OK"),
-                     valid.replace("Shard inventory 1:", "Shard inventory 2:"),
-                     valid.replace("2 selected of 3", "1 selected of 3")]:
+        # balanced(3, 2) == [1, 0, 1]: shard 0 owns only the second occurrence.
+        self.assertEqual(verify(valid, "MUL_MAT", (0, 2))["selectedIndices"], [1])
+        for text in [valid.replace("  MUL_MAT(o=1): OK\n", ""),
+                     valid.replace("  MUL_MAT(o=1): OK", "  MUL_MAT(o=3): OK"),
+                     valid.replace("Shard inventory 1 ->", "Shard inventory 2 ->"),
+                     valid.replace("Shard inventory 2 -> 1:", "Shard inventory 2 -> 0:"),
+                     valid.replace("Shard inventory 2 -> 1:", "Shard inventory 2 -> 2:"),
+                     valid.replace("Shard inventory 2 -> 1:", "Shard inventory 2:"),
+                     valid.replace("1 selected of 3", "2 selected of 3")]:
             with self.subTest(text=text), self.assertRaises(ValueError):
                 verify(text, "MUL_MAT", (0, 2))
         for shard in [(-1, 2), (2, 2), (0, 0), (0, 257)]:

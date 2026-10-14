@@ -54,6 +54,8 @@ static int     g_n_threads   = -1; // -1 means use backend default (N_THREADS)
 static bool    g_test_shard_requested = false;
 static size_t  g_test_shard_index = 0;
 static size_t  g_test_shard_count = 1;
+// Shard owning each matching case, indexed by occurrence (see assign_test_shards).
+static std::vector<size_t> g_test_shard_assignment;
 
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     size_t nels = ggml_nelements(tensor);
@@ -1303,6 +1305,43 @@ struct test_case {
         }
     }
 
+    // Estimated relative cost of one numerical case, used only to balance --test-shard
+    // partitions. Builds the same metadata-only graph as eval() and applies the same op
+    // filter; returns false when the case does not match. The estimate is the op's
+    // FLOP count plus a per-byte and per-case term, so FLOP-free ops still weigh in.
+    bool shard_cost(const char * op_names_filter, double & cost) {
+        mode = MODE_SUPPORT; // no sentinels: eval() rebuilds the graph from scratch
+
+        ggml_init_params params = {
+            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead(),
+            /* .mem_base = */ NULL,
+            /* .no_alloc = */ true,
+        };
+        ggml_context * ctx = ggml_init(params);
+        GGML_ASSERT(ctx);
+        gf = ggml_new_graph(ctx);
+
+        ggml_tensor * out = build_graph(ctx);
+        const bool match = matches_filter(out, op_names_filter);
+        if (match) {
+            ggml_build_forward_expand(gf, out);
+            double bytes = 0.0;
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                const ggml_tensor * node = ggml_graph_node(gf, i);
+                bytes += (double) ggml_nbytes(node);
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    if (node->src[j]) {
+                        bytes += (double) ggml_nbytes(node->src[j]);
+                    }
+                }
+            }
+            cost = (double) op_flops(out) + 16.0*bytes + 1e7;
+        }
+        ggml_free(ctx);
+        gf = nullptr;
+        return match;
+    }
+
     test_status_t eval(ggml_backend_t backend1,
                        ggml_backend_t backend2,
                        const char *   op_names_filter,
@@ -1337,10 +1376,13 @@ struct test_case {
         // Partition after the normal op filter, before capability checks or execution.
         // Whole-graph cases and duplicate parameter strings retain distinct indices.
         const size_t case_index = matching_cases++;
+        size_t case_shard = 0;
         if (g_test_shard_requested) {
-            printf("Shard inventory %zu: %s(%s)\n", case_index, current_op_name.c_str(), vars().c_str());
+            GGML_ASSERT(case_index < g_test_shard_assignment.size());
+            case_shard = g_test_shard_assignment[case_index];
+            printf("Shard inventory %zu -> %zu: %s(%s)\n", case_index, case_shard, current_op_name.c_str(), vars().c_str());
         }
-        if (case_index % g_test_shard_count != g_test_shard_index) {
+        if (case_shard != g_test_shard_index) {
             ggml_free(ctx);
             return test_status_t::SKIPPED;
         }
@@ -10019,6 +10061,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_from_file(const c
     return test_cases;
 }
 
+// Deterministic cost-balanced partition of the matching cases for --test-shard: longest
+// estimated case first, each to the currently lightest shard (ties: lower case index,
+// lower shard). Every worker computes the same assignment from the same inventory, and
+// each occurrence (including duplicates and whole-graph cases) belongs to one shard.
+static void assign_test_shards(std::vector<std::unique_ptr<test_case>> & test_cases, const char * op_names_filter) {
+    std::vector<double> costs;
+    for (auto & test : test_cases) {
+        double cost = 0.0;
+        if (test->shard_cost(op_names_filter, cost)) {
+            costs.push_back(cost);
+        }
+    }
+    std::vector<size_t> order(costs.size());
+    for (size_t i = 0; i < order.size(); ++i) {
+        order[i] = i;
+    }
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return costs[a] > costs[b]; });
+    std::vector<double> load(g_test_shard_count, 0.0);
+    g_test_shard_assignment.assign(costs.size(), 0);
+    for (size_t i : order) {
+        const size_t shard = (size_t) (std::min_element(load.begin(), load.end()) - load.begin());
+        g_test_shard_assignment[i] = shard;
+        load[shard] += costs[i];
+    }
+}
+
 static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op_names_filter, const char * params_filter,
                          printer * output_printer, const char * test_file_path) {
     auto filter_test_cases = [](std::vector<std::unique_ptr<test_case>> & test_cases, const char * params_filter) {
@@ -10078,6 +10146,10 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
             set_use_ref(backend_cpu, true);
         }
 
+        if (g_test_shard_requested) {
+            assign_test_shards(test_cases, op_names_filter);
+        }
+
         size_t n_ok = 0;
         size_t                   tests_run = 0;
         size_t                   matching_cases = 0;
@@ -10096,6 +10168,7 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
             }
         }
         if (g_test_shard_requested) {
+            GGML_ASSERT(matching_cases == g_test_shard_assignment.size());
             printf("Shard %zu/%zu: %zu selected of %zu matching cases\n",
                    g_test_shard_index, g_test_shard_count, selected_cases, matching_cases);
         }

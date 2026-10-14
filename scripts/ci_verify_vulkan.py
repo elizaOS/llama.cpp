@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Verify complete Vulkan results and the union of deterministic test shards.
 
+test-backend-ops assigns each matching occurrence to one shard by estimated cost
+(longest first onto the lightest shard) and prints that assignment in every
+worker's inventory; all workers must agree on it and their union must cover
+every occurrence exactly once.
+
 Unsupported outcomes remain explicit and never count as numerical passes.
 Occurrence indices preserve duplicate cases and whole-graph tests; support-mode
 inventories are deliberately not used because they omit whole-graph tests.
@@ -41,20 +46,24 @@ def verify(text, operation, shard=None):
         else:
             raise ValueError("Nonpassing or incomplete outcome: " + op + "(" + params + "): " + status)
     inventory = []
+    assignment = []
     selected = []
-    inventory_rows = re.findall(r"^Shard inventory (\d+): ([A-Z0-9_]+)\((.*)\)$", text, re.M)
+    inventory_rows = re.findall(r"^Shard inventory (\d+) -> (\d+): ([A-Z0-9_]+)\((.*)\)$", text, re.M)
     shard_rows = re.findall(r"^Shard (\d+)/(\d+): (\d+) selected of (\d+) matching cases$", text, re.M)
     if shard is not None:
         index, count = shard
         if not 0 <= index < count <= 256:
             raise ValueError("Invalid shard index/count")
-        for ordinal, (actual, op, params) in enumerate(inventory_rows):
+        for ordinal, (actual, owner, op, params) in enumerate(inventory_rows):
             if int(actual) != ordinal or op != operation:
                 raise ValueError("Noncontiguous or unexpected inventory")
+            if not 0 <= int(owner) < count:
+                raise ValueError("Occurrence assigned outside the shard range")
             inventory.append(params)
+            assignment.append(int(owner))
         if not inventory:
             raise ValueError("Missing full occurrence inventory")
-        selected = list(range(index, len(inventory), count))
+        selected = [i for i, owner in enumerate(assignment) if owner == index]
         if shard_rows != [(str(index), str(count), str(len(selected)), str(len(inventory)))]:
             raise ValueError("Missing or inconsistent shard completion")
         if observed != [inventory[i] for i in selected]:
@@ -70,7 +79,7 @@ def verify(text, operation, shard=None):
         raise ValueError("All four required ISTFT cases must execute numerically")
     return {"operation": operation, "numericalPasses": len(passed),
             "unsupportedCases": unsupported, "numericalCases": passed,
-            "inventory": inventory, "selectedIndices": selected,
+            "inventory": inventory, "assignment": assignment, "selectedIndices": selected,
             "shard": list(shard) if shard is not None else None}
 
 
@@ -98,10 +107,15 @@ def aggregate(records, head, build_sha, shards=SHARDS):
                 raise ValueError("No numerical execution for " + group + "/" + op)
             if (group, op) in SHARDED:
                 inventory = family[0]["inventory"]
+                assignment = family[0]["assignment"]
                 indices = []
                 for r in family:
                     if r["inventory"] != inventory:
                         raise ValueError("Workers generated different complete inventories")
+                    if r["assignment"] != assignment:
+                        raise ValueError("Workers computed different shard assignments")
+                    if r["selectedIndices"] != [i for i, owner in enumerate(assignment) if owner == r["shard"][0]]:
+                        raise ValueError("Shard ran occurrences it was not assigned")
                     indices.extend(r["selectedIndices"])
                 if Counter(indices) != Counter(range(len(inventory))):
                     raise ValueError("Shard union omits or repeats occurrences")

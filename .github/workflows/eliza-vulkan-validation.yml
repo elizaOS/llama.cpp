@@ -136,10 +136,16 @@ jobs:
             quantize-fns.log
           retention-days: 14
 
+  # MUL_MAT and FLASH_ATTN_EXT are split across 128 workers. test-backend-ops
+  # assigns every matching occurrence to one worker by estimated cost (longest
+  # first onto the lightest worker), so the large hsk=512/576 FLASH_ATTN_EXT
+  # cases no longer cluster on one worker the way index-modulo assignment let
+  # them (shard 86 exceeded the 600 s limit on llvmpipe). Sharded invocations
+  # get 1200 s; worker 0 additionally runs every unsharded operation.
   numerical-shards:
     needs: build-vulkan
     runs-on: ubuntu-24.04
-    timeout-minutes: 55
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       max-parallel: 4
@@ -189,16 +195,20 @@ jobs:
             for op in $ops; do
               shard_args=()
               verify_args=()
+              op_limit="$limit"
               if [ "$op" = MUL_MAT ] || [ "$op" = FLASH_ATTN_EXT ]; then
                 shard_args=(--test-shard "$SHARD/128")
                 verify_args=(--shard "$SHARD")
+                op_limit=1200
               elif [ "$SHARD" != 0 ]; then
                 continue
               fi
               log="results/$group-$op.log"
-              timeout "$limit" ./build-vulkan/bin/test-backend-ops \
+              start=$(date +%s)
+              timeout "$op_limit" ./build-vulkan/bin/test-backend-ops \
                 -b Vulkan0 -o "$op" "${shard_args[@]}" \
                 2>"results/$group-$op.stderr" | tee "$log"
+              echo "::notice::$group/$op shard $SHARD finished in $(( $(date +%s) - start ))s of ${op_limit}s"
               python3 scripts/ci_verify_vulkan.py record "$group" "$op" "$log" results/ledger.jsonl \
                 --head "$QUALIFIED_HEAD" --build-sha "$BUILD_SHA" "${verify_args[@]}"
             done
