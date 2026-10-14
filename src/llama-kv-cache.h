@@ -93,8 +93,12 @@ public:
 
     using slot_info_vec_t = std::vector<slot_info>;
 
+    // TODO: refactor the memory instances to not depend on `llama_model`
+    //       instead pass all necessary info (e.g. hparams, dev layers, arch, etc.) directly
+    //       likely through `struct llama_memory_params`
     llama_kv_cache(
             const llama_model & model,
+          const llama_hparams & hparams,
                     ggml_type   type_k,
                     ggml_type   type_v,
                          bool   v_trans,
@@ -162,6 +166,8 @@ public:
     bool try_resize();
     void copy_from(const llama_kv_cache & other);
     bool check_and_clear_resized();
+    std::vector<uint32_t> get_layer_ids() const;
+    ggml_tensor * get_k_storage(int32_t il) const;
 
     //
     // graph_build API
@@ -268,7 +274,12 @@ private:
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
     std::vector<uint32_t> v_heads;
 
-    std::vector<llama_kv_cells> v_cells;
+    // Shared caches retain the owner storage and cell metadata.
+    llama_kv_cache * other;
+
+    std::shared_ptr<llama_kv_cells_vec> v_cells_impl;
+
+    llama_kv_cells_vec & v_cells;
 
     // maps from a sequence id to a stream id
     std::vector<uint32_t> seq_to_stream;
@@ -277,10 +288,6 @@ private:
     stream_copy_info sc_info;
 
     std::vector<kv_layer> layers;
-
-    // sibling KV cache to share K/V tensors with (gemma4-assistant MTP drafter
-    // shares KV with the target). null for all other arches.
-    llama_kv_cache * other = nullptr;
 
     // dynamic resize state
     uint32_t kv_size_cur     = 0;

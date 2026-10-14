@@ -129,7 +129,8 @@ class GGUFReader:
         GGUFValueType.BOOL:    np.bool_,
     }
 
-    def __init__(self, path: os.PathLike[str] | str, mode: Literal['r', 'r+', 'c'] = 'r'):
+    def __init__(self, path: os.PathLike[str] | str, mode: Literal['r', 'r+', 'c'] = 'r', *, eliza_legacy_type_ids: bool = False):
+        self.eliza_legacy_type_ids = eliza_legacy_type_ids
         self.data = np.memmap(path, mode = mode)
         offs = 0
 
@@ -325,7 +326,16 @@ class GGUFReader:
             if tensor_name in tensor_names:
                 raise ValueError(f'Found duplicated tensor with name {tensor_name}')
             tensor_names.add(tensor_name)
-            ggml_type = GGMLQuantizationType(raw_dtype[0])
+            type_id = int(raw_dtype[0])
+            layout_field = self.fields.get("eliza.quantization_type_ids")
+            layout = layout_field.contents() if layout_field and layout_field.types == [GGUFValueType.STRING] else None
+            ftype_field = self.fields.get("general.file_type")
+            ftype = ftype_field.contents() if ftype_field and ftype_field.types == [GGUFValueType.UINT32] else None
+            if 43 <= type_id <= 50 or (type_id == 42 and (
+                self.eliza_legacy_type_ids or layout == "legacy-42" or (layout != "private-256" and ftype in (100, 101, 102))
+            )):
+                type_id += 214
+            ggml_type = GGMLQuantizationType(type_id)
             n_elems = int(np.prod(dims))
             np_dims = tuple(reversed(dims.tolist()))
             block_size, type_size = GGML_QUANT_SIZES[ggml_type]

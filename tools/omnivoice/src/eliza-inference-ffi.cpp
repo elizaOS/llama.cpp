@@ -14,6 +14,12 @@
 // resolve `eliza_inference_*` symbols from this object.
 
 #include "eliza-inference-ffi.h"
+#include "llm-backend.h"
+#include "embed-backend.h"
+#include "vision-backend.h"
+#include "asr-backend.h"
+#include "tts-backend.h"
+#include "eot-backend.h"
 #include "omnivoice.h"
 #include "llama.h"
 #include "mtmd.h"
@@ -236,6 +242,13 @@ struct EliInferenceContext {
     std::mutex paradee_mutex;
 #endif
 };
+
+/* M3 seam accessor (declared in llm-backend.h): hand a backend's open() the
+ * bundle root without exposing the struct. Defined here where the type is
+ * complete. */
+const char * llm_backend_context_bundle_dir(const EliInferenceContext * ctx) {
+    return ctx ? ctx->bundle_dir.c_str() : nullptr;
+}
 
 /* ELZ2 magic 'ELZ1' (the ascii bytes 'E','L','Z','1' little-endian).
  * The magic stays 'ELZ1' across format versions — only the version
@@ -1233,6 +1246,11 @@ static void reset_engine(Engine * e) {
 
 struct EliLlmStream {
     EliInferenceContext * ctx = nullptr;
+    /* Multi-backend seam (M3): when non-NULL, this session is driven by an
+     * alternate in-process runtime (LiteRT-LM / MLX-CoreML) and the llama.cpp
+     * fields below (lctx/sampler/mtp) are unused — every FFI streaming entry
+     * delegates to `backend` and returns before touching the llama.cpp path. */
+    LlmBackendSession * backend = nullptr;
     llama_context * lctx = nullptr;
     llama_sampler * sampler = nullptr;
     int n_past = 0;
@@ -2705,6 +2723,24 @@ int eliza_inference_tts_synthesize(
         return ELIZA_ERR_INVALID_ARG;
     }
 
+    /* Per-op backend seam: a TTS backend (e.g. LiteRT/NPU) serves this when it
+     * ships <bundle>/tts/*; otherwise fall through to the in-tree OmniVoice path
+     * below. Inert by default (no backend registered). */
+    {
+        char * be_error = nullptr;
+        TtsBackendFactory * be =
+            tts_backend_select(llm_backend_context_bundle_dir(ctx), &be_error);
+        if (be_error) {
+            eliza_set_error(out_error, std::string(be_error));
+            std::free(be_error);
+            return ELIZA_ERR_BUNDLE_INVALID;
+        }
+        if (be) {
+            return be->tts_synthesize(ctx, text, text_len, speaker_preset_id,
+                                      out_pcm, max_samples, out_error);
+        }
+    }
+
     std::lock_guard<std::mutex> lock(ctx->tts_mutex);
     if (!ctx->ov) {
         eliza_set_error(out_error, "[libelizainference] tts_synthesize: TTS region is not acquired; call mmap_acquire(\"tts\") after arming voice");
@@ -2937,7 +2973,7 @@ static int eliza_asr_decode_core(
     }
 
     std::string prompt = eliza_format_asr_prompt(ctx->asr_model);
-    mtmd_input_text text = { prompt.c_str(), true, true };
+    mtmd_input_text text = { prompt.c_str(), prompt.size(), true, true };
     const mtmd_bitmap * bitmaps[] = { bitmap.get() };
     std::unique_ptr<mtmd_input_chunks, decltype(&mtmd_input_chunks_free)> chunks(
         mtmd_input_chunks_init(),
@@ -2977,6 +3013,25 @@ int eliza_inference_asr_transcribe(
         eliza_set_error(out_error, "[libelizainference] asr_transcribe: invalid arguments");
         return ELIZA_ERR_INVALID_ARG;
     }
+
+    /* Per-op backend seam: an ASR backend (e.g. LiteRT/NPU) serves this when it
+     * ships <bundle>/asr/*; otherwise fall through to the in-tree ggml path
+     * below. Inert by default (no backend registered). */
+    {
+        char * be_error = nullptr;
+        AsrBackendFactory * be =
+            asr_backend_select(llm_backend_context_bundle_dir(ctx), &be_error);
+        if (be_error) {
+            eliza_set_error(out_error, std::string(be_error));
+            std::free(be_error);
+            return ELIZA_ERR_BUNDLE_INVALID;
+        }
+        if (be) {
+            return be->asr_transcribe(ctx, pcm, n_samples, sample_rate_hz,
+                                      out_text, max_text_bytes, out_error);
+        }
+    }
+
     std::string transcript;
     int rc = eliza_asr_decode_core(ctx, pcm, n_samples, sample_rate_hz, max_text_bytes, transcript, out_error);
     if (rc < 0) {
@@ -4048,6 +4103,40 @@ EliLlmStream * eliza_inference_llm_stream_open(
         return nullptr;
     }
 
+    /* Multi-backend seam (M3): an alternate in-process runtime (LiteRT-LM /
+     * MLX-CoreML) may serve this bundle. The selector returns nullptr with NO
+     * error to keep the in-tree llama.cpp path below; nullptr WITH an error is a
+     * hard env-select failure to propagate. */
+    {
+        char * sel_err = nullptr;
+        LlmBackendFactory * factory =
+            llm_backend_select(ctx->bundle_dir.c_str(), cfg, &sel_err);
+        if (!factory && sel_err) {
+            if (out_error) {
+                *out_error = sel_err;
+            } else {
+                eliza_inference_free_string(sel_err);
+            }
+            return nullptr;
+        }
+        if (factory) {
+            EliLlmStream * bstream = new (std::nothrow) EliLlmStream();
+            if (!bstream) {
+                eliza_set_error(out_error,
+                    "[libelizainference] llm_stream_open: out of memory");
+                return nullptr;
+            }
+            bstream->ctx = ctx;
+            bstream->max_tokens = cfg->max_tokens > 0 ? cfg->max_tokens : 0;
+            bstream->backend = factory->open(ctx, cfg, out_error);
+            if (!bstream->backend) {
+                delete bstream;
+                return nullptr;
+            }
+            return bstream;
+        }
+    }
+
     llama_model * model = nullptr;
     {
         std::lock_guard<std::mutex> lock(ctx->llm_mutex);
@@ -4153,6 +4242,9 @@ int eliza_inference_llm_stream_prefill(
     const int32_t * token_ids,
     size_t num_tokens,
     char ** out_error) {
+    if (stream && stream->backend) {
+        return stream->backend->prefill(token_ids, num_tokens, out_error);
+    }
     if (!stream || (!stream->lctx && !stream->mtp)) {
         eliza_set_error(out_error,
             "[libelizainference] llm_stream_prefill: invalid session");
@@ -4221,6 +4313,11 @@ int eliza_inference_llm_stream_next(
     if (drafter_accepted_out) *drafter_accepted_out = 0;
     if (text_out && text_cap > 0) text_out[0] = '\0';
 
+    if (stream && stream->backend) {
+        return stream->backend->next(tokens_out, tokens_cap, num_tokens_out,
+                                     text_out, text_cap, drafter_drafted_out,
+                                     drafter_accepted_out, out_error);
+    }
     if (!stream || (!stream->mtp && (!stream->lctx || !stream->sampler))) {
         eliza_set_error(out_error,
             "[libelizainference] llm_stream_next: invalid session");
@@ -4410,6 +4507,9 @@ int eliza_inference_llm_stream_next(
 }
 
 int eliza_inference_llm_stream_cancel(EliLlmStream * stream) {
+    if (stream && stream->backend) {
+        return stream->backend->cancel();
+    }
     if (stream) {
         stream->cancel.store(true, std::memory_order_release);
     }
@@ -4420,6 +4520,9 @@ int eliza_inference_llm_stream_save_slot(
     EliLlmStream * stream,
     const char * filename,
     char ** out_error) {
+    if (stream && stream->backend) {
+        return stream->backend->save_slot(filename, out_error);
+    }
     (void) stream;
     (void) filename;
     /* v1: cross-launch slot KV persistence is not wired. Return a structured
@@ -4434,6 +4537,9 @@ int eliza_inference_llm_stream_restore_slot(
     EliLlmStream * stream,
     const char * filename,
     char ** out_error) {
+    if (stream && stream->backend) {
+        return stream->backend->restore_slot(filename, out_error);
+    }
     (void) stream;
     (void) filename;
     eliza_set_error(out_error,
@@ -4450,6 +4556,7 @@ int eliza_inference_llm_stream_reset(EliLlmStream * stream) {
      * created/destroyed repeatedly. Handles both the plain fixed-KV stream and
      * the MTP speculative engine (which owns its own target/draft KV). */
     if (!stream) return ELIZA_ERR_INVALID_ARG;
+    if (stream->backend) return stream->backend->reset();
     if (!stream->mtp && !stream->lctx) return ELIZA_ERR_INVALID_ARG;
     if (stream->mtp) {
         /* MTP stream: clear both the target and draft KV caches, reset the
@@ -4484,6 +4591,7 @@ int eliza_inference_llm_stream_reset_keep(EliLlmStream * stream, int32_t n_keep)
      * separate (riskier) handling — prefix-reuse mode opens the resident stream
      * without MTP, trading MTP's ~1.5x decode for the much larger prefill cut. */
     if (!stream) return ELIZA_ERR_INVALID_ARG;
+    if (stream->backend) return stream->backend->reset_keep(n_keep);
     if (stream->mtp || !stream->lctx) return ELIZA_ERR_INVALID_ARG;
     if (n_keep < 0) n_keep = 0;
     if (n_keep > stream->n_past) n_keep = stream->n_past;
@@ -4504,6 +4612,10 @@ int eliza_inference_llm_stream_reset_keep(EliLlmStream * stream, int32_t n_keep)
 
 void eliza_inference_llm_stream_close(EliLlmStream * stream) {
     if (!stream) return;
+    if (stream->backend) {
+        delete stream->backend;
+        stream->backend = nullptr;
+    }
     if (stream->mtp) {
         eliza_mtp::free_engine(stream->mtp);
         stream->mtp = nullptr;
@@ -4605,6 +4717,24 @@ static int eliza_inference_embed_impl(
             "[libelizainference] embed: invalid pooling type " +
             std::to_string(pooling));
         return ELIZA_ERR_INVALID_ARG;
+    }
+
+    /* Per-op backend seam: an embedding backend (e.g. LiteRT/NPU) serves this
+     * when it ships <bundle>/embedding/*; otherwise fall through to the in-tree
+     * ggml encoder below. Inert by default (no backend registered). */
+    {
+        char * be_error = nullptr;
+        EmbedBackendFactory * be =
+            embed_backend_select(llm_backend_context_bundle_dir(ctx), &be_error);
+        if (be_error) {
+            eliza_set_error(out_error, std::string(be_error));
+            std::free(be_error);
+            return ELIZA_ERR_BUNDLE_INVALID;
+        }
+        if (be) {
+            return be->embed(ctx, text, text_len, pooling, out_embedding,
+                             out_capacity, out_dim, out_error);
+        }
     }
 
     std::lock_guard<std::mutex> lock(ctx->llm_mutex);
@@ -4761,6 +4891,25 @@ int eliza_inference_llm_eot_score(
         eliza_set_error(out_error,
             "[libelizainference] eot: invalid arguments");
         return ELIZA_ERR_INVALID_ARG;
+    }
+
+    /* Per-op backend seam: an EOT backend (e.g. LiteRT/NPU) serves this when it
+     * ships <bundle>/eot/*; otherwise fall through to the in-tree ggml
+     * causal-scoring path below. Inert by default (no backend registered). */
+    {
+        char * be_error = nullptr;
+        EotBackendFactory * be =
+            eot_backend_select(llm_backend_context_bundle_dir(ctx), &be_error);
+        if (be_error) {
+            eliza_set_error(out_error, std::string(be_error));
+            std::free(be_error);
+            return ELIZA_ERR_BUNDLE_INVALID;
+        }
+        if (be) {
+            return be->eot_score(ctx, token_ids, num_tokens, target_token_id,
+                                 out_target_prob, out_top_token, out_top_prob,
+                                 out_error);
+        }
     }
 
     std::lock_guard<std::mutex> lock(ctx->llm_mutex);
@@ -4924,6 +5073,24 @@ int eliza_inference_describe_image(
         return ELIZA_ERR_INVALID_ARG;
     }
 
+    /* Per-op backend seam: a vision backend (e.g. LiteRT/NPU) serves this when it
+     * ships <bundle>/vision/*; otherwise fall through to the in-tree ggml mmproj
+     * path below. Inert by default (no backend registered). */
+    {
+        char * be_error = nullptr;
+        VisionBackendFactory * be =
+            vision_backend_select(llm_backend_context_bundle_dir(ctx), &be_error);
+        if (be_error) {
+            eliza_set_error(out_error, std::string(be_error));
+            std::free(be_error);
+            return ELIZA_ERR_BUNDLE_INVALID;
+        }
+        if (be) {
+            return be->describe_image(ctx, image_bytes, n_bytes, mmproj_path,
+                                      prompt, out_text, max_text_bytes, out_error);
+        }
+    }
+
     std::lock_guard<std::mutex> lock(ctx->llm_mutex);
     int rc = eliza_load_llm_model_locked(ctx, /* n_gpu_layers= */ -1, out_error);
     if (rc != ELIZA_OK) return rc;
@@ -4966,8 +5133,15 @@ int eliza_inference_describe_image(
                 ? user_prompt
                 : (std::string(marker ? marker : "<__media__>") + "\n" + user_prompt);
 
-        bitmap = mtmd_helper_bitmap_init_from_buf(
-            ctx->vision_mtmd, image_bytes, n_bytes);
+        auto decoded = mtmd_helper_bitmap_init_from_buf(
+            ctx->vision_mtmd, image_bytes, n_bytes, false);
+        bitmap = decoded.bitmap;
+        // This API accepts a still image; do not retain a lazy video decoder.
+        if (decoded.video_ctx) {
+            if (bitmap) mtmd_bitmap_free(bitmap);
+            mtmd_helper_video_free(decoded.video_ctx);
+            bitmap = nullptr;
+        }
         if (!bitmap) {
             eliza_set_error(out_error,
                 "[libelizainference] describe_image: image decode failed");
@@ -4980,7 +5154,7 @@ int eliza_inference_describe_image(
                 "[libelizainference] describe_image: chunks allocation failed");
             break;
         }
-        mtmd_input_text text = { prompt_text.c_str(), true, true };
+        mtmd_input_text text = { prompt_text.c_str(), prompt_text.size(), true, true };
         const mtmd_bitmap * bitmaps[] = { bitmap };
         int32_t tok_rc = mtmd_tokenize(ctx->vision_mtmd, chunks, &text, bitmaps, 1);
         if (tok_rc != 0) {
@@ -5056,6 +5230,174 @@ int eliza_inference_describe_image(
     std::memcpy(out_text, transcript.data(), transcript.size());
     out_text[transcript.size()] = '\0';
     return (int) transcript.size();
+#endif // ELIZA_ENABLE_VISION
+}
+
+/* ---- Streaming mmproj vision describe (ABI v13) ------------------- *
+ *
+ * Token-by-token vision: open primes an EliLlmStream's KV with the image +
+ * prompt (the same mtmd prefill as _describe_image), and the caller drives the
+ * existing _llm_stream_next loop to pull tokens — so vision streams through the
+ * exact same path (and JS FfiStreamingRunner) as chat text. The returned stream
+ * carries a greedy sampler + ELIZA_VISION_MAX_TOKENS cap and no MTP engine. */
+
+int eliza_inference_vision_stream_supported(void) {
+#if defined(ELIZA_ENABLE_VISION)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+EliLlmStream * eliza_inference_describe_image_stream_open(
+    EliInferenceContext * ctx,
+    const unsigned char * image_bytes,
+    size_t n_bytes,
+    const char * mmproj_path,
+    const char * prompt,
+    char ** out_error) {
+#if !defined(ELIZA_ENABLE_VISION)
+    (void) ctx; (void) image_bytes; (void) n_bytes; (void) mmproj_path;
+    (void) prompt;
+    eliza_set_error(out_error,
+        "[libelizainference] describe_image_stream_open: this build was compiled "
+        "without ELIZA_ENABLE_VISION (eliza_inference_vision_stream_supported() == "
+        "0); use the buffered _describe_image path");
+    return nullptr;
+#else
+    if (!ctx || !image_bytes || n_bytes == 0 || !mmproj_path ||
+        mmproj_path[0] == '\0') {
+        eliza_set_error(out_error,
+            "[libelizainference] describe_image_stream_open: invalid arguments");
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx->llm_mutex);
+    int rc = eliza_load_llm_model_locked(ctx, /* n_gpu_layers= */ -1, out_error);
+    if (rc != ELIZA_OK) return nullptr;
+    rc = eliza_ensure_vision_mtmd_locked(ctx, std::string(mmproj_path), out_error);
+    if (rc != ELIZA_OK) return nullptr;
+
+    /* A fresh generation context (causal, no embeddings), owned by the returned
+     * stream and freed by eliza_inference_llm_stream_close. Same params as the
+     * buffered _describe_image so streamed and buffered describes decode
+     * identically. */
+    llama_context_params cparams = llama_context_default_params();
+    const int n_ctx_train = llama_model_n_ctx_train(ctx->llm_model);
+    int n_ctx = eliza_int_env_or_default("ELIZA_VISION_N_CTX", 4096);
+    if (n_ctx_train > 0 && n_ctx > n_ctx_train) n_ctx = n_ctx_train;
+    cparams.n_ctx = (uint32_t) n_ctx;
+    cparams.n_batch = (uint32_t) eliza_int_env_or_default("ELIZA_VISION_N_BATCH", 512);
+    cparams.n_ubatch = cparams.n_batch;
+    cparams.n_threads = eliza_thread_count(false);
+    cparams.n_threads_batch = eliza_thread_count(true);
+    cparams.flash_attn_type = eliza_llm_flash_attn_type();
+    llama_context * lctx = llama_init_from_model(ctx->llm_model, cparams);
+    if (!lctx) {
+        eliza_set_error(out_error,
+            "[libelizainference] describe_image_stream_open: failed to init context");
+        return nullptr;
+    }
+
+    llama_sampler * sampler = nullptr;
+    mtmd_bitmap * bitmap = nullptr;
+    mtmd_input_chunks * chunks = nullptr;
+    bool ok = false;
+    llama_pos n_past = 0;
+
+    do {
+        const char * marker = mtmd_default_marker();
+        std::string user_prompt = prompt && prompt[0] != '\0'
+            ? std::string(prompt)
+            : std::string("Describe what is in this image.");
+        std::string prompt_text =
+            (marker && user_prompt.find(marker) != std::string::npos)
+                ? user_prompt
+                : (std::string(marker ? marker : "<__media__>") + "\n" + user_prompt);
+
+        auto decoded = mtmd_helper_bitmap_init_from_buf(
+            ctx->vision_mtmd, image_bytes, n_bytes, false);
+        bitmap = decoded.bitmap;
+        // This API accepts a still image; do not retain a lazy video decoder.
+        if (decoded.video_ctx) {
+            if (bitmap) mtmd_bitmap_free(bitmap);
+            mtmd_helper_video_free(decoded.video_ctx);
+            bitmap = nullptr;
+        }
+        if (!bitmap) {
+            eliza_set_error(out_error,
+                "[libelizainference] describe_image_stream_open: image decode failed");
+            break;
+        }
+        chunks = mtmd_input_chunks_init();
+        if (!chunks) {
+            eliza_set_error(out_error,
+                "[libelizainference] describe_image_stream_open: chunks allocation failed");
+            break;
+        }
+        mtmd_input_text text = { prompt_text.c_str(), prompt_text.size(), true, true };
+        const mtmd_bitmap * bitmaps[] = { bitmap };
+        int32_t tok_rc = mtmd_tokenize(ctx->vision_mtmd, chunks, &text, bitmaps, 1);
+        if (tok_rc != 0) {
+            eliza_set_error(out_error,
+                "[libelizainference] describe_image_stream_open: mtmd_tokenize rc=" +
+                std::to_string(tok_rc));
+            break;
+        }
+
+        llama_memory_clear(llama_get_memory(lctx), true);
+        int32_t eval_rc = mtmd_helper_eval_chunks(
+            ctx->vision_mtmd, lctx, chunks, n_past, 0,
+            (int32_t) cparams.n_batch, true, &n_past);
+        if (eval_rc != 0) {
+            eliza_set_error(out_error,
+                "[libelizainference] describe_image_stream_open: mtmd_helper_eval_chunks rc=" +
+                std::to_string(eval_rc));
+            break;
+        }
+
+        llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
+        sampler = llama_sampler_chain_init(sparams);
+        if (!sampler) {
+            eliza_set_error(out_error,
+                "[libelizainference] describe_image_stream_open: failed to init sampler");
+            break;
+        }
+        llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
+        ok = true;
+    } while (false);
+
+    /* The bitmap + chunks are only needed for the prefill eval; the KV now holds
+     * the image + prompt, so release them (the lctx + sampler live on in the
+     * returned stream). */
+    if (chunks) mtmd_input_chunks_free(chunks);
+    if (bitmap) mtmd_bitmap_free(bitmap);
+
+    if (!ok) {
+        if (sampler) llama_sampler_free(sampler);
+        llama_free(lctx);
+        return nullptr;
+    }
+
+    EliLlmStream * stream = new (std::nothrow) EliLlmStream();
+    if (!stream) {
+        llama_sampler_free(sampler);
+        llama_free(lctx);
+        eliza_set_error(out_error,
+            "[libelizainference] describe_image_stream_open: out of memory");
+        return nullptr;
+    }
+    stream->ctx = ctx;
+    stream->lctx = lctx;
+    stream->sampler = sampler;
+    stream->n_past = (int) n_past;
+    stream->generated = 0;
+    stream->max_tokens = eliza_int_env_or_default("ELIZA_VISION_MAX_TOKENS", 256);
+    stream->eos = false;
+    /* mtp stays null — vision uses the plain fixed-KV decode path in
+     * _llm_stream_next, which samples from lctx (logits primed at -1 by
+     * mtmd_helper_eval_chunks above). */
+    return stream;
 #endif // ELIZA_ENABLE_VISION
 }
 

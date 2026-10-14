@@ -184,37 +184,13 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         endif()
     endif()
 
-    if (GGML_OPENMP AND EMSCRIPTEN)
-        # Let the Emscripten driver select its matching threaded system libraries.
-        # FindOpenMP records probe-time libc archives, which can conflict with
-        # the final executable's optimization, exception and threading settings.
-        include(CheckCXXSourceCompiles)
-        include(CMakePushCheckState)
-        cmake_push_check_state(RESET)
-        set(CMAKE_REQUIRED_FLAGS "-fopenmp")
-        check_cxx_source_compiles("#include <omp.h>
-int main() { return omp_get_max_threads(); }"
-                                  GGML_EMSCRIPTEN_OPENMP)
-        cmake_pop_check_state()
-        if (GGML_EMSCRIPTEN_OPENMP)
+    if (GGML_OPENMP_ENABLED)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_OPENMP)
+        if (EMSCRIPTEN)
             target_compile_options(${GGML_CPU_NAME} PRIVATE -fopenmp)
             target_link_options(${GGML_CPU_NAME} PUBLIC -fopenmp)
-            target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_OPENMP)
-            set(GGML_OPENMP_ENABLED "ON" CACHE INTERNAL "")
         else()
-            set(GGML_OPENMP_ENABLED "OFF" CACHE INTERNAL "")
-            message(WARNING "OpenMP not found")
-        endif()
-    elseif (GGML_OPENMP)
-        find_package(OpenMP)
-        if (OpenMP_FOUND)
-            set(GGML_OPENMP_ENABLED "ON" CACHE INTERNAL "")
-            target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_OPENMP)
-
             target_link_libraries(${GGML_CPU_NAME} PRIVATE OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
-        else()
-            set(GGML_OPENMP_ENABLED "OFF" CACHE INTERNAL "")
-            message(WARNING "OpenMP not found")
         endif()
     endif()
 
@@ -530,7 +506,7 @@ int main() { return omp_get_max_threads(); }"
             string(REGEX MATCHALL "POWER *([0-9]+)" MATCHED_STRING "${POWER10_M_UPPER}")
             string(REGEX REPLACE "POWER *([0-9]+)" "\\1" EXTRACTED_NUMBER "${MATCHED_STRING}")
 
-            if (EXTRACTED_NUMBER GREATER_EQUAL 10)
+            if (EXTRACTED_NUMBER EQUAL 10 OR EXTRACTED_NUMBER EQUAL 11)
                 list(APPEND ARCH_FLAGS -mcpu=power10)
             elseif (EXTRACTED_NUMBER EQUAL 9)
                 list(APPEND ARCH_FLAGS -mcpu=power9)
@@ -782,6 +758,7 @@ int main() { return omp_get_max_threads(); }"
             ${KLEIDIAI_SRC}/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi8cxp/
             ${KLEIDIAI_SRC}/kai/ukernels/matmul/matmul_clamp_fp32_bf16p_bf16p/
             ${KLEIDIAI_SRC}/kai/ukernels/matmul/matmul_clamp_f32_f16p_qsi4c32p/
+            ${KLEIDIAI_SRC}/kai/ukernels/matmul/matmul_clamp_f32_f32p_f32p/
             ${KLEIDIAI_SRC}/kai/ukernels/matmul/pack/)
 
         set(ARCH_FLAGS_TEMP "${ARCH_FLAGS}")
@@ -821,7 +798,18 @@ int main() { return omp_get_max_threads(); }"
         endif()
 
         if (NOT SME_ENABLED MATCHES -1)
-            list(APPEND GGML_KLEIDIAI_SOURCES
+            list(APPEND GGML_KLEIDIAI_SME_SOURCES
+                ${KLEIDIAI_SRC}/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi8cxp/kai_matmul_clamp_f32_qai8dxp1vlx4_qsi8cxp4vlx4_1vlx4vl_sme_mopa.c
+                ${KLEIDIAI_SRC}/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi8cxp/kai_matmul_clamp_f32_qai8dxp1vlx4_qsi8cxp4vlx4_1vlx4vl_sme_mopa_asm.S
+                ${KLEIDIAI_SRC}/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi8cxp/kai_matmul_clamp_f32_qai8dxp1x4_qsi8cxp4vlx4_1x4vl_sme_dot.c
+                ${KLEIDIAI_SRC}/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi8cxp/kai_matmul_clamp_f32_qai8dxp1x4_qsi8cxp4vlx4_1x4vl_sme_dot_asm.S
+                ${KLEIDIAI_SRC}/kai/ukernels/matmul/matmul_clamp_f32_f32p_f32p/kai_matmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa.c
+                ${KLEIDIAI_SRC}/kai/ukernels/matmul/matmul_clamp_f32_f32p_f32p/kai_matmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme_mopa_asm.S)
+            set_source_files_properties(${GGML_KLEIDIAI_SME_SOURCES}
+                PROPERTIES COMPILE_OPTIONS "-fno-tree-vectorize;${ARCH_FLAGS_TEMP}+sve+sve2+sme")
+            list(APPEND GGML_CPU_SOURCES ${GGML_KLEIDIAI_SME_SOURCES})
+
+            list(APPEND GGML_KLEIDIAI_SME2_SOURCES
                 ${KLEIDIAI_SRC}/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qsi4c32p/kai_matmul_clamp_f32_qsi8d32p1x4_qsi4c32p4vlx4_1x4vl_sme2_sdot.c
                 ${KLEIDIAI_SRC}/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi8cxp/kai_matmul_clamp_f32_qai8dxp1vlx4_qsi8cxp4vlx4_1vlx4vl_sme2_mopa.c
                 ${KLEIDIAI_SRC}/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi8cxp/kai_matmul_clamp_f32_qai8dxp1vlx4_qsi8cxp4vlx4_1vlx4vl_sme2_mopa_asm.S
@@ -831,11 +819,20 @@ int main() { return omp_get_max_threads(); }"
                 ${KLEIDIAI_SRC}/kai/ukernels/matmul/matmul_clamp_fp32_bf16p_bf16p/kai_matmul_clamp_f32_bf16p2vlx2_bf16p2vlx2_2vlx2vl_sme2_mopa_asm.S
                 ${KLEIDIAI_SRC}/kai/ukernels/matmul/matmul_clamp_f32_f16p_qsi4c32p/kai_matmul_clamp_f32_f16p1vlx2_qsi4c32p4vlx2_1vlx4vl_sme2_mopa.c
                 ${KLEIDIAI_SRC}/kai/ukernels/matmul/matmul_clamp_f32_f16p_qsi4c32p/kai_matmul_clamp_f32_f16p1vlx2_qsi4c32p4vlx2_1vlx4vl_sme2_mopa_asm.S
+                ${KLEIDIAI_SRC}/kai/ukernels/matmul/matmul_clamp_f32_f32p_f32p/kai_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa.c
+                ${KLEIDIAI_SRC}/kai/ukernels/matmul/matmul_clamp_f32_f32p_f32p/kai_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa_asm.S
                 ${KLEIDIAI_SRC}/kai/ukernels/matmul/pack/kai_lhs_pack_bf16p2vlx2_f32_sme.c
                 ${KLEIDIAI_SRC}/kai/ukernels/matmul/pack/kai_rhs_pack_kxn_bf16p2vlx2b_f32_x32_sme.c
                 ${KLEIDIAI_SRC}/kai/ukernels/matmul/pack/kai_lhs_pack_f16pmrx2_f32_neon.c
+                ${KLEIDIAI_SRC}/kai/ukernels/matmul/pack/kai_lhs_pack_f32p2vlx1_f32_sme.c
+                ${KLEIDIAI_SRC}/kai/ukernels/matmul/pack/kai_lhs_pack_f32p2vlx1_f32_sme_asm.S
+                ${KLEIDIAI_SRC}/kai/ukernels/matmul/pack/kai_rhs_pack_nxk_f32p2vlx1biasf32_f32_f32_sme.c
+                ${KLEIDIAI_SRC}/kai/ukernels/matmul/pack/kai_rhs_pack_nxk_f32p2vlx1biasf32_f32_f32_sme_asm.S
                 ${KLEIDIAI_SRC}/kai/kai_common_sme_asm.S)
-            set(PRIVATE_ARCH_FLAGS "-fno-tree-vectorize;${PRIVATE_ARCH_FLAGS}+sve+sve2+sme2+fp16")
+            set_source_files_properties(${GGML_KLEIDIAI_SME2_SOURCES}
+                PROPERTIES COMPILE_OPTIONS "-fno-tree-vectorize;${ARCH_FLAGS_TEMP}+sve+sve2+sme2+fp16")
+            list(APPEND GGML_CPU_SOURCES ${GGML_KLEIDIAI_SME2_SOURCES})
+            set(PRIVATE_ARCH_FLAGS "-fno-tree-vectorize;${PRIVATE_ARCH_FLAGS}")
         endif()
 
         if (NOT SVE_ENABLED MATCHES -1)

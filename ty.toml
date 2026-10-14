@@ -24,8 +24,7 @@ include = [
     # only in that pinned env (see tools/misaki-g2p/README.md), not under CI.
     "./tools/misaki-g2p/scripts/**",
     "./tools/misaki-g2p/tests/**",
-    # Same for the Paradee reference dumper (kokoro, misaki, espeakng_loader
-    # and the paradee training scripts are pinned in its own environment).
+    # Paradee reference tools run in their pinned Python environment.
     "./tools/paradee/tools/**",
     # Same for the Parakeet reference dumper and bench scorer (torch,
     # transformers, soundfile, librosa and whisper_normalizer live in the
@@ -37,6 +36,7 @@ include = [
     # composition at the mixin level, so the super() calls and
     # base-class attributes (ftype, metadata) appear unresolved.
     "./conversion/**",
+    "./tools/mtmd/tests/**",
 ]
 
 [overrides.rules]
