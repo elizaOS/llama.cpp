@@ -166,10 +166,19 @@ int main() {
             CHECK(count_words(fin) + 3 >= count_words(text) && count_words(fin) <= count_words(text) + 3,
                   "concurrent stream word count %zu far from batch %zu", count_words(fin), count_words(text));
             std::printf("concurrent feed/partial: %d polls, %zu words\n", polls, count_words(fin));
-            // a tiny buffer: truncated, NUL-terminated, length < capacity
+            // Insufficient output space must not return a successful prefix.
             char tiny[5];
             rc = eliza_inference_asr_stream_partial(cs, tiny, sizeof(tiny), nullptr, nullptr, &err);
-            CHECK(rc >= 0 && rc < (int) sizeof(tiny) && tiny[rc] == '\0', "tiny buffer rc %d", rc);
+            CHECK(rc < 0, "tiny partial buffer must fail, got %d", rc);
+            eliza_inference_free_string(err);
+            err = nullptr;
+            rc = eliza_inference_asr_stream_finish(cs, tiny, sizeof(tiny), nullptr, nullptr, &err);
+            CHECK(rc < 0, "tiny final buffer must fail, got %d", rc);
+            eliza_inference_free_string(err);
+            err = nullptr;
+            char retry[4096];
+            rc = eliza_inference_asr_stream_finish(cs, retry, sizeof(retry), nullptr, nullptr, &err);
+            CHECK(rc > 0 && std::strcmp(fin, retry) == 0, "retry after small buffer lost transcript");
             eliza_inference_asr_stream_close(cs);
         }
     }

@@ -105,7 +105,8 @@ pk_stream * pk_stream_open(pk_model * model, pk_stream_params params);
 int pk_stream_feed(pk_stream * st, const float * pcm16k, size_t n_samples);
 /* Decode if at least min_hop_ms of new audio arrived since the last decode,
  * then write committed + tentative text. Returns bytes written (excluding
- * NUL) or a negative pk_status. */
+ * NUL) or a negative pk_status. An insufficient output buffer returns
+ * PK_E_INVALID without partial text; retry with more space. */
 int pk_stream_partial(pk_stream * st, char * out, size_t cap, pk_cancel_cb cancel, void * cancel_user);
 /* Decode the remaining audio with full right context and write the final
  * transcript. */
