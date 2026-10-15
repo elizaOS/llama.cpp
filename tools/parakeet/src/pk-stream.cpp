@@ -345,14 +345,13 @@ static int write_text(pk_stream * s, char * out, size_t cap) {
     all.insert(all.end(), s->tentative.begin(), s->tentative.end());
     const std::string t = detokenize(s->m, all.data(), all.size());
     if (!out || cap == 0) return (int) t.size();
-    size_t n = std::min(t.size(), cap - 1);
-    // never cut a UTF-8 sequence: back off over continuation bytes
-    if (n < t.size()) {
-        while (n > 0 && ((unsigned char) t[n] & 0xC0) == 0x80) --n;
+    if (t.size() >= cap) {
+        out[0] = '\0';
+        return PK_E_INVALID;
     }
-    std::memcpy(out, t.data(), n);
-    out[n] = '\0';
-    return (int) n;
+    std::memcpy(out, t.data(), t.size());
+    out[t.size()] = '\0';
+    return (int) t.size();
 }
 
 extern "C" int pk_stream_partial(pk_stream * s, char * out, size_t cap, pk_cancel_cb cancel, void * cu) {
