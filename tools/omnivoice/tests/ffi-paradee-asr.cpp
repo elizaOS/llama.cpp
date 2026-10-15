@@ -198,12 +198,20 @@ static void test_paradee_streaming() {
     for (int i = 0; i < 40; ++i) text += "the quick brown fox jumps now. ";
     float * expected = nullptr; size_t count = 0;
     CHECK_RC(eliza_inference_paradee_synthesize_alloc(ctx, text.data(), text.size(), 1, &expected, &count, &err), ELIZA_OK);
-    struct Output { std::vector<float> pcm; int final = 0; int calls = 0; bool cancel = false; } output;
+    struct Output {
+        std::vector<float> pcm;
+        int final = 0, calls = 0, synth_before = 0;
+        bool cancel = false, cancel_final = false;
+        EliInferenceContext * cancel_context = nullptr;
+    } output;
+    output.synth_before = fake_paradee().synth_calls.load();
     auto receive = [](const float * pcm, size_t n, int final, void * user) {
         auto & out = *static_cast<Output *>(user);
-        if (final) { ++out.final; CHECK(n == 0 && pcm == nullptr); return 0; }
+        if (final) { ++out.final; CHECK(n == 0 && pcm == nullptr); return out.cancel_final ? 1 : 0; }
         CHECK(n <= 24000 && out.final == 0);
+        if (out.calls == 0) CHECK(fake_paradee().synth_calls.load() == out.synth_before + 1);
         ++out.calls;
+        if (out.cancel_context) CHECK_RC(eliza_inference_cancel_tts(out.cancel_context, nullptr), ELIZA_OK);
         out.pcm.insert(out.pcm.end(), pcm, pcm + n);
         return out.cancel ? 1 : 0;
     };
@@ -211,9 +219,19 @@ static void test_paradee_streaming() {
     CHECK(output.calls > 1 && output.final == 1);
     CHECK(output.pcm == std::vector<float>(expected, expected + count));
     eliza_inference_free_pcm(expected);
-    output = Output{}; output.cancel = true;
+    output = Output{}; output.cancel = true; output.synth_before = fake_paradee().synth_calls.load();
     CHECK_RC(eliza_inference_paradee_synthesize_stream(ctx, text.data(), text.size(), 1, receive, &output, &err), ELIZA_ERR_CANCELLED);
     CHECK(output.calls == 1 && output.final == 0);
+    CHECK(fake_paradee().synth_calls.load() == output.synth_before + 1);
+    clear_err(&err);
+    output = Output{}; output.cancel_context = ctx; output.synth_before = fake_paradee().synth_calls.load();
+    CHECK_RC(eliza_inference_paradee_synthesize_stream(ctx, text.data(), text.size(), 1, receive, &output, &err), ELIZA_ERR_CANCELLED);
+    CHECK(output.calls == 1 && output.final == 0);
+    CHECK(fake_paradee().synth_calls.load() == output.synth_before + 1);
+    clear_err(&err);
+    output = Output{}; output.cancel_final = true; output.synth_before = fake_paradee().synth_calls.load();
+    CHECK_RC(eliza_inference_paradee_synthesize_stream(ctx, "hi", 2, 1, receive, &output, &err), ELIZA_ERR_CANCELLED);
+    CHECK(output.calls == 1 && output.final == 1);
     clear_err(&err);
     output = Output{};
     CHECK_RC(eliza_inference_paradee_synthesize_stream(ctx, "12345", 5, 1, receive, &output, &err), ELIZA_OK);
