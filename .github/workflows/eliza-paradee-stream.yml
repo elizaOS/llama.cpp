@@ -1,0 +1,24 @@
+name: Paradee streaming contract
+on:
+  pull_request:
+    paths:
+      - 'tools/omnivoice/**'
+      - '.github/workflows/eliza-paradee-stream.yml'
+  workflow_dispatch:
+jobs:
+  contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure host contract doubles without models
+        run: >-
+          cmake -S . -B build-stream -G Ninja
+          -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF
+          -DLLAMA_BUILD_OMNIVOICE=ON -DLLAMA_BUILD_TESTS=ON
+          -DLLAMA_BUILD_SERVER=OFF -DLLAMA_CURL=OFF
+          -DMTMD_VIDEO=OFF
+      - name: Build FFI and bounded dispatch tests
+        run: cmake --build build-stream --target eliza-inference-test-paradee-asr eliza-inference-test-paradee-stream-output -j 2
+      - name: Exercise FFI chunking and cancellation
+        run: ctest --test-dir build-stream --output-on-failure -R 'eliza-inference-test-paradee-(asr|stream-output)$'

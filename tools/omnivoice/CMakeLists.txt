@@ -522,6 +522,13 @@ if(TARGET mtmd)
             endif()
         endif()
 
+        add_executable(eliza-inference-test-paradee-stream-output
+            tests/paradee-stream-output.cpp)
+        target_compile_features(eliza-inference-test-paradee-stream-output PRIVATE cxx_std_17)
+        if(BUILD_TESTING)
+            add_test(NAME eliza-inference-test-paradee-stream-output COMMAND eliza-inference-test-paradee-stream-output)
+        endif()
+
         add_executable(eliza-inference-test-paradee-asr
             tests/ffi-paradee-asr.cpp
             tests/paradee-contract/fake-paradee.cpp

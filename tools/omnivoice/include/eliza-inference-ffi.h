@@ -1,5 +1,5 @@
 /*
- * libelizainference FFI ABI v18.
+ * libelizainference FFI ABI v19.
  *
  * (Banner tracks ELIZA_INFERENCE_ABI_VERSION below; the per-version history is
  * at the end of this header preamble, newest first.)
@@ -134,6 +134,7 @@ extern "C" {
  * load and refuses to bind if they disagree.
  *
  * Changelog:
+ *   v19: bounded Paradee model-chunk PCM delivery and cancellation.
  *   v18: text-model context capacity resolved before stream admission.
  *         - `eliza_inference_llm_context_capacity(ctx, requested_context,
  *           n_gpu_layers, &out_capacity, &err)` loads the resident text model
@@ -296,9 +297,9 @@ extern "C" {
  *   v7: real Silero VAD (same symbol surface as v6).
  *   v6: fused wake-word, speaker, diarizer.
  */
-#define ELIZA_INFERENCE_ABI_VERSION 18
+#define ELIZA_INFERENCE_ABI_VERSION 19
 
-/* Returns a static, NUL-terminated string of the form "18" matching
+/* Returns a static, NUL-terminated string of the form "19" matching
  * ELIZA_INFERENCE_ABI_VERSION at the time the library was built. The
  * pointer is owned by the library — do NOT free. */
 const char * eliza_inference_abi_version(void);
@@ -673,6 +674,26 @@ int eliza_inference_paradee_synthesize_alloc(
     float ** out_pcm,
     size_t * out_samples,
     char ** out_error);
+
+/* Paradee model-chunk streaming (ABI v19). Emits each <=510-id model
+ * chunk before synthesizing the next, in callbacks of at most 24000 samples.
+ * This is not sub-model/incremental decoding. G2P runs before the first chunk.
+ * The synchronous callback provides backpressure; PCM is borrowed only during
+ * the callback. Return nonzero to cancel. cancel_tts may run on another thread.
+ * The callback must not reenter synthesis, loading, eviction or destruction of
+ * this context. No more PCM is delivered after cancellation is observed.
+ * Unlike the OmniVoice stream API, a zero-length is_final=1 callback occurs
+ * only after successful synthesis; errors/cancellation have no final callback.
+ * The return code is authoritative, including cancellation by the final callback.
+ * Already delivered PCM cannot be retracted: callers must stop their playback
+ * queue on any failure. Empty valid input produces only the final callback.
+ * No full-utterance PCM buffer is accumulated. Text/chunk metadata and a single
+ * model output still scale to their respective inputs; this is not an input cap.
+ */
+int eliza_inference_paradee_stream_supported(void);
+int eliza_inference_paradee_synthesize_stream(
+    EliInferenceContext * ctx, const char * text, size_t text_len, float speed,
+    eliza_tts_chunk_cb on_chunk, void * user_data, char ** out_error);
 
 /* Same as `paradee_synthesize_alloc`, but the input is a misaki phoneme
  * string (as returned by `paradee_phonemize`); G2P is skipped. Characters

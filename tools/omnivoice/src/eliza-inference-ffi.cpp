@@ -14,6 +14,7 @@
 // resolve `eliza_inference_*` symbols from this object.
 
 #include "eliza-inference-ffi.h"
+#include "paradee-stream-output.h"
 #include "llm-backend.h"
 #include "embed-backend.h"
 #include "vision-backend.h"
@@ -2360,17 +2361,19 @@ static int eliza_paradee_synthesize_owned(
     float speed,
     float ** out_pcm,
     size_t * out_samples,
-    char ** out_error) {
+    char ** out_error,
+    eliza_tts_chunk_cb on_chunk = nullptr,
+    void * user_data = nullptr) {
     const char * operation = phoneme_input
         ? "paradee_synthesize_phonemes_alloc"
         : "paradee_synthesize_alloc";
-    if (!out_pcm || !out_samples) {
+    if (!on_chunk && (!out_pcm || !out_samples)) {
         eliza_set_error(out_error,
             std::string("[libelizainference] ") + operation + ": null output argument");
         return ELIZA_ERR_INVALID_ARG;
     }
-    *out_pcm = nullptr;
-    *out_samples = 0;
+    if (out_pcm) *out_pcm = nullptr;
+    if (out_samples) *out_samples = 0;
     if (!ctx || !input) {
         eliza_set_error(out_error,
             std::string("[libelizainference] ") + operation + ": null argument");
@@ -2434,9 +2437,20 @@ static int eliza_paradee_synthesize_owned(
                 std::string("[libelizainference] ") + operation + ": paradee_synthesize failed: " + err);
             return st == eliza_paradee::PARADEE_E_OOM ? ELIZA_ERR_OOM : ELIZA_ERR_FFI_FAULT;
         }
-        pcm.insert(pcm.end(), audio.samples.begin(), audio.samples.end());
+        if (on_chunk) {
+            if (!eliza_paradee_stream_output(audio.samples.data(), audio.samples.size(),
+                    on_chunk, user_data, [&]() { return ctx->paradee_cancel.load(std::memory_order_acquire); }))
+                return cancelled();
+        } else {
+            pcm.insert(pcm.end(), audio.samples.begin(), audio.samples.end());
+        }
     }
     if (ctx->paradee_cancel.exchange(false, std::memory_order_acq_rel)) return cancelled();
+    if (on_chunk) {
+        if (on_chunk(nullptr, 0, 1, user_data) != 0 || ctx->paradee_cancel.load(std::memory_order_acquire))
+            return cancelled();
+        return ELIZA_OK;
+    }
     if (pcm.empty()) return ELIZA_OK;
 
     float * owned = static_cast<float *>(std::malloc(pcm.size() * sizeof(float)));
@@ -2597,6 +2611,31 @@ int eliza_inference_paradee_synthesize_phonemes_alloc(
     (void) ctx; (void) misaki_phonemes; (void) phonemes_len; (void) speed;
     if (out_pcm) *out_pcm = nullptr;
     if (out_samples) *out_samples = 0;
+    ELIZA_PARADEE_NOT_BUILT(out_error);
+#endif
+}
+
+int eliza_inference_paradee_stream_supported(void) {
+#ifdef ELIZA_ENABLE_PARADEE
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int eliza_inference_paradee_synthesize_stream(
+    EliInferenceContext * ctx, const char * text, size_t text_len, float speed,
+    eliza_tts_chunk_cb on_chunk, void * user_data, char ** out_error) {
+#ifdef ELIZA_ENABLE_PARADEE
+    if (!on_chunk) {
+        eliza_set_error(out_error, "[libelizainference] paradee stream: null callback");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    return eliza_paradee_synthesize_owned(
+        ctx, text, text_len, false, speed, nullptr, nullptr, out_error, on_chunk, user_data);
+#else
+    (void) ctx; (void) text; (void) text_len; (void) speed;
+    (void) on_chunk; (void) user_data;
     ELIZA_PARADEE_NOT_BUILT(out_error);
 #endif
 }

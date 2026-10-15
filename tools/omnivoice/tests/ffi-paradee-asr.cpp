@@ -9,7 +9,7 @@
 //   - eliza_inference_asr_cancel during prefill and during decode, over a
 //     scripted ASR engine that polls the same abort callback llama_decode
 //     uses
-//   - ABI string "18"
+//   - ABI string "19"
 //
 // The bridge is compiled into this TU (ELIZA_INFERENCE_TEST_HOOKS) against
 // the Paradee / misaki doubles in tests/paradee-contract/, so no weights are
@@ -86,7 +86,7 @@ static int synth_text(EliInferenceContext * ctx, const std::string & text, size_
 }
 
 static void test_abi_and_probes() {
-    CHECK(std::string(eliza_inference_abi_version()) == "18");
+    CHECK(std::string(eliza_inference_abi_version()) == "19");
     CHECK_RC(eliza_inference_paradee_supported(), 1);
     CHECK_RC(eliza_inference_asr_supported(), 1);
     CHECK_RC(eliza_inference_asr_stream_supported(), 0);
@@ -185,6 +185,42 @@ static void test_paradee_load_and_synth() {
     eliza_inference_destroy(ctx);
     CHECK_RC(fake_paradee().live_models.load(), 0);
     CHECK_RC(fake_paradee().live_lexicons.load(), 0);
+    fs::remove_all(bundle);
+}
+
+static void test_paradee_streaming() {
+    const fs::path bundle = make_bundle("paradee-streaming");
+    char * err = nullptr;
+    EliInferenceContext * ctx = eliza_inference_create(bundle.string().c_str(), &err);
+    CHECK_RC(eliza_inference_paradee_stream_supported(), 1);
+    CHECK_RC(eliza_inference_paradee_load(ctx, "/x/paradee.gguf", "/x/lex.bin", nullptr, &err), ELIZA_OK);
+    std::string text;
+    for (int i = 0; i < 40; ++i) text += "the quick brown fox jumps now. ";
+    float * expected = nullptr; size_t count = 0;
+    CHECK_RC(eliza_inference_paradee_synthesize_alloc(ctx, text.data(), text.size(), 1, &expected, &count, &err), ELIZA_OK);
+    struct Output { std::vector<float> pcm; int final = 0; int calls = 0; bool cancel = false; } output;
+    auto receive = [](const float * pcm, size_t n, int final, void * user) {
+        auto & out = *static_cast<Output *>(user);
+        if (final) { ++out.final; CHECK(n == 0 && pcm == nullptr); return 0; }
+        CHECK(n <= 24000 && out.final == 0);
+        ++out.calls;
+        out.pcm.insert(out.pcm.end(), pcm, pcm + n);
+        return out.cancel ? 1 : 0;
+    };
+    CHECK_RC(eliza_inference_paradee_synthesize_stream(ctx, text.data(), text.size(), 1, receive, &output, &err), ELIZA_OK);
+    CHECK(output.calls > 1 && output.final == 1);
+    CHECK(output.pcm == std::vector<float>(expected, expected + count));
+    eliza_inference_free_pcm(expected);
+    output = Output{}; output.cancel = true;
+    CHECK_RC(eliza_inference_paradee_synthesize_stream(ctx, text.data(), text.size(), 1, receive, &output, &err), ELIZA_ERR_CANCELLED);
+    CHECK(output.calls == 1 && output.final == 0);
+    clear_err(&err);
+    output = Output{};
+    CHECK_RC(eliza_inference_paradee_synthesize_stream(ctx, "12345", 5, 1, receive, &output, &err), ELIZA_OK);
+    CHECK(output.calls == 0 && output.final == 1);
+    CHECK_RC(eliza_inference_paradee_synthesize_stream(ctx, "hi", 2, 1, nullptr, &output, &err), ELIZA_ERR_INVALID_ARG);
+    clear_err(&err);
+    eliza_inference_destroy(ctx);
     fs::remove_all(bundle);
 }
 
@@ -617,6 +653,7 @@ int main() {
     test_abi_and_probes();
     test_paradee_load_and_synth();
     test_paradee_chunking();
+    test_paradee_streaming();
     test_paradee_cancel();
     test_paradee_race();
     test_evict_reload();

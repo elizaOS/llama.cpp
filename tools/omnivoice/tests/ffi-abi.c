@@ -1,7 +1,7 @@
 /* tools/omnivoice/tests/ffi-abi.c
  *
- * C11 test against the real libelizainference (ABI v18). Always runs:
- *   - ABI string "18" and the v17 capability probes
+ * C11 test against the real libelizainference (ABI v19). Always runs:
+ *   - ABI string "19" and the v17 capability probes
  *   - v18 llm_context_capacity argument validation and the no-text-GGUF error
  *   - cancel_tts / asr_cancel are no-ops with nothing in flight
  *   - mmap_evict / mmap_acquire("tts") on a bundle with no TTS weights
@@ -50,7 +50,7 @@ static double now_ms(void) {
 
 static void test_probes_and_noops(void) {
     char * err = NULL;
-    CHECK(strcmp(eliza_inference_abi_version(), "18") == 0);
+    CHECK(strcmp(eliza_inference_abi_version(), "19") == 0);
     CHECK_RC(eliza_inference_asr_supported(), 1);
 #if defined(ELIZA_TEST_EXPECT_PARADEE)
     CHECK_RC(eliza_inference_paradee_supported(), 1);
