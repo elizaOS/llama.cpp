@@ -50,6 +50,19 @@ bool decoder_forward(
         std::vector<float> & audio,
         std::string & err);
 
+// The decoder up to the generator (F0/N convs, encode, asr_res, decode[0..3]):
+// the AdaIN trunk on its own, for heads other than the iSTFTNet generator
+// (Paradee-8M v1.1). Same inputs as decoder_forward; x is
+// [decode[3].Cout, 2*T_frame] channel-major.
+bool decoder_front_forward(
+        ggml_context * ctx,
+        const std::string & ns, bool instnorm_affine,
+        const float * asr_ct, int asr_dim, int T_frame,
+        const float * F0, const float * N,
+        const float * style,
+        std::vector<float> & x,
+        std::string & err);
+
 // Run the full decoder. Inputs come from kokoro_predictor_forward:
 //   asr_ct   : [512, T_frame] channel-major (transpose of PredictorOut.asr [T,512])
 //   F0, N    : [2*T_frame]    (PredictorOut.F0_pred / N_pred — the up-2x curves)

@@ -41,6 +41,19 @@ well-conditioned target; the native graph implements the same three:
 The final waveform applies phase_lock.lock() in float64. lock_f32 is the unmodified
 float32 phase_lock.lock() on the same decoder output, for the Lock-only check.
 
+`dump --version 1.1` runs Paradee-8M v1.1 (pins.json "v1.1"): the same text side, then
+vhead.VDecoder(head="v2") loaded with load_ckpt, as export_paradee_v1_1.py builds it. The
+v1.1 head draws Gaussian noise, so the reference fixes it: each sentence's noise is
+torch.randn from torch.Generator().manual_seed(--noise-seed + index), or read from
+--noise-dir/<index>.noise.f32, and is written out as the `noise` stage for the native
+test to feed back in. Nothing else in the v1.1 reference is changed; it runs the
+upstream module in float32. Extra v1.1 stages: trunk (AdaIN trunk output), hn (the
+head's ConvNeXt stack after norm1), sine (vhead.sine_bank), sine64 (the same sine bank
+with the harmonics evaluated in float64: float32's 2*pi*k*cyc reaches ~440 rad, where one
+float32 step is ~3e-5 rad, so the float32 bank is up to ~9e-4 x RMS from its exact value),
+main (the n_fft 600 path, head run with burst=False), burst (the 150/75 noise-burst path)
+and wav (head output).
+
 usage:
   dump_paradee_reference.py phonemes --model-dir HF_SNAPSHOT --out tools/paradee/tests/fixtures/sentences.misaki.json
   dump_paradee_reference.py dump --model-dir HF_SNAPSHOT --paradee-src PARADEE_CHECKOUT --out REF_DIR
@@ -144,6 +157,138 @@ def cmd_phonemes(args) -> int:
 # ---------------------------------------------------------------------------
 # reference model
 # ---------------------------------------------------------------------------
+
+def load_reference_v11(model_dir: Path, paradee_src: Path):
+    """Paradee-8M v1.1 in float32, as export_paradee_v1_1.py builds it."""
+    pins = PINS["v1.1"]
+    check_versions("torch", "kokoro", "misaki")
+    for rel, digest in pins["source"]["files"].items():
+        check_file(paradee_src, rel, digest)
+    for rel in ("pytorch/text_side.pt", "pytorch/decoder.pt"):
+        check_file(model_dir, rel, pins["files"][rel])
+    import torch
+    sys.path.insert(0, str(paradee_src / "training" / "scripts"))
+    student = importlib.import_module("student")
+    vhead = importlib.import_module("vhead")
+    from torch.nn.utils import remove_weight_norm
+    from torch.nn.utils.parametrize import is_parametrized, remove_parametrizations
+    torch.set_grad_enabled(False)
+
+    def strip(m):  # export_paradee_v1_1.py strip()
+        for x in m.modules():
+            try:
+                remove_weight_norm(x)
+            except Exception:
+                pass
+            if is_parametrized(x, "weight"):
+                try:
+                    remove_parametrizations(x, "weight", leave_parametrized=True)
+                except Exception:
+                    pass
+
+    ts = student.TextStudent("s+mlp").eval()
+    ts.load_state_dict(torch.load(model_dir / "pytorch/text_side.pt", map_location="cpu", weights_only=True)["model"])
+    vd = vhead.VDecoder(head="v2").eval()
+    vd.load_ckpt(str(model_dir / "pytorch/decoder.pt"))
+    if not vd.head.burst:
+        raise SystemExit("v1.1 decoder.pt has no noise-burst path")
+    strip(ts)
+    strip(vd)
+    return torch, ts, vd, vhead, student
+
+
+def text_side(torch, ts, student, ids: list[int], speed: float):
+    """export_paradee.py Paradee.text() (the same in export_paradee_v1_1.py), with the stages kept."""
+    import torch.nn as nn
+    x_ids = torch.tensor([ids], dtype=torch.long)
+    p, s = ts.predictor, ts.style
+    bert = ts.bert(x_ids, attention_mask=torch.ones_like(x_ids))                  # [1,T,256]
+    d_en = ts.bert_encoder(bert).transpose(-1, -2)
+    T = x_ids.shape[1]
+    sx = s[:, :, None].expand(-1, -1, T)
+    x = torch.cat([d_en, sx], 1)
+    for b in p.text_encoder.lstms:
+        if isinstance(b, nn.LSTM):
+            x = b(x.transpose(-1, -2))[0].transpose(-1, -2)
+        else:
+            x = torch.cat([b(x.transpose(-1, -2), s).transpose(-1, -2), sx], 1)
+    d = x.transpose(-1, -2)                                                        # [1,T,224]
+    dur = torch.sigmoid(p.duration_proj(p.lstm(d)[0])).sum(-1)[0]                  # [T]
+    e = ts.text_encoder
+    h = e.embedding(x_ids).transpose(1, 2)
+    for c in e.cnn:
+        h = c(h)
+    t_en = e.lstm(h.transpose(1, 2))[0]
+    asr_tok = ts.asr_proj(t_en).transpose(-1, -2)                                  # [1,512,T]
+    n = torch.clamp(torch.round(dur / speed), min=1).long()
+    aln = student.alignment(n)[None]                                               # [1,T,F]
+    F0, N = p.F0Ntrain(d.transpose(-1, -2) @ aln, s)
+    asr = asr_tok @ aln                                                            # [1,512,F]
+    return bert, d, dur, n, F0, N, asr
+
+
+def sine_bank64(torch, F0, K=64, hop=300, sr=24000):
+    """vhead.sine_bank with sin(2 pi k cyc) and the harmonic sum in float64. The running
+    phase c, its step d, the interpolation weight and cyc are float32 as in the module."""
+    import torch.nn.functional as F
+    n = F0.shape[1]
+    r = F0.double() * hop / sr
+    c = (torch.cumsum(r, 1) % 1).float()
+    d = F.pad(r[:, 1:], (0, 1)).float()
+    p = (torch.arange(n * hop) + 0.5) / hop - 0.5
+    i = p.floor().clamp(0, n - 1).long()
+    fr = (p - i).clamp(0, 1)
+    cyc = c[:, i] + fr * d[:, i]
+    f0s = F0.repeat_interleave(hop, 1)
+    k = torch.arange(1, K + 1)[None, :, None]
+    amp = ((f0s[:, None] * k < 11000) & (f0s[:, None] > 10)).double()
+    return (torch.sin(2 * math.pi * k.double() * cyc.double()[:, None]) * amp).sum(1) * 0.1
+
+
+def run_reference_v11(torch, ts, vd, vhead, student, ids: list[int], speed: float, noise) -> dict:
+    """export_paradee_v1_1.py Paradee2.forward with the torch head (vhead.SourceFilterHead2)
+    and the given noise, with the stages kept."""
+    bert, d, dur, n, F0, N, asr = text_side(torch, ts, student, ids, speed)
+    h = vd.head
+    L = F0.shape[1] * vhead.FHOP
+    if noise is None:
+        raise SystemExit("v1.1 reference needs its noise")
+    nz = torch.as_tensor(noise, dtype=torch.float32)[None]
+    if nz.shape[1] != L:
+        raise SystemExit(f"noise has {nz.shape[1]} samples, the sentence needs {L}")
+    cap = {}
+    hook = h.norm1.register_forward_hook(lambda m, i, o: cap.__setitem__("hn", o))
+    s = vd.style.expand(1, -1)                                                     # VDecoder.forward up to the head
+    F0c = vd.F0_conv(F0.unsqueeze(1)); Nc = vd.N_conv(N.unsqueeze(1))
+    x = vd.encode(torch.cat([asr, F0c, Nc], 1), s); asr_res = vd.asr_res(asr); res = True
+    for block in vd.decode:
+        if res:
+            x = torch.cat([x, asr_res, F0c, Nc], 1)
+        x = block(x, s)
+        if block.upsample_type != "none":
+            res = False
+    wav = h(x, F0, nz)
+    gb = h.last["gb"]
+    hook.remove()
+    h.burst = False
+    main = h(x, F0, nz)
+    h.burst = True
+    Nb = torch.stft(nz.flip(-1), 150, 75, window=h.wb, return_complex=True)
+    burst = torch.istft(Nb * gb, 150, 75, window=h.wb, length=L)
+    sine = vhead.sine_bank(F0, h.K)[0]
+    sine64 = sine_bank64(torch, F0, h.K)
+    full = vd(asr, F0, N, noise=nz)                                                # VDecoder.forward itself
+    if not torch.equal(full, wav):
+        raise SystemExit("VDecoder.forward differs from the staged trunk + head")
+    f = lambda t: t.detach().contiguous().float().numpy()
+    return {
+        "ids": np.asarray(ids, dtype=np.int32),
+        "bert": f(bert[0]), "d": f(d[0]), "dur": f(dur / speed), "dur_int": n.numpy().astype(np.int32),
+        "F0": f(F0[0]), "N": f(N[0]), "asr": f(asr[0]), "noise": f(nz[0]),
+        "trunk": f(x[0]), "hn": f(cap["hn"][0]), "sine": f(sine[0]), "sine64": f(sine64[0]), "main": f(main[0]), "burst": f(burst[0]),
+        "wav": f(wav[0]),
+    }
+
 
 def load_reference(model_dir: Path, paradee_src: Path):
     check_versions("torch", "kokoro", "misaki")
@@ -269,31 +414,7 @@ def lock64(torch, phase_lock, s, src, f0, L):
 
 def run_reference(torch, ts, ds, cap, phase_lock, student, ids: list[int], speed: float) -> dict:
     """export_paradee.py Paradee.text() + forward(), with the stages kept."""
-    import torch.nn as nn
-    x_ids = torch.tensor([ids], dtype=torch.long)
-    p, s = ts.predictor, ts.style
-    bert = ts.bert(x_ids, attention_mask=torch.ones_like(x_ids))                  # [1,T,256]
-    d_en = ts.bert_encoder(bert).transpose(-1, -2)
-    T = x_ids.shape[1]
-    sx = s[:, :, None].expand(-1, -1, T)
-    x = torch.cat([d_en, sx], 1)
-    for b in p.text_encoder.lstms:
-        if isinstance(b, nn.LSTM):
-            x = b(x.transpose(-1, -2))[0].transpose(-1, -2)
-        else:
-            x = torch.cat([b(x.transpose(-1, -2), s).transpose(-1, -2), sx], 1)
-    d = x.transpose(-1, -2)                                                        # [1,T,224]
-    dur = torch.sigmoid(p.duration_proj(p.lstm(d)[0])).sum(-1)[0]                  # [T]
-    e = ts.text_encoder
-    h = e.embedding(x_ids).transpose(1, 2)
-    for c in e.cnn:
-        h = c(h)
-    t_en = e.lstm(h.transpose(1, 2))[0]
-    asr_tok = ts.asr_proj(t_en).transpose(-1, -2)                                  # [1,512,T]
-    n = torch.clamp(torch.round(dur / speed), min=1).long()
-    aln = student.alignment(n)[None]                                               # [1,T,F]
-    F0, N = p.F0Ntrain(d.transpose(-1, -2) @ aln, s)
-    asr = asr_tok @ aln                                                            # [1,512,F]
+    bert, d, dur, n, F0, N, asr = text_side(torch, ts, student, ids, speed)
     dec = ds(asr, F0, N).squeeze()                                                 # [L]
     src = cap["src"].squeeze()
     k = min(len(dec), len(src))
@@ -310,18 +431,35 @@ def run_reference(torch, ts, ds, cap, phase_lock, student, ids: list[int], speed
 
 def cmd_dump(args) -> int:
     fixture = json.loads(args.phonemes.read_text(encoding="utf-8"))
-    torch, ts, ds, cap, phase_lock, student = load_reference(args.model_dir, args.paradee_src)
+    v11 = args.version == "1.1"
+    pins = PINS["v1.1"] if v11 else PINS
+    if v11:
+        torch, ts, vd, vhead, student = load_reference_v11(args.model_dir, args.paradee_src)
+    else:
+        torch, ts, ds, cap, phase_lock, student = load_reference(args.model_dir, args.paradee_src)
     args.out.mkdir(parents=True, exist_ok=True)
     manifest = {
-        "model": PINS["model"], "source_commit": PINS["source"]["commit"],
+        "model": pins["model"], "source_commit": pins["source"]["commit"], "version": args.version,
         "phonemes_fixture_sha256": sha256_file(args.phonemes),
         "speed": args.speed,
         "versions": {k: importlib.metadata.version(k) for k in ("torch", "kokoro", "misaki")},
-        "reference": "deterministic: SineGen rand_ini=0, no noise, float64; canonical float64 source STFT; float64 phase lock",
+        "reference": ("float32 upstream modules; head noise fixed (the noise stage), "
+                      f"{'read from ' + str(args.noise_dir) if args.noise_dir else 'torch.randn seeded with %d + index' % args.noise_seed}"
+                      if v11 else
+                      "deterministic: SineGen rand_ini=0, no noise, float64; canonical float64 source STFT; float64 phase lock"),
         "sentences": [],
     }
     for item in fixture["sentences"]:
-        out = run_reference(torch, ts, ds, cap, phase_lock, student, item["ids"], args.speed)
+        if v11:
+            frames = int(text_side(torch, ts, student, item["ids"], args.speed)[3].sum())
+            L = 2 * frames * 300
+            if args.noise_dir:
+                noise = np.fromfile(args.noise_dir / f"{item['index']}.noise.f32", dtype="<f4")
+            else:
+                noise = torch.randn(L, generator=torch.Generator().manual_seed(args.noise_seed + item["index"])).numpy()
+            out = run_reference_v11(torch, ts, vd, vhead, student, item["ids"], args.speed, noise)
+        else:
+            out = run_reference(torch, ts, ds, cap, phase_lock, student, item["ids"], args.speed)
         files = {}
         for name, arr in out.items():
             ext = "i32" if arr.dtype == np.int32 else "f32"
@@ -542,6 +680,10 @@ def main(argv=None) -> int:
     p.add_argument("--phonemes", type=Path, default=DEFAULT_FIXTURE)
     p.add_argument("--speed", type=float, default=1.0)
     p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--version", choices=("1.0", "1.1"), default="1.0",
+                   help="1.1: Paradee-8M v1.1 (source-filter head; --model-dir and --paradee-src at the v1.1 pins)")
+    p.add_argument("--noise-seed", type=int, default=0, help="v1.1: noise = torch.randn seeded with this + index")
+    p.add_argument("--noise-dir", type=Path, help="v1.1: read <index>.noise.f32 from here instead")
     p = sub.add_parser("lock-fixture")
     p.add_argument("--paradee-src", type=Path, required=True)
     p.add_argument("--out", type=Path, default=PARADEE_DIR / "tests" / "fixtures" / "phase_lock_synthetic.f32")

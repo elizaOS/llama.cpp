@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //
-// paradee.h — Paradee-8M v1.0 text-to-speech, native in the elizaOS llama.cpp
-// fork (tools/paradee).
+// paradee.h — Paradee-8M (v1.0 and v1.1) text-to-speech, native in the
+// elizaOS llama.cpp fork (tools/paradee).
 //
 // Paradee (sahilmahendrakar/Paradee-8M-v1.0, Apache-2.0) is Kokoro-82M's
 // StyleTTS-2 + iSTFTNet code at smaller widths, distilled to the single
@@ -22,6 +22,21 @@
 //                      harmonic source (STFT 1024 / hop 256, 33-frame smoothing)
 //     -> 24 kHz mono float PCM
 //
+// Paradee-8M v1.1 (sahilmahendrakar/Paradee-8M-v1.1) keeps the text side and
+// the decoder's AdaIN trunk and replaces the generator and the phase lock
+// with a frame-rate source-filter head:
+//
+//     -> decoder     : AdaIN res blocks (256) -> 128 channels at 80 fps
+//     -> head        : ConvNeXt x4 (160) -> per STFT frame (n_fft 600, hop 150)
+//                      gains / phase / pulse shift on a 64-harmonic sine bank
+//                      from F0, gains on white and pitch-pulsed noise, plus a
+//                      3 ms noise-burst path (STFT 150 / 75) -> iSTFT
+//
+// The GGUF's paradee.decoder.head says which graph to run ("istftnet_lock" or
+// "source_filter_v2"; a file without the key is v1.0). The v1.1 head draws
+// Gaussian noise: from a fixed seed (PARADEE_DEFAULT_NOISE_SEED unless the
+// options say otherwise), so the same input gives the same audio.
+//
 // Input phonemes must be misaki's spelling (Kokoro's G2P); eSpeak IPA must be
 // converted to misaki spelling first.
 
@@ -39,7 +54,7 @@ struct paradee_model;
 struct paradee_model_deleter { void operator()(paradee_model *) const noexcept; };
 using paradee_model_ptr = std::unique_ptr<paradee_model, paradee_model_deleter>;
 
-// Input contract of Paradee-8M v1.0: at most 512 ids, the pad (0) at each end.
+// Input contract of Paradee-8M (v1.0 and v1.1): at most 512 ids, the pad (0) at each end.
 constexpr int PARADEE_MAX_INPUT_IDS = 512;
 constexpr int PARADEE_PAD_ID = 0;
 
@@ -61,13 +76,27 @@ enum paradee_status {
 
 const char * paradee_status_str(paradee_status st) noexcept;
 
+// Which decoder head a loaded model runs (from paradee.decoder.head).
+enum paradee_head_kind {
+    PARADEE_HEAD_ISTFTNET_LOCK = 0,   // v1.0: iSTFTNet generator + phase-locking filter
+    PARADEE_HEAD_SOURCE_FILTER = 1,   // v1.1: vhead.py SourceFilterHead2
+};
+
+// Seed of the v1.1 head's noise when the caller does not choose one.
+constexpr uint64_t PARADEE_DEFAULT_NOISE_SEED = 0;
+
 // Load a Paradee GGUF written by convert_paradee_pt_to_gguf.py. The file must
 // declare general.architecture == "paradee"; every hparam the graph reads is
 // required. Returns nullptr and sets `err` on failure.
 paradee_model_ptr paradee_load_model(const std::string & gguf_path, std::string & err) noexcept;
 
-// 24000 for Paradee-8M v1.0 (0 for a null model).
+// 24000 for Paradee-8M (0 for a null model).
 int paradee_sample_rate(const paradee_model * model) noexcept;
+
+// The head the model runs (PARADEE_HEAD_ISTFTNET_LOCK for a null model) and
+// the release it was converted from ("1.0", "1.1"; "" for a null model).
+paradee_head_kind paradee_get_head(const paradee_model * model) noexcept;
+const char * paradee_version(const paradee_model * model) noexcept;
 
 // Map a misaki phoneme string (UTF-8, one vocabulary symbol per code point)
 // to model input ids: [0] + ids + [0]. Rejects empty input, invalid UTF-8,
@@ -125,6 +154,7 @@ struct paradee_synth_options {
     float speed = 1.0f;
     paradee_cancel_fn cancel = nullptr;
     void * cancel_user_data = nullptr;
+    uint64_t noise_seed = PARADEE_DEFAULT_NOISE_SEED;   // v1.1 head only
 };
 
 struct paradee_audio {
@@ -154,12 +184,24 @@ struct paradee_stages {
     std::vector<float> F0;          // [2*T_frame]
     std::vector<float> N;           // [2*T_frame]
     std::vector<float> asr;         // [asr_dim, T_frame] aligned asr features (channel-major)
-    std::vector<float> dec;         // [2*T_frame*300]    generator output before the phase lock
-    std::vector<float> src;         // [2*T_frame*300]    harmonic source (m_source output)
+    std::vector<float> dec;         // [2*T_frame*300]    generator output before the phase lock (v1.0)
+    std::vector<float> src;         // [2*T_frame*300]    harmonic source (m_source output, v1.0)
     std::vector<float> wav;         // final waveform
+    // v1.1 (source-filter head) only, n = 2*T_frame:
+    std::vector<float> trunk;       // [128, n]           AdaIN trunk output (channel-major)
+    std::vector<float> hn;          // [n, 160]           head ConvNeXt stack after norm1
+    std::vector<float> sine;        // [n*300]            sine bank (vhead.sine_bank)
+    std::vector<float> main_path;   // [n*300]            the n_fft 600 path
+    std::vector<float> burst_path;  // [n*300]            the noise-burst path
+    std::vector<float> noise;       // [n*300]            the noise the head used
+    // Input (v1.1): when set, the head uses this noise ([n*300] samples)
+    // instead of drawing it from the seed. The parity test feeds the
+    // reference's noise here.
+    const std::vector<float> * noise_in = nullptr;
 };
 
-// paradee_synthesize_ids that also fills `stages` (when non-null).
+// paradee_synthesize_ids that also fills `stages` (when non-null; its
+// noise_in, if set, replaces the v1.1 head's noise).
 paradee_status paradee_synthesize_ids_staged(
         const paradee_model * model,
         const int32_t * ids, size_t n,
@@ -174,13 +216,25 @@ paradee_status paradee_synthesize_ids_staged(
 // its own). asr is [asr_dim, T_frame] channel-major, F0 and N are
 // [2*T_frame]. `src` (optional, [2*T_frame*300]) replaces the harmonic
 // source the generator would compute. Fills stages->dec / src / wav (stages
-// may not be null).
+// may not be null). For a v1.1 model: trunk + head, filling stages->trunk,
+// hn, sine, main_path, burst_path, noise and wav (`src` must be null; the
+// noise is stages->noise_in or the default seed's).
 paradee_status paradee_decode_staged(
         const paradee_model * model,
         const float * asr, int asr_dim, int T_frame,
         const float * F0, const float * N,
         const std::vector<float> * src,
         paradee_cancel_fn cancel, void * user,
+        paradee_stages * stages,
+        std::string & err) noexcept;
+
+// v1.1 only: the source-filter head alone from a given trunk output
+// (trunk [C, n] channel-major, F0 [n], noise [n*300]). Fills stages->hn,
+// sine, main_path, burst_path and wav.
+paradee_status paradee_head_staged(
+        const paradee_model * model,
+        const float * trunk, int channels, int n,
+        const float * F0, const float * noise,
         paradee_stages * stages,
         std::string & err) noexcept;
 
@@ -210,6 +264,7 @@ bool paradee_phase_lock(
         std::vector<float> & out,
         paradee_cancel_fn cancel = nullptr, void * user = nullptr);
 
+// nullptr for a null model and for a v1.1 model (it has no phase lock).
 const paradee_lock_params * paradee_get_lock_params(const paradee_model * model) noexcept;
 
 } // namespace eliza_paradee

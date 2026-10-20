@@ -17,6 +17,21 @@
 //               float32 evaluation is from float64 (+1e-4)
 //   end to end  final waveform SNR >= 35 dB against the reference
 //
+// For a v1.1 GGUF (source-filter head; reference from `dump --version 1.1`)
+// the text-side gates are the same, and the acoustic half is gated as:
+//   trunk       AdaIN trunk output from the reference asr / F0 / N:
+//               max|err| <= 1e-3 * RMS
+//   head        from the reference trunk, F0 and noise: hn (ConvNeXt stack),
+//               main (n_fft 600 path), burst (noise-burst path) and the head
+//               output, each max|err| <= 1e-3 * RMS
+//   sine        sine bank from the reference F0: max|err| <= 1e-4 * RMS
+//               against the bank evaluated in float64, and no further from
+//               the float32 vhead.sine_bank than that is from float64
+//               (+1e-4 * RMS). float32's own error reaches ~9e-4 * RMS.
+//   end to end  the whole chain with the reference's noise: SNR >= 35 dB
+// PARADEE_GGUF_V10=<v1.0 GGUF> also checks that the text side is unchanged:
+// the two GGUFs' text-side stages must be bit-identical.
+//
 // Each acoustic stage is fed the reference's inputs, so an error is charged
 // to the stage that made it: the harmonic source integrates F0 over seconds,
 // and float32 rounding differences in F0 (~1e-6 relative) would otherwise
@@ -107,13 +122,27 @@ int main() {
     const char * out_dir = std::getenv("PARADEE_PARITY_OUT");
 
     const json manifest = read_json(ref_dir + "/manifest.json");
-    const json fixture = read_json(std::string(PARADEE_FIXTURE_DIR) + "/sentences.misaki.json");
+    // PARADEE_FIXTURE_DIR in the environment overrides the build-time path
+    // (for runs on another machine, such as a device over adb).
+    const char * fixture_dir = std::getenv("PARADEE_FIXTURE_DIR");
+    const json fixture = read_json(std::string(fixture_dir && *fixture_dir ? fixture_dir : PARADEE_FIXTURE_DIR) +
+                                   "/sentences.misaki.json");
     const float speed = manifest.value("speed", 1.0f);
 
     std::string err;
     auto model = paradee_load_model(gguf, err);
     if (!model) { std::fprintf(stderr, "load failed: %s\n", err.c_str()); return 1; }
-    const paradee_lock_params lock = *paradee_get_lock_params(model.get());
+    const bool v11 = paradee_get_head(model.get()) == PARADEE_HEAD_SOURCE_FILTER;
+    std::printf("model: Paradee-8M v%s (%s head)\n", paradee_version(model.get()), v11 ? "source-filter" : "iSTFTNet + lock");
+    CHECK(manifest.value("version", std::string("1.0")) == (v11 ? "1.1" : "1.0"),
+          "the reference was dumped for another Paradee version");
+    const paradee_lock_params lock = v11 ? paradee_lock_params() : *paradee_get_lock_params(model.get());
+    paradee_model_ptr model_v10;
+    if (const char * g10 = std::getenv("PARADEE_GGUF_V10"); v11 && g10 && *g10) {
+        model_v10 = paradee_load_model(g10, err);
+        CHECK(model_v10 && paradee_get_head(model_v10.get()) == PARADEE_HEAD_ISTFTNET_LOCK,
+              "PARADEE_GGUF_V10 is not a v1.0 GGUF: %s", err.c_str());
+    }
 
     CHECK(manifest["sentences"].size() == fixture["sentences"].size(), "reference and fixture sentence counts differ");
     double total_audio = 0, total_secs = 0;
@@ -132,8 +161,11 @@ int main() {
         CHECK(ids == fx["ids"].get<std::vector<int32_t>>(), "sentence %d: ids differ from the fixture", sent);
         CHECK(ids == read_raw<int32_t>(file("ids")), "sentence %d: ids differ from the reference", sent);
 
-        // full synthesis
+        // full synthesis (v1.1: with the reference's noise)
+        std::vector<float> ref_noise;
+        if (v11) ref_noise = read_raw<float>(file("noise"));
         paradee_stages st;
+        if (v11) st.noise_in = &ref_noise;
         std::vector<float> pcm;
         const auto t0 = std::chrono::steady_clock::now();
         const paradee_status rc = paradee_synthesize_ids_staged(model.get(), ids.data(), ids.size(), speed,
@@ -152,6 +184,59 @@ int main() {
         gate_stage(sent, "F0", read_raw<float>(file("F0")), st.F0);
         gate_stage(sent, "N", read_raw<float>(file("N")), st.N);
         gate_stage(sent, "asr", read_raw<float>(file("asr")), st.asr);
+
+        if (model_v10) {
+            paradee_stages s10;
+            std::vector<float> p10;
+            CHECK(paradee_synthesize_ids_staged(model_v10.get(), ids.data(), ids.size(), speed, nullptr, nullptr,
+                                                p10, err, &s10) == PARADEE_OK, "%s", err.c_str());
+            const bool same = s10.bert == st.bert && s10.d == st.d && s10.dur == st.dur && s10.dur_int == st.dur_int &&
+                              s10.F0 == st.F0 && s10.N == st.N && s10.asr == st.asr;
+            std::printf("  text side bit-identical to the v1.0 GGUF: %s\n", same ? "yes" : "NO");
+            CHECK(same, "sentence %d: v1.1 text side differs from v1.0", sent);
+        }
+
+        if (v11) {
+            const std::vector<float> ref_asr = read_raw<float>(file("asr"));
+            const std::vector<float> ref_F0 = read_raw<float>(file("F0"));
+            const std::vector<float> ref_N = read_raw<float>(file("N"));
+            const std::vector<float> ref_trunk = read_raw<float>(file("trunk"));
+            const std::vector<float> ref_wav = read_raw<float>(file("wav"));
+            const int T = (int) ref_F0.size() / 2;
+            const int n = (int) ref_F0.size();
+            paradee_stages a;
+            a.noise_in = &ref_noise;
+            CHECK(paradee_decode_staged(model.get(), ref_asr.data(), 512, T, ref_F0.data(), ref_N.data(), nullptr,
+                                        nullptr, nullptr, &a, err) == PARADEE_OK, "%s", err.c_str());
+            gate_stage(sent, "trunk", ref_trunk, a.trunk);
+            const int C = n > 0 ? (int) (ref_trunk.size() / (size_t) n) : 0;
+            paradee_stages b;
+            CHECK(paradee_head_staged(model.get(), ref_trunk.data(), C, n, ref_F0.data(), ref_noise.data(), &b, err)
+                  == PARADEE_OK, "%s", err.c_str());
+            gate_stage(sent, "hn", read_raw<float>(file("hn")), b.hn);
+            {
+                const std::vector<float> s32 = read_raw<float>(file("sine")), s64 = read_raw<float>(file("sine64"));
+                const err_stats e64 = compare(s64, b.sine), e32 = compare(s32, b.sine), f32 = compare(s64, s32);
+                const double rms = std::max(e64.rms_ref, 1e-30);
+                std::printf("  sine   max|err| %9.3g x rms vs float64 (gate 1e-4); %9.3g vs float32 sine_bank "
+                            "(float32 itself: %.3g)\n", e64.max_abs / rms, e32.max_abs / rms, f32.max_abs / rms);
+                CHECK(e64.same_size && e64.max_abs <= 1e-4 * rms, "sentence %d sine: %.3g > 1e-4 * rms", sent,
+                      e64.max_abs / rms);
+                CHECK(e32.same_size && e32.max_abs <= f32.max_abs + 1e-4 * rms, "sentence %d sine vs float32", sent);
+            }
+            gate_stage(sent, "main", read_raw<float>(file("main")), b.main_path);
+            gate_stage(sent, "burst", read_raw<float>(file("burst")), b.burst_path);
+            gate_stage(sent, "head", ref_wav, b.wav);
+            const err_stats e = compare(ref_wav, pcm);
+            std::printf("  end to end: snr %.1f dB, max|err| %.3g, %zu samples, %.3f s synth (%.1fx realtime)\n",
+                        e.snr_db, e.max_abs, pcm.size(), secs, (double) pcm.size() / 24000.0 / secs);
+            CHECK(e.same_size && e.snr_db >= 35.0, "sentence %d: end-to-end SNR %.1f dB < 35 dB", sent, e.snr_db);
+            if (out_dir && *out_dir) {
+                std::ofstream f(std::string(out_dir) + "/" + std::to_string(sent) + ".wav.f32", std::ios::binary);
+                f.write((const char *) pcm.data(), (std::streamsize) (pcm.size() * sizeof(float)));
+            }
+            continue;
+        }
 
         // acoustic half, teacher-forced stage by stage
         const std::vector<float> ref_asr = read_raw<float>(file("asr"));

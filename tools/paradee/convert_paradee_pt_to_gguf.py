@@ -29,9 +29,17 @@ produce the same file. pins.json records the expected sha256. The metadata
 records the input pins and the git blob sha of this script (not the commit
 sha, which would make the expected output depend on the commit that pins it).
 
+--version 1.1 converts sahilmahendrakar/Paradee-8M-v1.1 (pins.json "v1.1").
+v1.1 keeps v1.0's text side (the same text_side.pt) and the decoder's AdaIN
+trunk (retrained weights, same layout), and replaces the iSTFTNet generator
+and the phase-locking filter with a frame-rate source-filter head
+(training/scripts/vhead.py SourceFilterHead2). The GGUF says which decoder
+head it holds in paradee.decoder.head ("istftnet_lock" or "source_filter_v2");
+the runtime picks the graph from that key (a file without it is v1.0).
+
 usage:
   convert_paradee_pt_to_gguf.py --model-dir <dir with pytorch/, config.json, tokenizer.json> \
-      --output paradee-8m-v1.0-f32.gguf [--outtype f32|f16] [--check-output]
+      --output paradee-8m-v1.0-f32.gguf [--version 1.0|1.1] [--outtype f32|f16] [--check-output]
 """
 
 from __future__ import annotations
@@ -58,6 +66,7 @@ NS = "paradee"
 # Architecture of Paradee-8M v1.0, read from the checkpoint shapes and from
 # training/scripts/{student.py, student_decoder.py} at the pinned source
 # commit. The converter checks every tensor against these values.
+# HPARAMS_V11 below is the v1.1 file's set.
 HPARAMS: dict[str, Any] = {
     # CustomAlbert (transformers AlbertConfig, num_hidden_groups=1).
     "text.n_layer": 6,
@@ -104,6 +113,35 @@ HPARAMS: dict[str, Any] = {
     "input.max_ids": 512,
 }
 
+# Paradee-8M v1.1: the same text side and AdaIN trunk, then SourceFilterHead2
+# (training/scripts/vhead.py at the pinned v1.1 source commit; constructor
+# defaults, as VDecoder(head="v2") builds it). No generator, no phase lock.
+_V10_GENERATOR_KEYS = ("decoder.upsample_rates", "decoder.upsample_kernels", "decoder.resblock_kernels",
+                       "decoder.resblock_dilations", "decoder.istft_n_fft", "decoder.istft_hop",
+                       "decoder.harmonic_num", "decoder.sine_amp", "decoder.voiced_threshold")
+HPARAMS_V11: dict[str, Any] = {
+    **{k: v for k, v in HPARAMS.items() if not k.startswith("lock.") and k not in _V10_GENERATOR_KEYS},
+    "head.dim": 160,               # ConvNeXt width
+    "head.blocks": 4,              # ConvNeXt blocks (depthwise 7, LayerNorm, Linear x3, GELU, Linear, gamma)
+    "head.kernel": 7,              # inp and depthwise kernel
+    "head.mult": 3,                # ConvNeXt expansion
+    "head.f0_hop": 300,            # samples per trunk frame / F0 value (80 fps)
+    "head.n_fft": 600,             # main STFT: periodic Hann, centred, reflect
+    "head.hop": 150,               # 2 STFT frames per trunk frame
+    "head.harmonics": 64,          # sine bank K
+    "head.sine_amp": 0.1,
+    "head.max_harmonic_hz": 11000.0,
+    "head.voiced_f0_hz": 10.0,     # sine bank / pulsing noise mute below this
+    "head.min_f0_hz": 60.0,        # F0 floor of the pulse-shift ratio
+    "head.mod": 2,                 # pulsing noise: cos/sin(m * phi), m = 1..mod
+    "head.points": 80,             # G: gains predicted at 80 mel-spaced points
+    "head.gain_clamp": 6.0,        # exp(min(x, 6))
+    "head.shift_scale": 0.5,       # pulse shift = 0.5 * tanh(x) cycles
+    "head.burst_n_fft": 150,       # noise-burst STFT (window 150, hop 75)
+    "head.burst_hop": 75,
+    "head.burst_points": 24,       # Gb
+}
+
 
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
@@ -132,10 +170,12 @@ def check_pins(model_dir: Path, pins: dict) -> None:
             raise SystemExit(f"{rel}: sha256 {digest} != pinned {pin['sha256']}")
 
 
-def load_vocab(model_dir: Path) -> list[tuple[str, int]]:
+def load_vocab(model_dir: Path, version: str = "1.0") -> list[tuple[str, int]]:
     config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
     tok = json.loads((model_dir / "tokenizer.json").read_text(encoding="utf-8"))
     vocab = config["vocab"]
+    if config.get("version") != version:
+        raise SystemExit(f"config.json version {config.get('version')!r} != {version!r}")
     if config.get("sample_rate") != HPARAMS["audio.sample_rate"]:
         raise SystemExit(f"config.json sample_rate {config.get('sample_rate')} != 24000")
     if config.get("n_token") != HPARAMS["text.vocab_size"]:
@@ -283,6 +323,38 @@ def decoder_map(sd: dict) -> list[tuple[str, str]]:
     return m
 
 
+def decoder_map_v11(sd: dict) -> list[tuple[str, str]]:
+    """v1.1 decoder.pt: v1.0's AdaIN trunk + head.* (SourceFilterHead2)."""
+    m = [p for p in decoder_map(sd) if not p[0].startswith("generator.")]
+    hp = HPARAMS_V11
+    for part in ("inp.weight", "inp.bias", "norm0.weight", "norm0.bias", "norm1.weight", "norm1.bias",
+                 "out.weight", "out.bias", "out_b.weight", "out_b.bias"):
+        m.append((f"head.{part}", f"{NS}.head.{part}"))
+    for i in range(hp["head.blocks"]):
+        for part in ("dw.weight", "dw.bias", "norm.weight", "norm.bias", "pw1.weight", "pw1.bias",
+                     "pw2.weight", "pw2.bias", "gamma"):
+            m.append((f"head.blocks.{i}.{part}", f"{NS}.head.blocks.{i}.{part}"))
+    return m
+
+
+def expected_shapes_v11() -> dict[str, tuple[int, ...]]:
+    h = HPARAMS_V11
+    D, uic, K = h["head.dim"], h["decoder.initial_ch"], h["head.kernel"]
+    up = h["head.f0_hop"] // h["head.hop"]
+    C = 4 + 2 * h["head.mod"]
+    shapes = {k: v for k, v in expected_shapes().items() if ".gen." not in k}
+    shapes.update({
+        f"{NS}.head.inp.weight": (D, uic, K),
+        f"{NS}.head.blocks.0.dw.weight": (D, 1, K),
+        f"{NS}.head.blocks.0.pw1.weight": (D * h["head.mult"], D),
+        f"{NS}.head.blocks.0.pw2.weight": (D, D * h["head.mult"]),
+        f"{NS}.head.blocks.0.gamma": (D,),
+        f"{NS}.head.out.weight": (up * (C * h["head.points"] + 1), D),
+        f"{NS}.head.out_b.weight": ((h["head.f0_hop"] // h["head.burst_hop"]) * h["head.burst_points"], D),
+    })
+    return shapes
+
+
 def expected_shapes() -> dict[str, tuple[int, ...]]:
     """Shapes (PyTorch order) of the tensors whose widths the C++ graph reads
     from hparams. Everything else is checked for consistency at load time."""
@@ -343,17 +415,27 @@ def collect(sd_raw: dict, mapping: list[tuple[str, str]], skipped: tuple[str, ..
     return out
 
 
+# paradee.decoder.head values. The runtime treats a file without the key as
+# HEAD_V10 (GGUFs written before v1.1 support).
+HEAD_V10 = "istftnet_lock"
+HEAD_V11 = "source_filter_v2"
+
+
 def write_gguf(out_path: Path, tensors: dict[str, np.ndarray], vocab: list[tuple[str, int]], pins: dict,
-               outtype: str) -> None:
+               outtype: str, version: str = "1.0") -> None:
+    v11 = version == "1.1"
     writer = gguf.GGUFWriter(str(out_path), arch=ARCH)
-    writer.add_string("general.name", "Paradee-8M v1.0")
+    writer.add_string("general.name", f"Paradee-8M v{version}")
     writer.add_string("general.license", "apache-2.0")
     writer.add_string("general.source.url", f"https://huggingface.co/{pins['model']['repo']}")
     writer.add_string("general.base_model.0.name", "Kokoro-82M")
     writer.add_string("general.description",
-                      "Paradee-8M v1.0 single-voice (af_heart) TTS, distilled from Kokoro-82M. "
-                      "StyleTTS-2 text side + iSTFTNet decoder + phase-locking filter.")
-    for key, val in HPARAMS.items():
+                      f"Paradee-8M v{version} single-voice (af_heart) TTS, distilled from Kokoro-82M. " +
+                      ("StyleTTS-2 text side + AdaIN decoder trunk + frame-rate source-filter head." if v11 else
+                       "StyleTTS-2 text side + iSTFTNet decoder + phase-locking filter."))
+    writer.add_string(f"{NS}.version", version)
+    writer.add_string(f"{NS}.decoder.head", HEAD_V11 if v11 else HEAD_V10)
+    for key, val in (HPARAMS_V11 if v11 else HPARAMS).items():
         full = f"{NS}.{key}"
         if isinstance(val, list):
             writer.add_array(full, [int(x) for x in val])
@@ -395,6 +477,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--model-dir", required=True, type=Path,
                     help="local snapshot of the pinned HF revision (pytorch/*.pt, config.json, tokenizer.json)")
     ap.add_argument("--output", required=True, type=Path)
+    ap.add_argument("--version", choices=("1.0", "1.1"), default="1.0",
+                    help="Paradee-8M release: 1.0 (default) or 1.1 (source-filter head); "
+                         "selects the pins.json section the inputs are checked against")
     ap.add_argument("--outtype", choices=("f32", "f16"), default="f32",
                     help="f32 (default, the parity-gated file) or f16 for >=2-D weights "
                          "(experimental: fails test-paradee-parity, not pinned)")
@@ -403,8 +488,10 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     pins = json.loads(PINS_PATH.read_text(encoding="utf-8"))
+    if args.version == "1.1":
+        pins = pins["v1.1"]
     check_pins(args.model_dir, pins)
-    vocab = load_vocab(args.model_dir)
+    vocab = load_vocab(args.model_dir, args.version)
 
     import torch
 
@@ -415,25 +502,26 @@ def main(argv: list[str] | None = None) -> int:
     text_sd, dec_sd = text_sd["model"], dec_sd["model"]
 
     tensors = collect(text_sd, text_side_map(text_sd), TEXT_SIDE_SKIPPED, "text_side.pt")
-    dec = collect(dec_sd, decoder_map(dec_sd), (), "decoder.pt")
+    dec_map = decoder_map_v11(dec_sd) if args.version == "1.1" else decoder_map(dec_sd)
+    dec = collect(dec_sd, dec_map, (), "decoder.pt")
     overlap = set(tensors) & set(dec)
     if overlap:
         raise SystemExit(f"tensor name collision: {sorted(overlap)}")
     tensors.update(dec)
 
-    for name, shape in expected_shapes().items():
+    for name, shape in (expected_shapes_v11() if args.version == "1.1" else expected_shapes()).items():
         if tuple(tensors[name].shape) != shape:
             raise SystemExit(f"{name}: shape {tuple(tensors[name].shape)} != expected {shape}")
     n_params = sum(int(a.size) for a in tensors.values())
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    write_gguf(args.output, tensors, vocab, pins, args.outtype)
+    write_gguf(args.output, tensors, vocab, pins, args.outtype, args.version)
     digest = sha256_file(args.output)
     print(f"wrote {args.output}: {len(tensors)} tensors, {n_params} parameters, "
           f"{args.output.stat().st_size} bytes, sha256 {digest}")
 
     if args.check_output:
-        want = pins["gguf"][args.outtype]["sha256"]
+        want = pins["gguf"].get(args.outtype, {}).get("sha256")
         if digest != want:
             print(f"error: sha256 {digest} != pinned {want}", file=sys.stderr)
             return 1
