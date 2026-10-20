@@ -83,7 +83,55 @@ front end.
 - **GGUF:** the expected sha256 of the F32 converter output. The converter is byte-reproducible.
   `--check-output` enforces this sha256.
 - **No F16 pin:** `--outtype f16` halves the file (16 MB) but fails the parity gate (end-to-end SNR
-  16–23 dB), so it is not pinned or shipped.
+  16–23 dB), so it is not pinned or shipped. See [F16 and v1.1](#f16-and-v11) for the full evaluation.
+
+## Memory
+
+`paradee_load_model` memory-maps an all-F32 GGUF (the converter's default) read-only and the layers read the
+weights in place. The 32 MB of weights are then clean, reclaimable page cache rather than private memory.
+`PARADEE_USE_MMAP=0` reads the file into private memory instead. Any other file (for example `--outtype f16`)
+is read and widened to F32 at load, so it keeps a private F32 copy of every weight as well as the file data.
+
+On a Lenovo TB336FU (4 GB), synthesizing 19.8 s of speech with `paradee-tts` gives byte-identical audio either
+way. Peak private memory is 170 MB mapped against 202 MB read, and peak file-backed memory is 34 MB against
+3 MB. Activations make up most of the peak.
+
+## F16 and v1.1
+
+Measured October 19, 2026 against the pinned v1.0 GGUF, with this directory's parity test, its reference dump,
+and 40 more sentences (20 assistant-style prompts and 20 Harvard sentences). Those sentences were phonemized
+with `tools/misaki-g2p` and transcribed with Phonon-2 (`tools/parakeet`) and with whisper.cpp `base.en`.
+
+| File | Size (deflate -9) | Parity test | Durations (40 sentences) | WER Phonon-2 / whisper | Log-mel vs F32 | RTF, TB336FU / M4 Max |
+|---|---|---|---|---|---|---|
+| F32 (shipped) | 32.1 MB (29.7) | pass, end to end 58–76 dB | – | 3.90% / 3.90% | – | 0.30 / 0.024 |
+| `--outtype f16` | 16.2 MB (14.9) | fail: end to end 9.8–23 dB, stage errors up to 1.1e-2 × RMS | 1 of 40 shorter by 25 ms | 3.90% / 3.90% | 0.039 mean, 0.56 max | 0.32 / 0.024 |
+| F16 decoder, F32 BERT and predictor (experiment, not in the converter) | 22.1 MB (20.4) | end to end 56–61 dB; fails the 1e-3 × RMS stage gate on `asr` and `dec` only | identical | 3.90% / 3.90% | 0.0026 | 0.30 / 0.024 |
+
+- The end-to-end error of `--outtype f16` comes from the BERT and the duration/F0 predictor. The decoder in F16
+  costs little. F0 errors near 1e-3 accumulate in the harmonic source's phase, which the waveform SNR punishes
+  while the spectrum barely changes.
+- F16 does not speed anything up here, because the runtime computes in F32. It does not save RAM either: an F16
+  file cannot be mapped and is widened at load, so private memory goes up by the size of the file (about 16–22 MB).
+- So F32 stays the shipped and pinned file. F16 would only make sense with layers that read F16 weights from
+  the mapping. The ggml conv1d path already converts its weights to a cached F16 copy (`cached_f16_weight`,
+  about 10 MB for the 3-D weights).
+- **v1.1** ([sahilmahendrakar/Paradee-8M-v1.1](https://huggingface.co/sahilmahendrakar/Paradee-8M-v1.1) at
+  `330617ad`, Apache-2.0) is not a weight update this runtime can load. It keeps the text side (same
+  `text_side.pt`) and the decoder's AdaIN trunk, but it replaces the iSTFTNet generator and the phase-locking
+  filter with a frame-rate source-filter head (`training/scripts/vhead.py` at github.com/sahilmahendrakar/paradee
+  `606e16e1`). That head is ConvNeXt blocks at 80 fps that shape the STFT of a 64-harmonic sine bank and of
+  random noise, plus a 3 ms noise path. Its output is not deterministic, because it draws random noise.
+- Upstream's fp32 ONNX graphs, one onnxruntime thread on the M4 Max, the same 40 sentences:
+
+  | Graph | RTF | WER Phonon-2 / whisper |
+  |---|---|---|
+  | v1.0 | 0.051 | 4.16% / 3.90% |
+  | v1.1 | 0.010 | 3.90% / 3.12% |
+
+  int8 graphs: v1.0 0.054, v1.1 0.011, with WER within one word of fp32.
+- Running v1.1 natively needs a new decoder head (sine bank, ConvNeXt, two STFT/iSTFT sizes, a seeded noise
+  source) and a new parity gate that does not compare the noise.
 
 ## Parity gate
 
