@@ -40,9 +40,33 @@ directory is new code.
 
 ## Kernels (`src/pk-kernels*.cpp`)
 
-The weights stay in the GGUF in kernel order (`fv5-pair16-v1`): 4-bit level codes, two rows by 16 k per
-16-byte block. The model is mmapped and used in place. Per 8-row block, one `vqtbl1q_s8` per 16 weights
-decodes the codes into an int8 panel that stays in L1. The panel is then multiplied against all tokens:
+The weights stay in the GGUF in kernel order and are used in place from the mmapped file. Per 8-row block,
+the codes are decoded into an int8 panel that stays in L1, and the panel is then multiplied against all
+tokens. Two code layouts decode to the same panel, so they give bit-identical results:
+
+| layout | bits per weight | Phonon-2 GGUF | decode per 16 weights |
+|---|---|---|---|
+| `fv5-b5x3t7-v1` (default) | 2.35–2.41 | 208.9 MB | 1/3 of: 2 `UMULL` + `UZP2` (x / 5), `TBL` (/ 25), 2 `MLS`, then 3 x (`ORR` + `TBL`); 1/8 of a 7-`SRI` bit gather |
+| `fv5-pair16-v1` | 4 | 330.6 MB | `AND` or `USHR`, one `vqtbl1q_s8` |
+
+- **`fv5-pair16-v1`**: 4-bit level codes, two rows by 16 k per 16-byte block.
+- **`fv5-b5x3t7-v1`**: the panel's 16-byte vectors are taken three at a time. Lane j of a code vector is the
+  base-5 number of the three levels, which is below 125, so 8 code vectors share 7 stored vectors (the eighth
+  code is spread over their top bits). `pk-kernels.h` specifies it.
+- The five-value alphabet carries log2(5) = 2.32 bits, and the levels' entropy is 1.95 bits. Fermion's own
+  container gets 2.11 bits with a variable-length bit per non-zero weight, but that cannot be decoded at an
+  arbitrary block without prefix counts.
+
+What the denser layout costs is decode time. It is fixed per encoder pass, so it only shows on short windows.
+These are `tools/bench-fv5-packing.cpp` results, decode plus tile over all 24 layers, on one thread:
+
+| N tokens (80 ms each) | 8 | 16 | 32 | 64 | 125 | 375 |
+|---|---|---|---|---|---|---|
+| TB336FU Cortex-A76, dotprod: pair16 → b5x3t7 (ms) | 101 → 121 | 176 → 191 | 324 → 330 | 596 → 613 | 1139 → 1142 | 3661 → 3602 |
+| M4 Max, i8mm: pair16 → b5x3t7 (ms) | 25 → 33 | 45 → 52 | 85 → 91 | 167 → 171 | 321 → 326 | 957 → 960 |
+
+The converter writes `fv5-b5x3t7-v1` unless given `--layout pair16`. The loader accepts both.
+
 
 | tier | instruction | runtime check |
 |---|---|---|
@@ -97,6 +121,7 @@ a **pause-delimited segment**, from the segment start to the newest sample.
 - `convert_phonon2_to_gguf.py` reads the pinned `phonon-2.bps.tar.zst`, or an unpacked `model.fermion` and
   `config.json`, and writes the GGUF.
   - It checks every input against `pins.json` (HF revision `7e153e40…`, size and sha256).
+  - `--layout b5x3t7` (default) or `--layout pair16` picks the code layout.
   - `--verify` re-reads the GGUF and checks that all 264 five-value records and 11 int tables expand
     bit-identically to the container, that all 723 records are consumed, and that the mel filterbank equals
     librosa's.
@@ -105,6 +130,8 @@ a **pause-delimited segment**, from the segment start to the newest sample.
   fp32 `transformers.ParakeetForTDT`. The fixtures hold the PCM, the normalised mel, the subsampling, layer-0
   and encoder outputs, and the token ids and text.
 - `tests/test_parakeet_parity.cpp` compares the native pipeline with those fixtures stage by stage.
+- `tools/bench-fv5-packing.cpp` times the two code layouts' decode and decode + tile per GEMM shape, and
+  checks that they decode to the same panel.
 - `tools/parakeet-bench.cpp` and `tools/bench_parakeet.py` measure RTFx (wall and CPU time), first-window
   partial latency, peak RSS and WER, plus stream WER and stream/batch agreement with `--stream`.
 - libelizainference integration lives in `tools/omnivoice/src/eliza-asr-parakeet.inc`.

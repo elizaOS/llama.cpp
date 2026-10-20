@@ -10,6 +10,8 @@
 #if PK_HAVE_X86_EXT
 #include <immintrin.h>
 
+#include <cstring>
+
 namespace pk {
 namespace {
 
@@ -28,6 +30,59 @@ void decode_fv5_avx2(const uint8_t * codes, size_t pair_stride, const int8_t * l
             const __m128i hi = _mm_and_si128(_mm_srli_epi16(b, 4), m);
             _mm_storeu_si128((__m128i *) (dst + (size_t) (2 * g) * 64), _mm_shuffle_epi8(lut, lo));
             _mm_storeu_si128((__m128i *) (dst + (size_t) (2 * g + 1) * 64), _mm_shuffle_epi8(lut, hi));
+        }
+    }
+}
+
+// `fv5-b5x3t7-v1` with the NEON tier's arithmetic: q = ((x + 1) * 51) >> 8
+// on 16-bit lanes, digits by subtraction, then the pair16 PSHUFB lookup.
+inline __m128i fv5t7_div5(__m128i x) {
+    const __m128i z = _mm_setzero_si128(), k51 = _mm_set1_epi16(51), one = _mm_set1_epi16(1);
+    const __m128i lo = _mm_srli_epi16(_mm_mullo_epi16(_mm_add_epi16(_mm_unpacklo_epi8(x, z), one), k51), 8);
+    const __m128i hi = _mm_srli_epi16(_mm_mullo_epi16(_mm_add_epi16(_mm_unpackhi_epi8(x, z), one), k51), 8);
+    return _mm_packus_epi16(lo, hi);
+}
+
+inline __m128i fv5t7_times5(__m128i q) {
+    const __m128i q2 = _mm_add_epi8(q, q);
+    return _mm_add_epi8(_mm_add_epi8(q2, q2), q);
+}
+
+void decode_fv5t7_avx2(const uint8_t * codes, const int8_t * luts, int K, int8_t * panel) {
+    const __m128i lut[4] = { _mm_loadu_si128((const __m128i *) luts), _mm_loadu_si128((const __m128i *) (luts + 16)),
+                             _mm_loadu_si128((const __m128i *) (luts + 32)), _mm_loadu_si128((const __m128i *) (luts + 48)) };
+    const __m128i row_hi = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8, 8, 8, 8, 8);
+    const __m128i m7 = _mm_set1_epi8(0x7F);
+    const size_t pbytes = (size_t) K * 8;
+    const int G = (fv5t7_codes(K) + 7) / 8;
+    alignas(16) int8_t stage[384];
+    for (int g = 0; g < G; ++g) {
+        const uint8_t * s = codes + (size_t) g * 112;
+        __m128i x[8];
+        __m128i c7 = _mm_setzero_si128();
+        for (int m = 0; m < 7; ++m) {
+            const __m128i v = _mm_loadu_si128((const __m128i *) (s + m * 16));
+            x[m] = _mm_and_si128(v, m7);
+            // bit 7 of every byte -> bit m (a 16-bit shift only brings in
+            // bits above m from the neighbouring byte, and those are masked)
+            c7 = _mm_or_si128(c7, _mm_and_si128(_mm_srli_epi16(v, 7 - m), _mm_set1_epi8((char) (1 << m))));
+        }
+        x[7] = c7;
+        const size_t off = (size_t) g * 384;
+        const bool full = off + 384 <= pbytes;
+        int8_t * dst = full ? panel + off : stage;
+        for (int m = 0; m < 8; ++m) {
+            const __m128i q1 = fv5t7_div5(x[m]);
+            const __m128i q2 = fv5t7_div5(q1);
+            const __m128i d0 = _mm_sub_epi8(x[m], fv5t7_times5(q1));
+            const __m128i d1 = _mm_sub_epi8(q1, fv5t7_times5(q2));
+            const int v0 = 3 * m;  // panel vector index within the group; row pair = v % 4
+            _mm_storeu_si128((__m128i *) (dst + (size_t) v0 * 16), _mm_shuffle_epi8(lut[v0 % 4], _mm_or_si128(d0, row_hi)));
+            _mm_storeu_si128((__m128i *) (dst + (size_t) (v0 + 1) * 16), _mm_shuffle_epi8(lut[(v0 + 1) % 4], _mm_or_si128(d1, row_hi)));
+            _mm_storeu_si128((__m128i *) (dst + (size_t) (v0 + 2) * 16), _mm_shuffle_epi8(lut[(v0 + 2) % 4], _mm_or_si128(q2, row_hi)));
+        }
+        if (!full) {
+            std::memcpy(panel + off, stage, pbytes - off);
         }
     }
 }
@@ -129,7 +184,7 @@ void matvec_avx2(const int8_t * w, int O, int K, const int8_t * x, int32_t * y) 
 }  // namespace
 
 const kernel_table & kernels_avx2() {
-    static const kernel_table t = { tier::avx2, "avx2", decode_fv5_avx2, tile_avx2, matvec_avx2 };
+    static const kernel_table t = { tier::avx2, "avx2", decode_fv5_avx2, decode_fv5t7_avx2, tile_avx2, matvec_avx2 };
     return t;
 }
 

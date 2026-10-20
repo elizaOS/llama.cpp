@@ -94,6 +94,7 @@ struct pk_model {
 
     pk::workspace ws;
     double fv5_grid_err = 0.0;
+    bool fv5t7 = false;  // weights in `fv5-b5x3t7-v1` (else `fv5-pair16-v1`)
 
     // relative-position keys W_pos . e(p) per layer for p in [-rc_P, rc_P],
     // row c <-> p = rc_P - c, fp16. They depend only on p, so they are

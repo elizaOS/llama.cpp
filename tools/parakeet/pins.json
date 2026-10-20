@@ -63,9 +63,15 @@
   },
   "gguf": {
     "file": "phonon-2-fv5.gguf",
-    "size": 330632256,
-    "sha256": "dc552eb786486167dde3ac80bbe49a6088c8ef39c03c257d5a090fc57b2c47b3",
-    "format": "fv5-pair16-v1",
-    "note": "convert_phonon2_to_gguf.py --archive output; byte-reproducible. Changes whenever the converter changes, because its git blob sha is in the metadata."
+    "size": 208932352,
+    "sha256": "c0f6ad42f0a5b481904416077dde0a1a78e5b8642295fdf2356ace822588c3df",
+    "format": "fv5-b5x3t7-v1",
+    "note": "convert_phonon2_to_gguf.py --archive output (default --layout b5x3t7); byte-reproducible. Changes whenever the converter changes, because its git blob sha is in the metadata.",
+    "pair16": {
+      "size": 330632256,
+      "sha256": "cc0ee571b01c549cef3a30bdd2626624c5e9059e1aaa7d02be56adab12e57fca",
+      "format": "fv5-pair16-v1",
+      "note": "--layout pair16 output of the same converter. Same weights and bit-identical results; 4 bits per weight."
+    }
   }
 }
