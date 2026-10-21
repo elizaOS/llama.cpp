@@ -63,7 +63,9 @@ const char * paradee_status_str(paradee_status st) noexcept;
 
 // Load a Paradee GGUF written by convert_paradee_pt_to_gguf.py. The file must
 // declare general.architecture == "paradee"; every hparam the graph reads is
-// required. Returns nullptr and sets `err` on failure.
+// required. An all-F32 file is memory-mapped read-only and used in place
+// (PARADEE_USE_MMAP=0 reads it into memory instead); other files are read and
+// widened to F32. Returns nullptr and sets `err` on failure.
 paradee_model_ptr paradee_load_model(const std::string & gguf_path, std::string & err) noexcept;
 
 // 24000 for Paradee-8M v1.0 (0 for a null model).
