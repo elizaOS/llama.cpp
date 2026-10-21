@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //
-// paradee.cpp — Paradee-8M v1.0 loader and synthesis (see include/paradee.h).
+// paradee.cpp — Paradee-8M loader and synthesis (see include/paradee.h).
 //
 // The text side and decoder are Kokoro's modules at smaller widths, so this
 // file only binds the GGUF to the generalised tools/kokoro layers
@@ -14,8 +14,13 @@
 //   - torch.round (half to even) for the integer durations,
 //   - the canonical source STFT (exact zeros for near-empty bins),
 //   - the phase-locking filter after the generator.
+//
+// A v1.1 GGUF (paradee.decoder.head = "source_filter_v2") runs the same text
+// side and the decoder's AdaIN trunk (kokoro decoder_front_forward), then the
+// source-filter head in paradee-head.cpp instead of the generator and lock.
 
 #include "paradee.h"
+#include "paradee-head.h"
 
 #include "kokoro-decoder.h"
 #include "kokoro-layers.h"
@@ -76,7 +81,11 @@ struct paradee_hparams {
 
 struct paradee_model {
     paradee_hparams hp;
-    paradee_lock_params lock;
+    paradee_head_kind head_kind = PARADEE_HEAD_ISTFTNET_LOCK;
+    std::string version;
+    paradee_lock_params lock;          // v1.0
+    head::params head_p;               // v1.1
+    head::weights head_w;
     std::unordered_map<uint32_t, int32_t> vocab;  // code point -> id
     gguf_context * gguf = nullptr;
     ggml_context * file_ctx = nullptr;   // tensors as stored
@@ -271,6 +280,17 @@ paradee_model_ptr paradee_load_model(const std::string & gguf_path, std::string 
                 return nullptr;
             }
         }
+        {
+            const int64_t id = gguf_find_key(g, "paradee.decoder.head");
+            const std::string kind = id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_STRING ? gguf_get_val_str(g, id)
+                                                                                           : "istftnet_lock";
+            if (kind == "istftnet_lock") m->head_kind = PARADEE_HEAD_ISTFTNET_LOCK;
+            else if (kind == "source_filter_v2") m->head_kind = PARADEE_HEAD_SOURCE_FILTER;
+            else { err = "unsupported paradee.decoder.head '" + kind + "'"; return nullptr; }
+            const int64_t vid = gguf_find_key(g, "paradee.version");
+            m->version = vid >= 0 && gguf_get_kv_type(g, vid) == GGUF_TYPE_STRING ? gguf_get_val_str(g, vid) : "1.0";
+        }
+        const bool v10 = m->head_kind == PARADEE_HEAD_ISTFTNET_LOCK;
         paradee_hparams & h = m->hp;
         std::vector<int> rates;
         bool ok =
@@ -287,24 +307,31 @@ paradee_model_ptr paradee_load_model(const std::string & gguf_path, std::string 
             read_i32(g, "paradee.style.text_dim", h.style_text_dim, err) &&
             read_i32(g, "paradee.style.decoder_dim", h.style_decoder_dim, err) &&
             read_i32(g, "paradee.asr.dim", h.asr_dim, err) &&
-            read_i32_array(g, "paradee.decoder.upsample_rates", rates, err) &&
-            read_i32(g, "paradee.decoder.istft_hop", h.istft_hop, err) &&
             read_i32(g, "paradee.audio.sample_rate", h.sample_rate, err) &&
             read_i32(g, "paradee.input.pad_id", h.pad_id, err) &&
-            read_i32(g, "paradee.input.max_ids", h.max_ids, err) &&
-            read_i32(g, "paradee.lock.n_fft", m->lock.n_fft, err) &&
-            read_i32(g, "paradee.lock.hop", m->lock.hop, err) &&
-            read_i32(g, "paradee.lock.smooth_frames", m->lock.smooth_frames, err) &&
-            read_i32(g, "paradee.lock.f0_hop", m->lock.f0_hop, err) &&
-            read_f32(g, "paradee.lock.voiced_f0_hz", m->lock.voiced_f0_hz, err);
+            read_i32(g, "paradee.input.max_ids", h.max_ids, err);
         if (!ok) return nullptr;
-        int band_lo = 0, band_hi = 0;
-        if (!read_i32(g, "paradee.lock.band_lo_hz", band_lo, err) ||
-            !read_i32(g, "paradee.lock.band_hi_hz", band_hi, err)) {
-            return nullptr;
+        // The generator and the phase lock are v1.0's; v1.1 has neither.
+        if (v10) {
+            ok = read_i32_array(g, "paradee.decoder.upsample_rates", rates, err) &&
+                 read_i32(g, "paradee.decoder.istft_hop", h.istft_hop, err) &&
+                 read_i32(g, "paradee.lock.n_fft", m->lock.n_fft, err) &&
+                 read_i32(g, "paradee.lock.hop", m->lock.hop, err) &&
+                 read_i32(g, "paradee.lock.smooth_frames", m->lock.smooth_frames, err) &&
+                 read_i32(g, "paradee.lock.f0_hop", m->lock.f0_hop, err) &&
+                 read_f32(g, "paradee.lock.voiced_f0_hz", m->lock.voiced_f0_hz, err);
+            if (!ok) return nullptr;
+            int band_lo = 0, band_hi = 0;
+            if (!read_i32(g, "paradee.lock.band_lo_hz", band_lo, err) ||
+                !read_i32(g, "paradee.lock.band_hi_hz", band_hi, err)) {
+                return nullptr;
+            }
+            m->lock.band_lo_hz = (float) band_lo;
+            m->lock.band_hi_hz = (float) band_hi;
+        } else {
+            rates = { 1, 1 };   // unused; keeps the shared bounds check below simple
+            h.istft_hop = 1;
         }
-        m->lock.band_lo_hz = (float) band_lo;
-        m->lock.band_hi_hz = (float) band_hi;
         m->lock.sample_rate = h.sample_rate;
         const int widths[] = {
             h.text_n_layer, h.text_n_head, h.text_d_model, h.text_d_ff, h.text_vocab_size,
@@ -379,11 +406,24 @@ paradee_model_ptr paradee_load_model(const std::string & gguf_path, std::string 
             "paradee.bert_encoder.weight", "paradee.predictor.duration_proj.weight",
             "paradee.predictor.F0_proj.weight", "paradee.text_encoder.embd.weight",
             "paradee.asr_proj.0.weight", "paradee.asr_proj.1.weight",
-            "paradee.decoder.encode.conv1.weight", "paradee.gen.conv_post.weight",
+            "paradee.decoder.encode.conv1.weight", "paradee.decoder.decode.3.conv1.weight",
         };
         for (const char * name : required) {
             if (!ggml_get_tensor(m->ctx, name)) {
                 err = std::string("required tensor missing: ") + name;
+                return nullptr;
+            }
+        }
+        if (v10 && !ggml_get_tensor(m->ctx, "paradee.gen.conv_post.weight")) {
+            err = "required tensor missing: paradee.gen.conv_post.weight";
+            return nullptr;
+        }
+        if (!v10) {
+            if (!head::load(g, m->ctx, m->head_p, m->head_w, err)) return nullptr;
+            // The head reads the trunk's output channels and runs at the F0 rate.
+            ggml_tensor * d3 = ggml_get_tensor(m->ctx, "paradee.decoder.decode.3.conv1.weight");   // [Cout, Cin, 3]
+            if ((int) d3->ne[2] != m->head_p.in_ch || m->head_p.sample_rate != h.sample_rate) {
+                err = "the head's input width does not match the decoder trunk";
                 return nullptr;
             }
         }
@@ -406,8 +446,16 @@ int paradee_sample_rate(const paradee_model * model) noexcept {
     return model ? model->hp.sample_rate : 0;
 }
 
+paradee_head_kind paradee_get_head(const paradee_model * model) noexcept {
+    return model ? model->head_kind : PARADEE_HEAD_ISTFTNET_LOCK;
+}
+
+const char * paradee_version(const paradee_model * model) noexcept {
+    return model ? model->version.c_str() : "";
+}
+
 const paradee_lock_params * paradee_get_lock_params(const paradee_model * model) noexcept {
-    return model ? &model->lock : nullptr;
+    return model && model->head_kind == PARADEE_HEAD_ISTFTNET_LOCK ? &model->lock : nullptr;
 }
 
 namespace {
@@ -528,6 +576,57 @@ bool cancel_trampoline(void * p) {
 
 namespace {
 
+// v1.1: AdaIN trunk + source-filter head. noise_in (optional) replaces the
+// seeded noise. Caller holds model->mu.
+paradee_status decode_head_locked(
+        const paradee_model * model,
+        const float * asr_ct, int A, int T,
+        const float * F0, const float * N,
+        paradee_cancel_fn cancel, void * user,
+        const std::vector<float> * noise_in, uint64_t seed,
+        std::vector<float> & pcm, paradee_stages * stages, std::string & err) {
+    std::vector<float> x;
+    if (!eliza_kokoro::decoder_front_forward(model->ctx, "paradee", /*instnorm_affine*/ true, asr_ct, A, T, F0, N,
+                                             model->style_dec.data(), x, err)) {
+        if (err.empty()) err = "decoder trunk failed";
+        return PARADEE_E_RUNTIME;
+    }
+    if (cancel && cancel(user)) { err = "cancelled"; return PARADEE_CANCELLED; }
+    const int n = 2 * T;
+    const head::params & hp = model->head_p;
+    if (x.size() != (size_t) hp.in_ch * (size_t) n) { err = "decoder trunk output width mismatch"; return PARADEE_E_RUNTIME; }
+    const size_t L = (size_t) n * (size_t) hp.f0_hop;
+    std::vector<float> drawn;
+    if (noise_in) {
+        if (noise_in->size() != L) {
+            err = "noise must have " + std::to_string(L) + " samples, got " + std::to_string(noise_in->size());
+            return PARADEE_E_INVALID_ARG;
+        }
+    } else {
+        head::gaussian_noise(seed, L, drawn);
+    }
+    const std::vector<float> & noise = noise_in ? *noise_in : drawn;
+    head::stages hs;
+    bool cancelled = false;
+    if (!head::forward(hp, model->head_w, x.data(), n, F0, noise.data(), pcm, stages ? &hs : nullptr,
+                       cancel, user, cancelled, err)) {
+        pcm.clear();
+        if (cancelled) { err = "cancelled"; return PARADEE_CANCELLED; }
+        if (err.empty()) err = "head failed";
+        return PARADEE_E_RUNTIME;
+    }
+    if (stages) {
+        stages->trunk = std::move(x);
+        stages->hn = std::move(hs.hn);
+        stages->sine = std::move(hs.sine);
+        stages->main_path = std::move(hs.main);
+        stages->burst_path = std::move(hs.burst);
+        stages->noise = noise;
+    }
+    if (cancel && cancel(user)) { pcm.clear(); err = "cancelled"; return PARADEE_CANCELLED; }
+    return PARADEE_OK;
+}
+
 // Decoder + generator + phase lock. Caller holds model->mu.
 paradee_status decode_locked(
         const paradee_model * model,
@@ -568,10 +667,12 @@ paradee_status decode_locked(
 
 } // namespace
 
-paradee_status paradee_synthesize_ids_staged(
+namespace {
+
+paradee_status synthesize_impl(
         const paradee_model * model,
         const int32_t * ids, size_t n,
-        float speed,
+        float speed, uint64_t seed,
         paradee_cancel_fn cancel, void * user,
         std::vector<float> & pcm,
         std::string & err,
@@ -643,10 +744,14 @@ paradee_status paradee_synthesize_ids_staged(
         }
         if (cancel && cancel(user)) { err = "cancelled"; return PARADEE_CANCELLED; }
 
-        // 2. Decoder + generator, 3. phase lock.
+        // 2. Decoder + generator, 3. phase lock (v1.0); or trunk + head (v1.1).
         std::vector<float> src, dec;
-        const paradee_status dst = decode_locked(model, asr_ct.data(), A, T, pred.F0_pred.data(),
-                                                 pred.N_pred.data(), cancel, user, dec, src, pcm, err);
+        const paradee_status dst =
+            model->head_kind == PARADEE_HEAD_SOURCE_FILTER
+                ? decode_head_locked(model, asr_ct.data(), A, T, pred.F0_pred.data(), pred.N_pred.data(), cancel,
+                                     user, stages ? stages->noise_in : nullptr, seed, pcm, stages, err)
+                : decode_locked(model, asr_ct.data(), A, T, pred.F0_pred.data(), pred.N_pred.data(), cancel, user,
+                                dec, src, pcm, err);
         if (dst != PARADEE_OK) { pcm.clear(); return dst; }
 
         if (stages) {
@@ -679,6 +784,19 @@ paradee_status paradee_synthesize_ids_staged(
     }
 }
 
+} // namespace
+
+paradee_status paradee_synthesize_ids_staged(
+        const paradee_model * model,
+        const int32_t * ids, size_t n,
+        float speed,
+        paradee_cancel_fn cancel, void * user,
+        std::vector<float> & pcm,
+        std::string & err,
+        paradee_stages * stages) noexcept {
+    return synthesize_impl(model, ids, n, speed, PARADEE_DEFAULT_NOISE_SEED, cancel, user, pcm, err, stages);
+}
+
 paradee_status paradee_synthesize_ids(
         const paradee_model * model,
         const int32_t * ids, size_t n,
@@ -686,7 +804,7 @@ paradee_status paradee_synthesize_ids(
         paradee_cancel_fn cancel, void * user,
         std::vector<float> & pcm,
         std::string & err) noexcept {
-    return paradee_synthesize_ids_staged(model, ids, n, speed, cancel, user, pcm, err, nullptr);
+    return synthesize_impl(model, ids, n, speed, PARADEE_DEFAULT_NOISE_SEED, cancel, user, pcm, err, nullptr);
 }
 
 } // namespace eliza_paradee
@@ -700,8 +818,8 @@ paradee_status paradee_synthesize(
         paradee_audio & out,
         std::string & err) noexcept {
     out.sample_rate = model ? model->hp.sample_rate : 24000;
-    return paradee_synthesize_ids_staged(model, input_ids.data(), input_ids.size(), opts.speed,
-                                         opts.cancel, opts.cancel_user_data, out.samples, err, nullptr);
+    return synthesize_impl(model, input_ids.data(), input_ids.size(), opts.speed, opts.noise_seed,
+                           opts.cancel, opts.cancel_user_data, out.samples, err, nullptr);
 }
 
 } // namespace eliza_paradee
@@ -726,6 +844,11 @@ paradee_status paradee_decode_staged(
         eliza_kokoro::detail::KokoroLayerOptionsScope layer_scope(fast_layers());
         stages->T_frame = T_frame;
         stages->asr_dim = asr_dim;
+        if (model->head_kind == PARADEE_HEAD_SOURCE_FILTER) {
+            if (src) { err = "a v1.1 model has no harmonic source to replace"; return PARADEE_E_INVALID_ARG; }
+            return decode_head_locked(model, asr, asr_dim, T_frame, F0, N, cancel, user, stages->noise_in,
+                                      PARADEE_DEFAULT_NOISE_SEED, stages->wav, stages, err);
+        }
         const paradee_hparams & h = model->hp;
         const size_t n_src = (size_t) T_frame * 2 * (size_t) (h.up_rates[0] * h.up_rates[1] * h.istft_hop);
         if (src && src->size() != n_src) {
@@ -734,6 +857,52 @@ paradee_status paradee_decode_staged(
         }
         return decode_locked(model, asr, asr_dim, T_frame, F0, N, cancel, user,
                              stages->dec, stages->src, stages->wav, err, src);
+    } catch (const std::bad_alloc &) {
+        err = "out of memory";
+        return PARADEE_E_OOM;
+    } catch (const std::exception & e) {
+        err = e.what();
+        return PARADEE_E_RUNTIME;
+    }
+}
+
+} // namespace eliza_paradee
+
+namespace eliza_paradee {
+
+paradee_status paradee_head_staged(
+        const paradee_model * model,
+        const float * trunk, int channels, int n,
+        const float * F0, const float * noise,
+        paradee_stages * stages,
+        std::string & err) noexcept {
+    err.clear();
+    if (!model || !trunk || !F0 || !noise || !stages || n < 2) {
+        err = "invalid head arguments";
+        return PARADEE_E_INVALID_ARG;
+    }
+    if (model->head_kind != PARADEE_HEAD_SOURCE_FILTER) {
+        err = "not a v1.1 (source-filter head) model";
+        return PARADEE_E_INVALID_ARG;
+    }
+    if (channels != model->head_p.in_ch) {
+        err = "trunk must have " + std::to_string(model->head_p.in_ch) + " channels";
+        return PARADEE_E_INVALID_ARG;
+    }
+    try {
+        std::lock_guard<std::mutex> lk(const_cast<paradee_model *>(model)->mu);
+        eliza_kokoro::detail::KokoroLayerOptionsScope layer_scope(fast_layers());
+        head::stages hs;
+        bool cancelled = false;
+        if (!head::forward(model->head_p, model->head_w, trunk, n, F0, noise, stages->wav, &hs, nullptr, nullptr,
+                           cancelled, err)) {
+            return PARADEE_E_RUNTIME;
+        }
+        stages->hn = std::move(hs.hn);
+        stages->sine = std::move(hs.sine);
+        stages->main_path = std::move(hs.main);
+        stages->burst_path = std::move(hs.burst);
+        return PARADEE_OK;
     } catch (const std::bad_alloc &) {
         err = "out of memory";
         return PARADEE_E_OOM;

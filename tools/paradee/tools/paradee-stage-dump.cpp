@@ -11,7 +11,8 @@
 // outputs (asr [512, T] channel-major, F0 / N [2T]).
 //
 // writes <prefix>.{bert,d,dur,F0,N,asr,dec,src,wav}.f32, <prefix>.dur_int.i32
-// and <prefix>.ids.i32.
+// and <prefix>.ids.i32. For a v1.1 GGUF (source-filter head) dec and src are
+// empty and <prefix>.{trunk,hn,sine,main,burst,noise}.f32 are written too.
 
 #include "paradee.h"
 
@@ -27,6 +28,13 @@ static bool write_raw(const std::string & path, const std::vector<T> & v) {
     std::ofstream f(path, std::ios::binary);
     f.write((const char *) v.data(), (std::streamsize) (v.size() * sizeof(T)));
     return (bool) f;
+}
+
+static bool write_head(const std::string & pre, const eliza_paradee::paradee_stages & st) {
+    if (st.trunk.empty()) return true;   // v1.0
+    return write_raw(pre + ".trunk.f32", st.trunk) && write_raw(pre + ".hn.f32", st.hn) &&
+           write_raw(pre + ".sine.f32", st.sine) && write_raw(pre + ".main.f32", st.main_path) &&
+           write_raw(pre + ".burst.f32", st.burst_path) && write_raw(pre + ".noise.f32", st.noise);
 }
 
 static std::vector<float> read_f32(const char * path) {
@@ -52,7 +60,7 @@ int main(int argc, char ** argv) {
         }
         const std::string pre = argv[6];
         return write_raw(pre + ".dec.f32", st.dec) && write_raw(pre + ".src.f32", st.src) &&
-               write_raw(pre + ".wav.f32", st.wav) ? 0 : 1;
+               write_raw(pre + ".wav.f32", st.wav) && write_head(pre, st) ? 0 : 1;
     }
     if (argc < 4) {
         std::fprintf(stderr, "usage: %s <model.gguf> <phonemes.txt> <out-prefix> [speed]\n", argv[0]);
@@ -85,7 +93,7 @@ int main(int argc, char ** argv) {
               write_raw(pre + ".dur_int.i32", st.dur_int) && write_raw(pre + ".F0.f32", st.F0) &&
               write_raw(pre + ".N.f32", st.N) && write_raw(pre + ".asr.f32", st.asr) &&
               write_raw(pre + ".dec.f32", st.dec) && write_raw(pre + ".src.f32", st.src) &&
-              write_raw(pre + ".wav.f32", st.wav);
+              write_raw(pre + ".wav.f32", st.wav) && write_head(pre, st);
     std::printf("T_phon=%d T_frame=%d samples=%zu\n", st.T_phon, st.T_frame, st.wav.size());
     return ok ? 0 : 1;
 }

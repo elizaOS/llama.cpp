@@ -3,7 +3,8 @@
 // test-paradee-api — the eliza_paradee C++ API contract on the real model:
 // loading, phoneme mapping (pads, unknown symbols, length limit, UTF-8),
 // input validation, determinism, speed, and cancellation (before the call,
-// between stages and inside the generator loops).
+// between stages and inside the generator loops). Runs on a v1.0 or a v1.1
+// GGUF; for v1.1 also the noise seed and injected noise.
 //
 // Needs PARADEE_GGUF (environment); exits 77 (CTest SKIP) without it.
 
@@ -44,10 +45,18 @@ int main() {
     if (!model) { std::fprintf(stderr, "load failed: %s\n", err.c_str()); return 1; }
     CHECK(paradee_sample_rate(model.get()) == 24000, "sample rate %d", paradee_sample_rate(model.get()));
     CHECK(paradee_sample_rate(nullptr) == 0, "null model sample rate");
+    const bool v11 = paradee_get_head(model.get()) == PARADEE_HEAD_SOURCE_FILTER;
+    CHECK(std::string(paradee_version(model.get())) == (v11 ? "1.1" : "1.0"), "version %s", paradee_version(model.get()));
+    CHECK(paradee_get_head(nullptr) == PARADEE_HEAD_ISTFTNET_LOCK && std::string(paradee_version(nullptr)).empty(),
+          "null model head / version");
     const paradee_lock_params * lp = paradee_get_lock_params(model.get());
-    CHECK(lp && lp->n_fft == 1024 && lp->hop == 256 && lp->smooth_frames == 33 && lp->f0_hop == 300 &&
-          lp->band_lo_hz == 2000.0f && lp->band_hi_hz == 8000.0f && lp->voiced_f0_hz == 60.0f,
-          "lock parameters not read from the GGUF");
+    if (v11) {
+        CHECK(!lp, "a v1.1 model has no phase lock");
+    } else {
+        CHECK(lp && lp->n_fft == 1024 && lp->hop == 256 && lp->smooth_frames == 33 && lp->f0_hop == 300 &&
+              lp->band_lo_hz == 2000.0f && lp->band_hi_hz == 8000.0f && lp->voiced_f0_hz == 60.0f,
+              "lock parameters not read from the GGUF");
+    }
 
     // Phonemes -> ids.
     std::vector<int32_t> ids;
@@ -149,6 +158,45 @@ int main() {
         paradee_audio audio;
         CHECK(paradee_synthesize(model.get(), ids, opts, audio, err) == PARADEE_OK && audio.samples == a &&
               audio.sample_rate == 24000, "paradee_synthesize differs");
+    }
+
+    // v1.1: the noise comes from the seed (the default one unless the options
+    // choose), or from the caller.
+    if (v11) {
+        paradee_synth_options opts;
+        paradee_audio s0, s1, s1b;
+        opts.noise_seed = PARADEE_DEFAULT_NOISE_SEED;
+        CHECK(paradee_synthesize(model.get(), ids, opts, s0, err) == PARADEE_OK && s0.samples == a, "default seed");
+        opts.noise_seed = 1;
+        CHECK(paradee_synthesize(model.get(), ids, opts, s1, err) == PARADEE_OK && s1.samples.size() == a.size() &&
+              s1.samples != a, "another seed must change the noise");
+        CHECK(paradee_synthesize(model.get(), ids, opts, s1b, err) == PARADEE_OK && s1b.samples == s1.samples,
+              "the same seed must give the same audio");
+        paradee_stages st;
+        const std::vector<float> wrong(a.size() + 1, 0.0f);
+        st.noise_in = &wrong;
+        CHECK(paradee_synthesize_ids_staged(model.get(), ids.data(), ids.size(), 1.0f, nullptr, nullptr, pcm, err, &st) ==
+              PARADEE_E_INVALID_ARG && pcm.empty(), "noise of the wrong length accepted");
+        paradee_stages s2;
+        CHECK(paradee_synthesize_ids_staged(model.get(), ids.data(), ids.size(), 1.0f, nullptr, nullptr, pcm, err, &s2) ==
+              PARADEE_OK && pcm == a && s2.noise.size() == a.size(), "staged synthesis differs");
+        paradee_stages s3;
+        s3.noise_in = &s2.noise;
+        CHECK(paradee_synthesize_ids_staged(model.get(), ids.data(), ids.size(), 1.0f, nullptr, nullptr, pcm, err, &s3) ==
+              PARADEE_OK && pcm == a, "the seeded noise fed back in must give the same audio");
+        const std::vector<float> silent(a.size(), 0.0f);
+        paradee_stages s4;
+        s4.noise_in = &silent;
+        CHECK(paradee_synthesize_ids_staged(model.get(), ids.data(), ids.size(), 1.0f, nullptr, nullptr, pcm, err, &s4) ==
+              PARADEE_OK && pcm != a, "zero noise must change the audio");
+        CHECK(paradee_head_staged(model.get(), s2.trunk.data(), (int) (s2.trunk.size() / (2 * s2.T_frame)) + 1,
+                                  2 * s2.T_frame, s2.F0.data(), s2.noise.data(), &s4, err) == PARADEE_E_INVALID_ARG,
+              "head with the wrong trunk width accepted");
+    } else {
+        paradee_stages st;
+        const std::vector<float> zeros(128 * 4 * 300, 0.0f);
+        CHECK(paradee_head_staged(model.get(), zeros.data(), 128, 4, zeros.data(), zeros.data(), &st, err) ==
+              PARADEE_E_INVALID_ARG, "a v1.0 model has no source-filter head");
     }
 
     // Concurrent calls on one model are serialised and give the same audio.

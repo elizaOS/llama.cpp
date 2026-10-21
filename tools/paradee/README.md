@@ -1,4 +1,4 @@
-# tools/paradee: Paradee-8M v1.0 TTS
+# tools/paradee: Paradee-8M TTS (v1.0 and v1.1)
 
 Paradee-8M v1.0 ([sahilmahendrakar/Paradee-8M-v1.0](https://huggingface.co/sahilmahendrakar/Paradee-8M-v1.0), Apache-2.0)
 is Kokoro-82M's StyleTTS-2 + iSTFTNet code at smaller widths. It is distilled to one voice (`af_heart`), has
@@ -13,6 +13,7 @@ natively, with no ONNX:
 - `paradee_lib` runs it on the `tools/kokoro` layers. Those layers now read their widths from the tensor
   shapes, and Kokoro-82M's output is unchanged bit for bit.
 - `src/paradee-phase-lock.cpp` is a native implementation of the model's phase-locking filter.
+- `src/paradee-head.cpp` runs Paradee-8M v1.1's source-filter head. See [v1.1](#v11-source-filter-head).
 
 ## Pipeline
 
@@ -52,10 +53,12 @@ namespace eliza_paradee {
   It checks `cancel` between stages and inside the generator and phase-lock loops. Calls on one model run
   one at a time.
 - `paradee_synthesize` takes the same arguments in two structs (`paradee_synth_options` and
-  `paradee_audio`).
+  `paradee_audio`). For v1.1, `paradee_synth_options::noise_seed` picks the head's noise.
+- `paradee_get_head` and `paradee_version` say which release a GGUF holds.
 - Diagnostics:
   - `paradee_synthesize_ids_staged` and `paradee_decode_staged` return every stage.
   - `paradee_phase_lock` runs the filter alone.
+  - `paradee_head_staged` runs the v1.1 head alone; `paradee_stages::noise_in` replaces its noise.
 
 ## Build and use
 
@@ -65,6 +68,8 @@ and `paradee-stage-dump`.
 ```sh
 python tools/paradee/convert_paradee_pt_to_gguf.py --model-dir <HF snapshot at the pinned revision> \
     --output paradee-8m-v1.0-f32.gguf --check-output
+python tools/paradee/convert_paradee_pt_to_gguf.py --version 1.1 --model-dir <v1.1 snapshot> \
+    --output paradee-8m-v1.1-f32.gguf --check-output
 build/bin/paradee-tts --model paradee-8m-v1.0-f32.gguf --phonemes "həlˈO wˈɜɹld." --output hello.wav
 ```
 
@@ -82,6 +87,13 @@ front end.
 - **Reference environment:** torch 2.14.0, kokoro 0.9.4 and misaki 0.9.4, from `training/uv.lock`.
 - **GGUF:** the expected sha256 of the F32 converter output. The converter is byte-reproducible.
   `--check-output` enforces this sha256.
+- **v1.1:** the `"v1.1"` section pins the same things for sahilmahendrakar/Paradee-8M-v1.1 at `330617ad`
+  (the `v1.1` tag) and github.com/sahilmahendrakar/paradee at `606e16e1` (`vhead.py` and
+  `export_paradee_v1_1.py` as well as the v1.0 scripts, which are unchanged there). The reference
+  environment is the same: `training/uv.lock` did not change.
+- **v1.0 GGUF sha256:** writing `paradee.version` and `paradee.decoder.head` changed the converter, and so the
+  v1.0 output's sha256 (the tensors are unchanged). Files from the earlier converter, such as `357477…`
+  (32,072,768 bytes), still load as v1.0 and give byte-identical audio.
 - **No F16 pin:** `--outtype f16` halves the file (16 MB) but fails the parity gate (end-to-end SNR
   16–23 dB), so it is not pinned or shipped. See [F16 and v1.1](#f16-and-v11) for the full evaluation.
 
@@ -160,7 +172,7 @@ ctest --test-dir build -R paradee --output-on-failure
 |---|---|---|
 | `test-paradee-phase-lock` | nothing (committed fixture) | Lock within 1e-4 of `phase_lock.lock()` evaluated in float64; no further from the shipped float32 `phase_lock.lock()` than float32 is from float64; pass-through, length and cancel behaviour |
 | `test-paradee-api` | `PARADEE_GGUF` | ids, vocabulary and length errors, input validation, determinism, speed, cancellation at several points |
-| `test-paradee-parity` | `PARADEE_GGUF`, `PARADEE_REF_DIR` | integer durations identical; bert/d/dur/F0/N/asr within 1e-3 × RMS; source (from the reference F0) and decoder output (from the reference asr/F0/N/source) within 1e-3 × RMS; lock alone within 1e-4 of float64 `phase_lock.lock()`; final waveform SNR ≥ 35 dB |
+| `test-paradee-parity` | `PARADEE_GGUF`, `PARADEE_REF_DIR` | integer durations identical; bert/d/dur/F0/N/asr within 1e-3 × RMS; source (from the reference F0) and decoder output (from the reference asr/F0/N/source) within 1e-3 × RMS; lock alone within 1e-4 of float64 `phase_lock.lock()`; final waveform SNR ≥ 35 dB. For v1.1, see [v1.1 parity](#v11-parity) |
 
 The model-backed tests exit 77 (CTest SKIP) when the model or the reference is not configured.
 
@@ -171,3 +183,94 @@ source phase error and be charged to the wrong stage. The end-to-end SNR covers 
 The shipped float32 `phase_lock.lock()` differs from its own float64 evaluation by up to about 1e-3, at
 bins where the source is nearly silent. No independent implementation can match it within 1e-4. The gate
 therefore uses the float64 evaluation and reports the float32 distance.
+
+## v1.1: source-filter head
+
+[sahilmahendrakar/Paradee-8M-v1.1](https://huggingface.co/sahilmahendrakar/Paradee-8M-v1.1) (`330617ad`,
+Apache-2.0) keeps v1.0's text side (the same `text_side.pt`) and the decoder's AdaIN trunk (same layout,
+retrained weights). It replaces the iSTFTNet generator and the phase-locking filter with `SourceFilterHead2`
+from `training/scripts/vhead.py` (github.com/sahilmahendrakar/paradee `606e16e1`). `src/paradee-head.cpp`
+implements that head:
+
+| Part | What it does |
+|---|---|
+| ConvNeXt stack | Conv1d 128→160 (k 7), LayerNorm, 4 × (depthwise conv 7, LayerNorm, Linear 160→480, GELU, Linear 480→160, gamma, residual), LayerNorm. 80 fps, on the kokoro layers. |
+| Output layers | Per STFT frame (n_fft 600, hop 150, 2 frames per trunk frame): harmonic log-gain, phase (cos, sin), noise log-gain and 4 pulsing-noise gains at 80 mel-spaced points, linearly interpolated to the 301 bins; one pulse shift (0.5 tanh, in pitch periods). Noise-burst gains at 24 points for a 150/75 STFT. |
+| Sources | A 64-harmonic sine bank from F0 (harmonics above 11 kHz and unvoiced frames muted), white noise, and noise × voicing × cos/sin(2πm·phase) for m = 1, 2. |
+| Output | iSTFT(E · gain · phase · e^{i2π(f/F0)·shift} + (noise + Σ pulsing noise · gain) · noise gain) + iSTFT_150/75(STFT_150/75(reversed noise) · burst gain). |
+
+The STFTs are mixed-radix FFTs (600 = 4·2·3·5·5, 150 = 2·3·5·5). The main path runs one STFT frame at a time,
+so no spectrogram is kept.
+
+- **Routing.** The converter writes `paradee.version` and `paradee.decoder.head` (`istftnet_lock` for v1.0,
+  `source_filter_v2` for v1.1). `paradee_load_model` picks the graph from that key. A file without it is v1.0,
+  so v1.0 GGUFs written before this change still load and give byte-identical audio (checked with the
+  `357477…` file). The v1.1 file has no generator or lock tensors and no `paradee.lock.*` keys.
+  `paradee_get_lock_params` returns null for it.
+- **Noise.** The head draws Gaussian noise. Natively, that is xoshiro256** seeded by splitmix64, with
+  Box-Muller in double. The seed is `PARADEE_DEFAULT_NOISE_SEED` (0) unless `paradee_synth_options::noise_seed`
+  says otherwise, so the same input gives the same audio. `paradee_stages::noise_in` replaces the noise, and
+  the parity test uses that to feed in the reference's noise. libelizainference needs no change: it calls
+  `paradee_synthesize` with the default options.
+- **Rounding.** The native head follows the module's float32 arithmetic, with three deliberate differences:
+  - The harmonics come from a rotation recurrence on exp(i2π·phase), computed in double, instead of one
+    float32 `sin(2πk·phase)` per harmonic. That float32 argument reaches about 440 rad, where one float32 step
+    is about 3e-5 rad.
+  - The pulse shift's phase steps across the bins in double.
+  - The running phase `c + fr·d` is rounded twice, exactly as torch rounds it, and never fused into one FMA.
+
+### v1.1 parity
+
+`dump_paradee_reference.py dump --version 1.1` runs the upstream module (`VDecoder(head="v2")` with
+`load_ckpt`, as `export_paradee_v1_1.py` builds it) in float32, with no other changes. The noise is
+`torch.randn` from `Generator().manual_seed(--noise-seed + index)`, or `--noise-dir/<i>.noise.f32`, and it is
+written out as the `noise` stage.
+
+```sh
+python tools/paradee/tools/dump_paradee_reference.py dump --version 1.1 --model-dir <v1.1 snapshot> \
+    --paradee-src <paradee checkout at 606e16e1> --out ref11
+PARADEE_GGUF=paradee-8m-v1.1-f32.gguf PARADEE_REF_DIR=ref11 PARADEE_GGUF_V10=paradee-8m-v1.0-f32.gguf \
+    build/bin/test-paradee-parity
+```
+
+| Gate | Input | Limit | Measured (5 sentences, M4 Max and TB336FU) |
+|---|---|---|---|
+| ids, integer durations | – | identical | identical |
+| text side unchanged | `PARADEE_GGUF_V10` | bert/d/dur/dur_int/F0/N/asr bit-identical between the v1.0 and v1.1 GGUFs | bit-identical |
+| bert, d, dur, F0, N, asr | – | max\|err\| ≤ 1e-3 × RMS | ≤ 6e-6 × RMS |
+| trunk | reference asr/F0/N | ≤ 1e-3 × RMS | ≤ 9e-6 × RMS |
+| hn (ConvNeXt stack) | reference trunk | ≤ 1e-3 × RMS | ≤ 1e-5 × RMS |
+| sine bank | reference F0 | ≤ 1e-4 × RMS of the float64 bank; no further from float32 `sine_bank` than float32 is from float64 (+1e-4) | 1.3–1.4e-5; float32 itself is 2.6–3.1e-4 away |
+| main path, burst path, head output | reference trunk, F0, noise | ≤ 1e-3 × RMS | ≤ 9.3e-5 × RMS |
+| end to end | reference noise | SNR ≥ 35 dB | 68.5–81.9 dB (Mac), 69.0–77.3 dB (tablet) |
+
+The end-to-end figure is set by the text side's float32 rounding, as in v1.0. F0 differs by about 1e-6 relative,
+and the harmonic phase integrates that error.
+
+### v1.1 against v1.0
+
+Measured October 19, 2026, with the 40 sentences of the F16 and v1.1 evaluation in elizaOS/llama.cpp#85: 20
+assistant prompts and 20 Harvard sentences (130.1 s of speech), phonemized with `tools/misaki-g2p`. Both releases give the same durations, because the text side is the same.
+Both GGUFs are F32 and read into memory, as on this branch. RTF is the sum of the best of 3 runs per sentence
+from `paradee-tts`, divided by the audio length.
+
+| | v1.0 | v1.1 |
+|---|---|---|
+| GGUF (F32) | 32,072,864 B (deflate -9: 29.7 MB) | 31,275,232 B (deflate -9: 29.0 MB) |
+| RTF, M4 Max, 1 thread | 0.025 | 0.0083 |
+| RTF, M4 Max, default threads | 0.025 | 0.0081 |
+| RTF, TB336FU (MT6835), 8 threads | 0.263 | 0.091 |
+| RTF, TB336FU, 1 thread on an A76 core | 0.533 | 0.105 |
+| WER, Phonon-2 / whisper.cpp `base.en` | 3.90% / 3.90% | 3.90% / 3.12% |
+| Peak RssAnon, TB336FU, 19.8 s utterance | 202 MB | 69–73 MB |
+| Peak footprint, M4 Max, 19.8 s utterance | 300 MB | 110–115 MB |
+
+- The WER figures equal upstream's ONNX graphs on the same sentences (v1.1 fp32: 3.90% / 3.12%). Phonon-2's
+  transcripts of the native v1.1 audio are identical to its transcripts of the ONNX v1.1 audio for all 40
+  sentences. That holds even though the two draw different noise.
+- On the tablet, v1.1 is 2.9× faster with 8 threads and 5× faster on one core. The head runs on one thread,
+  so most of the 8-thread gain is the text side's.
+- The Mac was busy with other work (load average ~50) and the tablet had load ~11–14 from its own background
+  work. Treat the absolute RTFs as approximate; the two releases were measured back to back.
+- Peak memory is lower mainly because the head never builds the generator's 24 kHz feature maps. With
+  #85's memory mapping, both files would also stop counting their 31–32 MB of weights as private memory.

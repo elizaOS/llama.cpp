@@ -75,9 +75,9 @@
   "gguf": {
     "f32": {
       "file": "paradee-8m-v1.0-f32.gguf",
-      "size": 32072768,
-      "sha256": "357477651abb53b3fb1911a6e932026f3f1697fd772668326152e3ca04c9be27",
-      "note": "convert_paradee_pt_to_gguf.py --outtype f32 output; byte-reproducible (check with --check-output). Changes whenever the converter changes, because its git blob sha is in the metadata."
+      "size": 32072864,
+      "sha256": "c0d8f2010571c01015277bc11c9901d4d4cfbbfb25145932cdd86398464281d2",
+      "note": "convert_paradee_pt_to_gguf.py --outtype f32 output; byte-reproducible (check with --check-output). Changes whenever the converter changes, because its git blob sha is in the metadata. A v1.0 file written by an earlier converter (for example 357477651abb…, 32072768 bytes, before paradee.version / paradee.decoder.head existed) still loads as v1.0 and gives byte-identical audio."
     }
   },
   "fixtures": {
@@ -88,6 +88,79 @@
     "tests/fixtures/phase_lock_synthetic.f32": {
       "sha256": "691b032dd084e0c9c28f363acef8fb3029880041c9e5a282452626733ef3ee34",
       "made_by": "tools/dump_paradee_reference.py lock-fixture"
+    }
+  },
+  "v1.1": {
+    "model": {
+      "repo": "sahilmahendrakar/Paradee-8M-v1.1",
+      "revision": "330617ad1f097b4f6b02c103e54b39006c090b45",
+      "tag": "v1.1",
+      "tag_commit": "330617ad1f097b4f6b02c103e54b39006c090b45",
+      "tag_note": "The v1.1 tag and main both resolve to 330617ad.",
+      "license": "Apache-2.0"
+    },
+    "files": {
+      "pytorch/text_side.pt": {
+        "size": 16998347,
+        "sha256": "0995bee746043e4f06f72be68fb8634530b95d6467b4a141759e721122648062"
+      },
+      "pytorch/decoder.pt": {
+        "size": 14655657,
+        "sha256": "143f9678a8cc2a53ca72e06a2f8a8dd67424a5395eb939c60ec820a1122c8a13"
+      },
+      "config.json": {
+        "size": 1774,
+        "sha256": "c3f420e8a5aea41b97f698404a1b1e28e403c662f65927345335fc5493f2e075"
+      },
+      "tokenizer.json": {
+        "size": 3497,
+        "sha256": "77a02c8e164413299b4b4c403b14f8e0e1c1b727db4d46a09d6327b861060a34"
+      },
+      "samples/sentences.txt": {
+        "size": 621,
+        "sha256": "2d411facb6b0429ad05f6ea3abf9c6a79ba6613990cadf54e2213e11a8c9fd1b"
+      },
+      "samples/1_paradee.wav": {
+        "size": 468044,
+        "sha256": "6fdb16483025c0349c0faaf82b646c54478df5edca415c5f47d651548bb5857b"
+      },
+      "samples/2_paradee.wav": {
+        "size": 283244,
+        "sha256": "15a9d34c5e0b976a2735286bb8a9fc342e1ad328ff550de8e9205b520acde1db"
+      },
+      "samples/3_paradee.wav": {
+        "size": 361244,
+        "sha256": "ea5de64b47ffb680a41c7a20043178ebf827acaaf915fb430f0fa98cc123e160"
+      },
+      "samples/4_paradee.wav": {
+        "size": 457244,
+        "sha256": "01994be7988be80b83ca9457519c106d75cf89f3570cf0e0906a46f8063d3d9b"
+      },
+      "samples/5_paradee.wav": {
+        "size": 512444,
+        "sha256": "a028892e7470f9c5e969dd845a4882043a40fa81481b523014247b60cc0b3376"
+      }
+    },
+    "text_side_note": "pytorch/text_side.pt is byte-identical to v1.0's. decoder.pt keeps v1.0's AdaIN trunk layout (retrained weights) and replaces the generator with head.* (SourceFilterHead2).",
+    "source": {
+      "repo": "https://github.com/sahilmahendrakar/paradee",
+      "commit": "606e16e12f53bc6dfb814fe89fef338726687161",
+      "license": "Apache-2.0",
+      "files": {
+        "training/scripts/student.py": "90456f28ac3d6dd06e76ad8f253f9bcadd9060cdecb6880268651e0ff8ba0f8b",
+        "training/scripts/student_decoder.py": "2443f14fe8ff27be5702d88dc80f8c566e92c03273b6216825fa7787cd66b97c",
+        "training/scripts/common.py": "76faab4b54f633c1dfee28bfb08c981d4adb3f4ee99b42271cf80a3fc0e9fc9c",
+        "training/scripts/vhead.py": "c3b6be6f8b4d5b883a1afd59ccd924712e690842a1723142703851ab8c152b63",
+        "training/scripts/export_paradee_v1_1.py": "b5e52cb27324c3bf728b41bf57d89ce549b9bae55316687aed27bf2fcca47173"
+      }
+    },
+    "gguf": {
+      "f32": {
+        "file": "paradee-8m-v1.1-f32.gguf",
+        "size": 31275232,
+        "sha256": "f205ab055f0120d571aa6fda2deadde1e6fbc88e8d8bd56a592917fd0e50892e",
+        "note": "convert_paradee_pt_to_gguf.py --version 1.1 --outtype f32 output; byte-reproducible (check with --check-output). Changes whenever the converter changes, because its git blob sha is in the metadata."
+      }
     }
   }
 }

@@ -96,7 +96,55 @@ bool fill_gen_block(const Lk & L, GenAdaResBlockWeights & b, const std::string &
     return true;
 }
 
+// decoder_front weights from "<ns>.decoder.*". Checks the asr width.
+bool fill_front(const Lk & L, bool affine, int asr_dim, DecoderFrontWeights & W, std::string & err) {
+    W.F0_conv_w = L.get(".decoder.F0_conv.weight");
+    W.F0_conv_b = L.get(".decoder.F0_conv.bias");
+    W.N_conv_w  = L.get(".decoder.N_conv.weight");
+    W.N_conv_b  = L.get(".decoder.N_conv.bias");
+    W.asr_res_w = L.get(".decoder.asr_res.weight");
+    W.asr_res_b = L.get(".decoder.asr_res.bias");
+    ggml_tensor * asr_res_t = L.tensor(".decoder.asr_res.weight");   // [Cr, asr_dim, 1]
+    bool ok = asr_res_t != nullptr;
+    if (ok) W.asr_res_C = (int) asr_res_t->ne[2];
+    ok = ok && fill_dec_block(L, W.encode, ".decoder.encode", /*upsample*/false, affine);
+    for (int b = 0; b < 4 && ok; ++b) {
+        ok = fill_dec_block(L, W.decode[b], ".decoder.decode." + std::to_string(b),
+                            /*upsample*/ b == 3, affine);
+    }
+    if (!ok || !W.F0_conv_w || !W.asr_res_w || !W.encode.conv1_w || !W.decode[3].pool_w) {
+        err = "missing decoder weights (is the GGUF a full " + L.ns + " model?)";
+        return false;
+    }
+    if (W.encode.Cin != asr_dim + 2 || (int) asr_res_t->ne[1] != asr_dim) {
+        err = "decoder input width " + std::to_string(W.encode.Cin - 2) +
+              " != asr width " + std::to_string(asr_dim);
+        return false;
+    }
+    return true;
+}
+
 } // namespace
+
+bool decoder_front_forward(
+        ggml_context * ctx,
+        const std::string & ns, bool instnorm_affine,
+        const float * asr_ct, int asr_dim, int T_frame,
+        const float * F0, const float * N,
+        const float * style,
+        std::vector<float> & x,
+        std::string & err) {
+    x.clear();
+    if (!ctx) { err = "null model context"; return false; }
+    if (T_frame <= 0) { err = "non-positive T_frame"; return false; }
+    Lk L{ctx, ns};
+    DecoderFrontWeights W;
+    if (!fill_front(L, instnorm_affine, asr_dim, W, err)) return false;
+    std::vector<float> F0_down, N_down;
+    kokoro_phase_timer t("decoder front");
+    decoder_front(W, asr_ct, asr_dim, T_frame, F0, N, style, x, F0_down, N_down);
+    return true;
+}
 
 bool decoder_forward(
         ggml_context * ctx,
@@ -115,29 +163,8 @@ bool decoder_forward(
 
     // --- decoder_front weights ---
     DecoderFrontWeights W;
-    W.F0_conv_w = L.get(".decoder.F0_conv.weight");
-    W.F0_conv_b = L.get(".decoder.F0_conv.bias");
-    W.N_conv_w  = L.get(".decoder.N_conv.weight");
-    W.N_conv_b  = L.get(".decoder.N_conv.bias");
-    W.asr_res_w = L.get(".decoder.asr_res.weight");
-    W.asr_res_b = L.get(".decoder.asr_res.bias");
-    ggml_tensor * asr_res_t = L.tensor(".decoder.asr_res.weight");   // [Cr, asr_dim, 1]
-    bool ok = asr_res_t != nullptr;
-    if (ok) W.asr_res_C = (int) asr_res_t->ne[2];
-    ok = ok && fill_dec_block(L, W.encode, ".decoder.encode", /*upsample*/false, affine);
-    for (int b = 0; b < 4 && ok; ++b) {
-        ok = fill_dec_block(L, W.decode[b], ".decoder.decode." + std::to_string(b),
-                            /*upsample*/ b == 3, affine);
-    }
-    if (!ok || !W.F0_conv_w || !W.asr_res_w || !W.encode.conv1_w || !W.decode[3].pool_w) {
-        err = "missing decoder weights (is the GGUF a full " + cfg.ns + " model?)";
-        return false;
-    }
-    if (W.encode.Cin != asr_dim + 2 || (int) asr_res_t->ne[1] != asr_dim) {
-        err = "decoder input width " + std::to_string(W.encode.Cin - 2) +
-              " != asr width " + std::to_string(asr_dim);
-        return false;
-    }
+    if (!fill_front(L, affine, asr_dim, W, err)) return false;
+    bool ok = true;
 
     // --- generator weights ---
     GeneratorWeights G;

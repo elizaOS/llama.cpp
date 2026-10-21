@@ -1,11 +1,12 @@
 # tools/paradee/CMakeLists.txt
 #
-# Paradee-8M v1.0 TTS (sahilmahendrakar/Paradee-8M-v1.0, Apache-2.0): a
+# Paradee-8M TTS (sahilmahendrakar/Paradee-8M-v1.0 and -v1.1, Apache-2.0): a
 # width-scaled, single-voice distillation of Kokoro-82M. Built when
 # LLAMA_BUILD_PARADEE=ON (see the top-level CMakeLists.txt).
 #
 # Produces:
-#   paradee_lib   static library (loader, synthesis, phase-locking filter).
+#   paradee_lib   static library (loader, synthesis, phase-locking filter,
+#                 v1.1 source-filter head).
 #                 Reuses kokoro_lib's StyleTTS-2 / iSTFTNet layers.
 #   paradee-tts   CLI: misaki phonemes -> 24 kHz WAV (host only).
 #   paradee-stage-dump   writes every stage for the PyTorch parity gate.
@@ -18,6 +19,8 @@ endif()
 add_library(paradee_lib STATIC
     src/paradee.cpp
     src/paradee-phase-lock.cpp
+    src/paradee-head.cpp
+    src/paradee-head.h
     include/paradee.h)
 set_target_properties(paradee_lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(paradee_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
