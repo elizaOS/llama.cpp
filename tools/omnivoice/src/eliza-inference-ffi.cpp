@@ -729,6 +729,15 @@ static bool eliza_asr_use_mmap() {
     return eliza_bool_env_or_default("ELIZA_ASR_USE_MMAP", !eliza_asr_android_cpu_profile());
 }
 
+// Parakeet-TDT (Phonon-2) reads its fv5 codes in place from the GGUF, so a
+// mapping costs only clean, reclaimable page cache. A private copy is a
+// ~320 MB anonymous allocation that a 4 GB Android device pushes to swap.
+// mmap is therefore the default on every platform; ELIZA_ASR_USE_MMAP=0
+// still selects the private copy.
+static bool eliza_parakeet_use_mmap() {
+    return eliza_bool_env_or_default("ELIZA_ASR_USE_MMAP", true);
+}
+
 static bool eliza_asr_use_extra_bufts() {
     return eliza_bool_env_or_default("ELIZA_ASR_USE_EXTRA_BUFTS", !eliza_asr_android_cpu_profile());
 }

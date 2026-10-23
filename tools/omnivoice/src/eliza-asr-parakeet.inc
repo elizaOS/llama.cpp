@@ -78,9 +78,9 @@ static int eliza_parakeet_load_locked(EliInferenceContext * ctx, char ** out_err
         return 0;
     }
     pk_params pp = pk_default_params();
-    /* same policy as the Qwen3-ASR path: Android's CPU profile keeps ASR
-     * weights in private memory (ELIZA_ASR_USE_MMAP overrides) */
-    pp.use_mmap = eliza_asr_use_mmap() ? 1 : 0;
+    /* the GGUF is used in place, so map it on every platform, Android
+     * included (ELIZA_ASR_USE_MMAP=0 reads it into private memory) */
+    pp.use_mmap = eliza_parakeet_use_mmap() ? 1 : 0;
     if (const char * env = std::getenv("ELIZA_ASR_THREADS")) {
         const int n = std::atoi(env);
         if (n > 0) pp.n_threads = n;

@@ -128,6 +128,8 @@ whose `asr/` holds a GGUF with `general.architecture = parakeet-tdt` loads this 
   word times.
 - `eliza_inference_asr_stream_supported()` returns 1 and the `asr_stream_*` session runs `pk-stream`. The
   stream does not return token ids, because Parakeet's vocabulary is not the text model's.
+- The GGUF is memory-mapped on every platform, Android included, so its pages stay clean and reclaimable.
+  `ELIZA_ASR_USE_MMAP=0` reads it into private memory instead (about 320 MB of anonymous memory).
 - `ELIZA_ASR_THREADS` sets the thread count. `ELIZA_ASR_STREAM_{RIGHT,HOP,MAX_WINDOW}_MS` tune the stream.
 
 ## Evidence boundary
