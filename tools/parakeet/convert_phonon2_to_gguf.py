@@ -19,10 +19,14 @@ header {format, index:[{n,k,shape,b}]}, then the records in index order.
   fp16:             raw half floats.
 
 GGUF layout written here (all lossless with respect to the container):
-  * five-value linears -> `<name>.fv5` (I8 bytes [O/2, I], 4-bit level
-    indices in the `fv5-pair16-v1` kernel order, see pack_pair16; level 0..4
-    = {-hi,-lo,0,+lo,+hi}) and `<name>.lohi` (F32 [O,2]). q/k/v are
-    concatenated into one `attn.qkv`. The file is mmapped and used in place.
+  * five-value linears (level 0..4 = {-hi,-lo,0,+lo,+hi}) -> the codes plus
+    `<name>.lohi` (F32 [O,2]). q/k/v are concatenated into one `attn.qkv`.
+    The file is mmapped and used in place. `--layout` picks the code layout:
+      b5x3t7 (default): `<name>.fv5t7`, I8 [O/8, fv5t7 block bytes], the
+        `fv5-b5x3t7-v1` order (see pack_b5x3t7), 2.35-2.41 bits per weight;
+      pair16: `<name>.fv5`, I8 [O/2, I], 4-bit level indices in the
+        `fv5-pair16-v1` order (see pack_pair16), 4 bits per weight.
+    Both decode to the same int8 panels, so they give identical results.
   * int6 tables -> `<name>.q` (I8, the exact integers) + `<name>.scale` (F32).
   * fp16 records -> F32 (exact widening).
   * BatchNorm is folded into the depthwise conv (F32 weight + bias); this is
@@ -42,6 +46,7 @@ usage:
   convert_phonon2_to_gguf.py --archive phonon-2.bps.tar.zst --output phonon-2-fv5.gguf [--verify]
   convert_phonon2_to_gguf.py --container model.fermion --nemo-config config.json \
       --notice NOTICE --output phonon-2-fv5.gguf [--verify]
+  add --layout pair16 for the 4-bit `fv5-pair16-v1` layout
 """
 
 from __future__ import annotations
@@ -300,6 +305,64 @@ def unpack_pair16(packed: np.ndarray) -> np.ndarray:
     return seq.reshape(2 * p, k).astype(np.uint8)
 
 
+def fv5t7_block_bytes(k: int) -> int:
+    t = (k // 2 + 2) // 3
+    return (t + 7) // 8 * 7 * 16
+
+
+def pack_b5x3t7(levels: np.ndarray) -> np.ndarray:
+    """Kernel layout `fv5-b5x3t7-v1`, [O/8, fv5t7_block_bytes(K)] bytes.
+
+    Per block of 8 rows, take the K/2 16-byte panel vectors of the int8 GEMM
+    (vector v = 4c + p holds row 2p at k 8c..8c+7, then row 2p+1) as level
+    indices, three vectors at a time: code lane j = l(3t) + 5 l(3t+1) +
+    25 l(3t+2) < 125 (vectors past K/2 count as level 2). Codes fit in 7 bits,
+    so 8 code vectors share 7 stored vectors: byte m of lane j = code m |
+    (bit m of code 7) << 7; a short last group is padded with code 62 (levels
+    2, 2, 2). A NEON kernel recovers the digits with two multiply-highs and
+    two multiply-subtracts per 16 codes, then makes each panel vector with
+    the same 16-byte LUT lookup as pair16."""
+    o, k = levels.shape
+    if o % 8 or k % 16:
+        die(f"five-value shape {levels.shape}: rows must be a multiple of 8 and width a multiple of 16")
+    nb, v = o // 8, k // 2
+    t = (v + 2) // 3
+    g = (t + 7) // 8
+    pan = levels.astype(np.uint8).reshape(nb, 4, 2, k // 8, 8).transpose(0, 3, 1, 2, 4).reshape(nb, v, 16)
+    pan = np.concatenate([pan, np.full((nb, 3 * t - v, 16), 2, np.uint8)], axis=1).astype(np.uint16)
+    pan = pan.reshape(nb, t, 3, 16)
+    code = pan[:, :, 0] + 5 * pan[:, :, 1] + 25 * pan[:, :, 2]
+    code = np.concatenate([code, np.full((nb, 8 * g - t, 16), 62, np.uint16)], axis=1).reshape(nb, g, 8, 16)
+    out = np.empty((nb, g, 7, 16), np.uint8)
+    for m in range(7):
+        out[:, :, m] = code[:, :, m] | (((code[:, :, 7] >> m) & 1) << 7)
+    return out.reshape(nb, g * 112)
+
+
+def unpack_b5x3t7(packed: np.ndarray, k: int) -> np.ndarray:
+    nb, nbytes = packed.shape
+    if nbytes != fv5t7_block_bytes(k):
+        die(f"unpack_b5x3t7: {nbytes} bytes per block, expected {fv5t7_block_bytes(k)} for K={k}")
+    v = k // 2
+    t = (v + 2) // 3
+    g = (t + 7) // 8
+    b = packed.reshape(nb, g, 7, 16).astype(np.uint16)
+    code = np.empty((nb, g, 8, 16), np.uint16)
+    code[:, :, :7] = b & 0x7F
+    code[:, :, 7] = sum(((b[:, :, m] >> 7) << m) for m in range(7))
+    code = code.reshape(nb, 8 * g, 16)
+    if code[:, :t].max() > 124 or (8 * g > t and np.any(code[:, t:] != 62)):
+        die("unpack_b5x3t7: code out of range")
+    pan = np.stack([code[:, :t] % 5, code[:, :t] // 5 % 5, code[:, :t] // 25], axis=2).reshape(nb, 3 * t, 16)
+    if np.any(pan[:, v:] != 2):
+        die("unpack_b5x3t7: padding is not level 2")
+    pan = pan[:, :v].reshape(nb, k // 8, 4, 2, 8).transpose(0, 2, 3, 1, 4)
+    return pan.reshape(nb * 8, k).astype(np.uint8)
+
+
+LAYOUTS = {"b5x3t7": ("fv5t7", "fv5-b5x3t7-v1"), "pair16": ("fv5", "fv5-pair16-v1")}
+
+
 def fv5_expand(levels: np.ndarray, lohi: np.ndarray) -> np.ndarray:
     lo = lohi[:, 0:1].astype(np.float16)
     hi = lohi[:, 1:2].astype(np.float16)
@@ -314,11 +377,13 @@ def container_fv5_expand(r: dict) -> np.ndarray:
 
 # --------------------------------------------------------------- writer
 class Builder:
-    def __init__(self, recs: dict):
+    def __init__(self, recs: dict, layout: str):
         self.recs = recs
+        self.layout = layout
         self.used: set[str] = set()
         self.tensors: list[tuple[str, np.ndarray]] = []
         self.fv5_src: dict[str, list[str]] = {}
+        self.fv5_k: dict[str, int] = {}
         self.int_src: dict[str, str] = {}
 
     def take(self, name: str, kind: str):
@@ -345,9 +410,13 @@ class Builder:
         levels = np.concatenate(lv, axis=0)
         if levels.shape[0] != o_expect:
             die(f"{out}: rows {levels.shape[0]} != {o_expect}")
-        self.add(out + ".fv5", pack_pair16(levels).view(np.int8))
+        if self.layout == "b5x3t7":
+            self.add(out + ".fv5t7", pack_b5x3t7(levels).view(np.int8))
+        else:
+            self.add(out + ".fv5", pack_pair16(levels).view(np.int8))
         self.add(out + ".lohi", np.concatenate(lohi, axis=0).astype(np.float32))
         self.fv5_src[out] = names
+        self.fv5_k[out] = i_expect
 
     def intq(self, out: str, name: str, shape2d: tuple[int, int] | None = None):
         r = self.take(name, "int")
@@ -365,8 +434,8 @@ class Builder:
         self.add(out, v)
 
 
-def build(recs: dict) -> Builder:
-    b = Builder(recs)
+def build(recs: dict, layout: str) -> Builder:
+    b = Builder(recs, layout)
     d, ff, L = HP["d_model"], HP["ff_dim"], HP["n_layers"]
     C = HP["sub_channels"]
     # subsampling (dw_striding): conv0 (1->C, 3x3 s2) relu, [dw 3x3 s2, pw 1x1, relu] x2, linear
@@ -450,7 +519,7 @@ def write_gguf(out: Path, b: Builder, labels: list[str], notice: str, pins: dict
         w.add_string(f"{NS}.source.{k}", v)
     w.add_string(f"{NS}.notice", notice)
     w.add_string(f"{NS}.converter.blob_sha1", git_blob_sha(Path(__file__)))
-    w.add_string(f"{NS}.weights.format", "fv5-pair16-v1")
+    w.add_string(f"{NS}.weights.format", LAYOUTS[b.layout][1])
     for key in ("d_model", "n_layers", "n_heads", "ff_dim", "conv_kernel", "sub_channels", "sub_factor",
                 "n_mels", "sample_rate", "n_fft", "win_length", "hop_length", "pos_max_len",
                 "pred_hidden", "pred_layers", "joint_hidden", "vocab", "blank_id", "max_symbols"):
@@ -479,8 +548,11 @@ def verify(out: Path, b: Builder, recs: dict):
     t = {x.name: np.array(x.data) for x in r.tensors}
     nfv = nint = 0
     for name, srcs in b.fv5_src.items():
-        lv = unpack_pair16(t[name + ".fv5"].view(np.uint8))
         lohi = t[name + ".lohi"]
+        if b.layout == "b5x3t7":
+            lv = unpack_b5x3t7(t[name + ".fv5t7"].view(np.uint8), b.fv5_k[name])
+        else:
+            lv = unpack_pair16(t[name + ".fv5"].view(np.uint8))
         got = fv5_expand(lv, lohi)
         row = 0
         for s in srcs:
@@ -520,6 +592,8 @@ def main():
     ap.add_argument("--notice", type=Path, help="NOTICE from the model repo (default: next to --archive)")
     ap.add_argument("--output", type=Path, required=True)
     ap.add_argument("--verify", action="store_true")
+    ap.add_argument("--layout", choices=sorted(LAYOUTS), default="b5x3t7",
+                    help="five-value code layout (default b5x3t7, 2.35-2.41 bits per weight; pair16 is 4 bits)")
     a = ap.parse_args()
     pins = json.loads(PINS_PATH.read_text())
 
@@ -564,7 +638,7 @@ def main():
     recs, index = read_container(container)
     if len(index) != 723:
         die(f"container has {len(index)} records, expected 723")
-    b = build(recs)
+    b = build(recs, a.layout)
     src = {"container_sha256": pins["archive_members"]["model.fermion"]["sha256"],
            "archive_sha256": pins["files"]["phonon-2.bps.tar.zst"]["sha256"]}
     write_gguf(a.output, b, labels, notice.decode("utf-8"), pins, src)

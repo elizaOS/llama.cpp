@@ -263,10 +263,11 @@ void quantize_acts(pool & P, const float * X, int N, int K, size_t ldx, qact & o
 
 // ------------------------------------------------------------ weights
 
-void wmat_from_fv5(wmat & w, const uint8_t * codes, const float * lohi, int O, int K) {
+void wmat_from_fv5(wmat & w, const uint8_t * codes, const float * lohi, int O, int K, bool t7) {
     w.O = O;
     w.K = K;
     w.fv5 = codes;
+    w.fv5t7 = t7;
     w.lut.assign((size_t) (O / 2) * 16, 0);
     w.ws.assign(O, 0.0f);
     w.grid_err = 0.0;
@@ -303,6 +304,15 @@ void wmat_from_fv5(wmat & w, const uint8_t * codes, const float * lohi, int O, i
         lut[2] = 0;
         lut[3] = (int8_t) L;
         lut[4] = (int8_t) H;
+    }
+}
+
+void decode_fv5_block(const kernel_table & kt, const wmat & W, int rb, int8_t * panel) {
+    const int K = W.K;
+    if (W.fv5t7) {
+        kt.decode_fv5t7(W.fv5 + (size_t) rb * fv5t7_block_bytes(K), W.lut.data() + (size_t) rb * 64, K, panel);
+    } else {
+        kt.decode_fv5(W.fv5 + (size_t) rb * 4 * K, (size_t) K, W.lut.data() + (size_t) rb * 64, K, panel);
     }
 }
 
@@ -343,7 +353,7 @@ static void gemm_f32_debug(pool & P, const kernel_table & kt, const wmat & W, co
         for (int rb = b; rb < e; ++rb) {
             const int8_t * panel;
             if (W.fv5) {
-                kt.decode_fv5(W.fv5 + (size_t) rb * 4 * K, (size_t) K, W.lut.data() + (size_t) rb * 64, K, scratch.data());
+                decode_fv5_block(kt, W, rb, scratch.data());
                 panel = scratch.data();
             } else {
                 panel = W.panels.data() + (size_t) rb * 8 * K;
@@ -403,7 +413,7 @@ void gemm_q8(pool & P, const kernel_table & kt, const wmat & W, const qact & X, 
             for (int rb = rb0; rb < rb1; ++rb) {
                 if (W.fv5) {
                     int8_t * dst = scratch.data() + (size_t) (rb - rb0) * 8 * K;
-                    kt.decode_fv5(W.fv5 + (size_t) rb * 4 * K, (size_t) K, W.lut.data() + (size_t) rb * 64, K, dst);
+                    decode_fv5_block(kt, W, rb, dst);
                     panels[rb - rb0] = dst;
                 } else {
                     panels[rb - rb0] = W.panels.data() + (size_t) rb * 8 * K;

@@ -44,6 +44,29 @@ static void decode_fv5_scalar(const uint8_t * codes, size_t pair_stride, const i
     }
 }
 
+static void decode_fv5t7_scalar(const uint8_t * codes, const int8_t * luts, int K, int8_t * panel) {
+    const int V = K / 2, T = fv5t7_codes(K);
+    for (int t = 0; t < T; ++t) {
+        const uint8_t * grp = codes + (size_t) (t / 8) * 112;
+        const int m = t % 8;
+        for (int j = 0; j < 16; ++j) {
+            int x;
+            if (m < 7) {
+                x = grp[m * 16 + j] & 0x7F;
+            } else {
+                x = 0;
+                for (int i = 0; i < 7; ++i) x |= (grp[i * 16 + j] >> 7) << i;
+            }
+            for (int d = 0; d < 3; ++d, x /= 5) {
+                const int v = 3 * t + d;
+                if (v < V) {
+                    panel[(size_t) v * 16 + j] = luts[(v % 4) * 16 + x % 5 + (j >= 8 ? 8 : 0)];
+                }
+            }
+        }
+    }
+}
+
 static void tile_scalar(const int8_t * panel, const int8_t * x, size_t x_stride, int K, int np, int32_t * out) {
     int32_t acc[8][8];
     std::memset(acc, 0, sizeof(acc));
@@ -85,7 +108,7 @@ static void matvec_scalar(const int8_t * w, int O, int K, const int8_t * x, int3
 }
 
 const kernel_table & kernels_scalar() {
-    static const kernel_table t = { tier::scalar, "scalar", decode_fv5_scalar, tile_scalar, matvec_scalar };
+    static const kernel_table t = { tier::scalar, "scalar", decode_fv5_scalar, decode_fv5t7_scalar, tile_scalar, matvec_scalar };
     return t;
 }
 

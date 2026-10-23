@@ -209,16 +209,17 @@ struct loader {
     }
 
     void fv5(wmat & w, const std::string & name, int O, int K) {
-        const int8_t * codes = i8(name + ".fv5", { K, O / 2 });
-        const float * lohi = f32(name + ".lohi", { 2, O });
-        if (!err.empty()) {
-            return;
-        }
         if (O % 8 || K % 16) {
             err = name + ": rows must be a multiple of 8 and width a multiple of 16";
             return;
         }
-        wmat_from_fv5(w, (const uint8_t *) codes, lohi, O, K);
+        const int8_t * codes = m->fv5t7 ? i8(name + ".fv5t7", { (int64_t) fv5t7_block_bytes(K), O / 8 })
+                                        : i8(name + ".fv5", { K, O / 2 });
+        const float * lohi = f32(name + ".lohi", { 2, O });
+        if (!err.empty()) {
+            return;
+        }
+        wmat_from_fv5(w, (const uint8_t *) codes, lohi, O, K, m->fv5t7);
         m->fv5_grid_err = std::max(m->fv5_grid_err, w.grid_err);
     }
     void intw(wmat & w, const std::string & name, int O, int K, const float * bias, const int * perm = nullptr) {
@@ -311,8 +312,11 @@ extern "C" pk_model * pk_model_load(const char * path, pk_params params, char * 
             return nullptr;
         }
         const char * fmt = str_kv("parakeet.weights.format");
-        if (!fmt || std::strcmp(fmt, "fv5-pair16-v1") != 0) {
-            set_err(err, err_len, "parakeet.weights.format is not fv5-pair16-v1 (re-run convert_phonon2_to_gguf.py)");
+        if (fmt && std::strcmp(fmt, "fv5-b5x3t7-v1") == 0) {
+            m->fv5t7 = true;
+        } else if (!fmt || std::strcmp(fmt, "fv5-pair16-v1") != 0) {
+            set_err(err, err_len,
+                    "parakeet.weights.format is neither fv5-b5x3t7-v1 nor fv5-pair16-v1 (re-run convert_phonon2_to_gguf.py)");
             return nullptr;
         }
         if (const char * notice = str_kv("parakeet.notice")) {

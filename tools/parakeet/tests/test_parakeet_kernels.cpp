@@ -1,7 +1,8 @@
 // tools/parakeet/tests/test_parakeet_kernels.cpp - every kernel tier must give
 // bit-identical int32 results to the scalar reference (decode, tile, matvec,
 // and the whole gemm_q8 driver), and gemm_q8 must match a double-precision
-// GEMM over the same int8 operands.
+// GEMM over the same int8 operands. The `fv5-b5x3t7-v1` layout must decode to
+// exactly the `fv5-pair16-v1` panels, on every tier.
 #include "pk-kernels.h"
 #include "pk-ops.h"
 #include "pk-pool.h"
@@ -44,6 +45,36 @@ static void make_fv5(std::mt19937 & rng, int O, int K, std::vector<uint8_t> & co
     }
 }
 
+// Repack pair16 codes as `fv5-b5x3t7-v1` (pk-kernels.h), independently of
+// the decoders: level of lane j in panel vector v of block rb, from pair16.
+static std::vector<uint8_t> pair16_to_t7(const std::vector<uint8_t> & codes, int O, int K) {
+    auto level = [&](int rb, int v, int j) -> int {
+        if (v >= K / 2) return 2;
+        const int c = v / 4, p = rb * 4 + v % 4;
+        const int g = c / 2, half = c % 2;
+        const uint8_t b = codes[(size_t) p * K + 16 * g + j];
+        return (half ? (b >> 4) : (b & 15)) - (j >= 8 ? 8 : 0);
+    };
+    const int T = fv5t7_codes(K), G = (T + 7) / 8;
+    const size_t bb = fv5t7_block_bytes(K);
+    std::vector<uint8_t> out((size_t) O / 8 * bb, 0);
+    for (int rb = 0; rb < O / 8; ++rb) {
+        for (int g = 0; g < G; ++g) {
+            for (int j = 0; j < 16; ++j) {
+                int code[8];
+                for (int m = 0; m < 8; ++m) {
+                    const int t = 8 * g + m;
+                    code[m] = t < T ? level(rb, 3 * t, j) + 5 * level(rb, 3 * t + 1, j) + 25 * level(rb, 3 * t + 2, j) : 62;
+                }
+                for (int m = 0; m < 7; ++m) {
+                    out[rb * bb + ((size_t) g * 7 + m) * 16 + j] = (uint8_t) (code[m] | (((code[7] >> m) & 1) << 7));
+                }
+            }
+        }
+    }
+    return out;
+}
+
 int main() {
     std::mt19937 rng(1234);
     const kernel_table & ref = kernels_scalar();
@@ -59,13 +90,30 @@ int main() {
     for (auto * t : tiers) std::printf(", %s", t->name);
     std::printf("\n");
 
-    for (int K : { 256, 1024, 4096 }) {
+    for (int K : { 256, 1024, 4096, 48, 80 }) {
         const int O = 64, N = 21;
         std::vector<uint8_t> codes;
         std::vector<float> lohi;
         make_fv5(rng, O, K, codes, lohi);
         wmat W;
         wmat_from_fv5(W, codes.data(), lohi.data(), O, K);
+        // fv5-b5x3t7-v1: every block decodes to the pair16 panel on every tier
+        const std::vector<uint8_t> t7 = pair16_to_t7(codes, O, K);
+        wmat W7;
+        wmat_from_fv5(W7, t7.data(), lohi.data(), O, K, true);
+        {
+            std::vector<int8_t> p0((size_t) 8 * K), p1((size_t) 8 * K);
+            for (int rb = 0; rb < O / 8; ++rb) {
+                decode_fv5_block(ref, W, rb, p0.data());
+                decode_fv5_block(ref, W7, rb, p1.data());
+                CHECK(std::memcmp(p0.data(), p1.data(), p0.size()) == 0, "scalar t7 decode differs (K=%d rb=%d)", K, rb);
+                for (auto * t : tiers) {
+                    std::memset(p1.data(), 0x5a, p1.size());
+                    decode_fv5_block(*t, W7, rb, p1.data());
+                    CHECK(std::memcmp(p0.data(), p1.data(), p0.size()) == 0, "%s t7 decode differs (K=%d rb=%d)", t->name, K, rb);
+                }
+            }
+        }
         CHECK(W.grid_err < 0.01, "grid error %g", W.grid_err);
         std::vector<float> X((size_t) N * K);
         std::normal_distribution<float> nd(0.0f, 1.0f);
@@ -110,6 +158,14 @@ int main() {
         for (auto * t : tiers) {
             gemm_q8(P3, *t, W, qa, y1.data(), O, epi::store);
             CHECK(std::memcmp(y0.data(), y1.data(), y0.size() * 4) == 0, "%s gemm differs (K=%d)", t->name, K);
+        }
+        for (const kernel_table * t : { &ref }) {
+            gemm_q8(P3, *t, W7, qa, y1.data(), O, epi::store);
+            CHECK(std::memcmp(y0.data(), y1.data(), y0.size() * 4) == 0, "%s t7 gemm differs (K=%d)", t->name, K);
+        }
+        for (auto * t : tiers) {
+            gemm_q8(P3, *t, W7, qa, y1.data(), O, epi::store);
+            CHECK(std::memcmp(y0.data(), y1.data(), y0.size() * 4) == 0, "%s t7 gemm differs (K=%d)", t->name, K);
         }
         // and the driver result is the dequantised product
         double maxrel = 0;

@@ -55,7 +55,7 @@ void tile_dotprod(const int8_t * panel, const int8_t * x, size_t x_stride, int K
 }  // namespace
 
 const kernel_table & kernels_dotprod() {
-    static const kernel_table t = { tier::dotprod, "dotprod", decode_fv5_neon, tile_dotprod, matvec_dotprod };
+    static const kernel_table t = { tier::dotprod, "dotprod", decode_fv5_neon, decode_fv5t7_neon, tile_dotprod, matvec_dotprod };
     return t;
 }
 

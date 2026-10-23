@@ -95,6 +95,13 @@ if (NOT CMAKE_SYSTEM_NAME STREQUAL "iOS" AND NOT CMAKE_SYSTEM_NAME STREQUAL "And
     endif()
 endif()
 
+if (NOT WIN32 AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    # weight-layout study (not installed): cost of denser fv5 code packings
+    add_executable(bench-fv5-packing tools/bench-fv5-packing.cpp)
+    target_link_libraries(bench-fv5-packing PRIVATE parakeet_lib)
+    target_include_directories(bench-fv5-packing PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+endif()
+
 if (LLAMA_BUILD_TESTS OR PARAKEET_BUILD_TESTS)
     add_subdirectory(tests)
 endif()

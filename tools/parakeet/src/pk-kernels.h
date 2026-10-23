@@ -20,6 +20,17 @@
 //                table per row pair maps the nibble to the int8 level:
 //                0..4 -> row 2p {-H,-L,0,L,H}, 8..12 -> row 2p+1.
 //
+//   fv5 t7       `fv5-b5x3t7-v1` (2.35-2.41 bits per weight): per block of
+//                8 rows, the K/2 panel vectors above are taken three at a
+//                time. Code vector t holds, in lane j, the base-5 number
+//                l(3t) + 5 l(3t+1) + 25 l(3t+2), where l(v) is the level
+//                0..4 of lane j of panel vector v (missing vectors past K/2
+//                count as level 2). Codes are < 128, so code vectors go in
+//                groups of 8 into 7 stored vectors: byte m (0..6) of lane j
+//                is code m | (bit m of code 7) << 7. A short last group is
+//                padded with code 62 (levels 2, 2, 2). Decoding uses the same
+//                16-byte LUTs as pair16 (level + 8 for row 2p+1).
+//
 // Every tier computes exact int32 dot products over the same int8 operands,
 // so all tiers are bit-identical (tests/test_parakeet_kernels.cpp).
 #pragma once
@@ -37,6 +48,9 @@ struct kernel_table {
     // decode the fv5 codes of one 8-row block (4 row pairs starting at
     // `codes`, `pair_stride` bytes apart) into a weight panel.
     void (*decode_fv5)(const uint8_t * codes, size_t pair_stride, const int8_t * luts, int K, int8_t * panel);
+    // same panel from one 8-row block in `fv5-b5x3t7-v1` (fv5t7_block_bytes(K)
+    // bytes at `codes`).
+    void (*decode_fv5t7)(const uint8_t * codes, const int8_t * luts, int K, int8_t * panel);
     // int32 tile: 8 rows x 2*np tokens (np = 1..4 token pairs). `panel` is
     // the 8-row weight panel, `x` the first token pair, `x_stride` the bytes
     // between token pairs. out[t * 8 + r] (token-major, so the epilogue
@@ -46,6 +60,10 @@ struct kernel_table {
     // [0, O) over row-major int8 weights (K % 16 == 0).
     void (*matvec)(const int8_t * w, int O, int K, const int8_t * x, int32_t * y);
 };
+
+// `fv5-b5x3t7-v1` sizes: code vectors and stored bytes per 8-row block.
+inline int fv5t7_codes(int K) { return (K / 2 + 2) / 3; }
+inline size_t fv5t7_block_bytes(int K) { return (size_t) ((fv5t7_codes(K) + 7) / 8) * 7 * 16; }
 
 // Best tier this CPU supports, or `want` when it is available.
 const kernel_table & kernels_for(int want /*0 = best*/);
