@@ -1424,9 +1424,12 @@ struct test_case {
         };
         ggml_context * ctx = ggml_init(params);
         GGML_ASSERT(ctx);
+        // cases with separate weight tensors build them in their own context, as in eval()
+        ggml_context_ptr ctx_weights(use_weight_context() ? ggml_init(params) : nullptr);
+        GGML_ASSERT(!use_weight_context() || ctx_weights);
         gf = ggml_new_graph(ctx);
 
-        ggml_tensor * out = build_graph(ctx);
+        ggml_tensor * out = build_graph(ctx, ctx_weights.get());
         const bool match = matches_filter(out, op_names_filter);
         if (match) {
             ggml_build_forward_expand(gf, out);
