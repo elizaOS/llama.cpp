@@ -41,8 +41,8 @@
 struct EliInferenceContext;
 
 /* The bundle directory the context was opened against. A backend's open()
- * resolves its own artifact under this root (e.g. `<dir>/text/*.litertlm`,
- * `<dir>/text/*.mlpackage`) — the ONLY supported way to read the bundle path,
+ * resolves its own artifact under this root (e.g. `<dir>/text/<name>.litertlm`,
+ * `<dir>/text/<name>.mlpackage`) — the ONLY supported way to read the bundle path,
  * since the struct itself is opaque here. Returns nullptr when ctx is null.
  * Defined in eliza-inference-ffi.cpp; the pointer is owned by the context and
  * stays valid for the session's lifetime. */
@@ -112,7 +112,7 @@ struct LlmBackendFactory {
     virtual bool available() const = 0;
 
     /* True when this backend can serve the bundle at `bundle_dir` — i.e. the
-     * backend-specific artifact exists (e.g. `text/*.litertlm`, `text/*.mlpackage`).
+     * backend-specific artifact exists (e.g. `text/<name>.litertlm`, `text/<name>.mlpackage`).
      * Cheap directory probe, no model load. */
     virtual bool can_serve(const char * bundle_dir) const = 0;
 

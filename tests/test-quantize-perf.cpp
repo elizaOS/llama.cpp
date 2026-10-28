@@ -318,7 +318,9 @@ int main(int argc, char * argv[]) {
                 printf("\n");
             }
 
-            if (params.op_quantize_row_q_dot) {
+            // elizaOS K-cache-only types (QJL1_256, TBQ3_TCQ) have no vec_dot;
+            // they are scored by the fused attention ops, not by mul_mat.
+            if (params.op_quantize_row_q_dot && qfns_cpu->vec_dot) {
                 printf("  quantize_row_q_dot\n");
                 for (size_t size : params.test_sizes) {
                     printf("    %zu values (%.2f MB)\n", size, 4*size/(float)(1024*1024));
@@ -333,7 +335,7 @@ int main(int argc, char * argv[]) {
                 printf("\n");
             }
 
-            if (params.op_vec_dot_q) {
+            if (params.op_vec_dot_q && qfns_cpu->vec_dot) {
                 printf("  vec_dot_q\n");
                 qfns_cpu->from_float(test_data1, test_q1, largest);
                 qfns_cpu->from_float(test_data2, test_q2, largest);

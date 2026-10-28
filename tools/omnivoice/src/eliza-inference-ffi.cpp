@@ -2772,7 +2772,7 @@ int eliza_inference_tts_synthesize(
     }
 
     /* Per-op backend seam: a TTS backend (e.g. LiteRT/NPU) serves this when it
-     * ships <bundle>/tts/*; otherwise fall through to the in-tree OmniVoice path
+     * ships <bundle>/tts/<files>; otherwise fall through to the in-tree OmniVoice path
      * below. Inert by default (no backend registered). */
     {
         char * be_error = nullptr;
@@ -3063,7 +3063,7 @@ int eliza_inference_asr_transcribe(
     }
 
     /* Per-op backend seam: an ASR backend (e.g. LiteRT/NPU) serves this when it
-     * ships <bundle>/asr/*; otherwise fall through to the in-tree ggml path
+     * ships <bundle>/asr/<files>; otherwise fall through to the in-tree ggml path
      * below. Inert by default (no backend registered). */
     {
         char * be_error = nullptr;
@@ -4768,7 +4768,7 @@ static int eliza_inference_embed_impl(
     }
 
     /* Per-op backend seam: an embedding backend (e.g. LiteRT/NPU) serves this
-     * when it ships <bundle>/embedding/*; otherwise fall through to the in-tree
+     * when it ships <bundle>/embedding/<files>; otherwise fall through to the in-tree
      * ggml encoder below. Inert by default (no backend registered). */
     {
         char * be_error = nullptr;
@@ -4942,7 +4942,7 @@ int eliza_inference_llm_eot_score(
     }
 
     /* Per-op backend seam: an EOT backend (e.g. LiteRT/NPU) serves this when it
-     * ships <bundle>/eot/*; otherwise fall through to the in-tree ggml
+     * ships <bundle>/eot/<files>; otherwise fall through to the in-tree ggml
      * causal-scoring path below. Inert by default (no backend registered). */
     {
         char * be_error = nullptr;
@@ -5122,7 +5122,7 @@ int eliza_inference_describe_image(
     }
 
     /* Per-op backend seam: a vision backend (e.g. LiteRT/NPU) serves this when it
-     * ships <bundle>/vision/*; otherwise fall through to the in-tree ggml mmproj
+     * ships <bundle>/vision/<files>; otherwise fall through to the in-tree ggml mmproj
      * path below. Inert by default (no backend registered). */
     {
         char * be_error = nullptr;

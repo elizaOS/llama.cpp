@@ -370,8 +370,10 @@ if (GGML_OPENMP_FETCH)
     install(FILES "${GGML_OPENMP_RUNTIME}" DESTINATION ${CMAKE_INSTALL_BINDIR})
     install(FILES "${GGML_OPENMP_LICENSE}" DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME LICENSE-LLVM-OpenMP)
 
-    set(GGML_OPENMP_TARGET_C ggml-openmp-c)
-    set(GGML_OPENMP_TARGET_CXX ggml-openmp-cxx)
+    # elizaOS installs ggml with EXPORT ggml-targets; these INTERFACE targets point into the
+    # build tree, so keep them out of the export set (installed consumers get libomp.dll from bin).
+    set(GGML_OPENMP_TARGET_C "$<BUILD_INTERFACE:ggml-openmp-c>")
+    set(GGML_OPENMP_TARGET_CXX "$<BUILD_INTERFACE:ggml-openmp-cxx>")
     set(GGML_OPENMP_ENABLED "ON" CACHE INTERNAL "")
 elseif (GGML_OPENMP AND EMSCRIPTEN)
     include(CheckCXXSourceCompiles)

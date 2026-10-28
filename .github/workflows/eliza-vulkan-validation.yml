@@ -77,10 +77,11 @@ jobs:
 
       - name: Install Vulkan SDK
         if: steps.cache-sdk.outputs.cache-hit != 'true'
-        uses: ./.github/actions/linux-setup-vulkan
+        uses: ./.github/actions/unarchive-tar
         with:
+          url: https://sdk.lunarg.com/sdk/download/${{ env.VULKAN_SDK_VERSION }}/linux/vulkan_sdk.tar.xz
           path: ./vulkan_sdk
-          version: ${{ env.VULKAN_SDK_VERSION }}
+          strip: 1
 
       - name: Configure
         run: |

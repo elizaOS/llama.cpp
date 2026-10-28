@@ -541,7 +541,7 @@ llama_context::llama_context(
                 ggml_tensor * v = ggml_new_tensor_4d(ctx_probe.get(), params.type_v, dv, n_kv, n_hk, 1);
                 ggml_tensor * m = ggml_new_tensor_4d(ctx_probe.get(), GGML_TYPE_F16, n_kv, 1, 1, 1);
                 ggml_tensor * fa = ggml_flash_attn_ext(ctx_probe.get(), q, k, v, m, 1.0f, 0.0f, 0.0f);
-                ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+                ggml_prec_set_acc(fa, GGML_PREC_F32);
                 if (!ggml_backend_dev_supports_op(dev, fa)) {
                     cparams.fa_dequant_kv = true;
                     LLAMA_LOG_INFO("%s: device %s has no native flash attention for K=%s V=%s; "
