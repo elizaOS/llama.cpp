@@ -19,6 +19,9 @@ import re
 import sys
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
+# test-backend-ops names every backend that rejects a tensor, including the CPU reference
+# (e.g. "not supported [Vulkan0, CPU]"); such cases have no numerical result on either side.
+UNSUPPORTED = re.compile(r"^not supported \[(?:Vulkan0|CPU)(?:, (?:Vulkan0|CPU))*\]$")
 LANES = {
     "broad": ["MUL_MAT", "MUL_MAT_ID", "ADD", "MUL", "SOFT_MAX", "RMS_NORM", "CPY", "ROPE", "FLASH_ATTN_EXT"],
     "custom": ["GET_ROWS", "CPY", "MUL_MAT", "ATTN_SCORE_TBQ", "ATTN_SCORE_POLAR", "ISTFT"],
@@ -41,7 +44,7 @@ def verify(text, operation, shard=None):
         observed.append(params)
         if status.strip() == "OK":
             passed.append(params)
-        elif status.strip() == "not supported [Vulkan0]":
+        elif UNSUPPORTED.match(status.strip()):
             unsupported.append(params)
         else:
             raise ValueError("Nonpassing or incomplete outcome: " + op + "(" + params + "): " + status)

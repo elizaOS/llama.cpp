@@ -406,6 +406,10 @@ static FILE * get_handcrafted_file(const unsigned int seed, const enum handcraft
         }
         if (hft == HANDCRAFTED_TENSORS_BAD_NAME_SIZE) {
             name += "_with_a_very_long_name_which_is_longer_than_what_is_allowed_for_ggml_tensors";
+            // elizaOS builds raise GGML_MAX_NAME to 128 (omnivoice), so pad up to the limit
+            if (name.length() < GGML_MAX_NAME) {
+                name.resize(GGML_MAX_NAME, '_');
+            }
             GGML_ASSERT(name.length() >= GGML_MAX_NAME);
         }
         {
