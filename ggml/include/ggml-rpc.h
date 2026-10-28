@@ -6,12 +6,15 @@
 extern "C" {
 #endif
 
-#define RPC_PROTO_MAJOR_VERSION    128 // Eliza wire format: custom op and tensor IDs
+// Eliza wire format: custom op and tensor IDs on top of upstream RPC proto 8.0.1.
+// Major stays above upstream's range so Eliza peers never handshake with stock
+// upstream peers; bumped from 128 because the upstream v8 command set changed.
+#define RPC_PROTO_MAJOR_VERSION    129
 #define RPC_PROTO_MINOR_VERSION    0
 #define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16

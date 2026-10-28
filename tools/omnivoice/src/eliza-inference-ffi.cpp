@@ -1062,7 +1062,7 @@ static int eliza_load_asr(EliInferenceContext * ctx, char ** out_error) {
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = eliza_asr_use_gpu() ? 99 : 0;
-    mparams.use_mmap = eliza_asr_use_mmap();
+    mparams.load_mode = eliza_asr_use_mmap() ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE;
     mparams.use_extra_bufts = eliza_asr_use_extra_bufts();
     eliza_asr_debug_log("loading ASR text model");
     ctx->asr_model = llama_model_load_from_file(ctx->asr_model_path.c_str(), mparams);
@@ -1190,7 +1190,7 @@ struct Engine {
     common_context_seq_rm_type seq_rm_dft = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_prompt_checkpoint ckpt;
 
-    llama_batch batch{};
+    common_batch batch;
 
     uint64_t st_drafted  = 0;
     uint64_t st_accepted = 0;
@@ -1202,6 +1202,14 @@ struct Engine {
 inline bool needs_ckpt(common_context_seq_rm_type t, int32_t n_draft, uint32_t n_rs_seq) {
     return t == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
            (t == COMMON_CONTEXT_SEQ_RM_TYPE_RS && (uint32_t) n_draft > n_rs_seq);
+}
+
+/* Remove [p0, p1) from seq_id and abort on failure (a failed rollback leaves
+ * the speculative state inconsistent). */
+inline void seq_rm_or_abort(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (!llama_memory_seq_rm(llama_get_memory(ctx), seq_id, p0, p1)) {
+        GGML_ABORT("failed to remove sequence %d with p0=%d, p1=%d", seq_id, p0, p1);
+    }
 }
 
 inline void rollback_to_committed(
@@ -1216,17 +1224,14 @@ inline void rollback_to_committed(
         } else {
             ckpt.load_dft(ctx, 0, CKPT_FLAGS);
         }
-        common_context_seq_rm(ctx, 0, ckpt.pos_max + 1, -1);
+        seq_rm_or_abort(ctx, 0, ckpt.pos_max + 1, -1);
     } else {
-        common_context_seq_rm(ctx, 0, n_committed, -1);
+        seq_rm_or_abort(ctx, 0, n_committed, -1);
     }
 }
 
 static void free_engine(Engine * e) {
     if (!e) return;
-    if (e->batch.token != nullptr || e->batch.embd != nullptr) {
-        llama_batch_free(e->batch);
-    }
     if (e->smpl) common_sampler_free(e->smpl);
     if (e->spec) common_speculative_free(e->spec);
     if (e->ctx_dft) llama_free(e->ctx_dft);
@@ -1335,7 +1340,7 @@ static int eliza_load_llm_model_locked(
             : (n_gpu_layers >= 0
                 ? n_gpu_layers
                 : (eliza_bool_env_or_default("ELIZA_LLM_USE_GPU", true) ? 99 : 0));
-    mparams.use_mmap = true;
+    mparams.load_mode = LLAMA_LOAD_MODE_MMAP;
     ctx->llm_model =
         llama_model_load_from_file(ctx->llm_model_path.c_str(), mparams);
     if (!ctx->llm_model) {
@@ -1415,7 +1420,7 @@ static llama_sampler * eliza_build_llm_sampler_chain(
 
     if (cfg->repeat_penalty != 0.0f && cfg->repeat_penalty != 1.0f) {
         llama_sampler_chain_add(chain,
-            llama_sampler_init_penalties(64, cfg->repeat_penalty, 0.0f, 0.0f));
+            llama_sampler_init_penalties(llama_vocab_n_tokens(vocab), 64, cfg->repeat_penalty, 0.0f, 0.0f));
     }
 
     const bool greedy = cfg->temperature <= 0.0f;
@@ -1498,7 +1503,7 @@ static Engine * create_engine(
             cfg->n_gpu_layers >= 0
                 ? cfg->n_gpu_layers
                 : (eliza_bool_env_or_default("ELIZA_LLM_USE_GPU", true) ? 99 : 0);
-        dmp.use_mmap = true;
+        dmp.load_mode = LLAMA_LOAD_MODE_MMAP;
         e->model_dft = llama_model_load_from_file(drafter_path.c_str(), dmp);
         if (!e->model_dft) {
             eliza_set_error(out_error,
@@ -1573,7 +1578,7 @@ static Engine * create_engine(
         return nullptr;
     }
 
-    e->batch = llama_batch_init(1 + e->draft_max, 0, 1);
+    e->batch = common_batch(e->ctx_tgt);
     return e;
 }
 
@@ -1594,17 +1599,12 @@ static int prefill(Engine * e, const int32_t * tokens, int32_t n_tokens) {
     const int32_t n_batch = (int32_t) llama_n_batch(e->ctx_tgt);
     for (int32_t i = 0; i < n_tokens; i += n_batch) {
         const int32_t cnt = std::min(n_batch, n_tokens - i);
-        llama_batch b = llama_batch_init(cnt, 0, 1);
+        common_batch b(e->ctx_tgt);
         for (int32_t k = 0; k < cnt; ++k) {
-            common_batch_add(b, tokens[i + k], i + k, { 0 }, /* logits= */ true);
+            b.add(tokens[i + k], i + k, 0, /* output= */ true);
         }
-        const int rc = llama_decode(e->ctx_tgt, b);
-        if (rc != 0) { llama_batch_free(b); return ELIZA_ERR_FFI_FAULT; }
-        if (!common_speculative_process(e->spec, b)) {
-            llama_batch_free(b);
-            return ELIZA_ERR_FFI_FAULT;
-        }
-        llama_batch_free(b);
+        if (llama_process(e->ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, b.get()) != 0) return ELIZA_ERR_FFI_FAULT;
+        if (!common_speculative_process(e->spec, b)) return ELIZA_ERR_FFI_FAULT;
     }
     common_speculative_begin(e->spec, 0, e->prompt);
     const llama_token id = common_sampler_sample(e->smpl, e->ctx_tgt, n_tokens - 1);
@@ -1667,9 +1667,9 @@ static int step(Engine * e, int32_t * out, int32_t cap) {
      * cleanly re-mirror the verify batch into it. */
     if (ckpt_dft_full) {
         e->ckpt.load_dft(e->ctx_dft, 0, CKPT_FLAGS);
-        common_context_seq_rm(e->ctx_dft, 0, e->ckpt.pos_max + 1, -1);
+        seq_rm_or_abort(e->ctx_dft, 0, e->ckpt.pos_max + 1, -1);
     } else {
-        common_context_seq_rm(e->ctx_dft, 0, P, -1);
+        seq_rm_or_abort(e->ctx_dft, 0, P, -1);
     }
 
     /* Snapshot the target AFTER the draft (the draft does not touch ctx_tgt)
@@ -1678,18 +1678,18 @@ static int step(Engine * e, int32_t * out, int32_t cap) {
         e->ckpt.update_tgt(e->ctx_tgt, 0, CKPT_FLAGS);
     }
 
-    common_batch_clear(e->batch);
+    e->batch.clear();
     std::vector<int> idxs;
     idxs.reserve((size_t) D + 1);
     idxs.push_back(0);
-    common_batch_add(e->batch, seed, P, { 0 }, true);
+    e->batch.add(seed, P, 0, true);
     for (int32_t i = 0; i < D; ++i) {
         idxs.push_back(i + 1);
-        common_batch_add(e->batch, draft[i], P + 1 + i, { 0 }, true);
+        e->batch.add(draft[i], P + 1 + i, 0, true);
     }
 
     llama_set_embeddings(e->ctx_tgt, false);
-    if (llama_decode(e->ctx_tgt, e->batch) != 0) return ELIZA_ERR_FFI_FAULT;
+    if (llama_process(e->ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, e->batch.get()) != 0) return ELIZA_ERR_FFI_FAULT;
     if (!common_speculative_process(e->spec, e->batch)) return ELIZA_ERR_FFI_FAULT;
     e->st_drafted += (uint64_t) D;
 
@@ -1711,18 +1711,18 @@ static int step(Engine * e, int32_t * out, int32_t cap) {
         /* full acceptance — nothing to retract */
     } else if (!use_ckpt_tgt && !use_ckpt_dft) {
         /* PART / RS-within-window: trim the rejected-draft tail directly. */
-        common_context_seq_rm(e->ctx_tgt, 0, newP, -1);
-        common_context_seq_rm(e->ctx_dft, 0, newP, -1);
+        seq_rm_or_abort(e->ctx_tgt, 0, newP, -1);
+        seq_rm_or_abort(e->ctx_dft, 0, newP, -1);
     } else {
         rollback_to_committed(e->ctx_tgt, use_ckpt_tgt, e->ckpt, /* is_tgt= */ true,  P);
         rollback_to_committed(e->ctx_dft, use_ckpt_dft, e->ckpt, /* is_tgt= */ false, P);
-        common_batch_clear(e->batch);
-        common_batch_add(e->batch, seed, P, { 0 }, true);
+        e->batch.clear();
+        e->batch.add(seed, P, 0, true);
         for (int32_t i = 0; i + 1 < A; ++i) {
-            common_batch_add(e->batch, accepted[i], P + 1 + i, { 0 }, true);
+            e->batch.add(accepted[i], P + 1 + i, 0, true);
         }
         llama_set_embeddings(e->ctx_tgt, false);
-        if (llama_decode(e->ctx_tgt, e->batch) != 0) return ELIZA_ERR_FFI_FAULT;
+        if (llama_process(e->ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, e->batch.get()) != 0) return ELIZA_ERR_FFI_FAULT;
         if (!common_speculative_process(e->spec, e->batch)) return ELIZA_ERR_FFI_FAULT;
     }
 
@@ -5182,7 +5182,7 @@ int eliza_inference_describe_image(
                 : (std::string(marker ? marker : "<__media__>") + "\n" + user_prompt);
 
         auto decoded = mtmd_helper_bitmap_init_from_buf(
-            ctx->vision_mtmd, image_bytes, n_bytes, false);
+            ctx->vision_mtmd, image_bytes, n_bytes, false, mtmd_helper_init_opt_default());
         bitmap = decoded.bitmap;
         // This API accepts a still image; do not retain a lazy video decoder.
         if (decoded.video_ctx) {
@@ -5364,7 +5364,7 @@ EliLlmStream * eliza_inference_describe_image_stream_open(
                 : (std::string(marker ? marker : "<__media__>") + "\n" + user_prompt);
 
         auto decoded = mtmd_helper_bitmap_init_from_buf(
-            ctx->vision_mtmd, image_bytes, n_bytes, false);
+            ctx->vision_mtmd, image_bytes, n_bytes, false, mtmd_helper_init_opt_default());
         bitmap = decoded.bitmap;
         // This API accepts a still image; do not retain a lazy video decoder.
         if (decoded.video_ctx) {

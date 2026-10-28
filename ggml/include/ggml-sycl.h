@@ -36,6 +36,8 @@ GGML_BACKEND_API void   ggml_backend_sycl_comm_free(void * comm_ctx);
 GGML_BACKEND_API bool   ggml_backend_sycl_comm_allreduce_tensor(void * comm_ctx, struct ggml_tensor ** tensors);
 
 // pinned host buffer for use with the CPU backend for faster copies between CPU and GPU
+// pins on device 0 - a copy between another device and this memory can fail,
+// use ggml_backend_dev_host_buffer_type to pin on the device that does the copy
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type(void);
 
 GGML_BACKEND_API void ggml_backend_sycl_print_sycl_devices(void);
@@ -43,7 +45,7 @@ GGML_BACKEND_API void ggml_backend_sycl_get_gpu_list(int *id_list, int max_len);
 GGML_BACKEND_API void ggml_backend_sycl_get_device_description(int device,
                                                        char *description,
                                                        size_t description_size);
-GGML_BACKEND_API int  ggml_backend_sycl_get_device_count();
+GGML_BACKEND_API int  ggml_backend_sycl_get_device_count(void);
 GGML_BACKEND_API void ggml_backend_sycl_get_device_memory(int device, size_t *free, size_t *total);
 
 // SYCL doesn't support registering host memory, keep here for reference
