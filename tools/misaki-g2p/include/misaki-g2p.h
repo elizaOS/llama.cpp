@@ -110,6 +110,38 @@ bool misaki_phonemize(const misaki_lexicon * lexicon, const std::string & text, 
 bool misaki_phonemize_chunks(const misaki_lexicon * lexicon, const std::string & text,
                              std::vector<std::string> & chunks_out, std::string & err_out) noexcept;
 
+/* eSpeak-only G2P for languages without a misaki lexicon: misaki 0.9.4
+ * espeak.EspeakG2P(language), which Kokoro's KPipeline uses for those
+ * languages and which made the training phonemes of Kokoro distillations
+ * such as Delibes-8M-esES. phonemizer-fork 3.3.2 semantics
+ * (preserve_punctuation, with_stress, tie '^', language_switch
+ * 'remove-flags'), EspeakG2P's E2M ties (t^ʃ -> ʧ, t^s -> ʦ, d^ʒ -> ʤ, ...),
+ * then '^' and '-' removed. Supported languages: "es" (eSpeak NG voice
+ * roa/es, Castilian Spanish). Needs libespeak-ng (misaki_g2p_espeak_linked)
+ * and an espeak-ng-data directory with that language's dictionary (es_dict,
+ * lang/roa/es); it shares libespeak-ng's process-global state with the
+ * English fallback and Kokoro under one lock and re-selects its voice on
+ * every call. One handle may be used from one thread at a time. */
+struct espeak_g2p;
+struct espeak_g2p_deleter {
+    void operator()(espeak_g2p *) const noexcept;
+};
+using espeak_g2p_ptr = std::unique_ptr<espeak_g2p, espeak_g2p_deleter>;
+
+espeak_g2p_ptr espeak_g2p_open(const std::string & language, const char * espeak_data_dir,
+                               std::string & err_out) noexcept;
+
+/* The language the handle was opened for ("" for null). */
+const char * espeak_g2p_language(const espeak_g2p * g) noexcept;
+
+/* Text -> phonemes in the Kokoro vocabulary: EspeakG2P's output with every
+ * symbol outside the vocabulary dropped (as Kokoro does when it maps symbols
+ * to ids; for example the inverted marks '¿' and '¡'). The whole text is one
+ * string: callers chunk it at sentence ends for the model. Returns false and
+ * sets `err_out` on failure. */
+bool espeak_g2p_phonemize(const espeak_g2p * g, const std::string & text, std::string & phonemes_out,
+                          std::string & err_out) noexcept;
+
 }  // namespace eliza_misaki
 #endif
 

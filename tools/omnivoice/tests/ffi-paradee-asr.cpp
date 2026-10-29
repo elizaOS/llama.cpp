@@ -9,7 +9,11 @@
 //   - eliza_inference_asr_cancel during prefill and during decode, over a
 //     scripted ASR engine that polls the same abort callback llama_decode
 //     uses
-//   - ABI string "19"
+//   - ABI v20 voice slots: named slots next to the v17 one, the G2P each
+//     model's phoneme format picks (misaki / eSpeak-only es), the voice row,
+//     en-gb refusal, validated chunk length and speed clamp, info JSON,
+//     evict -> reload and unload
+//   - ABI string "20"
 //
 // The bridge is compiled into this TU (ELIZA_INFERENCE_TEST_HOOKS) against
 // the Paradee / misaki doubles in tests/paradee-contract/, so no weights are
@@ -86,8 +90,9 @@ static int synth_text(EliInferenceContext * ctx, const std::string & text, size_
 }
 
 static void test_abi_and_probes() {
-    CHECK(std::string(eliza_inference_abi_version()) == "19");
+    CHECK(std::string(eliza_inference_abi_version()) == "20");
     CHECK_RC(eliza_inference_paradee_supported(), 1);
+    CHECK_RC(eliza_inference_paradee_voices_supported(), 1);
     CHECK_RC(eliza_inference_asr_supported(), 1);
     CHECK_RC(eliza_inference_asr_stream_supported(), 0);
 }
@@ -667,6 +672,148 @@ static void test_asr_cancel() {
     fs::remove_all(bundle);
 }
 
+static int synth_voice(EliInferenceContext * ctx, const char * voice_id, const std::string & text, float speed,
+                       size_t * n_out, char ** err) {
+    float * pcm = nullptr;
+    size_t n = 0;
+    const int rc = eliza_inference_paradee_synthesize_voice_alloc(ctx, voice_id, text.c_str(), text.size(), speed,
+                                                                  &pcm, &n, err);
+    if (rc != ELIZA_OK) CHECK(pcm == nullptr && n == 0);
+    eliza_inference_free_pcm(pcm);
+    if (n_out) *n_out = n;
+    return rc;
+}
+
+static std::string voice_info(EliInferenceContext * ctx, const char * voice_id) {
+    char * json = nullptr;
+    char * err = nullptr;
+    const int n = eliza_inference_paradee_voice_info(ctx, voice_id, &json, &err);
+    std::string out = n > 0 && json ? std::string(json, (size_t) n) : std::string();
+    eliza_inference_free_string(json);
+    clear_err(&err);
+    return out;
+}
+
+static void test_paradee_voice_slots() {
+    fake_paradee_reset();
+    const fs::path bundle = make_bundle("slots");
+    char * err = nullptr;
+    EliInferenceContext * ctx = eliza_inference_create(bundle.string().c_str(), &err);
+    CHECK(ctx != nullptr);
+    clear_err(&err);
+
+    // Argument checks; unknown slots.
+    CHECK_RC(eliza_inference_paradee_load_voice(ctx, "", "/x/paradee.gguf", "/x/lex.bin", nullptr, nullptr, &err),
+             ELIZA_ERR_INVALID_ARG);
+    clear_err(&err);
+    CHECK_RC(eliza_inference_paradee_load_voice(ctx, nullptr, "/x/paradee.gguf", "/x/lex.bin", nullptr, nullptr, &err),
+             ELIZA_ERR_INVALID_ARG);
+    clear_err(&err);
+    CHECK_RC(synth_voice(ctx, "es", "hola", 1.0f, nullptr, &err), ELIZA_ERR_INVALID_ARG);
+    CHECK(err && std::string(err).find("no voice 'es'") != std::string::npos);
+    clear_err(&err);
+
+    // English v1.2 slot: a voice by name; British voices are refused; misaki needs the lexicon.
+    CHECK_RC(eliza_inference_paradee_load_voice(ctx, "en", "/x/paradee-v12.gguf", "/x/lex.bin", nullptr, "bf_isabella", &err),
+             ELIZA_ERR_INVALID_ARG);
+    CHECK(err && std::string(err).find("British") != std::string::npos);
+    clear_err(&err);
+    CHECK_RC(eliza_inference_paradee_load_voice(ctx, "en", "/x/paradee-v12.gguf", nullptr, nullptr, nullptr, &err),
+             ELIZA_ERR_INVALID_ARG);
+    clear_err(&err);
+    CHECK_RC(eliza_inference_paradee_load_voice(ctx, "en", "/x/paradee-v12.gguf", "/x/lex.bin", nullptr, "nobody", &err),
+             ELIZA_ERR_INVALID_ARG);
+    clear_err(&err);
+    CHECK_RC(fake_paradee().live_models.load(), 0);
+    CHECK_RC(eliza_inference_paradee_load_voice(ctx, "en", "/x/paradee-v12.gguf", "/x/lex.bin", nullptr, "am_puck", &err),
+             ELIZA_OK);
+    // Spanish slot: Delibes needs eSpeak data, takes no lexicon.
+    CHECK_RC(eliza_inference_paradee_load_voice(ctx, "es", "/x/delibes.gguf", nullptr, nullptr, nullptr, &err),
+             ELIZA_ERR_INVALID_ARG);
+    CHECK(err && std::string(err).find("eSpeak") != std::string::npos);
+    clear_err(&err);
+    CHECK_RC(eliza_inference_paradee_load_voice(ctx, "es", "/x/delibes.gguf", nullptr, "/x/missing-espeak", nullptr, &err),
+             ELIZA_ERR_BUNDLE_INVALID);
+    clear_err(&err);
+    CHECK_RC(eliza_inference_paradee_load_voice(ctx, "es", "/x/delibes.gguf", nullptr, "/x/espeak-ng-data", nullptr, &err),
+             ELIZA_OK);
+    CHECK_RC(fake_paradee().live_models.load(), 2);
+    CHECK_RC(fake_paradee().live_lexicons.load(), 1);
+    CHECK_RC(fake_paradee().live_espeak.load(), 1);
+    // The v17 slot is separate and still empty.
+    CHECK(eliza_inference_paradee_sample_rate(ctx) < 0);
+    CHECK_RC(synth_text(ctx, "hello", nullptr, &err), ELIZA_ERR_INVALID_ARG);
+    clear_err(&err);
+
+    // Info.
+    const std::string en = voice_info(ctx, "en"), es = voice_info(ctx, "es");
+    CHECK(en.find("\"voice\":\"am_puck\"") != std::string::npos && en.find("\"language\":\"en\"") != std::string::npos &&
+          en.find("\"accent\":\"en-gb\"") != std::string::npos && en.find("\"validated_max_ids\":512") != std::string::npos);
+    CHECK(es.find("\"family\":\"delibes\"") != std::string::npos && es.find("\"language\":\"es\"") != std::string::npos &&
+          es.find("\"voice\":\"em_alex\"") != std::string::npos && es.find("\"phoneme_format\":\"espeak-es\"") != std::string::npos &&
+          es.find("\"validated_max_ids\":360") != std::string::npos && es.find("\"validated_speed\":[0.85,1.15]") != std::string::npos &&
+          es.find("\"g2p_kind\":2") != std::string::npos);
+    CHECK(voice_info(ctx, "fr").empty());
+
+    // Phonemize through each slot's G2P ('\xC2\xBF' is dropped only by the eSpeak-only fake).
+    char * ph = nullptr;
+    CHECK_RC(eliza_inference_paradee_phonemize_voice(ctx, "es", "\xC2\xBFHola?", 0, &ph, &err), 5);
+    CHECK(ph && std::string(ph) == "hola?");
+    eliza_inference_free_string(ph);
+    ph = nullptr;
+
+    // Synthesis: the voice row, the speed clamp and the validated chunk length.
+    {
+        std::lock_guard<std::mutex> lock(fake_paradee().sizes_mutex);
+        fake_paradee().voices.clear(); fake_paradee().speeds.clear(); fake_paradee().input_sizes.clear();
+    }
+    size_t n = 0;
+    CHECK_RC(synth_voice(ctx, "en", "hello", 1.2f, &n, &err), ELIZA_OK);
+    CHECK_RC((int) n, 5 * FAKE_PARADEE_SAMPLES_PER_ID);
+    std::string long_es;
+    for (int i = 0; i < 40; ++i) long_es += "abcdefghi ";   // 400 symbols, no punctuation
+    CHECK_RC(synth_voice(ctx, "es", long_es, 0.8f, &n, &err), ELIZA_OK);
+    CHECK_RC((int) n, 400 * FAKE_PARADEE_SAMPLES_PER_ID);
+    CHECK_RC(synth_voice(ctx, "es", "hola", 1.5f, nullptr, &err), ELIZA_OK);
+    {
+        std::lock_guard<std::mutex> lock(fake_paradee().sizes_mutex);
+        const auto & v = fake_paradee().voices;
+        const auto & sp = fake_paradee().speeds;
+        const auto & sz = fake_paradee().input_sizes;
+        CHECK(v.size() == 4 && sp.size() == 4 && sz.size() == 4);
+        if (v.size() == 4 && sp.size() == 4 && sz.size() == 4) {
+            CHECK(v[0] == 2 && sp[0] == 1.2f);                       // am_puck, Paradee speed untouched
+            CHECK(v[1] == 0 && sp[1] == 0.85f && sz[1] <= 360);      // Delibes: clamped, <= 360 ids
+            CHECK(sz[1] + sz[2] == 400 + 4);
+            CHECK(sp[3] == 1.15f);
+        }
+    }
+
+    // Evict frees every slot; the next use reloads it.
+    CHECK_RC(eliza_inference_mmap_evict(ctx, "tts", &err), ELIZA_OK);
+    clear_err(&err);
+    CHECK_RC(fake_paradee().live_models.load(), 0);
+    CHECK_RC(fake_paradee().live_espeak.load(), 0);
+    CHECK_RC(synth_voice(ctx, "es", "hola", 1.0f, nullptr, &err), ELIZA_OK);
+    CHECK_RC(fake_paradee().live_espeak.load(), 1);
+    CHECK_RC(fake_paradee().live_models.load(), 1);
+    CHECK_RC(eliza_inference_mmap_acquire(ctx, "tts", &err), ELIZA_OK);
+    clear_err(&err);
+    CHECK_RC(fake_paradee().live_models.load(), 2);
+
+    // Unload forgets the slot.
+    CHECK_RC(eliza_inference_paradee_unload_voice(ctx, "es", &err), ELIZA_OK);
+    CHECK_RC(eliza_inference_paradee_unload_voice(ctx, "es", &err), ELIZA_OK);
+    CHECK_RC(fake_paradee().live_espeak.load(), 0);
+    CHECK_RC(synth_voice(ctx, "es", "hola", 1.0f, nullptr, &err), ELIZA_ERR_INVALID_ARG);
+    clear_err(&err);
+
+    eliza_inference_destroy(ctx);
+    CHECK_RC(fake_paradee().live_models.load(), 0);
+    CHECK_RC(fake_paradee().live_lexicons.load(), 0);
+    fs::remove_all(bundle);
+}
+
 int main() {
     test_abi_and_probes();
     test_paradee_load_and_synth();
@@ -675,6 +822,7 @@ int main() {
     test_paradee_cancel();
     test_paradee_race();
     test_evict_reload();
+    test_paradee_voice_slots();
     test_asr_cancel();
     std::fprintf(stderr, "%s: %d checks, %d failures\n",
         g_failures.load() ? "FAIL" : "PASS", g_checks.load(), g_failures.load());

@@ -53,9 +53,12 @@
       "intonations",
       "en_dict",
       "lang/gmw/en",
-      "lang/gmw/en-US"
+      "lang/gmw/en-US",
+      "es_dict",
+      "lang/roa/es"
     ],
-    "same_as": "espeakng-loader 0.2.4 (bundles libespeak-ng 1.52.0 with byte-identical en data), which misaki's EspeakFallback loads"
+    "same_as": "espeakng-loader 0.2.4 (bundles libespeak-ng 1.52.0 with byte-identical en data), which misaki's EspeakFallback loads",
+    "data_note": "es_dict and lang/roa/es are the Spanish (Spain) data the eSpeak-only G2P (EspeakG2P, language 'es') loads; the English G2P never reads them."
   },
   "e2m": {
     "sources": [
@@ -113,5 +116,28 @@
     "reference.txt": "073a90f89a2b8af01b26d9e2aade8b60ae7cadaecdfc1a459c21daeac7e7c19b",
     "agent_style.txt": "de406bbe3d4a388e596f36d1da9ff4103dfb1e52494172c5a162e5720f514654",
     "comment": "Python misaki 0.9.4 reference phonemes (tests/compare_misaki.py reference); each has a .sha256 file the gate checks."
+  },
+  "espeak_g2p": {
+    "comment": "src/espeak-g2p.cpp: misaki espeak.EspeakG2P(language), the whole-text eSpeak G2P Kokoro's KPipeline uses for languages without a misaki lexicon (lang_code 'e' -> 'es'). Delibes-8M-esES (lapislabsai/Delibes-8M-esES) was trained on its output.",
+    "languages": {
+      "es": {
+        "espeak_voice": "roa/es",
+        "data": [
+          "es_dict",
+          "lang/roa/es"
+        ]
+      }
+    },
+    "reference_env": {
+      "misaki": "0.9.4",
+      "phonemizer-fork": "3.3.2",
+      "espeak-ng": "1.52.0"
+    },
+    "source": "hexgrad/misaki@fba1236595f2d2bf21d414ba6e57d25256afada3 misaki/espeak.py EspeakG2P (identical to the 0.9.4 wheel)",
+    "fixtures": {
+      "tests/fixtures/espeak_g2p_es.tsv": {
+        "made_by": "tests/gen_espeak_g2p_fixture.py --language es over tests/corpus/es_authored.txt and tests/corpus/es_numbers.txt (project-authored)"
+      }
+    }
   }
 }

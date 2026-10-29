@@ -6,6 +6,7 @@
 // then misaki espeak.EspeakFallback's eSpeak-to-misaki (E2M) table.
 #include "misaki-internal.h"
 
+#include <filesystem>
 #include <stdexcept>
 
 #if defined(MISAKI_G2P_USE_ESPEAK)
@@ -205,16 +206,43 @@ u32 EspeakFallback::e2m(const u32 & in) {
     return replace_all(ps, U"^", U"");
 }
 
-std::unique_ptr<EspeakFallback> EspeakFallback::open(const std::string & data_dir, std::string & err) {
+std::unique_ptr<EspeakFallback> EspeakFallback::open(const std::string & data_dir, std::string & err,
+                                                     const char * voice, bool remove_flags, const char * dict) {
 #if defined(MISAKI_G2P_USE_ESPEAK)
+    const std::string v = voice ? voice : kVoice;
     auto lock = eliza_espeak_shared::lock();
     // prepare() rejects a path longer than the linked libespeak-ng's
     // N_PATH_HOME buffer with an error naming the limit (no fixed size here:
     // the Android builds raise it).
-    if (!eliza_espeak_shared::prepare(lock, data_dir, kVoice, err)) return nullptr;
-    return std::unique_ptr<EspeakFallback>(new EspeakFallback(data_dir));
+    if (!eliza_espeak_shared::prepare(lock, data_dir, v.c_str(), err)) return nullptr;
+    if (dict) {
+        // espeak_SetVoiceByName returns EE_OK for a voice whose dictionary is
+        // missing or empty (libespeak-ng 1.52.0 only prints "Can't read
+        // dictionary file" to stderr), so check the file in the directory
+        // libespeak-ng resolved: data_dir, data_dir/espeak-ng-data, or its
+        // default path when data_dir is empty.
+        const char * in_use = nullptr;
+        espeak_Info(&in_use);
+        if (!in_use || !*in_use) {
+            err = "eSpeak NG reports no data directory in use for voice " + v;
+            return nullptr;
+        }
+        const std::filesystem::path dict_path = std::filesystem::path(in_use) / dict;
+        std::error_code ec;
+        const bool is_file = std::filesystem::is_regular_file(dict_path, ec);
+        const std::uintmax_t size = is_file ? std::filesystem::file_size(dict_path, ec) : 0;
+        if (!is_file || ec || size == 0) {
+            err = "eSpeak NG dictionary " + dict_path.string() + (is_file ? " is empty" : " not found") +
+                  " (voice " + v + " needs it)";
+            return nullptr;
+        }
+    }
+    return std::unique_ptr<EspeakFallback>(new EspeakFallback(data_dir, v, remove_flags));
 #else
     (void) data_dir;
+    (void) voice;
+    (void) remove_flags;
+    (void) dict;
     err = "misaki_g2p was built without libespeak-ng (MISAKI_G2P_ESPEAK=OFF)";
     return nullptr;
 #endif
@@ -228,7 +256,7 @@ u32 EspeakFallback::phonemize_line(const u32 & text) {
     // have selected its own since the last call.
     auto lock = eliza_espeak_shared::lock();
     std::string init_err;
-    if (!eliza_espeak_shared::prepare(lock, data_dir_, kVoice, init_err)) throw std::runtime_error(init_err);
+    if (!eliza_espeak_shared::prepare(lock, data_dir_, voice_.c_str(), init_err)) throw std::runtime_error(init_err);
     std::string utf8 = to_utf8(text);
     const void * ptr = utf8.c_str();
     // EspeakWrapper.text_to_phonemes(text, tie=True)
@@ -254,6 +282,22 @@ u32 EspeakFallback::phonemize_line(const u32 & text) {
         }
         line = replace_all(o, U"_ ", U" ");
     }
+    if (remove_flags_) {
+        // LanguageSwitch 'remove-flags': re.sub(r'\(.+?\)', '', line). eSpeak marks a switch to
+        // another language's rules as "(en)" and back as "(es)" (with ties, "(͡e͡n)").
+        u32 o;
+        for (size_t i = 0; i < line.size(); i++) {
+            if (line[i] == '(' && i + 1 < line.size()) {
+                const size_t close = line.find(U')', i + 2);
+                if (close != u32::npos) {
+                    i = close;
+                    continue;
+                }
+            }
+            o += line[i];
+        }
+        line = o;
+    }
     if (line.empty()) return u32();
     u32 out;
     size_t a = 0;
@@ -272,7 +316,7 @@ u32 EspeakFallback::phonemize_line(const u32 & text) {
 #endif
 }
 
-std::optional<u32> EspeakFallback::operator()(const u32 & text) {
+std::optional<u32> EspeakFallback::phonemize(const u32 & text) {
     std::vector<u32> chunks;
     std::vector<MarkIndex> marks;
     preserve(text, chunks, marks);
@@ -280,10 +324,14 @@ std::optional<u32> EspeakFallback::operator()(const u32 & text) {
     for (auto & c : chunks) phonemized.push_back(phonemize_line(c));
     std::vector<u32> restored = restore(phonemized, marks);
     if (restored.empty()) return std::nullopt;
-    u32 ps = py_strip(restored[0]);
-    ps = e2m(ps);
+    return py_strip(restored[0]);
+}
+
+std::optional<u32> EspeakFallback::operator()(const u32 & text) {
+    std::optional<u32> ps = phonemize(text);
     // EspeakFallback returns (None, None) only when phonemizer returns no line
-    return ps;
+    if (!ps) return std::nullopt;
+    return e2m(*ps);
 }
 
 }  // namespace misaki

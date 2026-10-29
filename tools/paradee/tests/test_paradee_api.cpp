@@ -57,13 +57,31 @@ int main() {
         CHECK(paradee_voice_count(nullptr) == 0 && paradee_default_voice(nullptr) == -1 &&
               std::string(paradee_voice_name(nullptr, 0)).empty() && paradee_find_voice(nullptr, "af_heart") == -1,
               "null model voices");
-        const char * def_name = "af_heart";
+        const bool delibes = std::string(paradee_family(model.get())) == "delibes";
+        const char * def_name = delibes ? "em_alex" : "af_heart";
         CHECK(paradee_default_voice(model.get()) == 0 && std::string(paradee_voice_name(model.get(), 0)) == def_name,
               "default voice %d %s", paradee_default_voice(model.get()), paradee_voice_name(model.get(), 0));
         CHECK(std::string(paradee_voice_name(model.get(), nv)).empty() &&
               std::string(paradee_voice_name(model.get(), -1)).empty(), "voice name out of range");
         CHECK(paradee_find_voice(model.get(), def_name) == 0 && paradee_find_voice(model.get(), "nobody") == -1,
               "find voice");
+        // Release metadata and the validated envelope.
+        float lo = 0, hi = 0;
+        CHECK(paradee_validated_speed(model.get(), lo, hi), "validated speed");
+        if (delibes) {
+            CHECK(std::string(paradee_language(model.get())) == "es" &&
+                  std::string(paradee_phoneme_format(model.get())) == "espeak-es" &&
+                  paradee_validated_max_ids(model.get()) == 360 && lo == 0.85f && hi == 1.15f,
+                  "Delibes metadata: %s %s %d [%g, %g]", paradee_language(model.get()),
+                  paradee_phoneme_format(model.get()), paradee_validated_max_ids(model.get()), lo, hi);
+        } else {
+            CHECK(std::string(paradee_family(model.get())) == "paradee" && std::string(paradee_language(model.get())) == "en" &&
+                  std::string(paradee_phoneme_format(model.get())) == "misaki" &&
+                  paradee_validated_max_ids(model.get()) == PARADEE_MAX_INPUT_IDS &&
+                  lo == PARADEE_MIN_SPEED && hi == PARADEE_MAX_SPEED, "Paradee metadata defaults");
+        }
+        CHECK(std::string(paradee_family(nullptr)).empty() && paradee_validated_max_ids(nullptr) == 0 &&
+              !paradee_validated_speed(nullptr, lo, hi), "null model metadata");
         if (v12) {
             const char * names[] = { "af_heart", "bf_isabella", "am_puck", "bm_fable" };
             const char * accents[] = { "en-us", "en-gb", "en-us", "en-gb" };
@@ -75,7 +93,7 @@ int main() {
                       paradee_voice_name(model.get(), i), paradee_voice_accent(model.get(), i));
             }
         } else {
-            CHECK(nv == 1 && std::string(paradee_voice_accent(model.get(), 0)).empty(), "v1.0 / v1.1 have one voice");
+            CHECK(nv == 1 && std::string(paradee_voice_accent(model.get(), 0)).empty(), "v1.0 / v1.1 / Delibes have one voice");
         }
     }
     CHECK(paradee_get_head(nullptr) == PARADEE_HEAD_ISTFTNET_LOCK && std::string(paradee_version(nullptr)).empty(),

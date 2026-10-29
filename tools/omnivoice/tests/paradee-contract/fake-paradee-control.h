@@ -17,8 +17,12 @@ struct fake_paradee_state {
     // > 0: each paradee_synthesize call runs this long, polling the cancel
     // callback every millisecond (stand-in for a slow forward pass).
     std::atomic<int>  block_ms{0};
+    std::atomic<int>  espeak_loads{0};
+    std::atomic<int>  live_espeak{0};
     std::mutex          sizes_mutex;
     std::vector<size_t> input_sizes;   // input_ids.size() per synth call
+    std::vector<int>    voices;        // opts.voice per synth call
+    std::vector<float>  speeds;        // opts.speed per synth call
 };
 
 fake_paradee_state & fake_paradee();

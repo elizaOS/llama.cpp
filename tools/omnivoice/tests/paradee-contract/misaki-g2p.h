@@ -38,4 +38,15 @@ bool misaki_phonemize(
     std::string & phonemes_out,
     std::string & err_out) noexcept;
 
+// eSpeak-only G2P (misaki espeak.EspeakG2P); see the real header.
+struct espeak_g2p;
+struct espeak_g2p_deleter { void operator()(espeak_g2p *) const noexcept; };
+using espeak_g2p_ptr = std::unique_ptr<espeak_g2p, espeak_g2p_deleter>;
+
+espeak_g2p_ptr espeak_g2p_open(const std::string & language, const char * espeak_data_dir,
+                               std::string & err_out) noexcept;
+const char * espeak_g2p_language(const espeak_g2p * g) noexcept;
+bool espeak_g2p_phonemize(const espeak_g2p * g, const std::string & text, std::string & phonemes_out,
+                          std::string & err_out) noexcept;
+
 } // namespace eliza_misaki

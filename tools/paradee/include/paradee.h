@@ -108,6 +108,27 @@ int paradee_sample_rate(const paradee_model * model) noexcept;
 paradee_head_kind paradee_get_head(const paradee_model * model) noexcept;
 const char * paradee_version(const paradee_model * model) noexcept;
 
+// Release metadata. paradee_family: "paradee", or the model family a GGUF
+// converted from another release of the same architecture declares
+// (paradee.family; "delibes" for Delibes-8M-esES). paradee_language: "en",
+// or paradee.language ("es"). paradee_phoneme_format: the phoneme spelling
+// the model was trained on, "misaki" (Kokoro's English G2P) or
+// paradee.phoneme_format ("espeak-es": misaki espeak.EspeakG2P('es')).
+// "" for a null model.
+const char * paradee_family(const paradee_model * model) noexcept;
+const char * paradee_language(const paradee_model * model) noexcept;
+const char * paradee_phoneme_format(const paradee_model * model) noexcept;
+
+// The input envelope the release was validated on: at most this many ids
+// per synthesis, pads included (paradee.input.validated_max_ids; 360 for
+// Delibes-8M-esES; else the architecture's 512), and this speed range
+// (paradee.validated_speed; [0.85, 1.15] for Delibes; else
+// [PARADEE_MIN_SPEED, PARADEE_MAX_SPEED]). Advisory: synthesis still
+// accepts the architecture's limits, and chunkers should split to
+// validated_max_ids. 0 / false for a null model.
+int paradee_validated_max_ids(const paradee_model * model) noexcept;
+bool paradee_validated_speed(const paradee_model * model, float & lo, float & hi) noexcept;
+
 // Voices: rows of the style tables, in model order. 1 for v1.0 / v1.1, 4 for
 // v1.2, 0 for a null model. Names and accents are "" for an index out of
 // range; the accent is the misaki dialect the voice was trained on ("en-us",

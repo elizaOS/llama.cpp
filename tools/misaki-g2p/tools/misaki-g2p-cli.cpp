@@ -2,6 +2,7 @@
 // misaki-g2p-cli: phonemize text from stdin, one input per line.
 //
 //   misaki-g2p-cli --lex misaki-en-us.lex [--espeak DIR] [MODE] < text.txt
+//   misaki-g2p-cli --espeak-g2p es --espeak DIR [--raw] < text.txt
 //
 // MODE
 //   (default)    Paradee chunks via the C API, one line per input ('\n' inside
@@ -11,6 +12,10 @@
 //                  T<TAB>token<TAB>phonemes<TAB>whitespace<TAB>tag...
 //   --tokenize   spaCy-compatible tokens and tags: text<TAB>tag<TAB>space
 //   --numbers    lines "cardinal N" / "ordinal N" / "year N" / "float X"
+//   --espeak-g2p LANG
+//                misaki espeak.EspeakG2P(LANG) (no lexicon; needs --espeak):
+//                one phoneme line per input, symbols outside the Kokoro
+//                vocabulary dropped (--raw keeps them)
 #include "misaki-g2p.h"
 #include "misaki-internal.h"
 
@@ -22,12 +27,14 @@
 using namespace misaki;
 
 static int usage() {
-    std::fprintf(stderr, "usage: misaki-g2p-cli --lex FILE [--espeak DIR] [--dump|--tokenize|--numbers] < lines\n");
+    std::fprintf(stderr, "usage: misaki-g2p-cli --lex FILE [--espeak DIR] [--dump|--tokenize|--numbers] < lines\n"
+                         "       misaki-g2p-cli --espeak-g2p LANG --espeak DIR [--raw] < lines\n");
     return 2;
 }
 
 int main(int argc, char ** argv) {
-    std::string lex, espeak, mode = "chunks";
+    std::string lex, espeak, mode = "chunks", g2p_lang;
+    bool raw = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--lex" && i + 1 < argc) lex = argv[++i];
@@ -35,6 +42,8 @@ int main(int argc, char ** argv) {
         else if (a == "--dump") mode = "dump";
         else if (a == "--tokenize") mode = "tokenize";
         else if (a == "--numbers") mode = "numbers";
+        else if (a == "--espeak-g2p" && i + 1 < argc) { mode = "espeak-g2p"; g2p_lang = argv[++i]; }
+        else if (a == "--raw") raw = true;
         else return usage();
     }
     std::string line;
@@ -49,6 +58,24 @@ int main(int argc, char ** argv) {
             else if (kind == "year") w = number_year(v);
             else w = number_float(v);
             std::printf("%s\n", to_utf8(w).c_str());
+        }
+        return 0;
+    }
+    if (mode == "espeak-g2p") {
+        if (espeak.empty()) return usage();
+        std::string err;
+        if (raw) {
+            std::unique_ptr<EspeakG2P> g = EspeakG2P::open(g2p_lang, espeak, err);
+            if (!g) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+            while (std::getline(std::cin, line)) std::printf("%s\n", to_utf8((*g)(from_utf8(line))).c_str());
+            return 0;
+        }
+        eliza_misaki::espeak_g2p_ptr g = eliza_misaki::espeak_g2p_open(g2p_lang, espeak.c_str(), err);
+        if (!g) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        std::string ps;
+        while (std::getline(std::cin, line)) {
+            if (!eliza_misaki::espeak_g2p_phonemize(g.get(), line, ps, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+            std::printf("%s\n", ps.c_str());
         }
         return 0;
     }

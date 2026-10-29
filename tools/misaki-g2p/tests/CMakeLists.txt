@@ -8,6 +8,8 @@
 #                         needs the full lexicon and libespeak-ng 1.52.0 data
 #   misaki_g2p_agent      the same gate on assistant-style sentences
 #                         (fixtures/agent_style.txt)
+#   misaki_g2p_espeak_g2p_es  the eSpeak-only Spanish G2P (EspeakG2P) against
+#                         fixtures/espeak_g2p_es.tsv: every line identical
 #
 # The full lexicon comes from MISAKI_G2P_LEXICON, or is built by the
 # misaki_g2p_lexicon fixture (convert_misaki_lexicon.py --fetch: Python 3 and
@@ -25,6 +27,15 @@ target_link_libraries(test-misaki-g2p PRIVATE misaki_g2p)
 add_executable(test-misaki-g2p-agreement test_agreement.cpp)
 target_include_directories(test-misaki-g2p-agreement PRIVATE ${MISAKI_ROOT}/src)
 target_link_libraries(test-misaki-g2p-agreement PRIVATE misaki_g2p)
+
+# eSpeak-only G2P (EspeakG2P, Spanish): the E2M table offline (label main),
+# and the agreement gate on fixtures/espeak_g2p_es.tsv (needs libespeak-ng
+# 1.52.0 with its es data; exact match on every line).
+add_executable(test-espeak-g2p test_espeak_g2p.cpp)
+target_include_directories(test-espeak-g2p PRIVATE ${MISAKI_ROOT}/src)
+target_link_libraries(test-espeak-g2p PRIVATE misaki_g2p)
+add_test(NAME misaki_g2p_espeak_g2p_e2m COMMAND test-espeak-g2p --e2m)
+set_tests_properties(misaki_g2p_espeak_g2p_e2m PROPERTIES LABELS main)
 
 if (NOT Python3_Interpreter_FOUND)
     message(STATUS "misaki-g2p: Python 3 not found, lexicon-based tests are not registered")
@@ -89,6 +100,11 @@ if (GATE_ESPEAK_DATA)
     set_tests_properties(misaki_g2p_espeak_data_path PROPERTIES
         FIXTURES_REQUIRED misaki_mini_lex SKIP_RETURN_CODE 77 TIMEOUT 120)
 endif()
+
+add_test(NAME misaki_g2p_espeak_g2p_es
+         COMMAND test-espeak-g2p --language es --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/espeak_g2p_es.tsv
+                 --espeak "${GATE_ESPEAK_DATA}")
+set_tests_properties(misaki_g2p_espeak_g2p_es PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 
 foreach(gate agreement agent)
     if (gate STREQUAL "agreement")
