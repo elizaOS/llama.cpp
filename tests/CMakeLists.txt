@@ -343,8 +343,11 @@ if (GGML_METAL AND NOT GGML_BACKEND_DL)
 endif()
 llama_build_and_test(test-backend-readback.cpp      LABEL "main behavior backend")
 llama_build_and_test(test-gguf-eliza-type-ids.cpp   LABEL "main behavior")
-llama_build_and_test(test-kv-cache-growth.cpp       LABEL "main behavior backend")
-target_include_directories(test-kv-cache-growth PRIVATE ${PROJECT_SOURCE_DIR}/src)
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    # uses llama_model and llama_kv_cache internals, which llama.dll does not export
+    llama_build_and_test(test-kv-cache-growth.cpp   LABEL "main behavior backend"  LINK llama)
+    target_include_directories(test-kv-cache-growth PRIVATE ${PROJECT_SOURCE_DIR}/src)
+endif()
 llama_build_and_test(test-metal-matmul-support.cpp  LABEL "main behavior backend")
 
 llama_build(test-backend-ops.cpp LINK ggml)
