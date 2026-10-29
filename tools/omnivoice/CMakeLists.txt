@@ -289,7 +289,13 @@ function(eliza_inference_fold_parakeet target)
     endif()
 endfunction()
 
-if(TARGET mtmd)
+# elizainference links llama-common (MTP speculative decoding), so it needs
+# LLAMA_BUILD_COMMON. Builds that turn common off (for example
+# build-xcframework.sh) skip the fused library instead of failing to link.
+if(TARGET mtmd AND NOT TARGET llama-common)
+    message(STATUS "elizainference: skipped, it needs llama-common (LLAMA_BUILD_COMMON=ON)")
+endif()
+if(TARGET mtmd AND TARGET llama-common)
     if(TARGET parakeet_lib)
         message(STATUS "elizainference: Parakeet-TDT ASR enabled (streaming via asr_stream_*)")
     endif()
