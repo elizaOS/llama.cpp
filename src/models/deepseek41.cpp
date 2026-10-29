@@ -646,11 +646,13 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
 
         const int32_t topk_src = hparams.dsv41_topk_src[il];
         const int64_t k_sel    = top_k->ne[0];
-        const int64_t n_raw    = raw_k->ne[2];
 
-        // few queries per stream: attend over [window | top-k rows of the query], one FA stream per query; same keys and mask as dense, different key order
+        // one query per stream: attend over [window | top-k rows of the query], one FA stream per query; same keys and mask as dense, different key order
+        // only the token-generation shape takes it, since its tensor sizes are fixed. Multi-token ubatches use the dense
+        // shape of the pp reserve: a multi-token gather shape is not reserved and grows with n_tokens, so a decode-time
+        // re-reserve made for one ubatch is too small for the next larger one [GGML_SCHED_DEBUG_REALLOC]
         const bool gather = sparse && cparams.flash_attn && raw_mask->type == GGML_TYPE_F16 && ci.kq_mask->type == GGML_TYPE_F16 &&
-                ((n_stream == 1 && nt <= 32) || nt == n_stream);
+                nt == n_stream;
 
         if (gather) {
             // ggml_top_k returns the rows in no fixed order and FA sums the keys in that order: sort them so the result is deterministic
@@ -684,24 +686,6 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                 cb(comp_k, "comp_k_sel", il);
             }
 
-            if (n_stream == 1 && nt > 1) {
-                if (ggml_is_quantized(raw_k->type)) {
-                    // no REPEAT kernel for quantized types: byte-exact copies by doubling concats
-                    ggml_tensor * rep = nullptr;
-                    ggml_tensor * pw  = raw_k;
-                    for (int64_t n = nt; n > 0; n >>= 1) {
-                        if (n & 1) {
-                            rep = rep ? ggml_concat(ctx0, rep, pw, 3) : pw;
-                        }
-                        if (n > 1) {
-                            pw = ggml_concat(ctx0, pw, pw, 3);
-                        }
-                    }
-                    raw_k = rep;
-                } else {
-                    raw_k = ggml_repeat_4d(ctx0, raw_k, n_embd_head, 1, n_raw, nt);
-                }
-            }
             ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
 
             // window mask, then the comp mask at the selected rows (-inf where top-k picked an invisible row); one per top-k source
