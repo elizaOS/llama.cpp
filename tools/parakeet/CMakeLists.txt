@@ -81,7 +81,7 @@ if (NOT MSVC)
     target_compile_options(parakeet_lib PRIVATE -O3)
 endif()
 
-if (NOT CMAKE_SYSTEM_NAME STREQUAL "iOS" AND NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
+if (NOT CMAKE_SYSTEM_NAME MATCHES "^(iOS|tvOS|visionOS|watchOS|Android)$")
     include(GNUInstallDirs)
     add_executable(parakeet-cli tools/parakeet-cli.cpp)
     target_link_libraries(parakeet-cli PRIVATE parakeet_lib)
@@ -95,7 +95,7 @@ if (NOT CMAKE_SYSTEM_NAME STREQUAL "iOS" AND NOT CMAKE_SYSTEM_NAME STREQUAL "And
     endif()
 endif()
 
-if (NOT WIN32 AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+if (NOT WIN32 AND NOT CMAKE_SYSTEM_NAME MATCHES "^(iOS|tvOS|visionOS|watchOS)$")
     # weight-layout study (not installed): cost of denser fv5 code packings
     add_executable(bench-fv5-packing tools/bench-fv5-packing.cpp)
     target_link_libraries(bench-fv5-packing PRIVATE parakeet_lib)

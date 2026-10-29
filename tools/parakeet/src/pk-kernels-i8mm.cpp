@@ -3,7 +3,7 @@
 // runtime check (HWCAP2_I8MM / hw.optional.arm.FEAT_I8MM).
 #include "pk-kernels.h"
 
-#if PK_HAVE_ARM_EXT
+#if PK_HAVE_ARM_EXT && defined(__ARM_FEATURE_DOTPROD) && defined(__ARM_FEATURE_MATMUL_INT8)
 #include "pk-kernels-neon.inc"
 
 namespace pk {
@@ -55,5 +55,13 @@ const kernel_table & kernels_i8mm() {
     return t;
 }
 
+}  // namespace pk
+#elif PK_HAVE_ARM_EXT
+// The build did not pass the per-file -march flag (for example an Xcode iOS,
+// tvOS or visionOS build), so this tier falls back to the dotprod table.
+namespace pk {
+const kernel_table & kernels_i8mm() {
+    return kernels_dotprod();
+}
 }  // namespace pk
 #endif
