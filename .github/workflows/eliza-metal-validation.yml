@@ -88,8 +88,15 @@ jobs:
           summary = re.findall(r"^  (\d+)/(\d+) tests passed$", text, re.M)
           assert summary == [(str(len(numeric)), str(len(numeric)))], "Missing or inconsistent completion summary"
           assert re.search(r"^  Backend MTL0: OK$", text, re.M), "Metal backend did not complete"
+          # GitHub-hosted macOS runners expose a paravirtual GPU without simdgroup
+          # reduction. The capability step records that, and then the
+          # simdgroup kernels must be refused instead of run.
+          no_simdgroup = Path("/tmp/metal-no-simdgroup-reduction").exists()
           if group == "custom" and op in {"ATTN_SCORE_QJL", "FUSED_ATTN_QJL_TBQ", "ISTFT"}:
-              assert numeric and not unsupported, "Required numerical operation became unsupported"
+              if no_simdgroup and op != "ISTFT":
+                  assert not numeric and unsupported, "Device without simdgroup reduction must refuse " + op
+              else:
+                  assert numeric and not unsupported, "Required numerical operation became unsupported"
           record = {"group": group, "op": op, "numericalPasses": len(numeric), "explicitUnsupported": len(unsupported), "allUnsupported": not numeric}
           with Path("/tmp/metal-operation-ledger.jsonl").open("a") as output:
               output.write(json.dumps(record) + "\n")
@@ -112,7 +119,14 @@ jobs:
                      test-backend-ops test-quantize-fns test-metal-matmul-support
 
       - name: Verify Metal matmul capability routing
-        run: ./build-metal/bin/test-metal-matmul-support --require-metal
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build-metal/bin/test-metal-matmul-support --require-metal 2>&1 | tee /tmp/metal-matmul-support.log
+          if grep -q "has no matmul kernels" /tmp/metal-matmul-support.log; then
+            echo "::warning::MTL0 has no simdgroup reduction (paravirtual GPU); simdgroup kernels are checked as unsupported only"
+            touch /tmp/metal-no-simdgroup-reduction
+          fi
 
       - name: test-quantize-fns (CPU; smoke for Eliza custom quants)
         shell: bash
@@ -203,7 +217,12 @@ jobs:
               echo "::error::Metal kernel divergence for op=$op_name"
               exit 1
             fi
-            if [ "$n_skip" -gt 0 ]; then
+            if [ -e /tmp/metal-no-simdgroup-reduction ]; then
+              if [ "$n_pass" -gt 0 ]; then
+                echo "::error::$op_name ran on a device without simdgroup reduction"
+                exit 1
+              fi
+            elif [ "$n_skip" -gt 0 ]; then
               echo "::error::Metal unexpectedly reports $op_name as not supported (regression in supports_op)"
               exit 1
             fi
