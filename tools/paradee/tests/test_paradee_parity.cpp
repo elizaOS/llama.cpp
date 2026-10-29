@@ -17,6 +17,11 @@
 //               float32 evaluation is from float64 (+1e-4)
 //   end to end  final waveform SNR >= 35 dB against the reference
 //
+// A v1.2 GGUF is gated like v1.1, on the voice the reference was dumped for
+// (`dump --version 1.2 --voice NAME`; the manifest's voice and voice_row
+// must name the same row of the GGUF's voice table). Every stage, the trunk
+// and the head included, runs with that voice.
+//
 // For a v1.1 GGUF (source-filter head; reference from `dump --version 1.1`)
 // the text-side gates are the same, and the acoustic half is gated as:
 //   trunk       AdaIN trunk output from the reference asr / F0 / N:
@@ -134,8 +139,17 @@ int main() {
     if (!model) { std::fprintf(stderr, "load failed: %s\n", err.c_str()); return 1; }
     const bool v11 = paradee_get_head(model.get()) == PARADEE_HEAD_SOURCE_FILTER;
     std::printf("model: Paradee-8M v%s (%s head)\n", paradee_version(model.get()), v11 ? "source-filter" : "iSTFTNet + lock");
-    CHECK(manifest.value("version", std::string("1.0")) == (v11 ? "1.1" : "1.0"),
+    const std::string version = paradee_version(model.get());
+    CHECK(manifest.value("version", std::string("1.0")) == (v11 ? version : "1.0"),
           "the reference was dumped for another Paradee version");
+    int voice = -1;
+    if (version == "1.2") {
+        const std::string name = manifest.value("voice", std::string());
+        voice = paradee_find_voice(model.get(), name);
+        CHECK(voice >= 0 && voice == manifest.value("voice_row", -2),
+              "reference voice '%s' (row %d) is not row %d of the GGUF", name.c_str(), manifest.value("voice_row", -2), voice);
+        std::printf("voice: %s (row %d of %d)\n", name.c_str(), voice, paradee_voice_count(model.get()));
+    }
     const paradee_lock_params lock = v11 ? paradee_lock_params() : *paradee_get_lock_params(model.get());
     paradee_model_ptr model_v10;
     if (const char * g10 = std::getenv("PARADEE_GGUF_V10"); v11 && g10 && *g10) {
@@ -165,6 +179,7 @@ int main() {
         std::vector<float> ref_noise;
         if (v11) ref_noise = read_raw<float>(file("noise"));
         paradee_stages st;
+        st.voice = voice;
         if (v11) st.noise_in = &ref_noise;
         std::vector<float> pcm;
         const auto t0 = std::chrono::steady_clock::now();
@@ -205,6 +220,7 @@ int main() {
             const int T = (int) ref_F0.size() / 2;
             const int n = (int) ref_F0.size();
             paradee_stages a;
+            a.voice = voice;
             a.noise_in = &ref_noise;
             CHECK(paradee_decode_staged(model.get(), ref_asr.data(), 512, T, ref_F0.data(), ref_N.data(), nullptr,
                                         nullptr, nullptr, &a, err) == PARADEE_OK, "%s", err.c_str());

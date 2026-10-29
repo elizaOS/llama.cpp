@@ -1,4 +1,4 @@
-# tools/paradee: Paradee-8M TTS (v1.0 and v1.1)
+# tools/paradee: Paradee-8M TTS (v1.0, v1.1 and v1.2)
 
 Paradee-8M v1.0 ([sahilmahendrakar/Paradee-8M-v1.0](https://huggingface.co/sahilmahendrakar/Paradee-8M-v1.0), Apache-2.0)
 is Kokoro-82M's StyleTTS-2 + iSTFTNet code at smaller widths. It is distilled to one voice (`af_heart`), has
@@ -14,6 +14,7 @@ natively, with no ONNX:
   shapes, and Kokoro-82M's output is unchanged bit for bit.
 - `src/paradee-phase-lock.cpp` is a native implementation of the model's phase-locking filter.
 - `src/paradee-head.cpp` runs Paradee-8M v1.1's source-filter head. See [v1.1](#v11-source-filter-head).
+- Paradee-8M v1.2 is v1.1 with four voices (a style table, one row per voice). See [v1.2](#v12-four-voices).
 
 ## Pipeline
 
@@ -274,3 +275,30 @@ from `paradee-tts`, divided by the audio length.
   work. Treat the absolute RTFs as approximate; the two releases were measured back to back.
 - Peak memory is lower mainly because the head never builds the generator's 24 kHz feature maps. With
   #85's memory mapping, both files would also stop counting their 31–32 MB of weights as private memory.
+
+## v1.2: four voices
+
+[sahilmahendrakar/Paradee-8M-v1.2](https://huggingface.co/sahilmahendrakar/Paradee-8M-v1.2) at `ed2934d4`
+(Apache-2.0; pins.json `"v1.2"`) is v1.1 retrained with four voices: `af_heart`, `bf_isabella`, `am_puck` and
+`bm_fable`, in that order (config.json `voices`). Every tensor has v1.1's name and shape except the two learned
+styles, which become tables: text `(4, 32)` and decoder `(4, 16)`. Both checkpoints carry a top-level `voices`
+list next to `model`. The training scripts the reference imports are byte-identical to v1.1's, and the weights
+are retrained, so `af_heart` sounds different from v1.1.
+
+- `convert_paradee_pt_to_gguf.py --version 1.2` writes the styles as 2-D tensors `paradee.style.text [4, 32]` and
+  `paradee.style.decoder [4, 16]`, plus `paradee.voices` (names in model order), `paradee.voices.accent`
+  (`en-us` for `a*_` voices, `en-gb` for `b*_` voices: the misaki dialect each was trained on) and
+  `paradee.voice = af_heart` (the default). v1.0 and v1.1 files keep their 1-D styles.
+- The runtime loads a 1-D style as one voice and a 2-D style as a table. `paradee_voice_count`,
+  `paradee_voice_name`, `paradee_voice_accent`, `paradee_find_voice` and `paradee_default_voice` describe the
+  voices; `paradee_synth_options::voice` (and `paradee_stages::voice` for the staged calls) selects one, -1 is
+  the default. `paradee-tts --voice NAME` (`--voice list` prints them).
+- The British voices need misaki's British lexicon (`en.G2P(british=True)`), which `tools/misaki-g2p` does not
+  ship.
+- `dump_paradee_reference.py dump --version 1.2 --voice NAME` runs v1.1's modules with row `NAME` of each
+  table loaded into their `(1, dim)` style parameter.
+
+Parity (`test-paradee-parity`, M4 Max, the 5 fixture sentences, the reference's noise; torch 2.14.1 in the
+reference env, pins say 2.14.0): every stage gate passes, end to end 66.2–80.1 dB for `af_heart` and
+72.2–77.3 dB for `am_puck`. `test-paradee-api` checks the table (names, accents, row selection, out-of-range
+rows) on the v1.2 file.

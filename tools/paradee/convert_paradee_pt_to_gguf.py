@@ -37,9 +37,20 @@ and the phase-locking filter with a frame-rate source-filter head
 head it holds in paradee.decoder.head ("istftnet_lock" or "source_filter_v2");
 the runtime picks the graph from that key (a file without it is v1.0).
 
+--version 1.2 converts sahilmahendrakar/Paradee-8M-v1.2 (pins.json "v1.2").
+v1.2 is v1.1 with four voices: every tensor has v1.1's layout except the two
+learned styles, which become tables with one row per voice (text [4, 32],
+decoder [4, 16]). Both checkpoints carry a top-level 'voices' list next to
+'model', which must equal config.json's. The GGUF stores the tables as 2-D
+tensors (paradee.style.text [n_voices, 32], paradee.style.decoder
+[n_voices, 16]), the voice names in model order (paradee.voices), each
+voice's misaki accent (paradee.voices.accent: en-us for a*_ voices, en-gb
+for b*_ voices) and the default voice (paradee.voice = af_heart). v1.0 and
+v1.1 files keep their 1-D styles, so their bytes do not change.
+
 usage:
   convert_paradee_pt_to_gguf.py --model-dir <dir with pytorch/, config.json, tokenizer.json> \
-      --output paradee-8m-v1.0-f32.gguf [--version 1.0|1.1] [--outtype f32|f16] [--check-output]
+      --output paradee-8m-v1.0-f32.gguf [--version 1.0|1.1|1.2] [--outtype f32|f16] [--check-output]
 """
 
 from __future__ import annotations
@@ -194,9 +205,9 @@ def load_vocab(model_dir: Path, version: str = "1.0") -> list[tuple[str, int]]:
 
 
 def fold_weight_norm(sd: dict) -> dict:
-    """Fold weight_g/weight_v into weight with torch._weight_norm(v, g, 0)."""
-    import torch
-
+    """Fold weight_g/weight_v into weight with torch._weight_norm(v, g, 0). A state dict without
+    weight_norm pairs (for example one read from ONNX, where the weights are already folded) passes
+    through unchanged and does not need torch."""
     out = {}
     pairs: dict[str, dict] = {}
     for k, v in sd.items():
@@ -206,6 +217,8 @@ def fold_weight_norm(sd: dict) -> dict:
             pairs.setdefault(k[: -len(".weight_g")], {})["g"] = v
         else:
             out[k] = v
+    if pairs:
+        import torch
     for base, p in pairs.items():
         if set(p) != {"v", "g"}:
             raise SystemExit(f"incomplete weight_norm pair for {base}")
@@ -355,6 +368,23 @@ def expected_shapes_v11() -> dict[str, tuple[int, ...]]:
     return shapes
 
 
+def expected_shapes_v12(n_voices: int) -> dict[str, tuple[int, ...]]:
+    """v1.2: v1.1's shapes, with the two styles as [n_voices, dim] tables."""
+    h = HPARAMS_V11
+    shapes = expected_shapes_v11()
+    shapes[f"{NS}.style.text"] = (n_voices, h["style.text_dim"])
+    shapes[f"{NS}.style.decoder"] = (n_voices, h["style.decoder_dim"])
+    return shapes
+
+
+def voice_accent(name: str) -> str:
+    """misaki accent a Paradee voice was trained on: Kokoro's a*_ voices are American English (lang_code
+    'a'), b*_ voices British English (lang_code 'b'); paradee/tts.py picks the G2P the same way."""
+    if len(name) > 3 and name[2] == "_" and name[0] in "ab" and name[1] in "fm":
+        return "en-us" if name[0] == "a" else "en-gb"
+    raise SystemExit(f"voice {name!r} is not a Kokoro English voice name (a/b, f/m, '_')")
+
+
 def expected_shapes() -> dict[str, tuple[int, ...]]:
     """Shapes (PyTorch order) of the tensors whose widths the C++ graph reads
     from hparams. Everything else is checked for consistency at load time."""
@@ -394,19 +424,27 @@ def expected_shapes() -> dict[str, tuple[int, ...]]:
     }
 
 
-def collect(sd_raw: dict, mapping: list[tuple[str, str]], skipped: tuple[str, ...], label: str) -> dict[str, np.ndarray]:
+def collect(sd_raw: dict, mapping: list[tuple[str, str]], skipped: tuple[str, ...], label: str,
+            style_table: bool = False) -> dict[str, np.ndarray]:
     sd = fold_weight_norm(sd_raw)
     out: dict[str, np.ndarray] = {}
     used = set()
     for src, dst in mapping:
         if src not in sd:
             raise SystemExit(f"{label}: missing tensor {src}")
-        t = sd[src].detach().cpu().contiguous()
-        if t.dtype.is_floating_point is False:
-            raise SystemExit(f"{label}: {src} is not floating point")
-        arr = t.float().numpy()
+        t = sd[src]
+        if isinstance(t, np.ndarray):
+            if t.dtype.kind != "f":
+                raise SystemExit(f"{label}: {src} is not floating point")
+            arr = t.astype(np.float32)
+        else:
+            t = t.detach().cpu().contiguous()
+            if t.dtype.is_floating_point is False:
+                raise SystemExit(f"{label}: {src} is not floating point")
+            arr = t.float().numpy()
         if dst.endswith(".style.text") or dst.endswith(".style.decoder"):
-            arr = arr.reshape(-1)
+            # v1.0 / v1.1: one voice, stored 1-D. v1.2: [n_voices, dim], one row per voice.
+            arr = arr.reshape(arr.shape[0], -1) if style_table else arr.reshape(-1)
         out[dst] = np.ascontiguousarray(arr, dtype=np.float32)
         used.add(src)
     leftover = sorted(set(sd) - used - set(skipped))
@@ -422,15 +460,17 @@ HEAD_V11 = "source_filter_v2"
 
 
 def write_gguf(out_path: Path, tensors: dict[str, np.ndarray], vocab: list[tuple[str, int]], pins: dict,
-               outtype: str, version: str = "1.0") -> None:
-    v11 = version == "1.1"
+               outtype: str, version: str = "1.0", voices: list[str] | None = None) -> None:
+    v11 = version in ("1.1", "1.2")
+    voices = voices or ["af_heart"]
     writer = gguf.GGUFWriter(str(out_path), arch=ARCH)
     writer.add_string("general.name", f"Paradee-8M v{version}")
     writer.add_string("general.license", "apache-2.0")
     writer.add_string("general.source.url", f"https://huggingface.co/{pins['model']['repo']}")
     writer.add_string("general.base_model.0.name", "Kokoro-82M")
+    who = (f"{len(voices)}-voice ({', '.join(voices)})" if len(voices) > 1 else f"single-voice ({voices[0]})")
     writer.add_string("general.description",
-                      f"Paradee-8M v{version} single-voice (af_heart) TTS, distilled from Kokoro-82M. " +
+                      f"Paradee-8M v{version} {who} TTS, distilled from Kokoro-82M. " +
                       ("StyleTTS-2 text side + AdaIN decoder trunk + frame-rate source-filter head." if v11 else
                        "StyleTTS-2 text side + iSTFTNet decoder + phase-locking filter."))
     writer.add_string(f"{NS}.version", version)
@@ -443,7 +483,11 @@ def write_gguf(out_path: Path, tensors: dict[str, np.ndarray], vocab: list[tuple
             writer.add_float32(full, val)
         else:
             writer.add_int32(full, int(val))
-    writer.add_string(f"{NS}.voice", "af_heart")
+    writer.add_string(f"{NS}.voice", voices[0])
+    if version == "1.2":
+        # The style tables' rows, in model order (config.json "voices"), and each row's misaki accent.
+        writer.add_array(f"{NS}.voices", list(voices))
+        writer.add_array(f"{NS}.voices.accent", [voice_accent(v) for v in voices])
     writer.add_string(f"{NS}.phoneme_format", "misaki")
     writer.add_string(f"{NS}.input.pad_symbol", "$")
     writer.add_array(f"{NS}.vocab.symbols", [s for s, _ in vocab])
@@ -477,8 +521,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--model-dir", required=True, type=Path,
                     help="local snapshot of the pinned HF revision (pytorch/*.pt, config.json, tokenizer.json)")
     ap.add_argument("--output", required=True, type=Path)
-    ap.add_argument("--version", choices=("1.0", "1.1"), default="1.0",
-                    help="Paradee-8M release: 1.0 (default) or 1.1 (source-filter head); "
+    ap.add_argument("--version", choices=("1.0", "1.1", "1.2"), default="1.0",
+                    help="Paradee-8M release: 1.0 (default), 1.1 (source-filter head) or 1.2 (1.1 with four "
+                         "voices); "
                          "selects the pins.json section the inputs are checked against")
     ap.add_argument("--outtype", choices=("f32", "f16"), default="f32",
                     help="f32 (default, the parity-gated file) or f16 for >=2-D weights "
@@ -488,34 +533,50 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     pins = json.loads(PINS_PATH.read_text(encoding="utf-8"))
-    if args.version == "1.1":
-        pins = pins["v1.1"]
+    if args.version in ("1.1", "1.2"):
+        pins = pins[f"v{args.version}"]
     check_pins(args.model_dir, pins)
     vocab = load_vocab(args.model_dir, args.version)
+    v12 = args.version == "1.2"
+    voices = None
+    if v12:
+        voices = json.loads((args.model_dir / "config.json").read_text(encoding="utf-8")).get("voices")
+        if (not isinstance(voices, list) or not voices or voices[0] != "af_heart" or
+                len(set(voices)) != len(voices) or not all(isinstance(v, str) for v in voices)):
+            raise SystemExit(f"config.json voices {voices!r}: expected a list of unique names starting with af_heart")
+        for v in voices:
+            voice_accent(v)
 
     import torch
 
     text_sd = torch.load(args.model_dir / "pytorch/text_side.pt", map_location="cpu", weights_only=True)
     dec_sd = torch.load(args.model_dir / "pytorch/decoder.pt", map_location="cpu", weights_only=True)
-    if set(text_sd) != {"model"} or set(dec_sd) != {"model"}:
-        raise SystemExit("expected {'model': state_dict} checkpoints")
+    want_keys = {"model", "voices"} if v12 else {"model"}
+    if set(text_sd) != want_keys or set(dec_sd) != want_keys:
+        raise SystemExit(f"expected {sorted(want_keys)} checkpoints, got {sorted(text_sd)} / {sorted(dec_sd)}")
+    if v12:
+        for label, ck in (("text_side.pt", text_sd), ("decoder.pt", dec_sd)):
+            if list(ck["voices"]) != voices:
+                raise SystemExit(f"{label}: voices {ck['voices']!r} != config.json voices {voices!r}")
     text_sd, dec_sd = text_sd["model"], dec_sd["model"]
 
-    tensors = collect(text_sd, text_side_map(text_sd), TEXT_SIDE_SKIPPED, "text_side.pt")
-    dec_map = decoder_map_v11(dec_sd) if args.version == "1.1" else decoder_map(dec_sd)
-    dec = collect(dec_sd, dec_map, (), "decoder.pt")
+    tensors = collect(text_sd, text_side_map(text_sd), TEXT_SIDE_SKIPPED, "text_side.pt", style_table=v12)
+    dec_map = decoder_map_v11(dec_sd) if args.version in ("1.1", "1.2") else decoder_map(dec_sd)
+    dec = collect(dec_sd, dec_map, (), "decoder.pt", style_table=v12)
     overlap = set(tensors) & set(dec)
     if overlap:
         raise SystemExit(f"tensor name collision: {sorted(overlap)}")
     tensors.update(dec)
 
-    for name, shape in (expected_shapes_v11() if args.version == "1.1" else expected_shapes()).items():
+    shapes = (expected_shapes_v12(len(voices)) if v12 else
+              expected_shapes_v11() if args.version == "1.1" else expected_shapes())
+    for name, shape in shapes.items():
         if tuple(tensors[name].shape) != shape:
             raise SystemExit(f"{name}: shape {tuple(tensors[name].shape)} != expected {shape}")
     n_params = sum(int(a.size) for a in tensors.values())
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    write_gguf(args.output, tensors, vocab, pins, args.outtype, args.version)
+    write_gguf(args.output, tensors, vocab, pins, args.outtype, args.version, voices)
     digest = sha256_file(args.output)
     print(f"wrote {args.output}: {len(tensors)} tensors, {n_params} parameters, "
           f"{args.output.stat().st_size} bytes, sha256 {digest}")

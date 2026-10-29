@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //
-// paradee.h — Paradee-8M (v1.0 and v1.1) text-to-speech, native in the
+// paradee.h — Paradee-8M (v1.0, v1.1 and v1.2) text-to-speech, native in the
 // elizaOS llama.cpp fork (tools/paradee).
 //
 // Paradee (sahilmahendrakar/Paradee-8M-v1.0, Apache-2.0) is Kokoro-82M's
@@ -36,6 +36,14 @@
 // "source_filter_v2"; a file without the key is v1.0). The v1.1 head draws
 // Gaussian noise: from a fixed seed (PARADEE_DEFAULT_NOISE_SEED unless the
 // options say otherwise), so the same input gives the same audio.
+//
+// Paradee-8M v1.2 (sahilmahendrakar/Paradee-8M-v1.2) is v1.1 with four
+// voices: the two learned styles become tables with one row per voice, and
+// the voice picks the row. Everything else is shared. A v1.0 / v1.1 file has
+// one voice. paradee_voice_count / _name / _accent / paradee_find_voice
+// describe the voices; paradee_synth_options::voice (or
+// paradee_stages::voice for the staged calls) selects one, and -1 is the
+// file's default (paradee.voice, af_heart).
 //
 // Input phonemes must be misaki's spelling (Kokoro's G2P); eSpeak IPA must be
 // converted to misaki spelling first.
@@ -100,6 +108,18 @@ int paradee_sample_rate(const paradee_model * model) noexcept;
 paradee_head_kind paradee_get_head(const paradee_model * model) noexcept;
 const char * paradee_version(const paradee_model * model) noexcept;
 
+// Voices: rows of the style tables, in model order. 1 for v1.0 / v1.1, 4 for
+// v1.2, 0 for a null model. Names and accents are "" for an index out of
+// range; the accent is the misaki dialect the voice was trained on ("en-us",
+// "en-gb"), "" when the file does not say. paradee_find_voice returns -1
+// for an unknown name. paradee_default_voice is the paradee.voice row (-1
+// for a null model).
+int paradee_voice_count(const paradee_model * model) noexcept;
+int paradee_default_voice(const paradee_model * model) noexcept;
+const char * paradee_voice_name(const paradee_model * model, int voice) noexcept;
+const char * paradee_voice_accent(const paradee_model * model, int voice) noexcept;
+int paradee_find_voice(const paradee_model * model, const std::string & name) noexcept;
+
 // Map a misaki phoneme string (UTF-8, one vocabulary symbol per code point)
 // to model input ids: [0] + ids + [0]. Rejects empty input, invalid UTF-8,
 // any symbol outside the vocabulary (PARADEE_E_UNKNOWN_SYMBOL, the code point
@@ -157,6 +177,7 @@ struct paradee_synth_options {
     paradee_cancel_fn cancel = nullptr;
     void * cancel_user_data = nullptr;
     uint64_t noise_seed = PARADEE_DEFAULT_NOISE_SEED;   // v1.1 head only
+    int voice = -1;   // style row (paradee_find_voice); -1 = paradee_default_voice. Out of range: PARADEE_E_INVALID_ARG
 };
 
 struct paradee_audio {
@@ -200,6 +221,8 @@ struct paradee_stages {
     // instead of drawing it from the seed. The parity test feeds the
     // reference's noise here.
     const std::vector<float> * noise_in = nullptr;
+    // Input: the voice (style row) the staged calls use; -1 = the default.
+    int voice = -1;
 };
 
 // paradee_synthesize_ids that also fills `stages` (when non-null; its

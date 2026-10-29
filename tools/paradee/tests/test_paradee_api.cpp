@@ -3,8 +3,9 @@
 // test-paradee-api — the eliza_paradee C++ API contract on the real model:
 // loading, phoneme mapping (pads, unknown symbols, length limit, UTF-8),
 // input validation, determinism, speed, and cancellation (before the call,
-// between stages and inside the generator loops). Runs on a v1.0 or a v1.1
-// GGUF; for v1.1 also the noise seed and injected noise.
+// between stages and inside the generator loops). Runs on a v1.0, v1.1 or
+// v1.2 GGUF; for v1.1 / v1.2 also the noise seed and injected noise, and for
+// v1.2 the voice table (names, accents, row selection).
 //
 // Needs PARADEE_GGUF (environment); exits 77 (CTest SKIP) without it.
 
@@ -45,8 +46,38 @@ int main() {
     if (!model) { std::fprintf(stderr, "load failed: %s\n", err.c_str()); return 1; }
     CHECK(paradee_sample_rate(model.get()) == 24000, "sample rate %d", paradee_sample_rate(model.get()));
     CHECK(paradee_sample_rate(nullptr) == 0, "null model sample rate");
-    const bool v11 = paradee_get_head(model.get()) == PARADEE_HEAD_SOURCE_FILTER;
-    CHECK(std::string(paradee_version(model.get())) == (v11 ? "1.1" : "1.0"), "version %s", paradee_version(model.get()));
+    const bool v11 = paradee_get_head(model.get()) == PARADEE_HEAD_SOURCE_FILTER;   // v1.1 or v1.2
+    const std::string version = paradee_version(model.get());
+    const bool v12 = version == "1.2";
+    CHECK(version == (v12 ? "1.2" : v11 ? "1.1" : "1.0"), "version %s", version.c_str());
+
+    // Voices: one for v1.0 / v1.1, the v1.2 table in model order.
+    {
+        const int nv = paradee_voice_count(model.get());
+        CHECK(paradee_voice_count(nullptr) == 0 && paradee_default_voice(nullptr) == -1 &&
+              std::string(paradee_voice_name(nullptr, 0)).empty() && paradee_find_voice(nullptr, "af_heart") == -1,
+              "null model voices");
+        const char * def_name = "af_heart";
+        CHECK(paradee_default_voice(model.get()) == 0 && std::string(paradee_voice_name(model.get(), 0)) == def_name,
+              "default voice %d %s", paradee_default_voice(model.get()), paradee_voice_name(model.get(), 0));
+        CHECK(std::string(paradee_voice_name(model.get(), nv)).empty() &&
+              std::string(paradee_voice_name(model.get(), -1)).empty(), "voice name out of range");
+        CHECK(paradee_find_voice(model.get(), def_name) == 0 && paradee_find_voice(model.get(), "nobody") == -1,
+              "find voice");
+        if (v12) {
+            const char * names[] = { "af_heart", "bf_isabella", "am_puck", "bm_fable" };
+            const char * accents[] = { "en-us", "en-gb", "en-us", "en-gb" };
+            CHECK(nv == 4, "v1.2 has %d voices", nv);
+            for (int i = 0; i < 4 && nv == 4; ++i) {
+                CHECK(std::string(paradee_voice_name(model.get(), i)) == names[i] &&
+                      std::string(paradee_voice_accent(model.get(), i)) == accents[i] &&
+                      paradee_find_voice(model.get(), names[i]) == i, "voice %d: %s %s", i,
+                      paradee_voice_name(model.get(), i), paradee_voice_accent(model.get(), i));
+            }
+        } else {
+            CHECK(nv == 1 && std::string(paradee_voice_accent(model.get(), 0)).empty(), "v1.0 / v1.1 have one voice");
+        }
+    }
     CHECK(paradee_get_head(nullptr) == PARADEE_HEAD_ISTFTNET_LOCK && std::string(paradee_version(nullptr)).empty(),
           "null model head / version");
     const paradee_lock_params * lp = paradee_get_lock_params(model.get());
@@ -158,6 +189,43 @@ int main() {
         paradee_audio audio;
         CHECK(paradee_synthesize(model.get(), ids, opts, audio, err) == PARADEE_OK && audio.samples == a &&
               audio.sample_rate == 24000, "paradee_synthesize differs");
+    }
+
+    // Voice selection: -1 and the default row give the same audio; every
+    // other row is a different voice; an index out of range is rejected.
+    {
+        const int nv = paradee_voice_count(model.get());
+        paradee_synth_options opts;
+        paradee_audio out;
+        opts.voice = paradee_default_voice(model.get());
+        CHECK(paradee_synthesize(model.get(), ids, opts, out, err) == PARADEE_OK && out.samples == a,
+              "the default voice by index differs from voice -1");
+        for (int v = 1; v < nv; ++v) {
+            opts.voice = v;
+            CHECK(paradee_synthesize(model.get(), ids, opts, out, err) == PARADEE_OK && !out.samples.empty() &&
+                  out.samples != a, "voice %d gives af_heart's audio", v);
+            paradee_audio again;
+            CHECK(paradee_synthesize(model.get(), ids, opts, again, err) == PARADEE_OK && again.samples == out.samples,
+                  "voice %d is not deterministic", v);
+        }
+        for (int bad : { nv, -2 }) {
+            opts.voice = bad;
+            out.samples.assign(4, 1.0f);
+            CHECK(paradee_synthesize(model.get(), ids, opts, out, err) == PARADEE_E_INVALID_ARG && out.samples.empty(),
+                  "voice %d accepted", bad);
+        }
+        paradee_stages st;
+        st.voice = nv;
+        CHECK(paradee_synthesize_ids_staged(model.get(), ids.data(), ids.size(), 1.0f, nullptr, nullptr, pcm, err, &st) ==
+              PARADEE_E_INVALID_ARG, "staged voice out of range accepted");
+        if (nv > 1) {
+            paradee_stages s1;
+            s1.voice = 1;
+            opts.voice = 1;
+            CHECK(paradee_synthesize_ids_staged(model.get(), ids.data(), ids.size(), 1.0f, nullptr, nullptr, pcm, err, &s1) ==
+                  PARADEE_OK && paradee_synthesize(model.get(), ids, opts, out, err) == PARADEE_OK && pcm == out.samples,
+                  "staged voice 1 differs from voice 1");
+        }
     }
 
     // v1.1: the noise comes from the seed (the default one unless the options
