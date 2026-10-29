@@ -3,7 +3,11 @@
 // paradee-tts — synthesize misaki phonemes with Paradee-8M to a 24 kHz WAV.
 //
 //   paradee-tts --model paradee-8m-v1.0-f32.gguf --phonemes "həlˈO wˈɜɹld." --output hello.wav
-//               [--speed 1.0] [--f32] [--repeat N]
+//               [--speed 1.0] [--voice NAME] [--seed N] [--f32] [--repeat N]
+//
+// --voice picks a row of a v1.2 file's voice table (default: the file's
+// default voice; --voice list prints them). --seed is the v1.1 / v1.2
+// head's noise seed.
 //
 // The input is misaki's phoneme spelling (Kokoro's G2P), not text and not
 // eSpeak IPA. --repeat N synthesizes N times and reports the real-time factor
@@ -28,7 +32,7 @@ namespace {
 void usage(const char * argv0) {
     std::fprintf(stderr,
         "usage: %s --model <gguf> (--phonemes \"...\" | --phonemes-file <utf8.txt>) --output <wav>\n"
-        "          [--speed 1.0] [--f32] [--repeat N]\n", argv0);
+        "          [--speed 1.0] [--voice NAME|list] [--seed N] [--f32] [--repeat N]\n", argv0);
 }
 
 bool write_wav(const std::string & path, const std::vector<float> & samples, int sample_rate, bool f32) {
@@ -62,6 +66,8 @@ int main(int argc, char ** argv) {
     float speed = 1.0f;
     bool f32 = false;
     int repeat = 1;
+    std::string voice_name;
+    uint64_t seed = eliza_paradee::PARADEE_DEFAULT_NOISE_SEED;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> const char * { return i + 1 < argc ? argv[++i] : nullptr; };
@@ -76,16 +82,34 @@ int main(int argc, char ** argv) {
         else if (a == "--output" && (v = next())) out_path = v;
         else if (a == "--speed" && (v = next())) speed = std::strtof(v, nullptr);
         else if (a == "--repeat" && (v = next())) repeat = std::max(1, std::atoi(v));
+        else if (a == "--voice" && (v = next())) voice_name = v;
+        else if (a == "--seed" && (v = next())) seed = std::strtoull(v, nullptr, 10);
         else if (a == "--f32") f32 = true;
         else { usage(argv[0]); return 2; }
     }
-    if (model_path.empty() || phonemes.empty() || out_path.empty()) { usage(argv[0]); return 2; }
+    const bool list_voices = voice_name == "list";
+    if (model_path.empty() || (!list_voices && (phonemes.empty() || out_path.empty()))) { usage(argv[0]); return 2; }
 
     std::string err;
     auto t0 = std::chrono::steady_clock::now();
     auto model = eliza_paradee::paradee_load_model(model_path, err);
     if (!model) { std::fprintf(stderr, "load failed: %s\n", err.c_str()); return 1; }
     const double load_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (list_voices) {
+        for (int i = 0; i < eliza_paradee::paradee_voice_count(model.get()); ++i) {
+            std::printf("%d %s %s%s\n", i, eliza_paradee::paradee_voice_name(model.get(), i),
+                        eliza_paradee::paradee_voice_accent(model.get(), i),
+                        i == eliza_paradee::paradee_default_voice(model.get()) ? " (default)" : "");
+        }
+        return 0;
+    }
+    eliza_paradee::paradee_synth_options opts;
+    opts.speed = speed;
+    opts.noise_seed = seed;
+    if (!voice_name.empty()) {
+        opts.voice = eliza_paradee::paradee_find_voice(model.get(), voice_name);
+        if (opts.voice < 0) { std::fprintf(stderr, "no voice '%s' (--voice list)\n", voice_name.c_str()); return 1; }
+    }
 
     std::vector<int32_t> ids;
     eliza_paradee::paradee_status st = eliza_paradee::paradee_phonemes_to_ids(model.get(), phonemes, ids, err);
@@ -93,11 +117,12 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "phonemes rejected (%s): %s\n", eliza_paradee::paradee_status_str(st), err.c_str());
         return 1;
     }
-    std::vector<float> pcm;
+    eliza_paradee::paradee_audio audio;
+    std::vector<float> & pcm = audio.samples;
     double best = 1e30;
     for (int r = 0; r < repeat; ++r) {
         const auto t = std::chrono::steady_clock::now();
-        st = eliza_paradee::paradee_synthesize_ids(model.get(), ids.data(), ids.size(), speed, nullptr, nullptr, pcm, err);
+        st = eliza_paradee::paradee_synthesize(model.get(), ids, opts, audio, err);
         best = std::min(best, std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count());
         if (st != eliza_paradee::PARADEE_OK) {
             std::fprintf(stderr, "synthesis failed (%s): %s\n", eliza_paradee::paradee_status_str(st), err.c_str());

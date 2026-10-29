@@ -92,7 +92,13 @@ struct paradee_model {
     ggml_context * ctx = nullptr;        // all-F32 view the layers read
     void * map_addr = nullptr;           // read-only mapping of an all-F32 file (else null)
     size_t map_size = 0;
+    // Learned styles, one row per voice: [n_voices * style_text_dim] and
+    // [n_voices * style_decoder_dim]. v1.0 / v1.1 have one voice.
     std::vector<float> style_text, style_dec;
+    int n_voices = 1;
+    int default_voice = 0;
+    std::vector<std::string> voice_names;     // [n_voices]
+    std::vector<std::string> voice_accents;   // [n_voices]; "" when the file does not say
     std::mutex mu;
 };
 
@@ -200,6 +206,30 @@ bool utf8_next(const std::string & s, size_t & i, uint32_t & cp) {
         return false;
     }
     i += (size_t) len;
+    return true;
+}
+
+// Optional string array: false (with `err`) only when the key exists with another type.
+bool read_str_array(gguf_context * g, const char * key, std::vector<std::string> & out, bool & present,
+                    std::string & err) {
+    out.clear();
+    present = false;
+    const int64_t id = gguf_find_key(g, key);
+    if (id < 0) return true;
+    if (gguf_get_kv_type(g, id) != GGUF_TYPE_ARRAY || gguf_get_arr_type(g, id) != GGUF_TYPE_STRING) {
+        err = std::string("GGUF key ") + key + " is not a string array";
+        return false;
+    }
+    const size_t n = gguf_get_arr_n(g, id);
+    for (size_t i = 0; i < n; ++i) out.emplace_back(gguf_get_arr_str(g, id, i));
+    present = true;
+    return true;
+}
+
+bool read_opt_str(gguf_context * g, const char * key, std::string & out) {
+    const int64_t id = gguf_find_key(g, key);
+    if (id < 0 || gguf_get_kv_type(g, id) != GGUF_TYPE_STRING) return false;
+    out = gguf_get_val_str(g, id);
     return true;
 }
 
@@ -392,14 +422,59 @@ paradee_model_ptr paradee_load_model(const std::string & gguf_path, std::string 
             }
         }
 
+        // Styles: a 1-D tensor is one voice (v1.0, v1.1); a 2-D [n_voices, dim]
+        // tensor (ggml ne = {dim, n_voices}) is a table, one row per voice (v1.2).
         ggml_tensor * st = ggml_get_tensor(m->ctx, "paradee.style.text");
         ggml_tensor * sd = ggml_get_tensor(m->ctx, "paradee.style.decoder");
-        if (!st || !sd || ggml_nelements(st) != h.style_text_dim || ggml_nelements(sd) != h.style_decoder_dim) {
+        const auto rows = [](const ggml_tensor * t, int dim) -> int64_t {
+            if (!t || t->ne[0] != dim || t->ne[2] != 1 || t->ne[3] != 1) return -1;
+            return t->ne[1];
+        };
+        const int64_t n_st = rows(st, h.style_text_dim), n_sd = rows(sd, h.style_decoder_dim);
+        if (n_st < 1 || n_st != n_sd || n_st > 4096) {
             err = "missing or mis-sized paradee.style.text / paradee.style.decoder";
             return nullptr;
         }
-        m->style_text.assign((const float *) st->data, (const float *) st->data + h.style_text_dim);
-        m->style_dec.assign((const float *) sd->data, (const float *) sd->data + h.style_decoder_dim);
+        m->n_voices = (int) n_st;
+        m->style_text.assign((const float *) st->data, (const float *) st->data + (size_t) n_st * h.style_text_dim);
+        m->style_dec.assign((const float *) sd->data, (const float *) sd->data + (size_t) n_st * h.style_decoder_dim);
+        {
+            bool have_names = false, have_accents = false;
+            if (!read_str_array(g, "paradee.voices", m->voice_names, have_names, err) ||
+                !read_str_array(g, "paradee.voices.accent", m->voice_accents, have_accents, err)) {
+                return nullptr;
+            }
+            std::string def;
+            const bool have_def = read_opt_str(g, "paradee.voice", def);
+            if (!have_names) {
+                if (m->n_voices != 1) { err = "a style table needs paradee.voices"; return nullptr; }
+                m->voice_names = { have_def ? def : std::string("default") };
+            }
+            if ((int) m->voice_names.size() != m->n_voices) {
+                err = "paradee.voices has " + std::to_string(m->voice_names.size()) + " names for " +
+                      std::to_string(m->n_voices) + " style rows";
+                return nullptr;
+            }
+            for (size_t i = 0; i < m->voice_names.size(); ++i) {
+                if (m->voice_names[i].empty() ||
+                    std::find(m->voice_names.begin(), m->voice_names.begin() + (long) i, m->voice_names[i]) !=
+                        m->voice_names.begin() + (long) i) {
+                    err = "paradee.voices has an empty or repeated name";
+                    return nullptr;
+                }
+            }
+            if (!have_accents) m->voice_accents.assign((size_t) m->n_voices, std::string());
+            if ((int) m->voice_accents.size() != m->n_voices) {
+                err = "paradee.voices.accent does not have one entry per voice";
+                return nullptr;
+            }
+            m->default_voice = 0;
+            if (have_def) {
+                const auto it = std::find(m->voice_names.begin(), m->voice_names.end(), def);
+                if (it == m->voice_names.end()) { err = "paradee.voice '" + def + "' is not in paradee.voices"; return nullptr; }
+                m->default_voice = (int) (it - m->voice_names.begin());
+            }
+        }
 
         const char * required[] = {
             "paradee.bert.token_embd.weight", "paradee.bert.layer.attn_q.weight",
@@ -452,6 +527,32 @@ paradee_head_kind paradee_get_head(const paradee_model * model) noexcept {
 
 const char * paradee_version(const paradee_model * model) noexcept {
     return model ? model->version.c_str() : "";
+}
+
+int paradee_voice_count(const paradee_model * model) noexcept {
+    return model ? model->n_voices : 0;
+}
+
+int paradee_default_voice(const paradee_model * model) noexcept {
+    return model ? model->default_voice : -1;
+}
+
+const char * paradee_voice_name(const paradee_model * model, int voice) noexcept {
+    if (!model || voice < 0 || voice >= model->n_voices) return "";
+    return model->voice_names[(size_t) voice].c_str();
+}
+
+const char * paradee_voice_accent(const paradee_model * model, int voice) noexcept {
+    if (!model || voice < 0 || voice >= model->n_voices) return "";
+    return model->voice_accents[(size_t) voice].c_str();
+}
+
+int paradee_find_voice(const paradee_model * model, const std::string & name) noexcept {
+    if (!model) return -1;
+    for (int i = 0; i < model->n_voices; ++i) {
+        if (model->voice_names[(size_t) i] == name) return i;
+    }
+    return -1;
 }
 
 const paradee_lock_params * paradee_get_lock_params(const paradee_model * model) noexcept {
@@ -579,7 +680,7 @@ namespace {
 // v1.1: AdaIN trunk + source-filter head. noise_in (optional) replaces the
 // seeded noise. Caller holds model->mu.
 paradee_status decode_head_locked(
-        const paradee_model * model,
+        const paradee_model * model, const float * style_dec,
         const float * asr_ct, int A, int T,
         const float * F0, const float * N,
         paradee_cancel_fn cancel, void * user,
@@ -587,7 +688,7 @@ paradee_status decode_head_locked(
         std::vector<float> & pcm, paradee_stages * stages, std::string & err) {
     std::vector<float> x;
     if (!eliza_kokoro::decoder_front_forward(model->ctx, "paradee", /*instnorm_affine*/ true, asr_ct, A, T, F0, N,
-                                             model->style_dec.data(), x, err)) {
+                                             style_dec, x, err)) {
         if (err.empty()) err = "decoder trunk failed";
         return PARADEE_E_RUNTIME;
     }
@@ -629,7 +730,7 @@ paradee_status decode_head_locked(
 
 // Decoder + generator + phase lock. Caller holds model->mu.
 paradee_status decode_locked(
-        const paradee_model * model,
+        const paradee_model * model, const float * style_dec,
         const float * asr_ct, int A, int T,
         const float * F0, const float * N,
         paradee_cancel_fn cancel, void * user,
@@ -650,7 +751,7 @@ paradee_status decode_locked(
     dc.cancel = cancel ? cancel_trampoline : nullptr;
     dc.cancel_user = &cs;
     if (!eliza_kokoro::decoder_forward(model->ctx, dc, asr_ct, A, T, F0, N,
-                                       model->style_dec.data(), dec, err)) {
+                                       style_dec, dec, err)) {
         if (dc.cancelled) { err = "cancelled"; return PARADEE_CANCELLED; }
         if (err.empty()) err = "decoder failed";
         return PARADEE_E_RUNTIME;
@@ -669,10 +770,21 @@ paradee_status decode_locked(
 
 namespace {
 
+// -1 selects the default voice; anything else must be a style row.
+bool resolve_voice(const paradee_model * model, int & voice, std::string & err) {
+    if (voice == -1) voice = model->default_voice;
+    if (voice < 0 || voice >= model->n_voices) {
+        err = "voice " + std::to_string(voice) + " out of range (the model has " + std::to_string(model->n_voices) +
+              (model->n_voices == 1 ? " voice)" : " voices)");
+        return false;
+    }
+    return true;
+}
+
 paradee_status synthesize_impl(
         const paradee_model * model,
         const int32_t * ids, size_t n,
-        float speed, uint64_t seed,
+        float speed, uint64_t seed, int voice,
         paradee_cancel_fn cancel, void * user,
         std::vector<float> & pcm,
         std::string & err,
@@ -700,6 +812,9 @@ paradee_status synthesize_impl(
               std::to_string(PARADEE_MAX_SPEED) + "]";
         return PARADEE_E_INVALID_ARG;
     }
+    if (!resolve_voice(model, voice, err)) return PARADEE_E_INVALID_ARG;
+    const float * style_text = model->style_text.data() + (size_t) voice * (size_t) h.style_text_dim;
+    const float * style_dec = model->style_dec.data() + (size_t) voice * (size_t) h.style_decoder_dim;
 
     try {
         std::lock_guard<std::mutex> lk(const_cast<paradee_model *>(model)->mu);
@@ -717,7 +832,7 @@ paradee_status synthesize_impl(
         pc.n_layer = h.predictor_n_layer;
         pc.max_dur = h.predictor_max_dur;
         pc.text_kernel = h.text_encoder_kernel;
-        pc.style = model->style_text.data();
+        pc.style = style_text;
         pc.torch_round = true;
         pc.instnorm_affine = true;
         pc.asr_proj_mlp = true;
@@ -748,10 +863,10 @@ paradee_status synthesize_impl(
         std::vector<float> src, dec;
         const paradee_status dst =
             model->head_kind == PARADEE_HEAD_SOURCE_FILTER
-                ? decode_head_locked(model, asr_ct.data(), A, T, pred.F0_pred.data(), pred.N_pred.data(), cancel,
-                                     user, stages ? stages->noise_in : nullptr, seed, pcm, stages, err)
-                : decode_locked(model, asr_ct.data(), A, T, pred.F0_pred.data(), pred.N_pred.data(), cancel, user,
-                                dec, src, pcm, err);
+                ? decode_head_locked(model, style_dec, asr_ct.data(), A, T, pred.F0_pred.data(), pred.N_pred.data(),
+                                     cancel, user, stages ? stages->noise_in : nullptr, seed, pcm, stages, err)
+                : decode_locked(model, style_dec, asr_ct.data(), A, T, pred.F0_pred.data(), pred.N_pred.data(), cancel,
+                                user, dec, src, pcm, err);
         if (dst != PARADEE_OK) { pcm.clear(); return dst; }
 
         if (stages) {
@@ -794,7 +909,8 @@ paradee_status paradee_synthesize_ids_staged(
         std::vector<float> & pcm,
         std::string & err,
         paradee_stages * stages) noexcept {
-    return synthesize_impl(model, ids, n, speed, PARADEE_DEFAULT_NOISE_SEED, cancel, user, pcm, err, stages);
+    return synthesize_impl(model, ids, n, speed, PARADEE_DEFAULT_NOISE_SEED, stages ? stages->voice : -1, cancel, user,
+                           pcm, err, stages);
 }
 
 paradee_status paradee_synthesize_ids(
@@ -804,7 +920,7 @@ paradee_status paradee_synthesize_ids(
         paradee_cancel_fn cancel, void * user,
         std::vector<float> & pcm,
         std::string & err) noexcept {
-    return synthesize_impl(model, ids, n, speed, PARADEE_DEFAULT_NOISE_SEED, cancel, user, pcm, err, nullptr);
+    return synthesize_impl(model, ids, n, speed, PARADEE_DEFAULT_NOISE_SEED, -1, cancel, user, pcm, err, nullptr);
 }
 
 } // namespace eliza_paradee
@@ -818,7 +934,7 @@ paradee_status paradee_synthesize(
         paradee_audio & out,
         std::string & err) noexcept {
     out.sample_rate = model ? model->hp.sample_rate : 24000;
-    return synthesize_impl(model, input_ids.data(), input_ids.size(), opts.speed, opts.noise_seed,
+    return synthesize_impl(model, input_ids.data(), input_ids.size(), opts.speed, opts.noise_seed, opts.voice,
                            opts.cancel, opts.cancel_user_data, out.samples, err, nullptr);
 }
 
@@ -844,9 +960,12 @@ paradee_status paradee_decode_staged(
         eliza_kokoro::detail::KokoroLayerOptionsScope layer_scope(fast_layers());
         stages->T_frame = T_frame;
         stages->asr_dim = asr_dim;
+        int voice = stages->voice;
+        if (!resolve_voice(model, voice, err)) return PARADEE_E_INVALID_ARG;
+        const float * style_dec = model->style_dec.data() + (size_t) voice * (size_t) model->hp.style_decoder_dim;
         if (model->head_kind == PARADEE_HEAD_SOURCE_FILTER) {
             if (src) { err = "a v1.1 model has no harmonic source to replace"; return PARADEE_E_INVALID_ARG; }
-            return decode_head_locked(model, asr, asr_dim, T_frame, F0, N, cancel, user, stages->noise_in,
+            return decode_head_locked(model, style_dec, asr, asr_dim, T_frame, F0, N, cancel, user, stages->noise_in,
                                       PARADEE_DEFAULT_NOISE_SEED, stages->wav, stages, err);
         }
         const paradee_hparams & h = model->hp;
@@ -855,7 +974,7 @@ paradee_status paradee_decode_staged(
             err = "src must have " + std::to_string(n_src) + " samples";
             return PARADEE_E_INVALID_ARG;
         }
-        return decode_locked(model, asr, asr_dim, T_frame, F0, N, cancel, user,
+        return decode_locked(model, style_dec, asr, asr_dim, T_frame, F0, N, cancel, user,
                              stages->dec, stages->src, stages->wav, err, src);
     } catch (const std::bad_alloc &) {
         err = "out of memory";
