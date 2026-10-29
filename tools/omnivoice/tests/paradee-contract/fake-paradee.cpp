@@ -5,6 +5,11 @@
 // Vocab: the Kokoro ids the real model uses for punctuation and space
 // (; 1, : 2, , 3, . 4, ! 5, ? 6, — 9, … 10, space 16); 'a'..'z' -> 43..68;
 // '#' is out of vocab and dropped; any other code point -> 100.
+//
+// Model paths name the fake release: "delibes" -> family delibes, language
+// es, phoneme format espeak-es, validated 360 ids and speed [0.85, 1.15],
+// voice em_alex; "v12" -> Paradee v1.2's four voices (af_heart en-us,
+// bf_isabella en-gb, am_puck en-us, bm_fable en-gb); else one voice af_heart.
 
 #include "paradee.h"
 #include "misaki-g2p.h"
@@ -24,14 +29,19 @@ void fake_paradee_reset() {
     g_state.synth_calls = 0;
     g_state.in_flight = false;
     g_state.block_ms = 0;
+    g_state.espeak_loads = 0;
     std::lock_guard<std::mutex> lock(g_state.sizes_mutex);
     g_state.input_sizes.clear();
+    g_state.voices.clear();
+    g_state.speeds.clear();
 }
 
 namespace eliza_paradee {
 
 struct paradee_model {
     std::string path;
+    bool delibes = false;
+    std::vector<std::string> voices, accents;
 };
 
 void paradee_model_deleter::operator()(paradee_model * m) const noexcept {
@@ -47,11 +57,49 @@ paradee_model_ptr paradee_load_model(const std::string & gguf_path, std::string 
     }
     g_state.model_loads.fetch_add(1);
     g_state.live_models.fetch_add(1);
-    return paradee_model_ptr(new paradee_model{ gguf_path });
+    paradee_model * m = new paradee_model{ gguf_path, false, {}, {} };
+    if (gguf_path.find("delibes") != std::string::npos) {
+        m->delibes = true;
+        m->voices = { "em_alex" };
+        m->accents = { "" };
+    } else if (gguf_path.find("v12") != std::string::npos) {
+        m->voices = { "af_heart", "bf_isabella", "am_puck", "bm_fable" };
+        m->accents = { "en-us", "en-gb", "en-us", "en-gb" };
+    } else {
+        m->voices = { "af_heart" };
+        m->accents = { "" };
+    }
+    return paradee_model_ptr(m);
 }
 
 int paradee_sample_rate(const paradee_model * model) noexcept {
     return model ? 24000 : -1;
+}
+
+const char * paradee_family(const paradee_model * m) noexcept { return !m ? "" : m->delibes ? "delibes" : "paradee"; }
+const char * paradee_language(const paradee_model * m) noexcept { return !m ? "" : m->delibes ? "es" : "en"; }
+const char * paradee_phoneme_format(const paradee_model * m) noexcept {
+    return !m ? "" : m->delibes ? "espeak-es" : "misaki";
+}
+int paradee_validated_max_ids(const paradee_model * m) noexcept { return !m ? 0 : m->delibes ? 360 : 512; }
+bool paradee_validated_speed(const paradee_model * m, float & lo, float & hi) noexcept {
+    if (!m) return false;
+    lo = m->delibes ? 0.85f : PARADEE_MIN_SPEED;
+    hi = m->delibes ? 1.15f : PARADEE_MAX_SPEED;
+    return true;
+}
+int paradee_voice_count(const paradee_model * m) noexcept { return m ? (int) m->voices.size() : 0; }
+int paradee_default_voice(const paradee_model * m) noexcept { return m ? 0 : -1; }
+const char * paradee_voice_name(const paradee_model * m, int v) noexcept {
+    return m && v >= 0 && v < (int) m->voices.size() ? m->voices[(size_t) v].c_str() : "";
+}
+const char * paradee_voice_accent(const paradee_model * m, int v) noexcept {
+    return m && v >= 0 && v < (int) m->accents.size() ? m->accents[(size_t) v].c_str() : "";
+}
+int paradee_find_voice(const paradee_model * m, const std::string & name) noexcept {
+    if (!m) return -1;
+    for (size_t i = 0; i < m->voices.size(); ++i) if (m->voices[i] == name) return (int) i;
+    return -1;
 }
 
 paradee_status paradee_phonemes_to_symbol_ids_lenient(
@@ -101,10 +149,16 @@ paradee_status paradee_synthesize(
         err_out = "fake: bad speed";
         return PARADEE_E_INVALID_ARG;
     }
+    if (opts.voice < -1 || opts.voice >= (int) model->voices.size()) {
+        err_out = "fake: voice out of range";
+        return PARADEE_E_INVALID_ARG;
+    }
     g_state.synth_calls.fetch_add(1);
     {
         std::lock_guard<std::mutex> lock(g_state.sizes_mutex);
         g_state.input_sizes.push_back(input_ids.size());
+        g_state.voices.push_back(opts.voice);
+        g_state.speeds.push_back(opts.speed);
     }
     const int block_ms = g_state.block_ms.load();
     g_state.in_flight = true;
@@ -173,6 +227,46 @@ bool misaki_phonemize(
     if (text.find("\x01" "fail") != std::string::npos) { err_out = "fake: g2p failure"; return false; }
     out.clear();
     for (unsigned char c : text) {
+        if (std::isalpha(c)) out.push_back((char) std::tolower(c));
+        else if (std::isdigit(c)) continue;
+        else out.push_back((char) c);
+    }
+    return true;
+}
+
+struct espeak_g2p {
+    std::string language;
+};
+
+void espeak_g2p_deleter::operator()(espeak_g2p * g) const noexcept {
+    if (!g) return;
+    g_state.live_espeak.fetch_sub(1);
+    delete g;
+}
+
+espeak_g2p_ptr espeak_g2p_open(const std::string & language, const char * espeak_data_dir,
+                               std::string & err_out) noexcept {
+    if (language != "es") { err_out = "fake: no eSpeak G2P for " + language; return nullptr; }
+    if (!espeak_data_dir || std::string(espeak_data_dir).find("missing") != std::string::npos) {
+        err_out = "fake: no eSpeak data";
+        return nullptr;
+    }
+    g_state.espeak_loads.fetch_add(1);
+    g_state.live_espeak.fetch_add(1);
+    return espeak_g2p_ptr(new espeak_g2p{ language });
+}
+
+const char * espeak_g2p_language(const espeak_g2p * g) noexcept { return g ? g->language.c_str() : ""; }
+
+// "G2P": like misaki_phonemize, and '\xC2\xBF' (U+00BF) is dropped as the
+// real one drops symbols outside the vocabulary.
+bool espeak_g2p_phonemize(const espeak_g2p * g, const std::string & text, std::string & out,
+                          std::string & err_out) noexcept {
+    if (!g) { err_out = "fake: null espeak g2p"; return false; }
+    out.clear();
+    for (size_t i = 0; i < text.size(); ++i) {
+        const unsigned char c = (unsigned char) text[i];
+        if (c == 0xC2 && i + 1 < text.size() && (unsigned char) text[i + 1] == 0xBF) { ++i; continue; }
         if (std::isalpha(c)) out.push_back((char) std::tolower(c));
         else if (std::isdigit(c)) continue;
         else out.push_back((char) c);

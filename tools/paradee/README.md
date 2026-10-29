@@ -1,4 +1,4 @@
-# tools/paradee: Paradee-8M TTS (v1.0 and v1.1)
+# tools/paradee: Paradee-8M TTS (v1.0, v1.1, v1.2) and Delibes-8M-esES
 
 Paradee-8M v1.0 ([sahilmahendrakar/Paradee-8M-v1.0](https://huggingface.co/sahilmahendrakar/Paradee-8M-v1.0), Apache-2.0)
 is Kokoro-82M's StyleTTS-2 + iSTFTNet code at smaller widths. It is distilled to one voice (`af_heart`), has
@@ -14,6 +14,9 @@ natively, with no ONNX:
   shapes, and Kokoro-82M's output is unchanged bit for bit.
 - `src/paradee-phase-lock.cpp` is a native implementation of the model's phase-locking filter.
 - `src/paradee-head.cpp` runs Paradee-8M v1.1's source-filter head. See [v1.1](#v11-source-filter-head).
+- Paradee-8M v1.2 is v1.1 with four voices (a style table, one row per voice). See [v1.2](#v12-four-voices).
+- `convert_paradee_onnx_to_gguf.py` converts Delibes-8M-esES, a Castilian Spanish model on v1.1's architecture
+  that is published only as ONNX. See [Delibes-8M-esES](#delibes-8m-eses-castilian-spanish).
 
 ## Pipeline
 
@@ -274,3 +277,63 @@ from `paradee-tts`, divided by the audio length.
   work. Treat the absolute RTFs as approximate; the two releases were measured back to back.
 - Peak memory is lower mainly because the head never builds the generator's 24 kHz feature maps. With
   #85's memory mapping, both files would also stop counting their 31–32 MB of weights as private memory.
+
+## v1.2: four voices
+
+[sahilmahendrakar/Paradee-8M-v1.2](https://huggingface.co/sahilmahendrakar/Paradee-8M-v1.2) at `ed2934d4`
+(Apache-2.0; pins.json `"v1.2"`) is v1.1 retrained with four voices: `af_heart`, `bf_isabella`, `am_puck` and
+`bm_fable`, in that order (config.json `voices`). Every tensor has v1.1's name and shape except the two learned
+styles, which become tables: text `(4, 32)` and decoder `(4, 16)`. Both checkpoints carry a top-level `voices`
+list next to `model`. The training scripts the reference imports are byte-identical to v1.1's, and the weights
+are retrained, so `af_heart` sounds different from v1.1.
+
+- `convert_paradee_pt_to_gguf.py --version 1.2` writes the styles as 2-D tensors `paradee.style.text [4, 32]` and
+  `paradee.style.decoder [4, 16]`, plus `paradee.voices` (names in model order), `paradee.voices.accent`
+  (`en-us` for `a*_` voices, `en-gb` for `b*_` voices: the misaki dialect each was trained on) and
+  `paradee.voice = af_heart` (the default). v1.0 and v1.1 files keep their 1-D styles.
+- The runtime loads a 1-D style as one voice and a 2-D style as a table. `paradee_voice_count`,
+  `paradee_voice_name`, `paradee_voice_accent`, `paradee_find_voice` and `paradee_default_voice` describe the
+  voices; `paradee_synth_options::voice` (and `paradee_stages::voice` for the staged calls) selects one, -1 is
+  the default. `paradee-tts --voice NAME` (`--voice list` prints them).
+- The British voices need misaki's British lexicon (`en.G2P(british=True)`), which `tools/misaki-g2p` does not
+  ship. libelizainference refuses an `en-gb` voice (ABI v20).
+- `dump_paradee_reference.py dump --version 1.2 --voice NAME` runs v1.1's modules with row `NAME` of each
+  table loaded into their `(1, dim)` style parameter.
+
+Parity (`test-paradee-parity`, M4 Max, the 5 fixture sentences, the reference's noise; torch 2.14.1 in the
+reference env, pins say 2.14.0): every stage gate passes, end to end 66.2–80.1 dB for `af_heart` and
+72.2–77.3 dB for `am_puck`. `test-paradee-api` checks the table (names, accents, row selection, out-of-range
+rows) on the v1.2 file.
+
+## Delibes-8M-esES (Castilian Spanish)
+
+[lapislabsai/Delibes-8M-esES](https://huggingface.co/lapislabsai/Delibes-8M-esES) at `5d06d548` (Apache-2.0;
+pins.json `"delibes"`) is a Kokoro-82M distillation for Castilian Spanish (teacher voice `em_alex`, male) that
+uses Paradee-8M v1.1's architecture and source unchanged (provenance.json: Paradee-8M-v1.1@330617ad, paradee
+source `606e16e1`). It is published only as two fp32 ONNX graphs (and their int8 versions), so:
+
+- `convert_paradee_onnx_to_gguf.py --family delibes` reads the fp32 graphs (checked against the pins first). Named
+  initializers carry the PyTorch names under `ts.` / `vd.`. The anonymised `onnx::MatMul_*` weights (stored
+  `[in, out]`) and `onnx::LSTM_*` weights (ONNX W/R/B, gates i, o, f, c) are traced to the node that consumes
+  them and turned back into PyTorch layout. The state dict then goes through the same maps and shape checks as a
+  v1.1 checkpoint. The head's fixed constants in the decoder graph (STFT bases, harmonic numbers, bin
+  frequencies, mel warp matrices) are checked against the formulas the native head implements. Every initializer
+  must be used or checked. The GGUF is byte-reproducible (`--check-output`).
+- GGUF keys on top of v1.1's: `paradee.family = delibes`, `paradee.language = es`, `paradee.voice = em_alex`,
+  `paradee.phoneme_format = espeak-es`, `paradee.input.validated_max_ids = 360` and
+  `paradee.validated_speed = [0.85, 1.15]` (the release's validated envelope). The runtime exposes them through
+  `paradee_family`, `paradee_language`, `paradee_phoneme_format`, `paradee_validated_max_ids` and
+  `paradee_validated_speed`; libelizainference chunks to 360 ids and clamps speed to that range.
+- Input: eSpeak NG `es` (roa/es) phonemes through misaki's `EspeakG2P`, which `tools/misaki-g2p`
+  reproduces (`espeak_g2p_open("es", ...)`), mapped to Kokoro's vocabulary (the same 114 symbols and ids as
+  Paradee's). The English misaki fallback must not be used for Spanish.
+- Noise: the release's decoder graph takes `white_noise` from NumPy PCG64; the native head draws its own seeded
+  Gaussian noise. Same model, a different noise realisation.
+- Release status, recorded in the pins and not resolved here: provenance.json and release-manifest.json say
+  `human_approval: PENDING` and `commercial_distribution: BLOCKED`, and NOTICE.md says voice consent and
+  provenance for `em_alex` have not been independently established.
+
+Parity (`test-paradee-parity` against `tools/dump_delibes_reference.py`: the fp32 ONNX graphs in onnxruntime
+1.31.1, one thread, with each sample's PCG64 noise; M4 Max, the release's 5 samples): integer durations
+identical, F0 / N / asr max|err| <= 5.5e-6 × RMS, the decoder from the reference's inputs <= 1.03e-4 × RMS,
+end to end 72.6–84.2 dB. The reference itself is within 3 LSB of the release's own `samples/0N_fp32.wav`.

@@ -1,0 +1,103 @@
+El número es 0.
+El número es 1.
+El número es 2.
+El número es 7.
+El número es 10.
+El número es 11.
+El número es 15.
+El número es 16.
+El número es 20.
+El número es 21.
+El número es 22.
+El número es 29.
+El número es 30.
+El número es 31.
+El número es 45.
+El número es 99.
+El número es 100.
+El número es 101.
+El número es 115.
+El número es 200.
+El número es 250.
+El número es 500.
+El número es 555.
+El número es 700.
+El número es 999.
+El número es 1000.
+El número es 1001.
+El número es 1500.
+El número es 2000.
+El número es 2026.
+El número es 10000.
+El número es 15000.
+El número es 100000.
+El número es 1000000.
+El número es 2500000.
+Nació en 1492.
+Nació en 1808.
+Nació en 1936.
+Nació en 1969.
+Nació en 1975.
+Nació en 1992.
+Nació en 2000.
+Nació en 2008.
+Nació en 2024.
+Nació en 2026.
+Son las 1:00.
+Son las 7:30.
+Son las 9:15.
+Son las 12:45.
+Son las 13:05.
+Son las 18:00.
+Son las 20:30.
+Son las 23:59.
+La cita es el 1 de enero.
+La cita es el 14 de febrero.
+La cita es el 23 de abril.
+La cita es el 12 de octubre.
+La cita es el 25 de diciembre.
+La cita es el 31 de agosto.
+Son 3,50 € en total.
+Son 12 euros en total.
+Son 0,99 euros en total.
+Son 1.250 euros en total.
+Son 45 % en total.
+Son 7,5 % en total.
+Son 100 km en total.
+Son 38,5 grados en total.
+Son 2 kg en total.
+Son 500 ml en total.
+Quedó en 1.º lugar.
+Quedó en 2.ª lugar.
+Quedó en 3.er lugar.
+Quedó en 10.º lugar.
+Tiene 997 mensajes y 81 llamadas perdidas.
+Tiene 573 mensajes y 90 llamadas perdidas.
+Tiene 743 mensajes y 76 llamadas perdidas.
+Tiene 961 mensajes y 7 llamadas perdidas.
+Tiene 594 mensajes y 89 llamadas perdidas.
+Tiene 219 mensajes y 6 llamadas perdidas.
+Tiene 513 mensajes y 71 llamadas perdidas.
+Tiene 147 mensajes y 35 llamadas perdidas.
+Tiene 9 mensajes y 60 llamadas perdidas.
+Tiene 996 mensajes y 31 llamadas perdidas.
+Tiene 612 mensajes y 29 llamadas perdidas.
+Tiene 600 mensajes y 86 llamadas perdidas.
+Tiene 797 mensajes y 96 llamadas perdidas.
+Tiene 795 mensajes y 6 llamadas perdidas.
+Tiene 601 mensajes y 2 llamadas perdidas.
+Tiene 219 mensajes y 60 llamadas perdidas.
+Tiene 419 mensajes y 47 llamadas perdidas.
+Tiene 702 mensajes y 86 llamadas perdidas.
+Tiene 210 mensajes y 29 llamadas perdidas.
+Tiene 476 mensajes y 13 llamadas perdidas.
+Llame al 912 345 678.
+Su código es 4 8 1 5.
+La habitación 204 está en la 2.ª planta.
+El Sr. López y la Dra. Ruiz llegan a las 10.
+Tome 2 comprimidos de 500 mg.
+Hoy es 28/10/2026.
+Faltan 3 días, 4 horas y 15 minutos.
+El capítulo XIV es el último.
+Carlos III reinó en el siglo XVIII.
+Vive en el n.º 7 de la calle Mayor.

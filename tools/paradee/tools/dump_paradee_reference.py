@@ -54,6 +54,12 @@ float32 step is ~3e-5 rad, so the float32 bank is up to ~9e-4 x RMS from its exa
 main (the n_fft 600 path, head run with burst=False), burst (the 150/75 noise-burst path)
 and wav (head output).
 
+`dump --version 1.2 --voice NAME` runs Paradee-8M v1.2 (pins.json "v1.2"). Its training scripts are
+byte-identical to v1.1's and its checkpoints have v1.1's layout except the two style tables, one row
+per voice. The reference loads row `NAME` of each table into the v1.1 modules' (1, dim) style
+parameter (what selecting a voice means: style.expand(B, -1) of that row) and is otherwise the v1.1
+reference. The manifest records the voice and its row.
+
 usage:
   dump_paradee_reference.py phonemes --model-dir HF_SNAPSHOT --out tools/paradee/tests/fixtures/sentences.misaki.json
   dump_paradee_reference.py dump --model-dir HF_SNAPSHOT --paradee-src PARADEE_CHECKOUT --out REF_DIR
@@ -158,9 +164,10 @@ def cmd_phonemes(args) -> int:
 # reference model
 # ---------------------------------------------------------------------------
 
-def load_reference_v11(model_dir: Path, paradee_src: Path):
-    """Paradee-8M v1.1 in float32, as export_paradee_v1_1.py builds it."""
-    pins = PINS["v1.1"]
+def load_reference_v11(model_dir: Path, paradee_src: Path, version: str = "1.1", voice: str = "af_heart"):
+    """Paradee-8M v1.1 in float32, as export_paradee_v1_1.py builds it. version 1.2: the same
+    modules with row `voice` of v1.2's style tables."""
+    pins = PINS[f"v{version}"]
     check_versions("torch", "kokoro", "misaki")
     for rel, digest in pins["source"]["files"].items():
         check_file(paradee_src, rel, digest)
@@ -187,9 +194,23 @@ def load_reference_v11(model_dir: Path, paradee_src: Path):
                     pass
 
     ts = student.TextStudent("s+mlp").eval()
-    ts.load_state_dict(torch.load(model_dir / "pytorch/text_side.pt", map_location="cpu", weights_only=True)["model"])
     vd = vhead.VDecoder(head="v2").eval()
-    vd.load_ckpt(str(model_dir / "pytorch/decoder.pt"))
+    if version == "1.2":
+        text_ck = torch.load(model_dir / "pytorch/text_side.pt", map_location="cpu", weights_only=True)
+        dec_ck = torch.load(model_dir / "pytorch/decoder.pt", map_location="cpu", weights_only=True)
+        voices = list(text_ck["voices"])
+        if voices != pins["voices"] or list(dec_ck["voices"]) != voices or voice not in voices:
+            raise SystemExit(f"voice {voice!r} / checkpoint voices {voices!r} do not match pins.json")
+        row = voices.index(voice)
+        tsd, dsd = dict(text_ck["model"]), dict(dec_ck["model"])
+        tsd["style"], dsd["style"] = tsd["style"][row:row + 1].clone(), dsd["style"][row:row + 1].clone()
+        ts.load_state_dict(tsd)
+        res = vd.load_state_dict(dsd, strict=False)   # VDecoder.load_ckpt's checks
+        if res.missing_keys or res.unexpected_keys:
+            raise SystemExit(f"v1.2 decoder.pt does not fit VDecoder(head='v2'): {res}")
+    else:
+        ts.load_state_dict(torch.load(model_dir / "pytorch/text_side.pt", map_location="cpu", weights_only=True)["model"])
+        vd.load_ckpt(str(model_dir / "pytorch/decoder.pt"))
     if not vd.head.burst:
         raise SystemExit("v1.1 decoder.pt has no noise-burst path")
     strip(ts)
@@ -431,10 +452,10 @@ def run_reference(torch, ts, ds, cap, phase_lock, student, ids: list[int], speed
 
 def cmd_dump(args) -> int:
     fixture = json.loads(args.phonemes.read_text(encoding="utf-8"))
-    v11 = args.version == "1.1"
-    pins = PINS["v1.1"] if v11 else PINS
+    v11 = args.version in ("1.1", "1.2")
+    pins = PINS[f"v{args.version}"] if v11 else PINS
     if v11:
-        torch, ts, vd, vhead, student = load_reference_v11(args.model_dir, args.paradee_src)
+        torch, ts, vd, vhead, student = load_reference_v11(args.model_dir, args.paradee_src, args.version, args.voice)
     else:
         torch, ts, ds, cap, phase_lock, student = load_reference(args.model_dir, args.paradee_src)
     args.out.mkdir(parents=True, exist_ok=True)
@@ -442,6 +463,7 @@ def cmd_dump(args) -> int:
         "model": pins["model"], "source_commit": pins["source"]["commit"], "version": args.version,
         "phonemes_fixture_sha256": sha256_file(args.phonemes),
         "speed": args.speed,
+        **({"voice": args.voice, "voice_row": pins["voices"].index(args.voice)} if args.version == "1.2" else {}),
         "versions": {k: importlib.metadata.version(k) for k in ("torch", "kokoro", "misaki")},
         "reference": ("float32 upstream modules; head noise fixed (the noise stage), "
                       f"{'read from ' + str(args.noise_dir) if args.noise_dir else 'torch.randn seeded with %d + index' % args.noise_seed}"
@@ -680,8 +702,10 @@ def main(argv=None) -> int:
     p.add_argument("--phonemes", type=Path, default=DEFAULT_FIXTURE)
     p.add_argument("--speed", type=float, default=1.0)
     p.add_argument("--out", type=Path, required=True)
-    p.add_argument("--version", choices=("1.0", "1.1"), default="1.0",
-                   help="1.1: Paradee-8M v1.1 (source-filter head; --model-dir and --paradee-src at the v1.1 pins)")
+    p.add_argument("--version", choices=("1.0", "1.1", "1.2"), default="1.0",
+                   help="1.1: Paradee-8M v1.1 (source-filter head; --model-dir and --paradee-src at the v1.1 pins); "
+                        "1.2: v1.2 (four voices, see --voice)")
+    p.add_argument("--voice", default="af_heart", help="1.2: the voice (style row) to run")
     p.add_argument("--noise-seed", type=int, default=0, help="v1.1: noise = torch.randn seeded with this + index")
     p.add_argument("--noise-dir", type=Path, help="v1.1: read <index>.noise.f32 from here instead")
     p = sub.add_parser("lock-fixture")

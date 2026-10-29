@@ -114,6 +114,29 @@ num2words (22201/22201 identical).
 - eSpeak symbols outside Paradee's vocabulary are dropped at the fallback,
   which gives the same ids paradee feeds the model.
 
+## eSpeak-only G2P (Spanish)
+
+`src/espeak-g2p.cpp` reproduces misaki 0.9.4 `espeak.EspeakG2P(language)`, the whole-text G2P Kokoro's
+`KPipeline` uses for languages without a misaki lexicon (`lang_code='e'` -> `'es'`), and so the phonemes
+Kokoro distillations such as Delibes-8M-esES were trained on: phonemizer-fork 3.3.2 semantics
+(`preserve_punctuation`, `with_stress`, tie `^`, `language_switch='remove-flags'`) over libespeak-ng, then
+`EspeakG2P`'s own E2M ties (`t^ʃ` -> `ʧ`, `t^s` -> `ʦ`, `d^ʒ` -> `ʤ`, ...), `^` and `-` removed. It shares the
+English fallback's punctuation handling and the process-wide libespeak-ng lock, and re-selects its voice on
+every call. Only `es` (eSpeak NG voice `roa/es`, Castilian) is supported; it needs `es_dict` and `lang/roa/es`
+in the eSpeak NG data (pins.json `espeak_ng.data`).
+
+C++ API: `eliza_misaki::espeak_g2p_open("es", espeak_data_dir, err)` and `espeak_g2p_phonemize` (symbols
+outside the Kokoro vocabulary, such as `¿` and `¡`, are dropped, as Kokoro does when it maps symbols to ids).
+CLI: `misaki-g2p-cli --espeak-g2p es --espeak DIR [--raw]`.
+
+Gate: `misaki_g2p_espeak_g2p_es` runs `test-espeak-g2p` on `tests/fixtures/espeak_g2p_es.tsv`, written by
+`tests/gen_espeak_g2p_fixture.py` (misaki 0.9.4, phonemizer-fork 3.3.2, espeak-ng 1.52.0) over 182
+project-authored sentences (`tests/corpus/es_authored.txt`, `es_numbers.txt`: everyday assistant sentences,
+numbers, years, times, dates, prices, percentages, ordinals, abbreviations, Roman numerals and English
+loanwords). Every line must match exactly, raw and vocabulary-filtered: 182/182 on macOS arm64 with Homebrew's
+libespeak-ng 1.52.0. `misaki_g2p_espeak_g2p_e2m` (label `main`) checks the E2M table offline. The native G2P
+also reproduces the phonemes of all 5 Delibes-8M-esES samples exactly.
+
 ## Regenerating generated files
 
 `scripts/gen_tables.py` (Python 3.12, spaCy 3.8.16) writes

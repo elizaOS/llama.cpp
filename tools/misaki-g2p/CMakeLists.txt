@@ -37,6 +37,7 @@ set(MISAKI_G2P_ESPEAK_DATA "" CACHE PATH "espeak-ng-data directory for the agree
 
 add_library(misaki_g2p STATIC
     src/espeak.cpp
+    src/espeak-g2p.cpp
     src/g2p.cpp
     src/lexicon.cpp
     src/misaki-g2p.cpp

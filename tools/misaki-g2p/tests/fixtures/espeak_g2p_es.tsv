@@ -1,0 +1,185 @@
+# misaki 0.9.4 espeak.EspeakG2P(language='es'); phonemizer-fork 3.3.2; espeak-ng 1.52.0
+# corpus: es_authored.txt:021b47509809befb es_numbers.txt:edba7a3fa8e8e983
+# text<TAB>EspeakG2P output<TAB>output in the Kokoro vocabulary
+Buenos días. ¿Cómo ha dormido esta noche?	bwˈenos ðˈias. ¿kˈomo ˈa ðoɾmˈiðo ˈesta nˈoʧe?	bwˈenos ðˈias. kˈomo ˈa ðoɾmˈiðo ˈesta nˈoʧe?
+Hoy hace sol y la temperatura máxima será de veintidós grados.	ˈoɪ ˈaθe sˈol i la tˌempeɾatˈuɾa mˈaksima seɾˈa ðe βˌAntiðˈos ɣɾˈaðos.	ˈoɪ ˈaθe sˈol i la tˌempeɾatˈuɾa mˈaksima seɾˈa ðe βˌAntiðˈos ɣɾˈaðos.
+Le recuerdo que a las nueve tiene que tomar la pastilla de la tensión.	le rekwˈeɾðo ke a las nwˈeβe tjˈene ke tomˈaɾ la pastˈiʎa ðe la tensjˈon.	le rekwˈeɾðo ke a las nwˈeβe tjˈene ke tomˈaɾ la pastˈiʎa ðe la tensjˈon.
+¿Quiere que llame a su hija ahora mismo?	¿kjˈeɾe ke ʎˈame a su ˈixa aˈoɾa mˈismo?	kjˈeɾe ke ʎˈame a su ˈixa aˈoɾa mˈismo?
+Su cita con la doctora Martínez es el martes a las diez y media.	su θˈita kon la ðoktˈoɾa maɾtˈineθ ˈes el mˈaɾtes a las ðjˈeθ i mˈeðja.	su θˈita kon la ðoktˈoɾa maɾtˈineθ ˈes el mˈaɾtes a las ðjˈeθ i mˈeðja.
+He apuntado la lista de la compra: leche, pan, huevos y aceite de oliva.	ˈe ˌapuntˈaðo la lˈista ðe la kˈompɾa: lˈeʧe, pˈan, wˈeβos i aθˈAte ðe olˈiβa.	ˈe ˌapuntˈaðo la lˈista ðe la kˈompɾa: lˈeʧe, pˈan, wˈeβos i aθˈAte ðe olˈiβa.
+¡Qué alegría oírle tan contento!	¡kˈe ˌaleɣɾˈia oˈiɾle tˈan kontˈɛnto!	kˈe ˌaleɣɾˈia oˈiɾle tˈan kontˈɛnto!
+La farmacia de la esquina cierra a las ocho y media de la tarde.	la faɾmˈaθja ðe la eskˈina θjˈera a las ˈoʧo i mˈeðja ðe la tˈaɾðe.	la faɾmˈaθja ðe la eskˈina θjˈera a las ˈoʧo i mˈeðja ðe la tˈaɾðe.
+Mañana por la mañana vendrá el fontanero a revisar el grifo de la cocina.	maɲˈana poɾ la maɲˈana βendɾˈa el fˌontanˈeɾo a rˌeβisˈaɾ el ɣɾˈifo ðe la koθˈina.	maɲˈana poɾ la maɲˈana βendɾˈa el fˌontanˈeɾo a rˌeβisˈaɾ el ɣɾˈifo ðe la koθˈina.
+¿Le leo las noticias o prefiere escuchar un poco de música?	¿le lˈeo las notˈiθjas o pɾefjˈeɾe ˌeskuʧˈaɾ ˈum pˈoko ðe mˈusika?	le lˈeo las notˈiθjas o pɾefjˈeɾe ˌeskuʧˈaɾ ˈum pˈoko ðe mˈusika?
+El tren de Zaragoza sale con veinte minutos de retraso.	el tɾˈen de θˌaɾaɣˈoθa sˈale kom bˈAnte minˈutos ðe retɾˈaso.	el tɾˈen de θˌaɾaɣˈoθa sˈale kom bˈAnte minˈutos ðe retɾˈaso.
+Mi abuela vivía en un pueblo pequeño cerca de Cáceres.	mi aβwˈela βiβˈia en ˈum pwˈeβlo pekˈeɲo θˈeɾka ðe kˈaθeɾes.	mi aβwˈela βiβˈia en ˈum pwˈeβlo pekˈeɲo θˈeɾka ðe kˈaθeɾes.
+El zapato izquierdo me aprieta un poco en el dedo gordo.	el θapˈato iθkjˈeɾðo me ˌapɾiˈeta ˈum pˈoko en el ðˈeðo ɣˈoɾðo.	el θapˈato iθkjˈeɾðo me ˌapɾiˈeta ˈum pˈoko en el ðˈeðo ɣˈoɾðo.
+La cigüeña volvió al campanario de la iglesia en marzo.	la θˌiɣuˈeɲa βolβjˈo al kˌampanˈaɾjo ðe la iɣlˈesja en mˈaɾθo.	la θˌiɣuˈeɲa βolβjˈo al kˌampanˈaɾjo ðe la iɣlˈesja en mˈaɾθo.
+Llueve sobre mojado, como decía siempre mi padre.	ʎuˈeβe sˌoβɾe moxˈaðo, kˌomo ðeθˈia sjˈempɾe mi pˈaðɾe.	ʎuˈeβe sˌoβɾe moxˈaðo, kˌomo ðeθˈia sjˈempɾe mi pˈaðɾe.
+El perro del vecino ladra cada vez que pasa el cartero.	el pˈero ðel βeθˈino lˈaðɾa kˈaða βˈeθ ke pˈasa el kaɾtˈeɾo.	el pˈero ðel βeθˈino lˈaðɾa kˈaða βˈeθ ke pˈasa el kaɾtˈeɾo.
+Ayer comimos paella en casa de mi hermano Javier.	aʝˈeɾ komˈimos paˈeʎa en kˈasa ðe mi eɾmˈano xaβjˈeɾ.	aʝˈeɾ komˈimos paˈeʎa en kˈasa ðe mi eɾmˈano xaβjˈeɾ.
+Guárdeme un trozo de tarta de queso, por favor.	ɡwˈaɾðeme ˈun tɾˈoθo ðe tˈaɾta ðe kˈeso, poɾ faβˈoɾ.	ɡwˈaɾðeme ˈun tɾˈoθo ðe tˈaɾta ðe kˈeso, poɾ faβˈoɾ.
+¿Dónde he dejado las gafas de leer?	¿dˈonde ˈe ðexˈaðo las ɣˈafas ðe leˈeɾ?	dˈonde ˈe ðexˈaðo las ɣˈafas ðe leˈeɾ?
+Están en la mesilla, al lado del vaso de agua.	estˈan en la mesˈiʎa, al lˈaðo ðel βˈaso ðe ˈaɣwa.	estˈan en la mesˈiʎa, al lˈaðo ðel βˈaso ðe ˈaɣwa.
+El ruiseñor cantaba en la rama más alta del olivo.	el ruˌiseɲˈoɾ kantˈaβa en la rˈama mˈas ˈalta ðel olˈiβo.	el ruˌiseɲˈoɾ kantˈaβa en la rˈama mˈas ˈalta ðel olˈiβo.
+Querría pedir hora para el oculista la semana que viene.	kerˈia peðˈiɾ ˈoɾa pˌaɾa el ˌokulˈista la semˈana ke βjˈene.	kerˈia peðˈiɾ ˈoɾa pˌaɾa el ˌokulˈista la semˈana ke βjˈene.
+La señora García ha preguntado por usted esta mañana.	la seɲˈoɾa ɣaɾθˈia ˈa pɾˌeɣuntˈaðo poɾ ustˈeð ˈesta maɲˈana.	la seɲˈoɾa ɣaɾθˈia ˈa pɾˌeɣuntˈaðo poɾ ustˈeð ˈesta maɲˈana.
+Recuerde beber agua aunque no tenga sed.	rekwˈeɾðe βeβˈeɾ ˈaɣwa ˌWnke nˈo tˈɛŋɡa sˈed.	rekwˈeɾðe βeβˈeɾ ˈaɣwa ˌWnke nˈo tˈɛŋɡa sˈed.
+El jueves es el cumpleaños de su nieta Lucía.	el xwˈeβes ˈes el kˌumpleˈaɲos ðe su njˈeta luθˈia.	el xwˈeβes ˈes el kˌumpleˈaɲos ðe su njˈeta luθˈia.
+¿Quiere que le ponga la radio en Radio Nacional?	¿kjˈeɾe ke le pˈoŋɡa la rˈaðjo en rˈaðjo nˌaθjonˈal?	kjˈeɾe ke le pˈoŋɡa la rˈaðjo en rˈaðjo nˌaθjonˈal?
+Hace mucho frío; abríguese bien antes de salir.	ˈaθe mˈuʧo fɾˈio; aβɾˈiɣese βjˈen ˈantes ðe salˈiɾ.	ˈaθe mˈuʧo fɾˈio; aβɾˈiɣese βjˈen ˈantes ðe salˈiɾ.
+La gente del barrio se reúne los domingos en la plaza.	la xˈɛnte ðel βˈario se reˈune los ðomˈiŋɡos en la plˈaθa.	la xˈɛnte ðel βˈario se reˈune los ðomˈiŋɡos en la plˈaθa.
+Me gustaría volver a ver el mar en Galicia.	me ɣˌustaɾˈia βolβˈeɾ a βˈeɾ el mˈaɾ eŋ ɡalˈiθja.	me ɣˌustaɾˈia βolβˈeɾ a βˈeɾ el mˈaɾ eŋ ɡalˈiθja.
+El año pasado viajamos a Sevilla en el AVE.	el ˈaɲo pasˈaðo βjaxˈamos a seβˈiʎa en el ˌaˌuβeˈe.	el ˈaɲo pasˈaðo βjaxˈamos a seβˈiʎa en el ˌaˌuβeˈe.
+Ponga el móvil a cargar antes de acostarse.	pˈoŋɡa el mˈoβil a kaɾɣˈaɾ ˈantes ðe ˌakostˈaɾse.	pˈoŋɡa el mˈoβil a kaɾɣˈaɾ ˈantes ðe ˌakostˈaɾse.
+Las llaves están colgadas detrás de la puerta.	las ʎˈaβes estˈan kolɣˈaðas ðetɾˈas ðe la pwˈeɾta.	las ʎˈaβes estˈan kolɣˈaðas ðetɾˈas ðe la pwˈeɾta.
+El cielo está despejado y no se esperan lluvias.	el θjˈelo estˈa ðˌespexˈaðo i nˈo se espˈeɾan ʎˈuβjas.	el θjˈelo estˈa ðˌespexˈaðo i nˈo se espˈeɾan ʎˈuβjas.
+Disculpe, no le he entendido bien. ¿Puede repetirlo?	diskˈulpe, nˈo le ˈe ˌentendˈiðo βjˈen. ¿pwˈeðe rˌepetˈiɾlo?	diskˈulpe, nˈo le ˈe ˌentendˈiðo βjˈen. pwˈeðe rˌepetˈiɾlo?
+Su médico dice que puede caminar media hora al día.	su mˈeðiko ðˈiθe ke pwˈeðe kˌaminˈaɾ mˈeðja ˈoɾa al ðˈia.	su mˈeðiko ðˈiθe ke pwˈeðe kˌaminˈaɾ mˈeðja ˈoɾa al ðˈia.
+El autobús número treinta y dos pasa cada quince minutos.	el ˌWtoβˈus nˈumeɾo tɾˈAnta i ðˈos pˈasa kˈaða kˈinθe minˈutos.	el ˌWtoβˈus nˈumeɾo tɾˈAnta i ðˈos pˈasa kˈaða kˈinθe minˈutos.
+Esta tarde a las cinco hay bingo en el centro de mayores.	ˈesta tˈaɾðe a las θˈinko ˈI βˈiŋɡo en el θˈɛntɾo ðe maʝˈoɾes.	ˈesta tˈaɾðe a las θˈinko ˈI βˈiŋɡo en el θˈɛntɾo ðe maʝˈoɾes.
+¿Ha visto el partido del Real Madrid?	¿ˈa βˈisto el paɾtˈiðo ðel reˈal maðɾˈid?	ˈa βˈisto el paɾtˈiðo ðel reˈal maðɾˈid?
+La sopa de ajo está demasiado caliente todavía.	la sˈopa ðe ˈaxo estˈa ðˌemasjˈaðo kaljˈɛnte tˌoðaβˈia.	la sˈopa ðe ˈaxo estˈa ðˌemasjˈaðo kaljˈɛnte tˌoðaβˈia.
+El chico del supermercado traerá el pedido el viernes.	el ʧˈiko ðel sˌupeɾmeɾkˈaðo tɾˌaeɾˈa el peðˈiðo el βjˈeɾnes.	el ʧˈiko ðel sˌupeɾmeɾkˈaðo tɾˌaeɾˈa el peðˈiðo el βjˈeɾnes.
+Vamos a hacer juntos unos ejercicios de respiración.	bˈamos a aθˈeɾ xˈuntos ˈunos ˌexeɾθˈiθjos ðe rˌespiɾaθjˈon.	bˈamos a aθˈeɾ xˈuntos ˈunos ˌexeɾθˈiθjos ðe rˌespiɾaθjˈon.
+Inspire despacio por la nariz y espire por la boca.	inspˈiɾe ðespˈaθjo poɾ la naɾˈiθ i espˈiɾe poɾ la βˈoka.	inspˈiɾe ðespˈaθjo poɾ la naɾˈiθ i espˈiɾe poɾ la βˈoka.
+La enfermera vendrá el lunes para cambiarle el vendaje.	la ˌenfeɾmˈeɾa βendɾˈa el lˈunes pˌaɾa kambjˈaɾle el βendˈaxe.	la ˌenfeɾmˈeɾa βendɾˈa el lˈunes pˌaɾa kambjˈaɾle el βendˈaxe.
+Mi canción favorita es un bolero antiguo de los años cincuenta.	mi kanθjˈon fˌaβoɾˈita ˈes ˈum bolˈeɾo antˈiɣwo ðe los ˈaɲos θinkwˈɛnta.	mi kanθjˈon fˌaβoɾˈita ˈes ˈum bolˈeɾo antˈiɣwo ðe los ˈaɲos θinkwˈɛnta.
+El jardín huele a jazmín y a hierbabuena.	el xaɾðˈin wˈele a xaθmˈin i a jˌeɾβaβwˈena.	el xaɾðˈin wˈele a xaθmˈin i a jˌeɾβaβwˈena.
+Juan y Ángela se casaron en la ermita de San Isidro.	xwˈan i ˈaŋxela se kasˈaɾon en la eɾmˈita ðe sˈan isˈiðɾo.	xwˈan i ˈaŋxela se kasˈaɾon en la eɾmˈita ðe sˈan isˈiðɾo.
+Los niños jugaban al escondite en el patio del colegio.	los nˈiɲos xuɣˈaβan al ˌeskondˈite en el pˈatjo ðel kolˈexjo.	los nˈiɲos xuɣˈaβan al ˌeskondˈite en el pˈatjo ðel kolˈexjo.
+El reloj de la cocina se ha parado otra vez.	el relˈox ðe la koθˈina se ˈa paɾˈaðo ˈotɾa βˈeθ.	el relˈox ðe la koθˈina se ˈa paɾˈaðo ˈotɾa βˈeθ.
+Hay que cambiar la bombilla del pasillo.	ˈI ke kambjˈaɾ la βombˈiʎa ðel pasˈiʎo.	ˈI ke kambjˈaɾ la βombˈiʎa ðel pasˈiʎo.
+Su sobrino ha enviado una foto desde Barcelona.	su soβɾˈino ˈa embjˈaðo ˈuna fˈoto ðˌesðe βˌaɾθelˈona.	su soβɾˈino ˈa embjˈaðo ˈuna fˈoto ðˌesðe βˌaɾθelˈona.
+¿Prefiere café con leche o un té de manzanilla?	¿pɾefjˈeɾe kafˈe kon lˈeʧe o ˈun tˈe ðe mˌanθanˈiʎa?	pɾefjˈeɾe kafˈe kon lˈeʧe o ˈun tˈe ðe mˌanθanˈiʎa?
+El viejo puente de piedra cruza el río Ebro.	el βjˈexo pwˈɛnte ðe pjˈeðɾa kɾˈuθa el rˈio ˈeβɾo.	el βjˈexo pwˈɛnte ðe pjˈeðɾa kɾˈuθa el rˈio ˈeβɾo.
+La exposición del museo del Prado termina en junio.	la ˌeksposiθjˈon del musˈeo ðel pɾˈaðo teɾmˈina en xˈunjo.	la ˌeksposiθjˈon del musˈeo ðel pɾˈaðo teɾmˈina en xˈunjo.
+Ojalá mañana haga buen tiempo para ir al parque.	ˌoxalˈa maɲˈana ˈaɣa βwˈen tjˈempo pˌaɾa ˈiɾ al pˈaɾke.	ˌoxalˈa maɲˈana ˈaɣa βwˈen tjˈempo pˌaɾa ˈiɾ al pˈaɾke.
+Ha llamado el banco para confirmar la transferencia.	ˈa ʎamˈaðo el βˈanko pˌaɾa kˌonfiɾmˈaɾ la tɾˌansfeɾˈɛnθja.	ˈa ʎamˈaðo el βˈanko pˌaɾa kˌonfiɾmˈaɾ la tɾˌansfeɾˈɛnθja.
+No abra la puerta a desconocidos sin preguntar quién es.	nˈo ˈaβɾa la pwˈeɾta a ðˌeskonoθˈiðos sim pɾˌeɣuntˈaɾ kjˈen ˈes.	nˈo ˈaβɾa la pwˈeɾta a ðˌeskonoθˈiðos sim pɾˌeɣuntˈaɾ kjˈen ˈes.
+La película empieza a las nueve y cuarto en la segunda cadena.	la pelˈikula empjˈeθa a las nwˈeβe i kwˈaɾto en la seɣˈunda kaðˈena.	la pelˈikula empjˈeθa a las nwˈeβe i kwˈaɾto en la seɣˈunda kaðˈena.
+Cuando era joven trabajaba en una fábrica de zapatos.	kwˌando ˈeɾa xˈoβen tɾˌaβaxˈaβa en ˈuna fˈaβɾika ðe θapˈatos.	kwˌando ˈeɾa xˈoβen tɾˌaβaxˈaβa en ˈuna fˈaβɾika ðe θapˈatos.
+El agua del pozo estaba fresquísima en pleno agosto.	el ˈaɣwa ðel pˈoθo estˈaβa fɾeskˈisima em plˈeno aɣˈosto.	el ˈaɣwa ðel pˈoθo estˈaβa fɾeskˈisima em plˈeno aɣˈosto.
+Échele un vistazo al calendario antes de quedar con su amiga.	ˈeʧele ˈum bistˈaθo al kˌalendˈaɾjo ˈantes ðe keðˈaɾ kon su amˈiɣa.	ˈeʧele ˈum bistˈaθo al kˌalendˈaɾjo ˈantes ðe keðˈaɾ kon su amˈiɣa.
+El médico le ha recetado ibuprofeno cada ocho horas.	el mˈeðiko le ˈa rˌeθetˈaðo ˌiβupɾofˈeno kˈaða ˈoʧo ˈoɾas.	el mˈeðiko le ˈa rˌeθetˈaðo ˌiβupɾofˈeno kˈaða ˈoʧo ˈoɾas.
+El email de su nieto dice que llegará el sábado.	el emˈIl ðe su njˈeto ðˈiθe ke ʎˌeɣaɾˈa el sˈaβaðo.	el emˈIl ðe su njˈeto ðˈiθe ke ʎˌeɣaɾˈa el sˈaβaðo.
+Hemos quedado en el bar Manolo a la hora de comer.	ˈemos keðˈaðo en el βˈaɾ manˈolo a la ˈoɾa ðe komˈeɾ.	ˈemos keðˈaðo en el βˈaɾ manˈolo a la ˈoɾa ðe komˈeɾ.
+Su vecina Pilar le ha dejado una bolsa de naranjas.	su βeθˈina pilˈaɾ le ˈa ðexˈaðo ˈuna βˈolsa ðe naɾˈaŋxas.	su βeθˈina pilˈaɾ le ˈa ðexˈaðo ˈuna βˈolsa ðe naɾˈaŋxas.
+¿Quién ganó el Mundial de fútbol de dos mil diez?	¿kjˈeŋ ɡanˈo el mundjˈal ðe fˈutβol ðe ðˈos mˈil ðjˈeθ?	kjˈeŋ ɡanˈo el mundjˈal ðe fˈutβol ðe ðˈos mˈil ðjˈeθ?
+Si se marea, siéntese y llame a alguien enseguida.	si se maɾˈea, sjˈentese i ʎˈame a ˈalɣjen ˌenseɣˈiða.	si se maɾˈea, sjˈentese i ʎˈame a ˈalɣjen ˌenseɣˈiða.
+La humedad relativa es del sesenta y cinco por ciento.	la ˌumeðˈad rˌelatˈiβa ˈes ðel sesˈɛnta i θˈinko poɾ θjˈɛnto.	la ˌumeðˈad rˌelatˈiβa ˈes ðel sesˈɛnta i θˈinko poɾ θjˈɛnto.
+El kilo de tomates cuesta dos euros con cuarenta céntimos.	el kˈilo ðe tomˈates kwˈesta ðˈos ˈeʊɾos kon kwaɾˈɛnta θˈentimos.	el kˈilo ðe tomˈates kwˈesta ðˈos ˈeʊɾos kon kwaɾˈɛnta θˈentimos.
+Las golondrinas vuelven cada primavera al mismo alero.	las ɣˌolondɾˈinas βwˈelβen kˈaða pɾˌimaβˈeɾa al mˈismo alˈeɾo.	las ɣˌolondɾˈinas βwˈelβen kˈaða pɾˌimaβˈeɾa al mˈismo alˈeɾo.
+Me encanta el olor del pan recién hecho.	me enkˈanta el olˈoɾ ðel pˈan reθjˈen ˈeʧo.	me enkˈanta el olˈoɾ ðel pˈan reθjˈen ˈeʧo.
+El ayuntamiento ha cortado la calle por obras hasta el viernes.	el ˌaʝuntamjˈɛnto ˈa koɾtˈaðo la kˈaʎe poɾ ˈoβɾas ˌasta el βjˈeɾnes.	el ˌaʝuntamjˈɛnto ˈa koɾtˈaðo la kˈaʎe poɾ ˈoβɾas ˌasta el βjˈeɾnes.
+Su programa favorito es a las cuatro, después de la siesta.	su pɾoɣɾˈama fˌaβoɾˈito ˈes a las kwˈatɾo, despwˈes ðe la sjˈesta.	su pɾoɣɾˈama fˌaβoɾˈito ˈes a las kwˈatɾo, despwˈes ðe la sjˈesta.
+La guitarra de mi tío sonaba de maravilla.	la ɣitˈara ðe mi tˈio sonˈaβa ðe mˌaɾaβˈiʎa.	la ɣitˈara ðe mi tˈio sonˈaβa ðe mˌaɾaβˈiʎa.
+En otoño las hojas del castaño se vuelven amarillas.	en otˈoɲo las ˈoxas ðel kastˈaɲo se βwˈelβen ˌamaɾˈiʎas.	en otˈoɲo las ˈoxas ðel kastˈaɲo se βwˈelβen ˌamaɾˈiʎas.
+El WhatsApp de la familia tiene tres mensajes nuevos.	el wˈats ˈapp ðe la famˈilja tjˈene tɾˈes mensˈaxes nwˈeβos.	el wˈats ˈapp ðe la famˈilja tjˈene tɾˈes mensˈaxes nwˈeβos.
+Vamos a repasar juntos qué medicinas toca hoy.	bˈamos a rˌepasˈaɾ xˈuntos kˈe mˌeðiθˈinas tˈoka ˈoɪ.	bˈamos a rˌepasˈaɾ xˈuntos kˈe mˌeðiθˈinas tˈoka ˈoɪ.
+El chocolate con churros es el desayuno del domingo.	el ʧˌokolˈate kon ʧˈuros ˈes el ðˌesaʝˈuno ðel ðomˈiŋɡo.	el ʧˌokolˈate kon ʧˈuros ˈes el ðˌesaʝˈuno ðel ðomˈiŋɡo.
+Usted me dijo que le gustaba la zarzuela.	ustˈed me ðˈixo ke le ɣustˈaβa la θaɾθwˈela.	ustˈed me ðˈixo ke le ɣustˈaβa la θaɾθwˈela.
+La luna llena se verá esta noche sobre la sierra.	la lˈuna ʎˈena se βeɾˈa ˈesta nˈoʧe sˌoβɾe la sjˈera.	la lˈuna ʎˈena se βeɾˈa ˈesta nˈoʧe sˌoβɾe la sjˈera.
+El número es 0.	el nˈumeɾo ˈes θˈeɾo.	el nˈumeɾo ˈes θˈeɾo.
+El número es 1.	el nˈumeɾo ˈes ˈuno.	el nˈumeɾo ˈes ˈuno.
+El número es 2.	el nˈumeɾo ˈes ðˈos.	el nˈumeɾo ˈes ðˈos.
+El número es 7.	el nˈumeɾo ˈes sjˈete.	el nˈumeɾo ˈes sjˈete.
+El número es 10.	el nˈumeɾo ˈes ðjˈɛθ.	el nˈumeɾo ˈes ðjˈɛθ.
+El número es 11.	el nˈumeɾo ˈes ˈonθe.	el nˈumeɾo ˈes ˈonθe.
+El número es 15.	el nˈumeɾo ˈes kˈinθe.	el nˈumeɾo ˈes kˈinθe.
+El número es 16.	el nˈumeɾo ˈes ðjˌɛθisˈAs.	el nˈumeɾo ˈes ðjˌɛθisˈAs.
+El número es 20.	el nˈumeɾo ˈes βˈAnte.	el nˈumeɾo ˈes βˈAnte.
+El número es 21.	el nˈumeɾo ˈes βˌAntiˈuno.	el nˈumeɾo ˈes βˌAntiˈuno.
+El número es 22.	el nˈumeɾo ˈes βˌAntiðˈos.	el nˈumeɾo ˈes βˌAntiðˈos.
+El número es 29.	el nˈumeɾo ˈes βˌAntinwˈeβe.	el nˈumeɾo ˈes βˌAntinwˈeβe.
+El número es 30.	el nˈumeɾo ˈes tɾˈAnta.	el nˈumeɾo ˈes tɾˈAnta.
+El número es 31.	el nˈumeɾo ˈes tɾˌAntaiˈuno.	el nˈumeɾo ˈes tɾˌAntaiˈuno.
+El número es 45.	el nˈumeɾo ˈes kwaɾˌɛntaiθˈinko.	el nˈumeɾo ˈes kwaɾˌɛntaiθˈinko.
+El número es 99.	el nˈumeɾo ˈes noβˌɛntainwˈeβe.	el nˈumeɾo ˈes noβˌɛntainwˈeβe.
+El número es 100.	el nˈumeɾo ˈes θjˈen.	el nˈumeɾo ˈes θjˈen.
+El número es 101.	el nˈumeɾo ˈes θjˈento ˈuno.	el nˈumeɾo ˈes θjˈento ˈuno.
+El número es 115.	el nˈumeɾo ˈes θjˈento kˈinθe.	el nˈumeɾo ˈes θjˈento kˈinθe.
+El número es 200.	el nˈumeɾo ˈes ðosθjˈentos.	el nˈumeɾo ˈes ðosθjˈentos.
+El número es 250.	el nˈumeɾo ˈes ðosθjˈentos θinkwˈɛnta.	el nˈumeɾo ˈes ðosθjˈentos θinkwˈɛnta.
+El número es 500.	el nˈumeɾo ˈes kinjˈɛntos.	el nˈumeɾo ˈes kinjˈɛntos.
+El número es 555.	el nˈumeɾo ˈes kinjˈɛntos θinkwˌɛntaiθˈinko.	el nˈumeɾo ˈes kinjˈɛntos θinkwˌɛntaiθˈinko.
+El número es 700.	el nˈumeɾo ˈes sˌeteθjˈɛntos.	el nˈumeɾo ˈes sˌeteθjˈɛntos.
+El número es 999.	el nˈumeɾo ˈes nˌoβeθjˈɛntos noβˌɛntainwˈeβe.	el nˈumeɾo ˈes nˌoβeθjˈɛntos noβˌɛntainwˈeβe.
+El número es 1000.	el nˈumeɾo ˈes mˈil.	el nˈumeɾo ˈes mˈil.
+El número es 1001.	el nˈumeɾo ˈes mˈil ˈuno.	el nˈumeɾo ˈes mˈil ˈuno.
+El número es 1500.	el nˈumeɾo ˈes mˈil kinjˈɛntos.	el nˈumeɾo ˈes mˈil kinjˈɛntos.
+El número es 2000.	el nˈumeɾo ˈes ðˈos mˈil.	el nˈumeɾo ˈes ðˈos mˈil.
+El número es 2026.	el nˈumeɾo ˈes ðˈos mˈil βAntisˈAs.	el nˈumeɾo ˈes ðˈos mˈil βAntisˈAs.
+El número es 10000.	el nˈumeɾo ˈes ðjˈɛθ mˈil.	el nˈumeɾo ˈes ðjˈɛθ mˈil.
+El número es 15000.	el nˈumeɾo ˈes kˈinθe mˈil.	el nˈumeɾo ˈes kˈinθe mˈil.
+El número es 100000.	el nˈumeɾo ˈes θjˈen mˈil.	el nˈumeɾo ˈes θjˈen mˈil.
+El número es 1000000.	el nˈumeɾo ˈes ˈunmiʝˈon.	el nˈumeɾo ˈes ˈunmiʝˈon.
+El número es 2500000.	el nˈumeɾo ˈes ðˈos miʝˈones kinjˈɛntos mˈil.	el nˈumeɾo ˈes ðˈos miʝˈones kinjˈɛntos mˈil.
+Nació en 1492.	naθjˈo en mˈil kwatɾoθjˈentos noβˌɛntaiðˈos.	naθjˈo en mˈil kwatɾoθjˈentos noβˌɛntaiðˈos.
+Nació en 1808.	naθjˈo en mˈil oʧoθjˈentos ˈoʧo.	naθjˈo en mˈil oʧoθjˈentos ˈoʧo.
+Nació en 1936.	naθjˈo en mˈil nˌoβeθjˈɛntos tɾˌAntaisˈAs.	naθjˈo en mˈil nˌoβeθjˈɛntos tɾˌAntaisˈAs.
+Nació en 1969.	naθjˈo en mˈil nˌoβeθjˈɛntos sɛsˌɛntainwˈeβe.	naθjˈo en mˈil nˌoβeθjˈɛntos sɛsˌɛntainwˈeβe.
+Nació en 1975.	naθjˈo en mˈil nˌoβeθjˈɛntos sɛtˌɛntaiθˈinko.	naθjˈo en mˈil nˌoβeθjˈɛntos sɛtˌɛntaiθˈinko.
+Nació en 1992.	naθjˈo en mˈil nˌoβeθjˈɛntos noβˌɛntaiðˈos.	naθjˈo en mˈil nˌoβeθjˈɛntos noβˌɛntaiðˈos.
+Nació en 2000.	naθjˈo en dˈos mˈil.	naθjˈo en dˈos mˈil.
+Nació en 2008.	naθjˈo en dˈos mˈil ˈoʧo.	naθjˈo en dˈos mˈil ˈoʧo.
+Nació en 2024.	naθjˈo en dˈos mˈil βAntikwˈatɾo.	naθjˈo en dˈos mˈil βAntikwˈatɾo.
+Nació en 2026.	naθjˈo en dˈos mˈil βAntisˈAs.	naθjˈo en dˈos mˈil βAntisˈAs.
+Son las 1:00.	sˈon las ˈuno:θˈeɾo θˈeɾo.	sˈon las ˈuno:θˈeɾo θˈeɾo.
+Son las 7:30.	sˈon las sjˈete:tɾˈAnta.	sˈon las sjˈete:tɾˈAnta.
+Son las 9:15.	sˈon las nwˈeβe:kˈinθe.	sˈon las nwˈeβe:kˈinθe.
+Son las 12:45.	sˈon las ðˈoθe:kwaɾˌɛntaiθˈinko.	sˈon las ðˈoθe:kwaɾˌɛntaiθˈinko.
+Son las 13:05.	sˈon las tɾˈeθe:θˈeɾo θˈinko.	sˈon las tɾˈeθe:θˈeɾo θˈinko.
+Son las 18:00.	sˈon las ðjˌɛθiˈoʧo:θˈeɾo θˈeɾo.	sˈon las ðjˌɛθiˈoʧo:θˈeɾo θˈeɾo.
+Son las 20:30.	sˈon las βˈAnte:tɾˈAnta.	sˈon las βˈAnte:tɾˈAnta.
+Son las 23:59.	sˈon las βˌAntitɾˈes:θinkwˌɛntainwˈeβe.	sˈon las βˌAntitɾˈes:θinkwˌɛntainwˈeβe.
+La cita es el 1 de enero.	la θˈita ˈes el ˈuno ðe enˈeɾo.	la θˈita ˈes el ˈuno ðe enˈeɾo.
+La cita es el 14 de febrero.	la θˈita ˈes el katˈoɾθe ðe feβɾˈeɾo.	la θˈita ˈes el katˈoɾθe ðe feβɾˈeɾo.
+La cita es el 23 de abril.	la θˈita ˈes el βˌAntitɾˈes ðe aβɾˈil.	la θˈita ˈes el βˌAntitɾˈes ðe aβɾˈil.
+La cita es el 12 de octubre.	la θˈita ˈes el ðˈoθe ðe oktˈuβɾe.	la θˈita ˈes el ðˈoθe ðe oktˈuβɾe.
+La cita es el 25 de diciembre.	la θˈita ˈes el βˌAntiθˈinko ðe ðiθjˈembɾe.	la θˈita ˈes el βˌAntiθˈinko ðe ðiθjˈembɾe.
+La cita es el 31 de agosto.	la θˈita ˈes el tɾˌAntaiˈuno ðe aɣˈosto.	la θˈita ˈes el tɾˌAntaiˈuno ðe aɣˈosto.
+Son 3,50 € en total.	sˈon tɾˈes,θinkwˈɛnta ˈeʊɾo en totˈal.	sˈon tɾˈes,θinkwˈɛnta ˈeʊɾo en totˈal.
+Son 12 euros en total.	sˈon dˈoθe ˈeʊɾos en totˈal.	sˈon dˈoθe ˈeʊɾos en totˈal.
+Son 0,99 euros en total.	sˈon θˈeɾo,noβˌɛntainwˈeβe ˈeʊɾos en totˈal.	sˈon θˈeɾo,noβˌɛntainwˈeβe ˈeʊɾos en totˈal.
+Son 1.250 euros en total.	sˈon ˈuno.dosθjˈentos θinkwˈɛnta ˈeʊɾos en totˈal.	sˈon ˈuno.dosθjˈentos θinkwˈɛnta ˈeʊɾos en totˈal.
+Son 45 % en total.	sˈon kwaɾˌɛntaiθˈinko poɾθjˈɛnto en totˈal.	sˈon kwaɾˌɛntaiθˈinko poɾθjˈɛnto en totˈal.
+Son 7,5 % en total.	sˈon sjˈete,θˈinko poɾθjˈɛnto en totˈal.	sˈon sjˈete,θˈinko poɾθjˈɛnto en totˈal.
+Son 100 km en total.	sˈon θjˈen kˌaˈɛme en totˈal.	sˈon θjˈen kˌaˈɛme en totˈal.
+Son 38,5 grados en total.	sˈon tɾˌAntaiˈoʧo,θˈinko ɣɾˈaðos en totˈal.	sˈon tɾˌAntaiˈoʧo,θˈinko ɣɾˈaðos en totˈal.
+Son 2 kg en total.	sˈon dˈos kˌiloɣɾˈamo en totˈal.	sˈon dˈos kˌiloɣɾˈamo en totˈal.
+Son 500 ml en total.	sˈon kinjˈɛntos ˌemeˈɛle en totˈal.	sˈon kinjˈɛntos ˌemeˈɛle en totˈal.
+Quedó en 1.º lugar.	keðˈo en ˈuno.ˈo luɣˈaɾ.	keðˈo en ˈuno.ˈo luɣˈaɾ.
+Quedó en 2.ª lugar.	keðˈo en dˈos.ˈa luɣˈaɾ.	keðˈo en dˈos.ˈa luɣˈaɾ.
+Quedó en 3.er lugar.	keðˈo en tɾˈes.ˈeɾ luɣˈaɾ.	keðˈo en tɾˈes.ˈeɾ luɣˈaɾ.
+Quedó en 10.º lugar.	keðˈo en djˈɛθ.ˈo luɣˈaɾ.	keðˈo en djˈɛθ.ˈo luɣˈaɾ.
+Tiene 997 mensajes y 81 llamadas perdidas.	tjˈene nˌoβeθjˈɛntos noβˌɛntaisjˈete mensˈaxes i oʧˌɛntaiˈuno ʎamˈaðas peɾðˈiðas.	tjˈene nˌoβeθjˈɛntos noβˌɛntaisjˈete mensˈaxes i oʧˌɛntaiˈuno ʎamˈaðas peɾðˈiðas.
+Tiene 573 mensajes y 90 llamadas perdidas.	tjˈene kinjˈɛntos sɛtˌɛntaitɾˈes mensˈaxes i noβˈɛnta ʎamˈaðas peɾðˈiðas.	tjˈene kinjˈɛntos sɛtˌɛntaitɾˈes mensˈaxes i noβˈɛnta ʎamˈaðas peɾðˈiðas.
+Tiene 743 mensajes y 76 llamadas perdidas.	tjˈene sˌeteθjˈɛntos kwaɾˌɛntaitɾˈes mensˈaxes i sɛtˌɛntaisˈAs ʎamˈaðas peɾðˈiðas.	tjˈene sˌeteθjˈɛntos kwaɾˌɛntaitɾˈes mensˈaxes i sɛtˌɛntaisˈAs ʎamˈaðas peɾðˈiðas.
+Tiene 961 mensajes y 7 llamadas perdidas.	tjˈene nˌoβeθjˈɛntos sɛsˌɛntaiˈuno mensˈaxes i sjˈete ʎamˈaðas peɾðˈiðas.	tjˈene nˌoβeθjˈɛntos sɛsˌɛntaiˈuno mensˈaxes i sjˈete ʎamˈaðas peɾðˈiðas.
+Tiene 594 mensajes y 89 llamadas perdidas.	tjˈene kinjˈɛntos noβˌɛntaikwˈatɾo mensˈaxes i oʧˌɛntainwˈeβe ʎamˈaðas peɾðˈiðas.	tjˈene kinjˈɛntos noβˌɛntaikwˈatɾo mensˈaxes i oʧˌɛntainwˈeβe ʎamˈaðas peɾðˈiðas.
+Tiene 219 mensajes y 6 llamadas perdidas.	tjˈene ðosθjˈentos ðjˌɛθinwˈeβe mensˈaxes i sˈAs ʎamˈaðas peɾðˈiðas.	tjˈene ðosθjˈentos ðjˌɛθinwˈeβe mensˈaxes i sˈAs ʎamˈaðas peɾðˈiðas.
+Tiene 513 mensajes y 71 llamadas perdidas.	tjˈene kinjˈɛntos tɾˈeθe mensˈaxes i sɛtˌɛntaiˈuno ʎamˈaðas peɾðˈiðas.	tjˈene kinjˈɛntos tɾˈeθe mensˈaxes i sɛtˌɛntaiˈuno ʎamˈaðas peɾðˈiðas.
+Tiene 147 mensajes y 35 llamadas perdidas.	tjˈene θjˈento kwaɾˌɛntaisjˈete mensˈaxes i tɾˌAntaiθˈinko ʎamˈaðas peɾðˈiðas.	tjˈene θjˈento kwaɾˌɛntaisjˈete mensˈaxes i tɾˌAntaiθˈinko ʎamˈaðas peɾðˈiðas.
+Tiene 9 mensajes y 60 llamadas perdidas.	tjˈene nwˈeβe mensˈaxes i sɛsˈɛnta ʎamˈaðas peɾðˈiðas.	tjˈene nwˈeβe mensˈaxes i sɛsˈɛnta ʎamˈaðas peɾðˈiðas.
+Tiene 996 mensajes y 31 llamadas perdidas.	tjˈene nˌoβeθjˈɛntos noβˌɛntaisˈAs mensˈaxes i tɾˌAntaiˈuno ʎamˈaðas peɾðˈiðas.	tjˈene nˌoβeθjˈɛntos noβˌɛntaisˈAs mensˈaxes i tɾˌAntaiˈuno ʎamˈaðas peɾðˈiðas.
+Tiene 612 mensajes y 29 llamadas perdidas.	tjˈene sAsθjˈentos ðˈoθe mensˈaxes i βˌAntinwˈeβe ʎamˈaðas peɾðˈiðas.	tjˈene sAsθjˈentos ðˈoθe mensˈaxes i βˌAntinwˈeβe ʎamˈaðas peɾðˈiðas.
+Tiene 600 mensajes y 86 llamadas perdidas.	tjˈene sAsθjˈentos mensˈaxes i oʧˌɛntaisˈAs ʎamˈaðas peɾðˈiðas.	tjˈene sAsθjˈentos mensˈaxes i oʧˌɛntaisˈAs ʎamˈaðas peɾðˈiðas.
+Tiene 797 mensajes y 96 llamadas perdidas.	tjˈene sˌeteθjˈɛntos noβˌɛntaisjˈete mensˈaxes i noβˌɛntaisˈAs ʎamˈaðas peɾðˈiðas.	tjˈene sˌeteθjˈɛntos noβˌɛntaisjˈete mensˈaxes i noβˌɛntaisˈAs ʎamˈaðas peɾðˈiðas.
+Tiene 795 mensajes y 6 llamadas perdidas.	tjˈene sˌeteθjˈɛntos noβˌɛntaiθˈinko mensˈaxes i sˈAs ʎamˈaðas peɾðˈiðas.	tjˈene sˌeteθjˈɛntos noβˌɛntaiθˈinko mensˈaxes i sˈAs ʎamˈaðas peɾðˈiðas.
+Tiene 601 mensajes y 2 llamadas perdidas.	tjˈene sAsθjˈentos ˈuno mensˈaxes i ðˈos ʎamˈaðas peɾðˈiðas.	tjˈene sAsθjˈentos ˈuno mensˈaxes i ðˈos ʎamˈaðas peɾðˈiðas.
+Tiene 219 mensajes y 60 llamadas perdidas.	tjˈene ðosθjˈentos ðjˌɛθinwˈeβe mensˈaxes i sɛsˈɛnta ʎamˈaðas peɾðˈiðas.	tjˈene ðosθjˈentos ðjˌɛθinwˈeβe mensˈaxes i sɛsˈɛnta ʎamˈaðas peɾðˈiðas.
+Tiene 419 mensajes y 47 llamadas perdidas.	tjˈene kwˌatɾoθjˈentos ðjˌɛθinwˈeβe mensˈaxes i kwaɾˌɛntaisjˈete ʎamˈaðas peɾðˈiðas.	tjˈene kwˌatɾoθjˈentos ðjˌɛθinwˈeβe mensˈaxes i kwaɾˌɛntaisjˈete ʎamˈaðas peɾðˈiðas.
+Tiene 702 mensajes y 86 llamadas perdidas.	tjˈene sˌeteθjˈɛntos ðˈos mensˈaxes i oʧˌɛntaisˈAs ʎamˈaðas peɾðˈiðas.	tjˈene sˌeteθjˈɛntos ðˈos mensˈaxes i oʧˌɛntaisˈAs ʎamˈaðas peɾðˈiðas.
+Tiene 210 mensajes y 29 llamadas perdidas.	tjˈene ðosθjˈentos ðjˈɛθ mensˈaxes i βˌAntinwˈeβe ʎamˈaðas peɾðˈiðas.	tjˈene ðosθjˈentos ðjˈɛθ mensˈaxes i βˌAntinwˈeβe ʎamˈaðas peɾðˈiðas.
+Tiene 476 mensajes y 13 llamadas perdidas.	tjˈene kwˌatɾoθjˈentos sɛtˌɛntaisˈAs mensˈaxes i tɾˈeθe ʎamˈaðas peɾðˈiðas.	tjˈene kwˌatɾoθjˈentos sɛtˌɛntaisˈAs mensˈaxes i tɾˈeθe ʎamˈaðas peɾðˈiðas.
+Llame al 912 345 678.	ʎˈame al nˌoβeθjˈɛntos ðˈoθe tɾesθjˈentos kwaɾˌɛntaiθˈinko sAsθjˈentos sɛtˌɛntaiˈoʧo.	ʎˈame al nˌoβeθjˈɛntos ðˈoθe tɾesθjˈentos kwaɾˌɛntaiθˈinko sAsθjˈentos sɛtˌɛntaiˈoʧo.
+Su código es 4 8 1 5.	su kˈoðiɣo ˈes kwˈatɾo ˈoʧo ˈuno θˈinko.	su kˈoðiɣo ˈes kwˈatɾo ˈoʧo ˈuno θˈinko.
+La habitación 204 está en la 2.ª planta.	la ˌaβitaθjˈon dosθjˈentos kwˈatɾo estˈa en la ðˈos.ˈa plˈanta.	la ˌaβitaθjˈon dosθjˈentos kwˈatɾo estˈa en la ðˈos.ˈa plˈanta.
+El Sr. López y la Dra. Ruiz llegan a las 10.	el seɲˈoɾ. lˈopeθ i la ðoktˈoɾa. ruˈiθ ʎˈeɣan a las ðjˈɛθ.	el seɲˈoɾ. lˈopeθ i la ðoktˈoɾa. ruˈiθ ʎˈeɣan a las ðjˈɛθ.
+Tome 2 comprimidos de 500 mg.	tˈome ðˈos kˌompɾimˈiðos ðe kinjˈɛntos ˌemexˈe.	tˈome ðˈos kˌompɾimˈiðos ðe kinjˈɛntos ˌemexˈe.
+Hoy es 28/10/2026.	ˈoɪ ˈes βˌAntiˈoʧo βˈara ðjˈɛθ βˈara ðˈos mˈil βAntisˈAs.	ˈoɪ ˈes βˌAntiˈoʧo βˈara ðjˈɛθ βˈara ðˈos mˈil βAntisˈAs.
+Faltan 3 días, 4 horas y 15 minutos.	fˈaltan tɾˈes ðˈias, kwˈatɾo ˈoɾas i kˈinθe minˈutos.	fˈaltan tɾˈes ðˈias, kwˈatɾo ˈoɾas i kˈinθe minˈutos.
+El capítulo XIV es el último.	el kapˈitulo katˈoɾθe ˈes el ˈultimo.	el kapˈitulo katˈoɾθe ˈes el ˈultimo.
+Carlos III reinó en el siglo XVIII.	kˈaɾlos tɾˈes rAnˈo en el sˈiɣlo ðjˌeθiˈoʧo.	kˈaɾlos tɾˈes rAnˈo en el sˈiɣlo ðjˌeθiˈoʧo.
+Vive en el n.º 7 de la calle Mayor.	bˈiβe en el ˈɛne.ˈo sjˈete ðe la kˈaʎe maʝˈoɾ.	bˈiβe en el ˈɛne.ˈo sjˈete ðe la kˈaʎe maʝˈoɾ.
