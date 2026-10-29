@@ -1397,6 +1397,10 @@ std::string llama_arch_kv_name(llm_arch arch, llm_kv key) {
     return LLM_KV(arch)(key);
 }
 
+std::string llama_arch_tensor_name(llm_arch arch, llm_tensor tensor, const char * suffix, int bid) {
+    return LLM_TN(arch)(tensor, suffix, bid).str();
+}
+
 bool llama_arch_supports_sm_tensor(llm_arch arch) {
     return llm_arch_supports_sm_tensor(arch);
 }

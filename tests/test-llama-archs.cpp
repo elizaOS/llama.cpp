@@ -755,16 +755,15 @@ static llama_model_ptr get_model(
             // Gemma4 RMSNorm gains and layer scalars initialize to one. Tiny
             // zero-centered gains compound across the paired backbone and
             // erase meaningful attention inputs through half underflow.
-            const auto tn = LLM_TN(arch);
-            tensor_params.unit_gains.insert(tn(LLM_TENSOR_OUTPUT_NORM, "weight").str());
-            tensor_params.unit_gains.insert(tn(LLM_TENSOR_PER_LAYER_PROJ_NORM, "weight", 0).str());
+            tensor_params.unit_gains.insert(llama_arch_tensor_name(arch, LLM_TENSOR_OUTPUT_NORM, "weight"));
+            tensor_params.unit_gains.insert(llama_arch_tensor_name(arch, LLM_TENSOR_PER_LAYER_PROJ_NORM, "weight", 0));
             const uint32_t n_layer = gguf_get_val_u32(gguf_ctx, gguf_find_key(gguf_ctx, llama_arch_kv_name(arch, LLM_KV_BLOCK_COUNT).c_str()));
             for (uint32_t il = 0; il < n_layer; ++il) {
                 for (const auto role : {LLM_TENSOR_ATTN_NORM, LLM_TENSOR_ATTN_Q_NORM, LLM_TENSOR_ATTN_K_NORM,
                         LLM_TENSOR_ATTN_POST_NORM, LLM_TENSOR_FFN_NORM, LLM_TENSOR_FFN_POST_NORM,
                         LLM_TENSOR_FFN_PRE_NORM_2, LLM_TENSOR_FFN_POST_NORM_1, LLM_TENSOR_FFN_POST_NORM_2,
                         LLM_TENSOR_PER_LAYER_POST_NORM, LLM_TENSOR_LAYER_OUT_SCALE}) {
-                    tensor_params.unit_gains.insert(tn(role, "weight", il).str());
+                    tensor_params.unit_gains.insert(llama_arch_tensor_name(arch, role, "weight", il));
                 }
             }
         }
