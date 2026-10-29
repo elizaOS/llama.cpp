@@ -34,6 +34,16 @@
 //               the float32 vhead.sine_bank than that is from float64
 //               (+1e-4 * RMS). float32's own error reaches ~9e-4 * RMS.
 //   end to end  the whole chain with the reference's noise: SNR >= 35 dB
+// Delibes-8M-esES (paradee.family delibes; reference from
+// tools/dump_delibes_reference.py, the release's fp32 ONNX graphs in
+// onnxruntime with its NumPy PCG64 noise): the ONNX graphs expose only
+// durations, F0, N, asr and the waveform, so the gates are integer
+// durations identical, F0 / N / asr max|err| <= 1e-3 * RMS, the decoder
+// (trunk + head) from the reference asr / F0 / N and noise max|err| <=
+// 1e-3 * RMS, and end to end SNR >= 35 dB. Stages a reference does not
+// have are skipped. The manifest's "fixture" names the phoneme fixture
+// (default sentences.misaki.json).
+//
 // PARADEE_GGUF_V10=<v1.0 GGUF> also checks that the text side is unchanged:
 // the two GGUFs' text-side stages must be bit-identical.
 //
@@ -131,7 +141,7 @@ int main() {
     // (for runs on another machine, such as a device over adb).
     const char * fixture_dir = std::getenv("PARADEE_FIXTURE_DIR");
     const json fixture = read_json(std::string(fixture_dir && *fixture_dir ? fixture_dir : PARADEE_FIXTURE_DIR) +
-                                   "/sentences.misaki.json");
+                                   "/" + manifest.value("fixture", std::string("sentences.misaki.json")));
     const float speed = manifest.value("speed", 1.0f);
 
     std::string err;
@@ -140,6 +150,8 @@ int main() {
     const bool v11 = paradee_get_head(model.get()) == PARADEE_HEAD_SOURCE_FILTER;
     std::printf("model: Paradee-8M v%s (%s head)\n", paradee_version(model.get()), v11 ? "source-filter" : "iSTFTNet + lock");
     const std::string version = paradee_version(model.get());
+    CHECK(manifest.value("family", std::string("paradee")) == paradee_family(model.get()),
+          "the reference was dumped for another model family (%s)", paradee_family(model.get()));
     CHECK(manifest.value("version", std::string("1.0")) == (v11 ? version : "1.0"),
           "the reference was dumped for another Paradee version");
     int voice = -1;
@@ -166,6 +178,7 @@ int main() {
         const int sent = m["index"].get<int>();
         const std::string phonemes = fx["phonemes"].get<std::string>();
         auto file = [&](const char * name) { return ref_dir + "/" + m["files"][name]["file"].get<std::string>(); };
+        auto has = [&](const char * name) { return m["files"].contains(name); };
         std::printf("sentence %d (%zu bytes of phonemes)\n", sent, phonemes.size());
         CHECK(m["phonemes"].get<std::string>() == phonemes, "sentence %d: reference was dumped from other phonemes", sent);
 
@@ -193,9 +206,11 @@ int main() {
         const std::vector<int32_t> ref_dur = read_raw<int32_t>(file("dur_int"));
         CHECK(st.dur_int == ref_dur, "sentence %d: integer durations differ", sent);
         std::printf("  durations identical: %s (%d frames)\n", st.dur_int == ref_dur ? "yes" : "NO", st.T_frame);
-        gate_stage(sent, "bert", read_raw<float>(file("bert")), st.bert);
-        gate_stage(sent, "d", read_raw<float>(file("d")), st.d);
-        gate_stage(sent, "dur", read_raw<float>(file("dur")), st.dur);
+        for (const char * name : { "bert", "d", "dur" }) {
+            if (!has(name)) continue;   // an ONNX reference has none of these
+            const std::vector<float> & got = name[0] == 'b' ? st.bert : name[1] == 0 ? st.d : st.dur;
+            gate_stage(sent, name, read_raw<float>(file(name)), got);
+        }
         gate_stage(sent, "F0", read_raw<float>(file("F0")), st.F0);
         gate_stage(sent, "N", read_raw<float>(file("N")), st.N);
         gate_stage(sent, "asr", read_raw<float>(file("asr")), st.asr);
@@ -215,7 +230,6 @@ int main() {
             const std::vector<float> ref_asr = read_raw<float>(file("asr"));
             const std::vector<float> ref_F0 = read_raw<float>(file("F0"));
             const std::vector<float> ref_N = read_raw<float>(file("N"));
-            const std::vector<float> ref_trunk = read_raw<float>(file("trunk"));
             const std::vector<float> ref_wav = read_raw<float>(file("wav"));
             const int T = (int) ref_F0.size() / 2;
             const int n = (int) ref_F0.size();
@@ -224,6 +238,20 @@ int main() {
             a.noise_in = &ref_noise;
             CHECK(paradee_decode_staged(model.get(), ref_asr.data(), 512, T, ref_F0.data(), ref_N.data(), nullptr,
                                         nullptr, nullptr, &a, err) == PARADEE_OK, "%s", err.c_str());
+            if (!has("trunk")) {
+                // ONNX reference: the decoder as a whole, from the reference's asr / F0 / N and noise.
+                gate_stage(sent, "decode", ref_wav, a.wav);
+                const err_stats e = compare(ref_wav, pcm);
+                std::printf("  end to end: snr %.1f dB, max|err| %.3g, %zu samples, %.3f s synth (%.1fx realtime)\n",
+                            e.snr_db, e.max_abs, pcm.size(), secs, (double) pcm.size() / 24000.0 / secs);
+                CHECK(e.same_size && e.snr_db >= 35.0, "sentence %d: end-to-end SNR %.1f dB < 35 dB", sent, e.snr_db);
+                if (out_dir && *out_dir) {
+                    std::ofstream f(std::string(out_dir) + "/" + std::to_string(sent) + ".wav.f32", std::ios::binary);
+                    f.write((const char *) pcm.data(), (std::streamsize) (pcm.size() * sizeof(float)));
+                }
+                continue;
+            }
+            const std::vector<float> ref_trunk = read_raw<float>(file("trunk"));
             gate_stage(sent, "trunk", ref_trunk, a.trunk);
             const int C = n > 0 ? (int) (ref_trunk.size() / (size_t) n) : 0;
             paradee_stages b;

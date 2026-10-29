@@ -144,19 +144,52 @@ bool number_fits(const std::string & digits);        // within the supported ran
 class EspeakFallback {
   public:
     // Returns null and sets err when libespeak-ng is not linked or fails to load.
-    static std::unique_ptr<EspeakFallback> open(const std::string & data_dir, std::string & err);
+    // `voice` is the eSpeak NG voice identifier phonemizer would select
+    // (nullptr: gmw/en-US, misaki's American fallback). `remove_flags` applies
+    // phonemizer's language_switch='remove-flags' (EspeakG2P); the English
+    // fallback keeps phonemizer's default ('keep-flags').
+    static std::unique_ptr<EspeakFallback> open(const std::string & data_dir, std::string & err,
+                                                const char * voice = nullptr, bool remove_flags = false);
     ~EspeakFallback();
     // misaki espeak.EspeakFallback.__call__ on a token text: phonemizer
     // (preserve_punctuation, with_stress, tie='^') then the E2M table.
     std::optional<u32> operator()(const u32 & text);
+    // phonemizer EspeakBackend.phonemize([text])[0].strip() alone (no E2M):
+    // preserve_punctuation, with_stress, tie='^'. nullopt when phonemizer
+    // returns no line.
+    std::optional<u32> phonemize(const u32 & text);
     // The E2M mapping alone, on phonemizer-style output (tests).
     static u32 e2m(const u32 & espeak_tied_ipa);
   private:
-    explicit EspeakFallback(std::string data_dir) : data_dir_(std::move(data_dir)) {}
+    EspeakFallback(std::string data_dir, std::string voice, bool remove_flags)
+        : data_dir_(std::move(data_dir)), voice_(std::move(voice)), remove_flags_(remove_flags) {}
     u32 phonemize_line(const u32 & text);
     // libespeak-ng is process-global: another handle may have re-initialised
     // it with a different data directory since this one was opened.
     std::string data_dir_;
+    std::string voice_;
+    bool remove_flags_ = false;
+};
+
+// misaki espeak.EspeakG2P (misaki 0.9.4, version=None): whole-text eSpeak G2P
+// for the languages Kokoro's KPipeline has no misaki lexicon for. `language`
+// is a phonemizer language code; only "es" (eSpeak NG roa/es, Castilian
+// Spanish, as Delibes-8M-esES was trained) is supported.
+class EspeakG2P {
+  public:
+    static std::unique_ptr<EspeakG2P> open(const std::string & language, const std::string & data_dir,
+                                           std::string & err);
+    // EspeakG2P.__call__(text)[0]. Symbols outside the model vocabulary are
+    // left in (Kokoro drops them when it maps symbols to ids).
+    u32 operator()(const u32 & text);
+    // The EspeakG2P E2M table, tie removal, '-' removal (tests).
+    static u32 e2m(const u32 & espeak_tied_ipa);
+    const std::string & language() const { return language_; }
+  private:
+    EspeakG2P(std::string language, std::unique_ptr<EspeakFallback> backend)
+        : language_(std::move(language)), backend_(std::move(backend)) {}
+    std::string language_;
+    std::unique_ptr<EspeakFallback> backend_;
 };
 bool espeak_linked();
 

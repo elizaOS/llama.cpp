@@ -51,11 +51,24 @@ struct paradee_synth_options {
     float             speed            = 1.0f;
     paradee_cancel_cb cancel           = nullptr;
     void *            cancel_user_data = nullptr;
+    uint64_t          noise_seed       = 0;
+    int               voice            = -1;
 };
 
 paradee_model_ptr paradee_load_model(const std::string & gguf_path, std::string & err_out) noexcept;
 
 int paradee_sample_rate(const paradee_model * model) noexcept;
+
+const char * paradee_family(const paradee_model * model) noexcept;
+const char * paradee_language(const paradee_model * model) noexcept;
+const char * paradee_phoneme_format(const paradee_model * model) noexcept;
+int paradee_validated_max_ids(const paradee_model * model) noexcept;
+bool paradee_validated_speed(const paradee_model * model, float & lo, float & hi) noexcept;
+int paradee_voice_count(const paradee_model * model) noexcept;
+int paradee_default_voice(const paradee_model * model) noexcept;
+const char * paradee_voice_name(const paradee_model * model, int voice) noexcept;
+const char * paradee_voice_accent(const paradee_model * model, int voice) noexcept;
+int paradee_find_voice(const paradee_model * model, const std::string & name) noexcept;
 
 // Map a misaki phoneme string to model vocab ids (no pad tokens added, no
 // length limit). Characters outside the vocab are dropped and counted, as

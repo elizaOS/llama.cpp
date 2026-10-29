@@ -1,7 +1,7 @@
 /* tools/omnivoice/tests/ffi-abi.c
  *
- * C11 test against the real libelizainference (ABI v19). Always runs:
- *   - ABI string "19" and the v17 capability probes
+ * C11 test against the real libelizainference (ABI v20). Always runs:
+ *   - ABI string "20" and the v17 / v20 capability probes
  *   - v18 llm_context_capacity argument validation and the no-text-GGUF error
  *   - cancel_tts / asr_cancel are no-ops with nothing in flight
  *   - mmap_evict / mmap_acquire("tts") on a bundle with no TTS weights
@@ -14,9 +14,18 @@
  * It transcribes uncancelled (after one warm-up run), cancels a run 20 ms in
  * (prefill) and a run late in its decode, expecting ELIZA_ERR_CANCELLED,
  * then checks an uncancelled run still returns the same text.
+ *
+ * Opt-in real-model Paradee voice slots (ABI v20; skipped unless set):
+ *   ELIZA_TEST_PARADEE_EN_GGUF + ELIZA_TEST_PARADEE_LEXICON  English slot
+ *   ELIZA_TEST_PARADEE_ES_GGUF                              Spanish slot
+ *   ELIZA_TEST_ESPEAK_DATA      eSpeak NG data (es_dict for the es slot)
+ *   ELIZA_TEST_PARADEE_OUT      optional dir: writes <slot>.f32 PCM
+ * Each slot synthesizes a sentence; the PCM must be non-empty, finite and
+ * speech-level, and the info JSON must name the slot's language.
  */
 #include "eliza-inference-ffi.h"
 
+#include <math.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -50,12 +59,14 @@ static double now_ms(void) {
 
 static void test_probes_and_noops(void) {
     char * err = NULL;
-    CHECK(strcmp(eliza_inference_abi_version(), "19") == 0);
+    CHECK(strcmp(eliza_inference_abi_version(), "20") == 0);
     CHECK_RC(eliza_inference_asr_supported(), 1);
 #if defined(ELIZA_TEST_EXPECT_PARADEE)
     CHECK_RC(eliza_inference_paradee_supported(), 1);
+    CHECK_RC(eliza_inference_paradee_voices_supported(), 1);
 #else
     CHECK_RC(eliza_inference_paradee_supported(), 0);
+    CHECK_RC(eliza_inference_paradee_voices_supported(), 0);
 #endif
 
     char dir_template[] = "/tmp/eliza-ffi-abi-XXXXXX";
@@ -112,6 +123,72 @@ static void test_probes_and_noops(void) {
     clear_err(&err);
 #endif
 
+    eliza_inference_destroy(ctx);
+    rmdir(dir);
+}
+
+/* ---- opt-in real-model Paradee voice slots (ABI v20) --------------- */
+
+static void real_voice_slot(EliInferenceContext * ctx, const char * id, const char * gguf, const char * lexicon,
+                            const char * espeak, const char * text, const char * language) {
+    char * err = NULL;
+    const int rc = eliza_inference_paradee_load_voice(ctx, id, gguf, lexicon, espeak, NULL, &err);
+    CHECK_RC(rc, ELIZA_OK);
+    if (rc != ELIZA_OK) { fprintf(stderr, "load %s: %s\n", id, err ? err : "?"); clear_err(&err); return; }
+    char * json = NULL;
+    CHECK(eliza_inference_paradee_voice_info(ctx, id, &json, &err) > 0);
+    char want[64];
+    snprintf(want, sizeof(want), "\"language\":\"%s\"", language);
+    CHECK(json && strstr(json, want));
+    fprintf(stderr, "voice %s: %s\n", id, json ? json : "?");
+    eliza_inference_free_string(json);
+    float * pcm = NULL;
+    size_t n = 0;
+    const double t0 = now_ms();
+    CHECK_RC(eliza_inference_paradee_synthesize_voice_alloc(ctx, id, text, strlen(text), 1.0f, &pcm, &n, &err), ELIZA_OK);
+    const double ms = now_ms() - t0;
+    clear_err(&err);
+    double e = 0;
+    int finite = n > 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (!(pcm[i] == pcm[i]) || pcm[i] > 4.0f || pcm[i] < -4.0f) finite = 0;
+        e += (double) pcm[i] * (double) pcm[i];
+    }
+    const double rms = n ? sqrt(e / (double) n) : 0;
+    CHECK(finite && rms > 0.01 && rms < 0.3);
+    fprintf(stderr, "voice %s: %zu samples (%.2f s) in %.0f ms, rms %.4f\n", id, n, n / 24000.0, ms, rms);
+    const char * out = getenv("ELIZA_TEST_PARADEE_OUT");
+    if (out && pcm) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s.f32", out, id);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(pcm, sizeof(float), n, f); fclose(f); }
+    }
+    eliza_inference_free_pcm(pcm);
+}
+
+static void test_real_voice_slots(void) {
+    const char * en = getenv("ELIZA_TEST_PARADEE_EN_GGUF");
+    const char * lex = getenv("ELIZA_TEST_PARADEE_LEXICON");
+    const char * es = getenv("ELIZA_TEST_PARADEE_ES_GGUF");
+    const char * espeak = getenv("ELIZA_TEST_ESPEAK_DATA");
+    if (!(en && lex) && !(es && espeak)) {
+        fprintf(stderr, "skip: real-model Paradee voice slots (set ELIZA_TEST_PARADEE_EN_GGUF + "
+                        "ELIZA_TEST_PARADEE_LEXICON and/or ELIZA_TEST_PARADEE_ES_GGUF + ELIZA_TEST_ESPEAK_DATA)\n");
+        return;
+    }
+    char dir[] = "/tmp/eliza-ffi-voices-XXXXXX";
+    if (!mkdtemp(dir)) { CHECK(0); return; }
+    char * err = NULL;
+    EliInferenceContext * ctx = eliza_inference_create(dir, &err);
+    CHECK(ctx != NULL);
+    clear_err(&err);
+    if (en && lex) {
+        real_voice_slot(ctx, "en", en, lex, espeak, "Good morning. Your appointment is at ten thirty.", "en");
+    }
+    if (es && espeak) {
+        real_voice_slot(ctx, "es", es, NULL, espeak, "Buenos días. Su cita es a las diez y media.", "es");
+    }
     eliza_inference_destroy(ctx);
     rmdir(dir);
 }
@@ -254,6 +331,7 @@ static void test_real_asr_cancel(void) {
 int main(void) {
     test_probes_and_noops();
     test_real_asr_cancel();
+    test_real_voice_slots();
     fprintf(stderr, "%s: %d checks, %d failures\n", g_fail ? "FAIL" : "PASS", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

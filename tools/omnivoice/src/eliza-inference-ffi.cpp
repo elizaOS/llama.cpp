@@ -96,6 +96,7 @@ extern "C" {
 #include <new>
 #include <string>
 #include <thread>
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -137,6 +138,26 @@ struct EliVoicePreset {
 
 #ifdef ELIZA_ENABLE_PARAKEET
 struct EliParakeetAsr;
+#endif
+
+#ifdef ELIZA_ENABLE_PARADEE
+/* One loaded Paradee-family voice (ABI v20): a GGUF, the row of its voice
+ * table, and the G2P its phoneme format needs (the misaki English lexicon
+ * for "misaki", eSpeak-only EspeakG2P for "espeak-es"). */
+struct EliParadeeSlot {
+    eliza_paradee::paradee_model_ptr model;
+    eliza_misaki::misaki_lexicon_ptr lexicon;      /* phoneme format "misaki" */
+    eliza_misaki::espeak_g2p_ptr espeak_g2p;       /* phoneme format "espeak-es" */
+    int rate = 0;                    /* sample rate of the last successful load */
+    int g2p_kind = -1;               /* ELIZA_PARADEE_G2P_* of the last load */
+    int voice = -1;                  /* style row of the last successful load */
+    std::string gguf_path;
+    std::string lexicon_path;        /* "" when the format needs none */
+    std::string espeak_dir;
+    std::string voice_name;          /* "" = the GGUF's default voice */
+    bool has_espeak_dir = false;
+    bool configured = false;         /* true once a load has succeeded */
+};
 #endif
 
 struct EliInferenceContext {
@@ -227,19 +248,12 @@ struct EliInferenceContext {
     std::mutex kokoro_mutex;
 #endif
 #ifdef ELIZA_ENABLE_PARADEE
-    /* Paradee TTS + misaki lexicon (ABI v17), owned by the ctx and protected
-     * by paradee_mutex. The paths are kept after mmap_evict("tts") frees the
-     * model and lexicon, so the next synth / mmap_acquire("tts") reloads
-     * them. paradee_configured is true once a load has succeeded. */
-    eliza_paradee::paradee_model_ptr paradee_model;
-    int paradee_rate = 0;            /* sample rate of the last successful load */
-    int paradee_g2p_kind = -1;       /* ELIZA_PARADEE_G2P_* of the last load */
-    eliza_misaki::misaki_lexicon_ptr paradee_lexicon;
-    std::string paradee_gguf_path;
-    std::string paradee_lexicon_path;
-    std::string paradee_espeak_dir;
-    bool paradee_has_espeak_dir = false;
-    bool paradee_configured = false;
+    /* Paradee-family TTS voices (ABI v17; voice slots ABI v20), owned by the
+     * ctx and protected by paradee_mutex. Slot "" is the v17 voice
+     * (paradee_load / paradee_synthesize_*); paradee_load_voice adds named
+     * slots. The paths are kept after mmap_evict("tts") frees the models and
+     * G2P state, so the next synth / mmap_acquire("tts") reloads them. */
+    std::map<std::string, EliParadeeSlot> paradee_slots;
     std::mutex paradee_mutex;
 #endif
 };
@@ -1827,9 +1841,7 @@ void eliza_inference_destroy(EliInferenceContext * ctx) {
 #ifdef ELIZA_ENABLE_PARADEE
     {
         std::lock_guard<std::mutex> lock(ctx->paradee_mutex);
-        ctx->paradee_model.reset();
-        ctx->paradee_lexicon.reset();
-        ctx->paradee_configured = false;
+        ctx->paradee_slots.clear();
     }
 #endif
     delete ctx;
@@ -2220,13 +2232,18 @@ static int eliza_paradee_map_g2p_kind(eliza_misaki::misaki_fallback_kind kind) {
     }
 }
 
-/* Load model + lexicon into ctx. Caller holds paradee_mutex. On failure the
- * previously loaded model and lexicon (if any) stay in place. */
+/* Load a voice into `slot`. Caller holds paradee_mutex. The G2P follows the
+ * GGUF's phoneme format: "misaki" needs the misaki lexicon (American English;
+ * a voice whose accent is en-gb is refused, there is no British lexicon),
+ * "espeak-es" needs eSpeak NG data with the es dictionary. `voice_name`
+ * ("" = the GGUF's default) picks the style row. On failure the slot's
+ * previous voice (if any) stays in place. */
 static int eliza_paradee_load_locked(
-    EliInferenceContext * ctx,
+    EliParadeeSlot & slot,
     const std::string & gguf_path,
     const std::string & lexicon_path,
     const char * espeak_dir,
+    const std::string & voice_name,
     char ** out_error) {
     std::string err;
     eliza_paradee::paradee_model_ptr model = eliza_paradee::paradee_load_model(gguf_path, err);
@@ -2235,48 +2252,120 @@ static int eliza_paradee_load_locked(
             std::string("[libelizainference] paradee_load_model failed: ") + err);
         return ELIZA_ERR_BUNDLE_INVALID;
     }
-    err.clear();
-    eliza_misaki::misaki_lexicon_ptr lexicon =
-        eliza_misaki::misaki_load_lexicon(lexicon_path, espeak_dir, err);
-    if (!lexicon) {
+    const int voice = voice_name.empty() ? eliza_paradee::paradee_default_voice(model.get())
+                                         : eliza_paradee::paradee_find_voice(model.get(), voice_name);
+    if (voice < 0) {
         eliza_set_error(out_error,
-            std::string("[libelizainference] misaki_load_lexicon failed: ") + err);
+            "[libelizainference] paradee_load: the model has no voice '" + voice_name + "'");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    const std::string format = eliza_paradee::paradee_phoneme_format(model.get());
+    eliza_misaki::misaki_lexicon_ptr lexicon;
+    eliza_misaki::espeak_g2p_ptr espeak_g2p;
+    int g2p_kind = -1;
+    err.clear();
+    if (format == "misaki") {
+        if (std::string(eliza_paradee::paradee_voice_accent(model.get(), voice)) == "en-gb") {
+            eliza_set_error(out_error,
+                std::string("[libelizainference] paradee_load: voice '") +
+                eliza_paradee::paradee_voice_name(model.get(), voice) +
+                "' needs British misaki phonemes, and only the American lexicon is available");
+            return ELIZA_ERR_INVALID_ARG;
+        }
+        if (lexicon_path.empty()) {
+            eliza_set_error(out_error, "[libelizainference] paradee_load: a misaki model needs the misaki lexicon");
+            return ELIZA_ERR_INVALID_ARG;
+        }
+        lexicon = eliza_misaki::misaki_load_lexicon(lexicon_path, espeak_dir, err);
+        if (!lexicon) {
+            eliza_set_error(out_error,
+                std::string("[libelizainference] misaki_load_lexicon failed: ") + err);
+            return ELIZA_ERR_BUNDLE_INVALID;
+        }
+        g2p_kind = eliza_paradee_map_g2p_kind(eliza_misaki::misaki_get_fallback_kind(lexicon.get()));
+    } else if (format == "espeak-es") {
+        if (!espeak_dir) {
+            eliza_set_error(out_error,
+                "[libelizainference] paradee_load: an espeak-es model needs eSpeak NG data (espeak_data_dir)");
+            return ELIZA_ERR_INVALID_ARG;
+        }
+        espeak_g2p = eliza_misaki::espeak_g2p_open("es", espeak_dir, err);
+        if (!espeak_g2p) {
+            eliza_set_error(out_error, std::string("[libelizainference] ") + err);
+            return ELIZA_ERR_BUNDLE_INVALID;
+        }
+        g2p_kind = ELIZA_PARADEE_G2P_ESPEAK;
+    } else {
+        eliza_set_error(out_error,
+            "[libelizainference] paradee_load: unsupported phoneme format '" + format + "'");
         return ELIZA_ERR_BUNDLE_INVALID;
     }
-    ctx->paradee_rate = eliza_paradee::paradee_sample_rate(model.get());
-    ctx->paradee_g2p_kind =
-        eliza_paradee_map_g2p_kind(eliza_misaki::misaki_get_fallback_kind(lexicon.get()));
-    ctx->paradee_model = std::move(model);
-    ctx->paradee_lexicon = std::move(lexicon);
-    ctx->paradee_gguf_path = gguf_path;
-    ctx->paradee_lexicon_path = lexicon_path;
-    ctx->paradee_has_espeak_dir = espeak_dir != nullptr;
-    ctx->paradee_espeak_dir = espeak_dir ? std::string(espeak_dir) : std::string();
-    ctx->paradee_configured = true;
+    slot.rate = eliza_paradee::paradee_sample_rate(model.get());
+    slot.g2p_kind = g2p_kind;
+    slot.voice = voice;
+    slot.model = std::move(model);
+    slot.lexicon = std::move(lexicon);
+    slot.espeak_g2p = std::move(espeak_g2p);
+    slot.gguf_path = gguf_path;
+    slot.lexicon_path = lexicon_path;
+    slot.has_espeak_dir = espeak_dir != nullptr;
+    slot.espeak_dir = espeak_dir ? std::string(espeak_dir) : std::string();
+    slot.voice_name = voice_name;
+    slot.configured = true;
     return ELIZA_OK;
+}
+
+static bool eliza_paradee_slot_loaded(const EliParadeeSlot & slot) {
+    return slot.model && (slot.lexicon || slot.espeak_g2p);
 }
 
 /* Reload what mmap_evict("tts") freed. Caller holds paradee_mutex. */
 static int eliza_paradee_ensure_loaded_locked(
-    EliInferenceContext * ctx, const char * operation, char ** out_error) {
-    if (ctx->paradee_model && ctx->paradee_lexicon) return ELIZA_OK;
-    if (!ctx->paradee_configured) {
+    EliParadeeSlot & slot, const char * operation, char ** out_error) {
+    if (eliza_paradee_slot_loaded(slot)) return ELIZA_OK;
+    if (!slot.configured) {
         eliza_set_error(out_error,
             std::string("[libelizainference] ") + operation +
             ": no model loaded (call paradee_load first)");
         return ELIZA_ERR_INVALID_ARG;
     }
-    const std::string gguf = ctx->paradee_gguf_path;
-    const std::string lexicon = ctx->paradee_lexicon_path;
-    const std::string espeak = ctx->paradee_espeak_dir;
+    const std::string gguf = slot.gguf_path;
+    const std::string lexicon = slot.lexicon_path;
+    const std::string espeak = slot.espeak_dir;
+    const std::string voice = slot.voice_name;
     return eliza_paradee_load_locked(
-        ctx, gguf, lexicon, ctx->paradee_has_espeak_dir ? espeak.c_str() : nullptr, out_error);
+        slot, gguf, lexicon, slot.has_espeak_dir ? espeak.c_str() : nullptr, voice, out_error);
+}
+
+/* The slot `voice_id` names, or null (with *out_error) when none was loaded.
+ * Caller holds paradee_mutex. */
+static EliParadeeSlot * eliza_paradee_slot_locked(
+    EliInferenceContext * ctx, const std::string & voice_id, const char * operation, char ** out_error) {
+    auto it = ctx->paradee_slots.find(voice_id);
+    if (it == ctx->paradee_slots.end() || !it->second.configured) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] ") + operation +
+            (voice_id.empty() ? std::string(": no model loaded (call paradee_load first)")
+                              : ": no voice '" + voice_id + "' loaded (call paradee_load_voice first)"));
+        return nullptr;
+    }
+    return &it->second;
+}
+
+/* Text -> the slot's phoneme spelling. Caller holds paradee_mutex. */
+static bool eliza_paradee_g2p_locked(
+    const EliParadeeSlot & slot, const std::string & text, std::string & phonemes, std::string & err) {
+    if (slot.espeak_g2p) return eliza_misaki::espeak_g2p_phonemize(slot.espeak_g2p.get(), text, phonemes, err);
+    return eliza_misaki::misaki_phonemize(slot.lexicon.get(), text, phonemes, err);
 }
 
 static void eliza_paradee_evict(EliInferenceContext * ctx) {
     std::lock_guard<std::mutex> lock(ctx->paradee_mutex);
-    ctx->paradee_model.reset();
-    ctx->paradee_lexicon.reset();
+    for (auto & kv : ctx->paradee_slots) {
+        kv.second.model.reset();
+        kv.second.lexicon.reset();
+        kv.second.espeak_g2p.reset();
+    }
 }
 
 /* Split `text` after any of `boundaries`, keeping the boundary and the spaces
@@ -2364,6 +2453,7 @@ static int eliza_paradee_chunk(
 
 static int eliza_paradee_synthesize_owned(
     EliInferenceContext * ctx,
+    const std::string & voice_id,
     const char * input,
     size_t input_len,
     bool phoneme_input,
@@ -2389,15 +2479,23 @@ static int eliza_paradee_synthesize_owned(
         return ELIZA_ERR_INVALID_ARG;
     }
     if (!(speed > 0.0f) || !std::isfinite(speed)) speed = 1.0f;
-    speed = std::min(std::max(speed, eliza_paradee::PARADEE_MIN_SPEED), eliza_paradee::PARADEE_MAX_SPEED);
     const std::string in(input, input_len ? input_len : std::strlen(input));
 
     std::lock_guard<std::mutex> lock(ctx->paradee_mutex);
     /* Start clean: a cancel issued before this call held the lock was aimed
      * at an earlier call. */
     ctx->paradee_cancel.store(false, std::memory_order_release);
-    const int load_rc = eliza_paradee_ensure_loaded_locked(ctx, operation, out_error);
+    EliParadeeSlot * slot = eliza_paradee_slot_locked(ctx, voice_id, operation, out_error);
+    if (!slot) return ELIZA_ERR_INVALID_ARG;
+    const int load_rc = eliza_paradee_ensure_loaded_locked(*slot, operation, out_error);
     if (load_rc != ELIZA_OK) return load_rc;
+    const eliza_paradee::paradee_model * model = slot->model.get();
+    /* The speed range and chunk size the release was validated on (the
+     * architecture's limits for Paradee; [0.85, 1.15] and 360 ids for
+     * Delibes-8M-esES). */
+    float speed_lo = eliza_paradee::PARADEE_MIN_SPEED, speed_hi = eliza_paradee::PARADEE_MAX_SPEED;
+    eliza_paradee::paradee_validated_speed(model, speed_lo, speed_hi);
+    speed = std::min(std::max(speed, speed_lo), speed_hi);
     auto cancelled = [&]() {
         eliza_set_error(out_error,
             std::string("[libelizainference] ") + operation + ": cancelled");
@@ -2409,15 +2507,17 @@ static int eliza_paradee_synthesize_owned(
     std::string err;
     if (phoneme_input) {
         phonemes = in;
-    } else if (!eliza_misaki::misaki_phonemize(ctx->paradee_lexicon.get(), in, phonemes, err)) {
+    } else if (!eliza_paradee_g2p_locked(*slot, in, phonemes, err)) {
         eliza_set_error(out_error,
-            std::string("[libelizainference] ") + operation + ": misaki_phonemize failed: " + err);
+            std::string("[libelizainference] ") + operation + ": G2P failed: " + err);
         return ELIZA_ERR_FFI_FAULT;
     }
 
     std::vector<std::vector<int32_t>> chunks;
-    const size_t max_ids = (size_t) eliza_paradee::PARADEE_MAX_INPUT_IDS - 2;
-    if (eliza_paradee_chunk(ctx->paradee_model.get(), phonemes, max_ids, 0, chunks, err) != ELIZA_OK) {
+    const int validated_ids = eliza_paradee::paradee_validated_max_ids(model);
+    const size_t max_ids = (size_t) std::min(validated_ids > 2 ? validated_ids : eliza_paradee::PARADEE_MAX_INPUT_IDS,
+                                             eliza_paradee::PARADEE_MAX_INPUT_IDS) - 2;
+    if (eliza_paradee_chunk(model, phonemes, max_ids, 0, chunks, err) != ELIZA_OK) {
         eliza_set_error(out_error,
             std::string("[libelizainference] ") + operation + ": phoneme mapping failed: " + err);
         return ELIZA_ERR_INVALID_ARG;
@@ -2425,6 +2525,7 @@ static int eliza_paradee_synthesize_owned(
 
     eliza_paradee::paradee_synth_options opts;
     opts.speed = speed;
+    opts.voice = slot->voice;
     opts.cancel = eliza_paradee_cancel_requested;
     opts.cancel_user_data = ctx;
     std::vector<float> pcm;
@@ -2439,7 +2540,7 @@ static int eliza_paradee_synthesize_owned(
         eliza_paradee::paradee_audio audio;
         err.clear();
         const eliza_paradee::paradee_status st =
-            eliza_paradee::paradee_synthesize(ctx->paradee_model.get(), input_ids, opts, audio, err);
+            eliza_paradee::paradee_synthesize(model, input_ids, opts, audio, err);
         if (st == eliza_paradee::PARADEE_E_CANCELLED) return cancelled();
         if (st != eliza_paradee::PARADEE_OK) {
             eliza_set_error(out_error,
@@ -2490,6 +2591,39 @@ int eliza_inference_paradee_supported(void) {
 #endif
 }
 
+#ifdef ELIZA_ENABLE_PARADEE
+static int eliza_paradee_load_slot(
+    EliInferenceContext * ctx,
+    const std::string & voice_id,
+    const char * gguf_path,
+    const char * lexicon_path,
+    const char * espeak_data_dir,
+    const char * model_voice,
+    const char * operation,
+    char ** out_error) {
+    if (!ctx || !gguf_path || !gguf_path[0]) {
+        eliza_set_error(out_error, std::string("[libelizainference] ") + operation + ": null argument");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    if (espeak_data_dir && !espeak_data_dir[0]) espeak_data_dir = nullptr;
+    const std::string lexicon = lexicon_path ? lexicon_path : "";
+    const std::string voice = model_voice ? model_voice : "";
+    std::lock_guard<std::mutex> lock(ctx->paradee_mutex);
+    EliParadeeSlot & slot = ctx->paradee_slots[voice_id];
+    if (eliza_paradee_slot_loaded(slot) &&
+        slot.gguf_path == gguf_path &&
+        slot.lexicon_path == lexicon &&
+        slot.voice_name == voice &&
+        slot.has_espeak_dir == (espeak_data_dir != nullptr) &&
+        (!espeak_data_dir || slot.espeak_dir == espeak_data_dir)) {
+        return ELIZA_OK;
+    }
+    const int rc = eliza_paradee_load_locked(slot, gguf_path, lexicon, espeak_data_dir, voice, out_error);
+    if (rc != ELIZA_OK && !slot.configured) ctx->paradee_slots.erase(voice_id);
+    return rc;
+}
+#endif
+
 int eliza_inference_paradee_load(
     EliInferenceContext * ctx,
     const char * gguf_path,
@@ -2497,20 +2631,12 @@ int eliza_inference_paradee_load(
     const char * espeak_data_dir,
     char ** out_error) {
 #ifdef ELIZA_ENABLE_PARADEE
-    if (!ctx || !gguf_path || !lexicon_path || !gguf_path[0] || !lexicon_path[0]) {
+    if (!lexicon_path || !lexicon_path[0]) {
         eliza_set_error(out_error, "[libelizainference] paradee_load: null argument");
         return ELIZA_ERR_INVALID_ARG;
     }
-    if (espeak_data_dir && !espeak_data_dir[0]) espeak_data_dir = nullptr;
-    std::lock_guard<std::mutex> lock(ctx->paradee_mutex);
-    if (ctx->paradee_model && ctx->paradee_lexicon &&
-        ctx->paradee_gguf_path == gguf_path &&
-        ctx->paradee_lexicon_path == lexicon_path &&
-        ctx->paradee_has_espeak_dir == (espeak_data_dir != nullptr) &&
-        (!espeak_data_dir || ctx->paradee_espeak_dir == espeak_data_dir)) {
-        return ELIZA_OK;
-    }
-    return eliza_paradee_load_locked(ctx, gguf_path, lexicon_path, espeak_data_dir, out_error);
+    return eliza_paradee_load_slot(ctx, std::string(), gguf_path, lexicon_path, espeak_data_dir, nullptr,
+                                   "paradee_load", out_error);
 #else
     (void) ctx; (void) gguf_path; (void) lexicon_path; (void) espeak_data_dir;
     ELIZA_PARADEE_NOT_BUILT(out_error);
@@ -2521,8 +2647,9 @@ int eliza_inference_paradee_sample_rate(EliInferenceContext * ctx) {
 #ifdef ELIZA_ENABLE_PARADEE
     if (!ctx) return ELIZA_ERR_INVALID_ARG;
     std::lock_guard<std::mutex> lock(ctx->paradee_mutex);
-    if (!ctx->paradee_configured || ctx->paradee_rate <= 0) return ELIZA_ERR_INVALID_ARG;
-    return ctx->paradee_rate;
+    auto it = ctx->paradee_slots.find(std::string());
+    if (it == ctx->paradee_slots.end() || !it->second.configured || it->second.rate <= 0) return ELIZA_ERR_INVALID_ARG;
+    return it->second.rate;
 #else
     (void) ctx;
     return ELIZA_ERR_NOT_IMPLEMENTED;
@@ -2533,13 +2660,59 @@ int eliza_inference_paradee_g2p_kind(EliInferenceContext * ctx) {
 #ifdef ELIZA_ENABLE_PARADEE
     if (!ctx) return ELIZA_ERR_INVALID_ARG;
     std::lock_guard<std::mutex> lock(ctx->paradee_mutex);
-    if (!ctx->paradee_configured || ctx->paradee_g2p_kind < 0) return ELIZA_ERR_INVALID_ARG;
-    return ctx->paradee_g2p_kind;
+    auto it = ctx->paradee_slots.find(std::string());
+    if (it == ctx->paradee_slots.end() || !it->second.configured || it->second.g2p_kind < 0) return ELIZA_ERR_INVALID_ARG;
+    return it->second.g2p_kind;
 #else
     (void) ctx;
     return ELIZA_ERR_NOT_IMPLEMENTED;
 #endif
 }
+
+#ifdef ELIZA_ENABLE_PARADEE
+static int eliza_paradee_phonemize_slot(
+    EliInferenceContext * ctx,
+    const std::string & voice_id,
+    const char * text,
+    size_t text_len,
+    char ** out_utf8,
+    const char * operation,
+    char ** out_error) {
+    if (!out_utf8) {
+        eliza_set_error(out_error, std::string("[libelizainference] ") + operation + ": null output argument");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    *out_utf8 = nullptr;
+    if (!ctx || !text) {
+        eliza_set_error(out_error, std::string("[libelizainference] ") + operation + ": null argument");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    const std::string in(text, text_len ? text_len : std::strlen(text));
+    std::lock_guard<std::mutex> lock(ctx->paradee_mutex);
+    EliParadeeSlot * slot = eliza_paradee_slot_locked(ctx, voice_id, operation, out_error);
+    if (!slot) return ELIZA_ERR_INVALID_ARG;
+    const int load_rc = eliza_paradee_ensure_loaded_locked(*slot, operation, out_error);
+    if (load_rc != ELIZA_OK) return load_rc;
+    std::string phonemes;
+    std::string err;
+    if (!eliza_paradee_g2p_locked(*slot, in, phonemes, err)) {
+        eliza_set_error(out_error,
+            std::string("[libelizainference] ") + operation + ": G2P failed: " + err);
+        return ELIZA_ERR_FFI_FAULT;
+    }
+    if (phonemes.size() > (size_t) INT32_MAX) {
+        eliza_set_error(out_error, std::string("[libelizainference] ") + operation + ": output too large");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    char * owned = eliza_strdup(phonemes);
+    if (!owned) {
+        eliza_set_error(out_error, std::string("[libelizainference] ") + operation + ": allocation failed");
+        return ELIZA_ERR_OOM;
+    }
+    *out_utf8 = owned;
+    return (int) phonemes.size();
+}
+#endif
 
 int eliza_inference_paradee_phonemize(
     EliInferenceContext * ctx,
@@ -2548,37 +2721,7 @@ int eliza_inference_paradee_phonemize(
     char ** out_utf8,
     char ** out_error) {
 #ifdef ELIZA_ENABLE_PARADEE
-    if (!out_utf8) {
-        eliza_set_error(out_error, "[libelizainference] paradee_phonemize: null output argument");
-        return ELIZA_ERR_INVALID_ARG;
-    }
-    *out_utf8 = nullptr;
-    if (!ctx || !text) {
-        eliza_set_error(out_error, "[libelizainference] paradee_phonemize: null argument");
-        return ELIZA_ERR_INVALID_ARG;
-    }
-    const std::string in(text, text_len ? text_len : std::strlen(text));
-    std::lock_guard<std::mutex> lock(ctx->paradee_mutex);
-    const int load_rc = eliza_paradee_ensure_loaded_locked(ctx, "paradee_phonemize", out_error);
-    if (load_rc != ELIZA_OK) return load_rc;
-    std::string phonemes;
-    std::string err;
-    if (!eliza_misaki::misaki_phonemize(ctx->paradee_lexicon.get(), in, phonemes, err)) {
-        eliza_set_error(out_error,
-            std::string("[libelizainference] paradee_phonemize: misaki_phonemize failed: ") + err);
-        return ELIZA_ERR_FFI_FAULT;
-    }
-    if (phonemes.size() > (size_t) INT32_MAX) {
-        eliza_set_error(out_error, "[libelizainference] paradee_phonemize: output too large");
-        return ELIZA_ERR_INVALID_ARG;
-    }
-    char * owned = eliza_strdup(phonemes);
-    if (!owned) {
-        eliza_set_error(out_error, "[libelizainference] paradee_phonemize: allocation failed");
-        return ELIZA_ERR_OOM;
-    }
-    *out_utf8 = owned;
-    return (int) phonemes.size();
+    return eliza_paradee_phonemize_slot(ctx, std::string(), text, text_len, out_utf8, "paradee_phonemize", out_error);
 #else
     (void) ctx; (void) text; (void) text_len;
     if (out_utf8) *out_utf8 = nullptr;
@@ -2596,7 +2739,7 @@ int eliza_inference_paradee_synthesize_alloc(
     char ** out_error) {
 #ifdef ELIZA_ENABLE_PARADEE
     return eliza_paradee_synthesize_owned(
-        ctx, text, text_len, false, speed, out_pcm, out_samples, out_error);
+        ctx, std::string(), text, text_len, false, speed, out_pcm, out_samples, out_error);
 #else
     (void) ctx; (void) text; (void) text_len; (void) speed;
     if (out_pcm) *out_pcm = nullptr;
@@ -2615,7 +2758,7 @@ int eliza_inference_paradee_synthesize_phonemes_alloc(
     char ** out_error) {
 #ifdef ELIZA_ENABLE_PARADEE
     return eliza_paradee_synthesize_owned(
-        ctx, misaki_phonemes, phonemes_len, true, speed, out_pcm, out_samples, out_error);
+        ctx, std::string(), misaki_phonemes, phonemes_len, true, speed, out_pcm, out_samples, out_error);
 #else
     (void) ctx; (void) misaki_phonemes; (void) phonemes_len; (void) speed;
     if (out_pcm) *out_pcm = nullptr;
@@ -2641,9 +2784,190 @@ int eliza_inference_paradee_synthesize_stream(
         return ELIZA_ERR_INVALID_ARG;
     }
     return eliza_paradee_synthesize_owned(
-        ctx, text, text_len, false, speed, nullptr, nullptr, out_error, on_chunk, user_data);
+        ctx, std::string(), text, text_len, false, speed, nullptr, nullptr, out_error, on_chunk, user_data);
 #else
     (void) ctx; (void) text; (void) text_len; (void) speed;
+    (void) on_chunk; (void) user_data;
+    ELIZA_PARADEE_NOT_BUILT(out_error);
+#endif
+}
+
+/* ---- Paradee voice slots (ABI v20) -------------------------------- */
+
+int eliza_inference_paradee_voices_supported(void) {
+#ifdef ELIZA_ENABLE_PARADEE
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+#define ELIZA_PARADEE_VOICE_ID(voice_id, operation, out_error) \
+    do { \
+        if (!(voice_id) || !(voice_id)[0]) { \
+            eliza_set_error((out_error), std::string("[libelizainference] ") + (operation) + ": empty voice id"); \
+            return ELIZA_ERR_INVALID_ARG; \
+        } \
+    } while (0)
+
+int eliza_inference_paradee_load_voice(
+    EliInferenceContext * ctx,
+    const char * voice_id,
+    const char * gguf_path,
+    const char * lexicon_path,
+    const char * espeak_data_dir,
+    const char * model_voice,
+    char ** out_error) {
+#ifdef ELIZA_ENABLE_PARADEE
+    ELIZA_PARADEE_VOICE_ID(voice_id, "paradee_load_voice", out_error);
+    return eliza_paradee_load_slot(ctx, voice_id, gguf_path, lexicon_path, espeak_data_dir,
+                                   model_voice && model_voice[0] ? model_voice : nullptr,
+                                   "paradee_load_voice", out_error);
+#else
+    (void) ctx; (void) voice_id; (void) gguf_path; (void) lexicon_path; (void) espeak_data_dir; (void) model_voice;
+    ELIZA_PARADEE_NOT_BUILT(out_error);
+#endif
+}
+
+int eliza_inference_paradee_unload_voice(EliInferenceContext * ctx, const char * voice_id, char ** out_error) {
+#ifdef ELIZA_ENABLE_PARADEE
+    ELIZA_PARADEE_VOICE_ID(voice_id, "paradee_unload_voice", out_error);
+    if (!ctx) {
+        eliza_set_error(out_error, "[libelizainference] paradee_unload_voice: null argument");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::mutex> lock(ctx->paradee_mutex);
+    ctx->paradee_slots.erase(voice_id);
+    return ELIZA_OK;
+#else
+    (void) ctx; (void) voice_id;
+    ELIZA_PARADEE_NOT_BUILT(out_error);
+#endif
+}
+
+#ifdef ELIZA_ENABLE_PARADEE
+static std::string eliza_json_string(const std::string & v) {
+    std::string out = "\"";
+    for (unsigned char c : v) {
+        if (c == '"' || c == '\\') { out += '\\'; out += (char) c; }
+        else if (c < 0x20) { char buf[8]; std::snprintf(buf, sizeof(buf), "\\u%04x", c); out += buf; }
+        else out += (char) c;
+    }
+    return out + "\"";
+}
+#endif
+
+int eliza_inference_paradee_voice_info(
+    EliInferenceContext * ctx,
+    const char * voice_id,
+    char ** out_json,
+    char ** out_error) {
+#ifdef ELIZA_ENABLE_PARADEE
+    if (!out_json) {
+        eliza_set_error(out_error, "[libelizainference] paradee_voice_info: null output argument");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    *out_json = nullptr;
+    if (!ctx || !voice_id) {
+        eliza_set_error(out_error, "[libelizainference] paradee_voice_info: null argument");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::mutex> lock(ctx->paradee_mutex);
+    EliParadeeSlot * slot = eliza_paradee_slot_locked(ctx, voice_id, "paradee_voice_info", out_error);
+    if (!slot) return ELIZA_ERR_INVALID_ARG;
+    const int load_rc = eliza_paradee_ensure_loaded_locked(*slot, "paradee_voice_info", out_error);
+    if (load_rc != ELIZA_OK) return load_rc;
+    const eliza_paradee::paradee_model * m = slot->model.get();
+    float lo = 0, hi = 0;
+    eliza_paradee::paradee_validated_speed(m, lo, hi);
+    char speed_buf[64];
+    std::snprintf(speed_buf, sizeof(speed_buf), "[%.6g,%.6g]", (double) lo, (double) hi);
+    std::string voices = "[";
+    for (int i = 0; i < eliza_paradee::paradee_voice_count(m); ++i) {
+        if (i) voices += ",";
+        voices += "{\"name\":" + eliza_json_string(eliza_paradee::paradee_voice_name(m, i)) +
+                  ",\"accent\":" + eliza_json_string(eliza_paradee::paradee_voice_accent(m, i)) + "}";
+    }
+    voices += "]";
+    const std::string json =
+        std::string("{\"voice_id\":") + eliza_json_string(voice_id) +
+        ",\"family\":" + eliza_json_string(eliza_paradee::paradee_family(m)) +
+        ",\"language\":" + eliza_json_string(eliza_paradee::paradee_language(m)) +
+        ",\"phoneme_format\":" + eliza_json_string(eliza_paradee::paradee_phoneme_format(m)) +
+        ",\"voice\":" + eliza_json_string(eliza_paradee::paradee_voice_name(m, slot->voice)) +
+        ",\"voices\":" + voices +
+        ",\"sample_rate\":" + std::to_string(slot->rate) +
+        ",\"g2p_kind\":" + std::to_string(slot->g2p_kind) +
+        ",\"validated_max_ids\":" + std::to_string(eliza_paradee::paradee_validated_max_ids(m)) +
+        ",\"validated_speed\":" + speed_buf + "}";
+    char * owned = eliza_strdup(json);
+    if (!owned) {
+        eliza_set_error(out_error, "[libelizainference] paradee_voice_info: allocation failed");
+        return ELIZA_ERR_OOM;
+    }
+    *out_json = owned;
+    return (int) json.size();
+#else
+    (void) ctx; (void) voice_id;
+    if (out_json) *out_json = nullptr;
+    ELIZA_PARADEE_NOT_BUILT(out_error);
+#endif
+}
+
+int eliza_inference_paradee_phonemize_voice(
+    EliInferenceContext * ctx,
+    const char * voice_id,
+    const char * text,
+    size_t text_len,
+    char ** out_utf8,
+    char ** out_error) {
+#ifdef ELIZA_ENABLE_PARADEE
+    if (out_utf8) *out_utf8 = nullptr;
+    ELIZA_PARADEE_VOICE_ID(voice_id, "paradee_phonemize_voice", out_error);
+    return eliza_paradee_phonemize_slot(ctx, voice_id, text, text_len, out_utf8, "paradee_phonemize_voice", out_error);
+#else
+    (void) ctx; (void) voice_id; (void) text; (void) text_len;
+    if (out_utf8) *out_utf8 = nullptr;
+    ELIZA_PARADEE_NOT_BUILT(out_error);
+#endif
+}
+
+int eliza_inference_paradee_synthesize_voice_alloc(
+    EliInferenceContext * ctx,
+    const char * voice_id,
+    const char * text,
+    size_t text_len,
+    float speed,
+    float ** out_pcm,
+    size_t * out_samples,
+    char ** out_error) {
+#ifdef ELIZA_ENABLE_PARADEE
+    if (out_pcm) *out_pcm = nullptr;
+    if (out_samples) *out_samples = 0;
+    ELIZA_PARADEE_VOICE_ID(voice_id, "paradee_synthesize_voice_alloc", out_error);
+    return eliza_paradee_synthesize_owned(
+        ctx, voice_id, text, text_len, false, speed, out_pcm, out_samples, out_error);
+#else
+    (void) ctx; (void) voice_id; (void) text; (void) text_len; (void) speed;
+    if (out_pcm) *out_pcm = nullptr;
+    if (out_samples) *out_samples = 0;
+    ELIZA_PARADEE_NOT_BUILT(out_error);
+#endif
+}
+
+int eliza_inference_paradee_synthesize_voice_stream(
+    EliInferenceContext * ctx, const char * voice_id, const char * text, size_t text_len, float speed,
+    eliza_tts_chunk_cb on_chunk, void * user_data, char ** out_error) {
+#ifdef ELIZA_ENABLE_PARADEE
+    ELIZA_PARADEE_VOICE_ID(voice_id, "paradee_synthesize_voice_stream", out_error);
+    if (!on_chunk) {
+        eliza_set_error(out_error, "[libelizainference] paradee voice stream: null callback");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    return eliza_paradee_synthesize_owned(
+        ctx, voice_id, text, text_len, false, speed, nullptr, nullptr, out_error, on_chunk, user_data);
+#else
+    (void) ctx; (void) voice_id; (void) text; (void) text_len; (void) speed;
     (void) on_chunk; (void) user_data;
     ELIZA_PARADEE_NOT_BUILT(out_error);
 #endif
@@ -2673,9 +2997,10 @@ static int eliza_acquire_tts_region(EliInferenceContext * ctx, char ** out_error
 #ifdef ELIZA_ENABLE_PARADEE
     {
         std::lock_guard<std::mutex> lock(ctx->paradee_mutex);
-        if (ctx->paradee_configured) {
+        for (auto & kv : ctx->paradee_slots) {
+            if (!kv.second.configured) continue;
             other_head = true;
-            const int rc = eliza_paradee_ensure_loaded_locked(ctx, "mmap_acquire(tts)", out_error);
+            const int rc = eliza_paradee_ensure_loaded_locked(kv.second, "mmap_acquire(tts)", out_error);
             if (rc != ELIZA_OK) return rc;
         }
     }

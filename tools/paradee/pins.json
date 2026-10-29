@@ -247,5 +247,126 @@
         "note": "convert_paradee_pt_to_gguf.py --version 1.2 --outtype f32 output; byte-reproducible (check with --check-output). Changes whenever the converter changes, because its git blob sha is in the metadata."
       }
     }
+  },
+  "delibes": {
+    "model": {
+      "repo": "lapislabsai/Delibes-8M-esES",
+      "revision": "5d06d5482e5341214460cd2881f1b71f8a88e02d",
+      "license": "Apache-2.0",
+      "base": "sahilmahendrakar/Paradee-8M-v1.1@330617ad1f097b4f6b02c103e54b39006c090b45 architecture; paradee source 606e16e12f53bc6dfb814fe89fef338726687161 (provenance.json)",
+      "teacher": "hexgrad/Kokoro-82M voice em_alex (Castilian Spanish, male)",
+      "release_status": "provenance.json and release-manifest.json say human_approval PENDING and commercial_distribution BLOCKED; NOTICE.md says the release is not commercial clearance and that voice consent and provenance for em_alex have not been independently established. Recorded here, not resolved."
+    },
+    "files": {
+      "onnx/fp32/text.onnx": {
+        "size": 16897730,
+        "sha256": "1d9861600a4bac95b15d40489bc57ea74438982b121469717d647b9f529cce9b"
+      },
+      "onnx/fp32/decoder.onnx": {
+        "size": 17880852,
+        "sha256": "869f9a92d347900b442805f9038a1c8d02b7082ac60875d727f4a71d39973630"
+      },
+      "config.json": {
+        "size": 3266,
+        "sha256": "37d141031284ae9883c558cf7ffe38966fafb4d70ba3edd57ccb4220717fd1f5"
+      },
+      "LICENSE": {
+        "size": 11357,
+        "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+      },
+      "NOTICE.md": {
+        "size": 2053,
+        "sha256": "8d673dcc2e649eec908bf6638490a53b67ab93f2ba2832a02b70d47e66bf88f7"
+      },
+      "provenance.json": {
+        "size": 2208,
+        "sha256": "82628b14f0fd86705f871c0be6ab260b15cfbfa7f10eb1c7a9716026a9ba3337"
+      },
+      "release-manifest.json": {
+        "size": 5700,
+        "sha256": "f2a8b7713e7bc3b46b392b07aa38884157a7ebac1d7dbe3fd81541b2ad27b6c8"
+      },
+      "third_party/kokoro/LICENSE": {
+        "size": 11357,
+        "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+      },
+      "third_party/paradee/LICENSE": {
+        "size": 11358,
+        "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+      },
+      "third_party/TATOEBA.md": {
+        "size": 1033,
+        "sha256": "27d6dd608f53acdc8cfc569339587438f9c7e63e5241fab3e9fe5cbde7c7ad39"
+      },
+      "samples/sentences.json": {
+        "size": 8847,
+        "sha256": "9d60887423db2d1bbd0278e6aa480c1c29376eace9b29582f9e6b84c6d9ee19e"
+      },
+      "samples/01.json": {
+        "size": 1470,
+        "sha256": "39bc6e98bd2731a6bacacbd593ee96a1c9c678d3d4104232540f1c2f741006fd"
+      },
+      "samples/02.json": {
+        "size": 1615,
+        "sha256": "65a13a6f165b9ecfb58301b525a63ec77306775f43d7117db09664d10881ee05"
+      },
+      "samples/03.json": {
+        "size": 1562,
+        "sha256": "6a35f777b5cb735ac474c598dfa665044e505ddd71a53f5be44ed2256d392af0"
+      },
+      "samples/04.json": {
+        "size": 1461,
+        "sha256": "1ff4d02c6da5f15dd0e54911c853920086cebed409790dcde29418c0a842dd6d"
+      },
+      "samples/05.json": {
+        "size": 1701,
+        "sha256": "9a6eaec1060c350e53355dac6bb33a8275e68815fc607266a420a5b0a0db997f"
+      },
+      "samples/01_fp32.wav": {
+        "size": 188444,
+        "sha256": "e2f540b9d266667f2d986a9f32fff878ebeb7fbfd067fa9c016cd6feaae6015e"
+      },
+      "samples/02_fp32.wav": {
+        "size": 214844,
+        "sha256": "a419dd95c335fe8e39d6ac41b27f74a80a8740afcb30be7d23dcd0c2e8be045d"
+      },
+      "samples/03_fp32.wav": {
+        "size": 208844,
+        "sha256": "433f411f28c48852d4b99160384e1b71fc769170f5b0961d80b3381a766674cc"
+      },
+      "samples/04_fp32.wav": {
+        "size": 194444,
+        "sha256": "c87afff008892380a80585269cae719f94100fa525107fb58ac4087134e75559"
+      },
+      "samples/05_fp32.wav": {
+        "size": 219644,
+        "sha256": "cfc33c05ce4e44de7c0893ba804508024d07e228a73ee3ba84fa9a136e7152ce"
+      }
+    },
+    "config": {
+      "model_name": "Delibes-8M-esES",
+      "language": "es-ES",
+      "sample_rate": 24000,
+      "hop_samples": 600,
+      "parameters": 7884450,
+      "validated_max_tokens": 360,
+      "maximum_frames_guard": 2500,
+      "validated_speed": [
+        0.85,
+        1.15
+      ]
+    },
+    "parameters_converted": 7812126,
+    "parameters_note": "The tensors written to the GGUF; the same count as the Paradee-8M v1.1 GGUF (same architecture). config.json's 7,884,450 is the release's own count of the training modules.",
+    "g2p": "misaki 0.9.4 espeak.EspeakG2P('es') (phonemizer-fork 3.3.2, eSpeak NG 1.52.0 voice roa/es); tools/misaki-g2p espeak_g2p_open('es') reproduces it. The vocabulary is Kokoro's (114 symbols, the same ids as Paradee's config.json).",
+    "noise": "The decoder graph takes white_noise float32[1, 600F] from NumPy PCG64 standard_normal(seed); the native head draws its own seeded Gaussian noise (a different realisation of the same distribution). The parity test feeds the reference's noise to the native head.",
+    "gguf": {
+      "f32": {
+        "file": "delibes-8m-eses-f32.gguf",
+        "size": 31275328,
+        "sha256": "a2f5acff3ac8218c7973c0a76a449365faace53ee6af4cf0f3bdc1f61868f0da",
+        "note": "convert_paradee_onnx_to_gguf.py --family delibes output; byte-reproducible (check with --check-output). Changes whenever either converter changes (both git blob shas are in the metadata)."
+      }
+    }
   }
 }

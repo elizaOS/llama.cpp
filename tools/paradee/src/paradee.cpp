@@ -99,6 +99,13 @@ struct paradee_model {
     int default_voice = 0;
     std::vector<std::string> voice_names;     // [n_voices]
     std::vector<std::string> voice_accents;   // [n_voices]; "" when the file does not say
+    // Release metadata (paradee.family / language / phoneme_format) and the
+    // input envelope the release was validated on (paradee.input.validated_max_ids,
+    // paradee.validated_speed); defaults: Paradee, English, misaki, the
+    // architecture limits.
+    std::string family = "paradee", language = "en", phoneme_format = "misaki";
+    int validated_max_ids = 0;
+    float validated_speed[2] = { PARADEE_MIN_SPEED, PARADEE_MAX_SPEED };
     std::mutex mu;
 };
 
@@ -468,6 +475,32 @@ paradee_model_ptr paradee_load_model(const std::string & gguf_path, std::string 
                 err = "paradee.voices.accent does not have one entry per voice";
                 return nullptr;
             }
+            read_opt_str(g, "paradee.family", m->family);
+            read_opt_str(g, "paradee.language", m->language);
+            read_opt_str(g, "paradee.phoneme_format", m->phoneme_format);
+            m->validated_max_ids = h.max_ids;
+            if (gguf_find_key(g, "paradee.input.validated_max_ids") >= 0) {
+                if (!read_i32(g, "paradee.input.validated_max_ids", m->validated_max_ids, err)) return nullptr;
+                if (m->validated_max_ids < 3 || m->validated_max_ids > h.max_ids) {
+                    err = "paradee.input.validated_max_ids out of range";
+                    return nullptr;
+                }
+            }
+            if (const int64_t vs = gguf_find_key(g, "paradee.validated_speed"); vs >= 0) {
+                if (gguf_get_kv_type(g, vs) != GGUF_TYPE_ARRAY || gguf_get_arr_type(g, vs) != GGUF_TYPE_FLOAT32 ||
+                    gguf_get_arr_n(g, vs) != 2) {
+                    err = "paradee.validated_speed must be two float32 values";
+                    return nullptr;
+                }
+                const float * v = (const float *) gguf_get_arr_data(g, vs);
+                if (!(std::isfinite(v[0]) && std::isfinite(v[1]) && PARADEE_MIN_SPEED <= v[0] && v[0] <= 1.0f &&
+                      1.0f <= v[1] && v[1] <= PARADEE_MAX_SPEED)) {
+                    err = "paradee.validated_speed out of range";
+                    return nullptr;
+                }
+                m->validated_speed[0] = v[0];
+                m->validated_speed[1] = v[1];
+            }
             m->default_voice = 0;
             if (have_def) {
                 const auto it = std::find(m->voice_names.begin(), m->voice_names.end(), def);
@@ -527,6 +560,29 @@ paradee_head_kind paradee_get_head(const paradee_model * model) noexcept {
 
 const char * paradee_version(const paradee_model * model) noexcept {
     return model ? model->version.c_str() : "";
+}
+
+const char * paradee_family(const paradee_model * model) noexcept {
+    return model ? model->family.c_str() : "";
+}
+
+const char * paradee_language(const paradee_model * model) noexcept {
+    return model ? model->language.c_str() : "";
+}
+
+const char * paradee_phoneme_format(const paradee_model * model) noexcept {
+    return model ? model->phoneme_format.c_str() : "";
+}
+
+int paradee_validated_max_ids(const paradee_model * model) noexcept {
+    return model ? model->validated_max_ids : 0;
+}
+
+bool paradee_validated_speed(const paradee_model * model, float & lo, float & hi) noexcept {
+    if (!model) return false;
+    lo = model->validated_speed[0];
+    hi = model->validated_speed[1];
+    return true;
 }
 
 int paradee_voice_count(const paradee_model * model) noexcept {

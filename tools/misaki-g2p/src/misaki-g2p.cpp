@@ -236,3 +236,68 @@ bool eliza_misaki::misaki_phonemize(const misaki_lexicon * l, const std::string 
         return false;
     }
 }
+
+// ------------------------------------------------------------ eSpeak-only G2P (EspeakG2P)
+struct eliza_misaki::espeak_g2p {
+    std::unique_ptr<misaki::EspeakG2P> g2p;
+};
+
+void eliza_misaki::espeak_g2p_deleter::operator()(espeak_g2p * g) const noexcept { delete g; }
+
+eliza_misaki::espeak_g2p_ptr eliza_misaki::espeak_g2p_open(const std::string & language, const char * espeak_data_dir,
+                                                           std::string & err_out) noexcept {
+    try {
+        if (!misaki::espeak_linked()) {
+            err_out = "espeak_g2p_open: misaki_g2p was built without libespeak-ng (MISAKI_G2P_ESPEAK=OFF)";
+            return nullptr;
+        }
+        std::string err;
+        std::unique_ptr<misaki::EspeakG2P> g =
+            misaki::EspeakG2P::open(language, espeak_data_dir ? espeak_data_dir : "", err);
+        if (!g) {
+            err_out = "espeak_g2p_open: " + err;
+            return nullptr;
+        }
+        espeak_g2p_ptr out(new espeak_g2p());
+        out->g2p = std::move(g);
+        return out;
+    } catch (const std::exception & e) {
+        try {
+            err_out = std::string("espeak_g2p_open: ") + e.what();
+        } catch (...) {
+        }
+        return nullptr;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+const char * eliza_misaki::espeak_g2p_language(const espeak_g2p * g) noexcept {
+    return g && g->g2p ? g->g2p->language().c_str() : "";
+}
+
+bool eliza_misaki::espeak_g2p_phonemize(const espeak_g2p * g, const std::string & text, std::string & phonemes_out,
+                                        std::string & err_out) noexcept {
+    try {
+        phonemes_out.clear();
+        if (!g || !g->g2p) {
+            err_out = "espeak_g2p_phonemize: no handle";
+            return false;
+        }
+        const misaki::u32 ps = (*g->g2p)(misaki::from_utf8(text));
+        misaki::u32 kept;
+        for (char32_t c : ps) {
+            if (misaki::in_paradee_vocab(c)) kept += c;
+        }
+        phonemes_out = misaki::to_utf8(kept);
+        return true;
+    } catch (const std::exception & e) {
+        try {
+            err_out = std::string("espeak_g2p_phonemize: ") + e.what();
+        } catch (...) {
+        }
+        return false;
+    } catch (...) {
+        return false;
+    }
+}
