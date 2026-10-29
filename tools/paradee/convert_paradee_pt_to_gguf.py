@@ -568,7 +568,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"tensor name collision: {sorted(overlap)}")
     tensors.update(dec)
 
-    shapes = (expected_shapes_v12(len(voices)) if v12 else
+    shapes = (expected_shapes_v12(len(voices)) if voices is not None else
               expected_shapes_v11() if args.version == "1.1" else expected_shapes())
     for name, shape in shapes.items():
         if tuple(tensors[name].shape) != shape:

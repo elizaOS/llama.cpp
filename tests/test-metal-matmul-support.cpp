@@ -17,6 +17,21 @@ int main(int argc, char **) {
         GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ4_0, GGML_TYPE_TBQ3_K, GGML_TYPE_TBQ4_K,
         GGML_TYPE_QJL1_256, GGML_TYPE_Q4_POLAR, GGML_TYPE_TBQ3_TCQ,
     };
+    // Devices without simdgroup reduction (for example the paravirtual GPU of a
+    // CI virtual machine) have no matmul kernels, so every matmul must be refused.
+    bool matmul_available = false;
+    {
+        ggml_init_params params = {4 * ggml_tensor_overhead(), nullptr, true};
+        ggml_context * ctx = ggml_init(params);
+        GGML_ASSERT(ctx);
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 32);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 1);
+        matmul_available = ggml_backend_dev_supports_op(device, ggml_mul_mat(ctx, a, b));
+        ggml_free(ctx);
+    }
+    if (!matmul_available) {
+        std::puts("MTL0 has no matmul kernels (no simdgroup reduction): expecting every matmul to be unsupported");
+    }
     size_t checked = 0;
     for (ggml_type type : types) {
         for (int64_t n : {1, 4, 32}) {
@@ -30,8 +45,9 @@ int main(int argc, char **) {
             ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 2, n);
             ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, n);
             ggml_tensor * indexed = ggml_mul_mat_id(ctx, experts, input, ids);
-            const bool standard = type == GGML_TYPE_F32 || type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q2_0;
-            const bool ordinary_expected = standard || type == GGML_TYPE_Q1_0_g128;
+            const bool standard = matmul_available &&
+                (type == GGML_TYPE_F32 || type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q2_0);
+            const bool ordinary_expected = standard || (matmul_available && type == GGML_TYPE_Q1_0_g128);
             GGML_ASSERT(ggml_backend_dev_supports_op(device, ordinary) == ordinary_expected);
             GGML_ASSERT(ggml_backend_dev_supports_op(device, indexed) == standard);
             checked += 2;

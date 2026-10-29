@@ -13,7 +13,7 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
 
     int mrope_sections[4] = {d_head/4, d_head/4, d_head/4, d_head/4};
 
-    ggml_tensor * inp = build_inp_with_temporal_merge();
+    ggml_tensor * inp = build_inp_temporal_merge();
 
     // spatial merge
     {
@@ -37,7 +37,7 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
     }
 
     // calculate absolute position embedding and apply
-    ggml_tensor * learned_pos_embd = resize_position_embeddings();
+    ggml_tensor * learned_pos_embd = resize_position_embeddings(GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ALIGN_CORNERS);
     learned_pos_embd = ggml_cont_4d(
         ctx0, learned_pos_embd,
         n_embd * 2, n_patches_x / 2, n_patches_y, batch_size);

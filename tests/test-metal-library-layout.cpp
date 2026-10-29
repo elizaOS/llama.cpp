@@ -5,7 +5,7 @@
 // Both libraries are compiled on the same device. A hardware capability flag
 // cannot distinguish their contracts, and a global tensor disable cannot pass.
 int main() {
-    ggml_metal_device_t dev = ggml_metal_device_init(0);
+    ggml_metal_device_t dev = ggml_metal_device_init(0, 1);
     if (!dev) {
         std::fprintf(stderr, "No Metal device available\n");
         return 77;

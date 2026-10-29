@@ -26,6 +26,8 @@ include = [
     "./tools/misaki-g2p/tests/**",
     # Paradee reference tools run in their pinned Python environment.
     "./tools/paradee/tools/**",
+    # The ONNX converter imports onnx, which only that pinned env installs.
+    "./tools/paradee/convert_paradee_onnx_to_gguf.py",
     # Same for the Parakeet reference dumper and bench scorer (torch,
     # transformers, soundfile, librosa and whisper_normalizer live in the
     # pinned reference env, see tools/parakeet/pins.json).

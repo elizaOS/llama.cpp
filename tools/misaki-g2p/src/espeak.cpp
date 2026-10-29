@@ -312,6 +312,7 @@ u32 EspeakFallback::phonemize_line(const u32 & text) {
 #else
     (void) text;
     (void) data_dir_;
+    (void) remove_flags_;
     return u32();
 #endif
 }

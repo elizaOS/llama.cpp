@@ -26,9 +26,9 @@ struct cache_test_model : llama_model {
 
 static void check(bool transposed) {
     cache_test_model model;
-    llama_kv_cache cache(model, model.hparams, GGML_TYPE_F32, GGML_TYPE_F32,
-        transposed, false, false, 1024, 2, 1, 0, LLAMA_SWA_TYPE_NONE,
-        nullptr, nullptr, nullptr, nullptr, 1024);
+    llama_kv_cache cache(model, false, model.hparams, GGML_TYPE_F32, GGML_TYPE_F32,
+        transposed, false, false, 1024, 2, 0, LLAMA_SWA_TYPE_NONE,
+        nullptr, nullptr, nullptr, nullptr, "", 1024);
     GGML_ASSERT(cache.get_size() == 256);
     std::vector<float> expected(2 * 32 * 256);
     for (size_t i = 0; i < expected.size(); ++i) expected[i] = float(i + 1);
@@ -67,9 +67,9 @@ static void check(bool transposed) {
         ggml_free(ctx);
     }
     // Attaching a shared cache must finish growth before borrowing its storage.
-    llama_kv_cache shared(model, model.hparams, GGML_TYPE_F32, GGML_TYPE_F32,
-        transposed, false, false, 1024, 2, 1, 0, LLAMA_SWA_TYPE_NONE,
-        &cache, nullptr, nullptr, [](int32_t layer) { return layer; }, 1024);
+    llama_kv_cache shared(model, false, model.hparams, GGML_TYPE_F32, GGML_TYPE_F32,
+        transposed, false, false, 1024, 2, 0, LLAMA_SWA_TYPE_NONE,
+        &cache, nullptr, nullptr, [](int32_t layer) { return layer; }, "", 1024);
     GGML_ASSERT(cache.get_size() == 1024 && shared.get_size() == 1024);
     GGML_ASSERT(shared.get_k_storage(0) == cache.get_k_storage(0));
     GGML_ASSERT(!cache.try_resize() && !shared.try_resize());

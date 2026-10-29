@@ -2,7 +2,7 @@
 // Compiled with -march=armv8.2-a+dotprod; only called after a runtime check.
 #include "pk-kernels.h"
 
-#if PK_HAVE_ARM_EXT
+#if PK_HAVE_ARM_EXT && defined(__ARM_FEATURE_DOTPROD)
 #include "pk-kernels-neon.inc"
 
 namespace pk {
@@ -59,5 +59,13 @@ const kernel_table & kernels_dotprod() {
     return t;
 }
 
+}  // namespace pk
+#elif PK_HAVE_ARM_EXT
+// The build did not pass the per-file -march flag (for example an Xcode iOS,
+// tvOS or visionOS build), so this tier falls back to the scalar kernels.
+namespace pk {
+const kernel_table & kernels_dotprod() {
+    return kernels_scalar();
+}
 }  // namespace pk
 #endif
