@@ -130,13 +130,14 @@ elseif (NOT GGML_METAL_TARGET_OS STREQUAL "macos" AND CMAKE_OSX_DEPLOYMENT_TARGE
     list   (APPEND XC_FLAGS -mtargetos=${GGML_METAL_TARGET_OS}${CMAKE_OSX_DEPLOYMENT_TARGET}${METAL_TARGET_SIM})
 endif()
 
+# the tensor API needs OS 26+ and the Metal 4 language that the OS 26 target
+# selects by default, so GGML_METAL_STD (an older -std) must not apply to it
+set(XC_FLAGS_TENSOR ${XC_FLAGS} -mtargetos=${GGML_METAL_TARGET_OS}26.0${METAL_TARGET_SIM})
+
 if (GGML_METAL_STD)
     message(STATUS "Adding  -std=${GGML_METAL_STD} flag to metal compilation")
     list   (APPEND XC_FLAGS -std=${GGML_METAL_STD})
 endif()
-
-# the tensor API needs OS 26+
-set(XC_FLAGS_TENSOR ${XC_FLAGS} -mtargetos=${GGML_METAL_TARGET_OS}26.0${METAL_TARGET_SIM})
 
 # # ELIZA-METAL-BF16-FIX
 # Define GGML_METAL_HAS_BF16 when compiling the precompiled metallibs so that
