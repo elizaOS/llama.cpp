@@ -503,6 +503,11 @@ if(TARGET mtmd AND TARGET llama-common)
                 ${CMAKE_CURRENT_SOURCE_DIR}/include)
             find_package(Threads REQUIRED)
             target_link_libraries(eliza-inference-test-abi PRIVATE elizainference Threads::Threads)
+            # ffi-abi.c calls sqrt(); glibc keeps it in libm, which a C link
+            # does not add by itself.
+            if(UNIX AND NOT APPLE)
+                target_link_libraries(eliza-inference-test-abi PRIVATE m)
+            endif()
             if(TARGET paradee_lib AND TARGET misaki_g2p)
                 target_compile_definitions(eliza-inference-test-abi PRIVATE ELIZA_TEST_EXPECT_PARADEE=1)
             endif()
