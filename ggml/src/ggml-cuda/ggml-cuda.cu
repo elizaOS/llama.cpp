@@ -1956,26 +1956,6 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     return use_mul_mat_vec_f;
 }
 
-static bool ggml_cuda_should_use_mmvq(ggml_type type, int cc, int64_t ncols_dst) {
-    if (ncols_dst > MMVQ_MAX_BATCH_SIZE) {
-        return false;
-    }
-
-    if (GGML_CUDA_CC_IS_RDNA4(cc)) {
-        switch (type) {
-            case GGML_TYPE_IQ2_S:
-            case GGML_TYPE_IQ2_XXS:
-            case GGML_TYPE_IQ3_XXS:
-            case GGML_TYPE_IQ3_S:
-                return ncols_dst <= 4;
-            default:
-                break;
-        }
-    }
-
-    return true;
-}
-
 static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
