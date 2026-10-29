@@ -10,6 +10,7 @@
 // eSpeak NG 1.52.0.
 #include "misaki-internal.h"
 
+#include <exception>
 #include <utility>
 
 namespace misaki {
@@ -20,26 +21,54 @@ namespace {
 struct LanguageVoice {
     const char * language;
     const char * voice;
+    const char * dict;   // the dictionary file the voice loads
+    const char * probe;  // a word that must phonemize to phoneme letters
 };
 constexpr LanguageVoice kVoices[] = {
-    {"es", "roa/es"},  // Spanish (Spain): distinción, ʎ, θ
+    {"es", "roa/es", "es_dict", "hola"},  // Spanish (Spain): distinción, ʎ, θ
 };
+
+// True when `ps` has a phoneme letter: anything but whitespace, the
+// punctuation phonemizer preserves, stress and length marks, ties and '-'.
+bool has_phoneme_letter(const u32 & ps) {
+    static const u32 kNotLetters = U";:,.!?¡¿—…\"«»“”(){}[]ˈˌː^-";
+    for (char32_t c : ps) {
+        if (!py_isspace(c) && !contains(kNotLetters, c)) return true;
+    }
+    return false;
+}
 
 }  // namespace
 
 std::unique_ptr<EspeakG2P> EspeakG2P::open(const std::string & language, const std::string & data_dir,
                                            std::string & err) {
-    const char * voice = nullptr;
-    for (const auto & lv : kVoices) {
-        if (language == lv.language) voice = lv.voice;
+    const LanguageVoice * lv = nullptr;
+    for (const auto & candidate : kVoices) {
+        if (language == candidate.language) lv = &candidate;
     }
-    if (!voice) {
+    if (!lv) {
         err = "no eSpeak G2P for language '" + language + "' (supported: es)";
         return nullptr;
     }
-    std::unique_ptr<EspeakFallback> backend = EspeakFallback::open(data_dir, err, voice, /*remove_flags*/ true);
+    std::unique_ptr<EspeakFallback> backend =
+        EspeakFallback::open(data_dir, err, lv->voice, /*remove_flags*/ true, lv->dict);
     if (!backend) return nullptr;
-    return std::unique_ptr<EspeakG2P>(new EspeakG2P(language, std::move(backend)));
+    std::unique_ptr<EspeakG2P> g2p(new EspeakG2P(language, std::move(backend)));
+    // Probe: a voice that loaded without usable rules phonemizes every word
+    // to nothing (only punctuation survives), which would synthesize garbage.
+    u32 probed;
+    try {
+        probed = (*g2p)(from_utf8(lv->probe));
+    } catch (const std::exception & e) {
+        err = std::string("eSpeak NG probe phonemization of '") + lv->probe + "' failed: " + e.what();
+        return nullptr;
+    }
+    if (!has_phoneme_letter(probed)) {
+        err = std::string("eSpeak NG voice ") + lv->voice + " phonemized '" + lv->probe + "' to '" + to_utf8(probed) +
+              "' (no phonemes): its " + lv->dict + " data is unusable";
+        return nullptr;
+    }
+    return g2p;
 }
 
 u32 EspeakG2P::e2m(const u32 & in) {

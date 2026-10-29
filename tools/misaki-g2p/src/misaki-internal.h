@@ -147,9 +147,14 @@ class EspeakFallback {
     // `voice` is the eSpeak NG voice identifier phonemizer would select
     // (nullptr: gmw/en-US, misaki's American fallback). `remove_flags` applies
     // phonemizer's language_switch='remove-flags' (EspeakG2P); the English
-    // fallback keeps phonemizer's default ('keep-flags').
+    // fallback keeps phonemizer's default ('keep-flags'). `dict`, when set,
+    // is the language's dictionary file (e.g. "es_dict"): open fails unless
+    // it exists, non-empty, in the data directory libespeak-ng actually uses
+    // (libespeak-ng 1.52.0 selects a voice whose dictionary is missing and
+    // then phonemizes every word to nothing).
     static std::unique_ptr<EspeakFallback> open(const std::string & data_dir, std::string & err,
-                                                const char * voice = nullptr, bool remove_flags = false);
+                                                const char * voice = nullptr, bool remove_flags = false,
+                                                const char * dict = nullptr);
     ~EspeakFallback();
     // misaki espeak.EspeakFallback.__call__ on a token text: phonemizer
     // (preserve_punctuation, with_stress, tie='^') then the E2M table.

@@ -8,14 +8,20 @@
 // The fixture (tests/gen_espeak_g2p_fixture.py: misaki 0.9.4, phonemizer-fork
 // 3.3.2, espeak-ng 1.52.0) has text, EspeakG2P output and that output in the
 // Kokoro vocabulary per line. Every line must match exactly, both the raw
-// output and the public API's (eliza_misaki::espeak_g2p_phonemize). Exits 77
-// (skip) when libespeak-ng is not linked or DIR is empty.
+// output and the public API's (eliza_misaki::espeak_g2p_phonemize). Before
+// that, a copy of DIR without es_dict (and one with an empty es_dict) must
+// fail to open: libespeak-ng 1.52.0 still selects roa/es there and then
+// phonemizes every word to nothing. Exits 77 (skip) when libespeak-ng is not
+// linked or DIR is empty.
 #include "misaki-g2p.h"
 #include "misaki-internal.h"
 
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <string>
+#include <system_error>
+#include <unistd.h>
 
 using namespace misaki;
 
@@ -42,6 +48,51 @@ static int e2m_unit() {
     return fails ? 1 : 0;
 }
 
+// A copy of the eSpeak NG data in `espeak` (or its espeak-ng-data child)
+// with es_dict missing (`empty` false) or truncated to zero bytes; open must
+// fail through both the class and the public API, naming es_dict.
+static int broken_dict(const std::string & espeak, bool empty) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path src = espeak;
+    if (fs::is_directory(src / "espeak-ng-data", ec)) src /= "espeak-ng-data";
+    src = fs::canonical(src, ec);  // Homebrew's share/espeak-ng-data is a relative symlink
+    if (ec) {
+        std::fprintf(stderr, "cannot resolve %s: %s\n", espeak.c_str(), ec.message().c_str());
+        return 1;
+    }
+    // short: libespeak-ng truncates data paths longer than N_PATH_HOME
+    const fs::path dir = fs::temp_directory_path(ec) /
+                         ("espeak-g2p-" + std::to_string(getpid()) + (empty ? "-empty" : "-missing"));
+    fs::remove_all(dir, ec);
+    fs::copy(src, dir, fs::copy_options::recursive, ec);
+    // never remove es_dict through a link into the real data
+    if (!ec && (fs::is_symlink(dir) || fs::is_symlink(dir / "es_dict"))) ec = std::make_error_code(std::errc::not_supported);
+    if (ec) {
+        std::fprintf(stderr, "cannot copy %s to %s: %s\n", src.string().c_str(), dir.string().c_str(),
+                     ec.message().c_str());
+        return 1;
+    }
+    fs::remove(dir / "es_dict", ec);
+    if (empty) std::ofstream(dir / "es_dict", std::ios::binary | std::ios::trunc);
+    std::string raw_err, api_err;
+    const bool raw_opened = EspeakG2P::open("es", dir.string(), raw_err) != nullptr;
+    const bool api_opened = eliza_misaki::espeak_g2p_open("es", dir.string().c_str(), api_err) != nullptr;
+    fs::remove_all(dir, ec);
+    const char * what = empty ? "an empty es_dict" : "no es_dict";
+    if (raw_opened || api_opened) {
+        std::fprintf(stderr, "EspeakG2P opened with %s (class %d, API %d)\n", what, raw_opened, api_opened);
+        return 1;
+    }
+    if (raw_err.find("es_dict") == std::string::npos || api_err.find("es_dict") == std::string::npos) {
+        std::fprintf(stderr, "open with %s failed without naming es_dict: '%s' / '%s'\n", what, raw_err.c_str(),
+                     api_err.c_str());
+        return 1;
+    }
+    std::printf("open with %s fails: %s\n", what, api_err.c_str());
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     std::string fixture, espeak, language = "es";
     for (int i = 1; i < argc; i++) {
@@ -56,6 +107,7 @@ int main(int argc, char ** argv) {
         std::printf("test-espeak-g2p: libespeak-ng or its data not available, skipping\n");
         return 77;
     }
+    if (language == "es" && (broken_dict(espeak, /*empty*/ false) || broken_dict(espeak, /*empty*/ true))) return 1;
     std::string err;
     std::unique_ptr<EspeakG2P> raw = EspeakG2P::open(language, espeak, err);
     eliza_misaki::espeak_g2p_ptr api = eliza_misaki::espeak_g2p_open(language, espeak.c_str(), err);

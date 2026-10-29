@@ -6,6 +6,7 @@
 // then misaki espeak.EspeakFallback's eSpeak-to-misaki (E2M) table.
 #include "misaki-internal.h"
 
+#include <filesystem>
 #include <stdexcept>
 
 #if defined(MISAKI_G2P_USE_ESPEAK)
@@ -206,7 +207,7 @@ u32 EspeakFallback::e2m(const u32 & in) {
 }
 
 std::unique_ptr<EspeakFallback> EspeakFallback::open(const std::string & data_dir, std::string & err,
-                                                     const char * voice, bool remove_flags) {
+                                                     const char * voice, bool remove_flags, const char * dict) {
 #if defined(MISAKI_G2P_USE_ESPEAK)
     const std::string v = voice ? voice : kVoice;
     auto lock = eliza_espeak_shared::lock();
@@ -214,11 +215,34 @@ std::unique_ptr<EspeakFallback> EspeakFallback::open(const std::string & data_di
     // N_PATH_HOME buffer with an error naming the limit (no fixed size here:
     // the Android builds raise it).
     if (!eliza_espeak_shared::prepare(lock, data_dir, v.c_str(), err)) return nullptr;
+    if (dict) {
+        // espeak_SetVoiceByName returns EE_OK for a voice whose dictionary is
+        // missing or empty (libespeak-ng 1.52.0 only prints "Can't read
+        // dictionary file" to stderr), so check the file in the directory
+        // libespeak-ng resolved: data_dir, data_dir/espeak-ng-data, or its
+        // default path when data_dir is empty.
+        const char * in_use = nullptr;
+        espeak_Info(&in_use);
+        if (!in_use || !*in_use) {
+            err = "eSpeak NG reports no data directory in use for voice " + v;
+            return nullptr;
+        }
+        const std::filesystem::path dict_path = std::filesystem::path(in_use) / dict;
+        std::error_code ec;
+        const bool is_file = std::filesystem::is_regular_file(dict_path, ec);
+        const std::uintmax_t size = is_file ? std::filesystem::file_size(dict_path, ec) : 0;
+        if (!is_file || ec || size == 0) {
+            err = "eSpeak NG dictionary " + dict_path.string() + (is_file ? " is empty" : " not found") +
+                  " (voice " + v + " needs it)";
+            return nullptr;
+        }
+    }
     return std::unique_ptr<EspeakFallback>(new EspeakFallback(data_dir, v, remove_flags));
 #else
     (void) data_dir;
     (void) voice;
     (void) remove_flags;
+    (void) dict;
     err = "misaki_g2p was built without libespeak-ng (MISAKI_G2P_ESPEAK=OFF)";
     return nullptr;
 #endif
