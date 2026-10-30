@@ -76,8 +76,8 @@
     "f32": {
       "file": "paradee-8m-v1.0-f32.gguf",
       "size": 32072864,
-      "sha256": "ac9983f724c15688ef650cba9e7dfaf2197294c9cc4d4fd4b62122428e374690",
-      "note": "convert_paradee_pt_to_gguf.py --outtype f32 output; byte-reproducible (check with --check-output). Changes whenever the converter changes, because its git blob sha is in the metadata. A v1.0 file written by an earlier converter (for example 357477651abb…, 32072768 bytes, before paradee.version / paradee.decoder.head existed) still loads as v1.0 and gives byte-identical audio. The tensors are those of the previous pin c0d8f2010571…; only the converter's blob sha in the metadata changed (v1.2 support)."
+      "sha256": "5c7a282f577deeeef23272a39e85a835cb58842bd0481c7707fdbb3f5552cae1",
+      "note": "F32 output with deterministic binary64 weight_norm folding (math.fsum), then one F32 rounding. Normalized tensor values differ slightly from the former platform-dependent torch._weight_norm output; native stage and waveform parity remain gated. The converter git blob is also recorded in metadata, so any converter source edit requires a new pin."
     }
   },
   "fixtures": {
@@ -158,8 +158,8 @@
       "f32": {
         "file": "paradee-8m-v1.1-f32.gguf",
         "size": 31275232,
-        "sha256": "01d12ea2751642636ecc8cb5cd48be8d940620c3e1540be0b94cd002a10bfe74",
-        "note": "convert_paradee_pt_to_gguf.py --version 1.1 --outtype f32 output; byte-reproducible (check with --check-output). Changes whenever the converter changes, because its git blob sha is in the metadata. The tensors are those of the previous pin f205ab055f01…; only the converter's blob sha in the metadata changed (v1.2 support)."
+        "sha256": "71f2558ba38eb70a1e59114426c1d5400551e9a24754a8b5bd2ec228305e6e0f",
+        "note": "F32 output with deterministic binary64 weight_norm folding (math.fsum), then one F32 rounding. Normalized tensor values differ slightly from the former platform-dependent torch._weight_norm output; native stage and waveform parity remain gated. The converter git blob is also recorded in metadata, so any converter source edit requires a new pin."
       }
     }
   },
@@ -243,8 +243,8 @@
       "f32": {
         "file": "paradee-8m-v1.2-f32.gguf",
         "size": 31276064,
-        "sha256": "a43118932f7ec01bb3e9f1b92a56b24dd2622011c8fd5c77dca1e353b56e6df6",
-        "note": "convert_paradee_pt_to_gguf.py --version 1.2 --outtype f32 output; byte-reproducible (check with --check-output). Changes whenever the converter changes, because its git blob sha is in the metadata."
+        "sha256": "4b2819180a9e3b096fb71a93d6a719794246ee230f7faa857edcc0bee2a1529e",
+        "note": "F32 output with deterministic binary64 weight_norm folding (math.fsum), then one F32 rounding. Normalized tensor values differ slightly from the former platform-dependent torch._weight_norm output; native stage and waveform parity remain gated. The converter git blob is also recorded in metadata, so any converter source edit requires a new pin."
       }
     }
   },
@@ -364,8 +364,8 @@
       "f32": {
         "file": "delibes-8m-eses-f32.gguf",
         "size": 31275328,
-        "sha256": "a2f5acff3ac8218c7973c0a76a449365faace53ee6af4cf0f3bdc1f61868f0da",
-        "note": "convert_paradee_onnx_to_gguf.py --family delibes output; byte-reproducible (check with --check-output). Changes whenever either converter changes (both git blob shas are in the metadata)."
+        "sha256": "3b635dc24a8952254066daad77ff64aa08368a8b5a689abf4be05bdf2b0afe51",
+        "note": "convert_paradee_onnx_to_gguf.py --family delibes output. All tensor bytes are unchanged; only converter.base_git_blob_sha1 metadata changes for deterministic folding in the shared PyTorch converter. Both converter blobs are recorded, so any source edit requires a new pin."
       }
     }
   }
