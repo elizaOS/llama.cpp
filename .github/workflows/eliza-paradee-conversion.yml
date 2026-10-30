@@ -39,7 +39,9 @@ jobs:
           pins = json.loads(Path('tools/paradee/pins.json').read_text())
           out = Path('test-results/paradee-conversion')
           out.mkdir(parents=True, exist_ok=True)
-          report = {'platform': platform.platform(), 'python': sys.version, 'models': []}
+          expected_machine = 'arm64' if sys.platform == 'darwin' else 'x86_64'
+          assert platform.machine() == expected_machine, (platform.machine(), expected_machine)
+          report = {'platform': platform.platform(), 'machine': platform.machine(), 'python': sys.version, 'models': []}
           failures = []
           models = [('1.0', pins), ('1.1', pins['v1.1']), ('1.2', pins['v1.2']), ('delibes', pins['delibes'])]
           for version, pin in models:
