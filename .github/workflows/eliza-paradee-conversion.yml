@@ -1,0 +1,83 @@
+name: Paradee conversion reproducibility
+on:
+  pull_request:
+    paths:
+      - 'tools/paradee/convert_*.py'
+      - 'tools/paradee/pins.json'
+      - 'gguf-py/**'
+      - '.github/workflows/eliza-paradee-conversion.yml'
+  workflow_dispatch:
+
+jobs:
+  conversion:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install conversion dependencies
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            python -m pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cpu
+          else
+            python -m pip install torch==2.14.0
+          fi
+          python -m pip install numpy==2.5.4 onnx==1.23.2 pyyaml==6.0.3 requests==2.34.2 tqdm==4.70.1
+      - name: Convert pinned models twice and check complete file hashes
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, platform, subprocess, sys, urllib.request
+          from pathlib import Path
+          pins = json.loads(Path('tools/paradee/pins.json').read_text())
+          out = Path('test-results/paradee-conversion')
+          out.mkdir(parents=True, exist_ok=True)
+          report = {'platform': platform.platform(), 'python': sys.version, 'models': []}
+          failures = []
+          models = [('1.0', pins), ('1.1', pins['v1.1']), ('1.2', pins['v1.2']), ('delibes', pins['delibes'])]
+          for version, pin in models:
+              source = out / ('source-' + version)
+              for name, expected in pin['files'].items():
+                  if name.startswith('samples/'):
+                      continue
+                  target = source / name
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  url = f"https://huggingface.co/{pin['model']['repo']}/resolve/{pin['model']['revision']}/{name}"
+                  data = urllib.request.urlopen(url).read()
+                  assert len(data) == expected['size'] and hashlib.sha256(data).hexdigest() == expected['sha256'], name
+                  target.write_bytes(data)
+              hashes = []
+              for mode in ['native', 'scalar']:
+                  target = out / f'{version}-{mode}.gguf'
+                  env = dict(os.environ, OMP_NUM_THREADS='1', MKL_NUM_THREADS='1')
+                  if mode == 'scalar':
+                      env['ATEN_CPU_CAPABILITY'] = 'default'
+                  if version == 'delibes':
+                      script, selection = 'convert_paradee_onnx_to_gguf.py', ['--family', 'delibes']
+                  else:
+                      script, selection = 'convert_paradee_pt_to_gguf.py', ['--version', version]
+                  subprocess.run([sys.executable, 'tools/paradee/' + script, *selection,
+                                  '--model-dir', str(source), '--output', str(target)], check=True, env=env)
+                  hashes.append(hashlib.sha256(target.read_bytes()).hexdigest())
+              expected = pin['gguf']['f32']
+              row = {'version': version, 'hashes': hashes, 'expected': expected['sha256'],
+                     'bytes': target.stat().st_size, 'expectedBytes': expected['size']}
+              report['models'].append(row)
+              if hashes[0] != hashes[1] or hashes[0] != expected['sha256'] or row['bytes'] != expected['size']:
+                  failures.append(version)
+              (out / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
+          assert not failures, f'Conversion pin or reproducibility failure: {failures}'
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: paradee-conversion-${{ matrix.os }}
+          path: test-results/paradee-conversion/report.json
+          if-no-files-found: error

@@ -18,9 +18,8 @@ natively in this fork.
 
 Every input is checked against tools/paradee/pins.json (size + sha256) before
 torch.load(weights_only=True) touches it. weight_norm pairs are folded with
-torch._weight_norm, the same function PyTorch uses when it removes the
-parametrisation, so the GGUF weights are bit-identical to the reference
-module's effective weights. Every state-dict key must be consumed (only the
+a fixed binary64 reduction before rounding to float32, so conversion does
+not depend on PyTorch's CPU dispatch or reduction order. Every state-dict key must be consumed (only the
 unused ALBERT pooler is skipped), and every tensor shape is checked against
 the hparams written to the GGUF.
 
@@ -58,6 +57,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -205,7 +205,7 @@ def load_vocab(model_dir: Path, version: str = "1.0") -> list[tuple[str, int]]:
 
 
 def fold_weight_norm(sd: dict) -> dict:
-    """Fold weight_g/weight_v into weight with torch._weight_norm(v, g, 0). A state dict without
+    """Fold weight_g/weight_v into weight with a fixed reduction order. A state dict without
     weight_norm pairs (for example one read from ONNX, where the weights are already folded) passes
     through unchanged and does not need torch."""
     out = {}
@@ -217,12 +217,15 @@ def fold_weight_norm(sd: dict) -> dict:
             pairs.setdefault(k[: -len(".weight_g")], {})["g"] = v
         else:
             out[k] = v
-    if pairs:
-        import torch
     for base, p in pairs.items():
         if set(p) != {"v", "g"}:
             raise SystemExit(f"incomplete weight_norm pair for {base}")
-        out[base + ".weight"] = torch._weight_norm(p["v"], p["g"], 0)
+        v = p["v"].detach().cpu().numpy()
+        g = p["g"].detach().cpu().numpy().astype(np.float64)
+        # SIMD and threaded float32 reductions change the pinned GGUF bytes.
+        norms = np.array([math.sqrt(math.fsum(float(x) * float(x) for x in row))
+                          for row in v.reshape(v.shape[0], -1)]).reshape(g.shape)
+        out[base + ".weight"] = (v.astype(np.float64) * (g / norms)).astype(np.float32)
     return out
 
 

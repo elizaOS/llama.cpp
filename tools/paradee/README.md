@@ -100,6 +100,12 @@ front end.
 - **No F16 pin:** `--outtype f16` halves the file (16 MB) but fails the parity gate (end-to-end SNR
   16–23 dB), so it is not pinned or shipped. See [F16 and v1.1](#f16-and-v11) for the full evaluation.
 
+The converter folds weight normalization with `math.fsum` over binary64 products, then rounds the result
+to F32. PyTorch's F32 reduction changes with CPU dispatch and can produce a different file from the same
+weights. The conversion workflow checks complete file hashes on Linux x86_64 and macOS arm64. The GGUF
+also records the converter's Git blob: even a source edit that does not change tensors needs new output
+pins. Delibes records both converter blobs, so its pin changes when the shared converter changes too.
+
 ## Memory
 
 `paradee_load_model` memory-maps an all-F32 GGUF (the converter's default) read-only and the layers read the
