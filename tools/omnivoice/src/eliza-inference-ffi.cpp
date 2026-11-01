@@ -157,6 +157,13 @@ struct EliParadeeSlot {
     std::string voice_name;          /* "" = the GGUF's default voice */
     bool has_espeak_dir = false;
     bool configured = false;         /* true once a load has succeeded */
+    /* The caller's synthesis speed range (ABI v21,
+     * paradee_set_voice_speed_range); unset = the model's validated range.
+     * It belongs to the slot: kept across mmap_evict -> reload and across a
+     * new load_voice into the slot, dropped by unload_voice. */
+    bool speed_override = false;
+    float speed_lo = 0.0f;
+    float speed_hi = 0.0f;
 };
 #endif
 
@@ -2352,6 +2359,21 @@ static EliParadeeSlot * eliza_paradee_slot_locked(
     return &it->second;
 }
 
+/* The speed range a synthesis on `slot` is clamped to: the caller's override
+ * (ABI v21) when set, else the model's validated range (paradee.validated_speed:
+ * [0.85, 1.15] for Delibes-8M-esES; the architecture's limits for Paradee).
+ * The slot must be loaded. Caller holds paradee_mutex. */
+static void eliza_paradee_speed_range_locked(const EliParadeeSlot & slot, float & lo, float & hi) {
+    if (slot.speed_override) {
+        lo = slot.speed_lo;
+        hi = slot.speed_hi;
+        return;
+    }
+    lo = eliza_paradee::PARADEE_MIN_SPEED;
+    hi = eliza_paradee::PARADEE_MAX_SPEED;
+    eliza_paradee::paradee_validated_speed(slot.model.get(), lo, hi);
+}
+
 /* Text -> the slot's phoneme spelling. Caller holds paradee_mutex. */
 static bool eliza_paradee_g2p_locked(
     const EliParadeeSlot & slot, const std::string & text, std::string & phonemes, std::string & err) {
@@ -2490,11 +2512,11 @@ static int eliza_paradee_synthesize_owned(
     const int load_rc = eliza_paradee_ensure_loaded_locked(*slot, operation, out_error);
     if (load_rc != ELIZA_OK) return load_rc;
     const eliza_paradee::paradee_model * model = slot->model.get();
-    /* The speed range and chunk size the release was validated on (the
-     * architecture's limits for Paradee; [0.85, 1.15] and 360 ids for
-     * Delibes-8M-esES). */
-    float speed_lo = eliza_paradee::PARADEE_MIN_SPEED, speed_hi = eliza_paradee::PARADEE_MAX_SPEED;
-    eliza_paradee::paradee_validated_speed(model, speed_lo, speed_hi);
+    /* The slot's speed range (the caller's override, else the range the
+     * release was validated on) and the validated chunk size (360 ids for
+     * Delibes-8M-esES, else the architecture's 512). */
+    float speed_lo = 0.0f, speed_hi = 0.0f;
+    eliza_paradee_speed_range_locked(*slot, speed_lo, speed_hi);
     speed = std::min(std::max(speed, speed_lo), speed_hi);
     auto cancelled = [&]() {
         eliza_set_error(out_error,
@@ -2882,6 +2904,9 @@ int eliza_inference_paradee_voice_info(
     eliza_paradee::paradee_validated_speed(m, lo, hi);
     char speed_buf[64];
     std::snprintf(speed_buf, sizeof(speed_buf), "[%.6g,%.6g]", (double) lo, (double) hi);
+    eliza_paradee_speed_range_locked(*slot, lo, hi);
+    char range_buf[64];
+    std::snprintf(range_buf, sizeof(range_buf), "[%.6g,%.6g]", (double) lo, (double) hi);
     std::string voices = "[";
     for (int i = 0; i < eliza_paradee::paradee_voice_count(m); ++i) {
         if (i) voices += ",";
@@ -2899,7 +2924,8 @@ int eliza_inference_paradee_voice_info(
         ",\"sample_rate\":" + std::to_string(slot->rate) +
         ",\"g2p_kind\":" + std::to_string(slot->g2p_kind) +
         ",\"validated_max_ids\":" + std::to_string(eliza_paradee::paradee_validated_max_ids(m)) +
-        ",\"validated_speed\":" + speed_buf + "}";
+        ",\"validated_speed\":" + speed_buf +
+        ",\"speed_range\":" + range_buf + "}";
     char * owned = eliza_strdup(json);
     if (!owned) {
         eliza_set_error(out_error, "[libelizainference] paradee_voice_info: allocation failed");
@@ -2910,6 +2936,45 @@ int eliza_inference_paradee_voice_info(
 #else
     (void) ctx; (void) voice_id;
     if (out_json) *out_json = nullptr;
+    ELIZA_PARADEE_NOT_BUILT(out_error);
+#endif
+}
+
+/* ---- Paradee voice speed range (ABI v21) ------------------------- */
+
+int eliza_inference_paradee_set_voice_speed_range(
+    EliInferenceContext * ctx,
+    const char * voice_id,
+    float min_speed,
+    float max_speed,
+    char ** out_error) {
+#ifdef ELIZA_ENABLE_PARADEE
+    if (!ctx || !voice_id) {
+        eliza_set_error(out_error, "[libelizainference] paradee_set_voice_speed_range: null argument");
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    const bool reset = min_speed == 0.0f && max_speed == 0.0f;
+    if (!reset &&
+        !(std::isfinite(min_speed) && std::isfinite(max_speed) &&
+          eliza_paradee::PARADEE_MIN_SPEED <= min_speed && min_speed <= 1.0f &&
+          1.0f <= max_speed && max_speed <= eliza_paradee::PARADEE_MAX_SPEED)) {
+        char buf[200];
+        std::snprintf(buf, sizeof(buf),
+            "[libelizainference] paradee_set_voice_speed_range: expected %.6g <= min <= 1 <= max <= %.6g, "
+            "or 0, 0 to restore the model's validated range",
+            (double) eliza_paradee::PARADEE_MIN_SPEED, (double) eliza_paradee::PARADEE_MAX_SPEED);
+        eliza_set_error(out_error, buf);
+        return ELIZA_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::mutex> lock(ctx->paradee_mutex);
+    EliParadeeSlot * slot = eliza_paradee_slot_locked(ctx, voice_id, "paradee_set_voice_speed_range", out_error);
+    if (!slot) return ELIZA_ERR_INVALID_ARG;
+    slot->speed_override = !reset;
+    slot->speed_lo = reset ? 0.0f : min_speed;
+    slot->speed_hi = reset ? 0.0f : max_speed;
+    return ELIZA_OK;
+#else
+    (void) ctx; (void) voice_id; (void) min_speed; (void) max_speed;
     ELIZA_PARADEE_NOT_BUILT(out_error);
 #endif
 }
