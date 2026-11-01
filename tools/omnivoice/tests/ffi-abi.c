@@ -1,7 +1,7 @@
 /* tools/omnivoice/tests/ffi-abi.c
  *
- * C11 test against the real libelizainference (ABI v20). Always runs:
- *   - ABI string "20" and the v17 / v20 capability probes
+ * C11 test against the real libelizainference (ABI v21). Always runs:
+ *   - ABI string "21" and the v17 / v20 capability probes
  *   - v18 llm_context_capacity argument validation and the no-text-GGUF error
  *   - cancel_tts / asr_cancel are no-ops with nothing in flight
  *   - mmap_evict / mmap_acquire("tts") on a bundle with no TTS weights
@@ -59,7 +59,7 @@ static double now_ms(void) {
 
 static void test_probes_and_noops(void) {
     char * err = NULL;
-    CHECK(strcmp(eliza_inference_abi_version(), "20") == 0);
+    CHECK(strcmp(eliza_inference_abi_version(), "21") == 0);
     CHECK_RC(eliza_inference_asr_supported(), 1);
 #if defined(ELIZA_TEST_EXPECT_PARADEE)
     CHECK_RC(eliza_inference_paradee_supported(), 1);
@@ -118,6 +118,9 @@ static void test_probes_and_noops(void) {
     clear_err(&err);
     CHECK(eliza_inference_paradee_sample_rate(ctx) < 0);
     CHECK(eliza_inference_paradee_g2p_kind(ctx) < 0);
+    /* v21: no slot to set a speed range on before a load. */
+    CHECK_RC(eliza_inference_paradee_set_voice_speed_range(ctx, "es", 0.5f, 1.5f, &err), want);
+    clear_err(&err);
 #if !defined(ELIZA_TEST_EXPECT_PARADEE)
     CHECK_RC(eliza_inference_paradee_load(ctx, "a.gguf", "lex.bin", NULL, &err), ELIZA_ERR_NOT_IMPLEMENTED);
     clear_err(&err);

@@ -329,7 +329,10 @@ source `606e16e1`). It is published only as two fp32 ONNX graphs (and their int8
   `paradee.phoneme_format = espeak-es`, `paradee.input.validated_max_ids = 360` and
   `paradee.validated_speed = [0.85, 1.15]` (the release's validated envelope). The runtime exposes them through
   `paradee_family`, `paradee_language`, `paradee_phoneme_format`, `paradee_validated_max_ids` and
-  `paradee_validated_speed`; libelizainference chunks to 360 ids and clamps speed to that range.
+  `paradee_validated_speed`; libelizainference chunks to 360 ids and clamps speed to that range unless the
+  caller sets another range on the voice slot with `eliza_inference_paradee_set_voice_speed_range` (ABI v21,
+  within the architecture's [0.25, 4]). The override is a runtime policy: the GGUF, its `validated_speed` and its
+  hash do not change, and `paradee_voice_info` reports both `validated_speed` and the `speed_range` in force.
 - Input: eSpeak NG `es` (roa/es) phonemes through misaki's `EspeakG2P`, which `tools/misaki-g2p`
   reproduces (`espeak_g2p_open("es", ...)`), mapped to Kokoro's vocabulary (the same 114 symbols and ids as
   Paradee's). The English misaki fallback must not be used for Spanish.

@@ -13,7 +13,9 @@
 //     model's phoneme format picks (misaki / eSpeak-only es), the voice row,
 //     en-gb refusal, validated chunk length and speed clamp, info JSON,
 //     evict -> reload and unload
-//   - ABI string "20"
+//   - ABI v21 slot speed range: the override's argument checks, the clamp it
+//     sets, info JSON, its lifetime across evict / reload / unload, reset
+//   - ABI string "21"
 //
 // The bridge is compiled into this TU (ELIZA_INFERENCE_TEST_HOOKS) against
 // the Paradee / misaki doubles in tests/paradee-contract/, so no weights are
@@ -27,6 +29,7 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <limits>
 #include <random>
 #include <thread>
 
@@ -90,7 +93,7 @@ static int synth_text(EliInferenceContext * ctx, const std::string & text, size_
 }
 
 static void test_abi_and_probes() {
-    CHECK(std::string(eliza_inference_abi_version()) == "20");
+    CHECK(std::string(eliza_inference_abi_version()) == "21");
     CHECK_RC(eliza_inference_paradee_supported(), 1);
     CHECK_RC(eliza_inference_paradee_voices_supported(), 1);
     CHECK_RC(eliza_inference_asr_supported(), 1);
@@ -753,6 +756,8 @@ static void test_paradee_voice_slots() {
           es.find("\"voice\":\"em_alex\"") != std::string::npos && es.find("\"phoneme_format\":\"espeak-es\"") != std::string::npos &&
           es.find("\"validated_max_ids\":360") != std::string::npos && es.find("\"validated_speed\":[0.85,1.15]") != std::string::npos &&
           es.find("\"g2p_kind\":2") != std::string::npos);
+    CHECK(es.find("\"speed_range\":[0.85,1.15]") != std::string::npos);
+    CHECK(en.find("\"speed_range\":[0.25,4]") != std::string::npos);
     CHECK(voice_info(ctx, "fr").empty());
 
     // Phonemize through each slot's G2P ('\xC2\xBF' is dropped only by the eSpeak-only fake).
@@ -789,24 +794,108 @@ static void test_paradee_voice_slots() {
         }
     }
 
-    // Evict frees every slot; the next use reloads it.
+    // ABI v21: the caller widens the Delibes slot's range; the model's
+    // validated range is still reported next to it.
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float bad[][2] = {
+        { 0.2f, 1.5f },    // below the architecture's 0.25
+        { 0.5f, 4.5f },    // above the architecture's 4
+        { 1.1f, 1.5f },    // does not span 1.0
+        { 0.5f, 0.9f },
+        { 1.5f, 0.5f },
+        { nan, 1.5f },
+        { 0.5f, std::numeric_limits<float>::infinity() },
+        { 0.0f, 1.5f },    // only 0, 0 resets
+    };
+    for (const auto & r : bad) {
+        CHECK_RC(eliza_inference_paradee_set_voice_speed_range(ctx, "es", r[0], r[1], &err), ELIZA_ERR_INVALID_ARG);
+        CHECK(err != nullptr);
+        clear_err(&err);
+    }
+    CHECK_RC(eliza_inference_paradee_set_voice_speed_range(ctx, "fr", 0.5f, 1.5f, &err), ELIZA_ERR_INVALID_ARG);
+    CHECK(err && std::string(err).find("no voice 'fr'") != std::string::npos);
+    clear_err(&err);
+    CHECK_RC(eliza_inference_paradee_set_voice_speed_range(nullptr, "es", 0.5f, 1.5f, &err), ELIZA_ERR_INVALID_ARG);
+    clear_err(&err);
+    CHECK_RC(eliza_inference_paradee_set_voice_speed_range(ctx, nullptr, 0.5f, 1.5f, &err), ELIZA_ERR_INVALID_ARG);
+    clear_err(&err);
+    CHECK(voice_info(ctx, "es").find("\"speed_range\":[0.85,1.15]") != std::string::npos);   // refusals left it
+    CHECK_RC(eliza_inference_paradee_set_voice_speed_range(ctx, "es", 0.5f, 1.5f, &err), ELIZA_OK);
+    {
+        const std::string info = voice_info(ctx, "es");
+        CHECK(info.find("\"validated_speed\":[0.85,1.15]") != std::string::npos &&
+              info.find("\"speed_range\":[0.5,1.5]") != std::string::npos);
+        CHECK(voice_info(ctx, "en").find("\"speed_range\":[0.25,4]") != std::string::npos);   // other slots untouched
+    }
+    auto spoken_speeds = [&](std::initializer_list<float> asked) {
+        {
+            std::lock_guard<std::mutex> lock(fake_paradee().sizes_mutex);
+            fake_paradee().speeds.clear();
+        }
+        for (float speed : asked) CHECK_RC(synth_voice(ctx, "es", "hola", speed, nullptr, &err), ELIZA_OK);
+        std::lock_guard<std::mutex> lock(fake_paradee().sizes_mutex);
+        return fake_paradee().speeds;
+    };
+    {
+        const std::vector<float> sp = spoken_speeds({ 0.3f, 0.6f, 0.8f, 1.2f, 1.4f, 2.0f });
+        CHECK(sp == std::vector<float>({ 0.5f, 0.6f, 0.8f, 1.2f, 1.4f, 1.5f }));
+    }
+
+    // Evict frees every slot; the next use reloads it, and the slot keeps its range.
     CHECK_RC(eliza_inference_mmap_evict(ctx, "tts", &err), ELIZA_OK);
     clear_err(&err);
     CHECK_RC(fake_paradee().live_models.load(), 0);
     CHECK_RC(fake_paradee().live_espeak.load(), 0);
-    CHECK_RC(synth_voice(ctx, "es", "hola", 1.0f, nullptr, &err), ELIZA_OK);
+    {
+        const std::vector<float> sp = spoken_speeds({ 0.3f });
+        CHECK(sp == std::vector<float>({ 0.5f }));
+    }
+    CHECK_RC(fake_paradee().live_espeak.load(), 1);
+    CHECK_RC(fake_paradee().live_models.load(), 1);
+    // Setting a range does not load an evicted slot.
+    CHECK_RC(eliza_inference_mmap_evict(ctx, "tts", &err), ELIZA_OK);
+    CHECK_RC(eliza_inference_paradee_set_voice_speed_range(ctx, "es", 0.6f, 1.4f, &err), ELIZA_OK);
+    CHECK_RC(fake_paradee().live_models.load(), 0);
+    {
+        const std::vector<float> sp = spoken_speeds({ 0.3f, 2.0f });
+        CHECK(sp == std::vector<float>({ 0.6f, 1.4f }));
+    }
+    // 0, 0 restores the validated range.
+    CHECK_RC(eliza_inference_paradee_set_voice_speed_range(ctx, "es", 0.0f, 0.0f, &err), ELIZA_OK);
+    {
+        const std::vector<float> sp = spoken_speeds({ 0.3f, 1.0f, 2.0f });
+        CHECK(sp == std::vector<float>({ 0.85f, 1.0f, 1.15f }));
+    }
+    CHECK(voice_info(ctx, "es").find("\"speed_range\":[0.85,1.15]") != std::string::npos);
+    CHECK_RC(eliza_inference_paradee_set_voice_speed_range(ctx, "es", 0.5f, 1.5f, &err), ELIZA_OK);
+    // A new load into the slot keeps the slot's range.
+    CHECK_RC(eliza_inference_paradee_load_voice(ctx, "es", "/x/delibes-b.gguf", nullptr, "/x/espeak-ng-data", nullptr, &err),
+             ELIZA_OK);
+    {
+        const std::vector<float> sp = spoken_speeds({ 2.0f });
+        CHECK(sp == std::vector<float>({ 1.5f }));
+    }
     CHECK_RC(fake_paradee().live_espeak.load(), 1);
     CHECK_RC(fake_paradee().live_models.load(), 1);
     CHECK_RC(eliza_inference_mmap_acquire(ctx, "tts", &err), ELIZA_OK);
     clear_err(&err);
     CHECK_RC(fake_paradee().live_models.load(), 2);
 
-    // Unload forgets the slot.
+    // Unload forgets the slot, and its range with it.
     CHECK_RC(eliza_inference_paradee_unload_voice(ctx, "es", &err), ELIZA_OK);
     CHECK_RC(eliza_inference_paradee_unload_voice(ctx, "es", &err), ELIZA_OK);
     CHECK_RC(fake_paradee().live_espeak.load(), 0);
     CHECK_RC(synth_voice(ctx, "es", "hola", 1.0f, nullptr, &err), ELIZA_ERR_INVALID_ARG);
     clear_err(&err);
+    CHECK_RC(eliza_inference_paradee_set_voice_speed_range(ctx, "es", 0.5f, 1.5f, &err), ELIZA_ERR_INVALID_ARG);
+    clear_err(&err);
+    CHECK_RC(eliza_inference_paradee_load_voice(ctx, "es", "/x/delibes.gguf", nullptr, "/x/espeak-ng-data", nullptr, &err),
+             ELIZA_OK);
+    {
+        const std::vector<float> sp = spoken_speeds({ 2.0f });
+        CHECK(sp == std::vector<float>({ 1.15f }));
+    }
+    CHECK_RC(eliza_inference_paradee_unload_voice(ctx, "es", &err), ELIZA_OK);
 
     eliza_inference_destroy(ctx);
     CHECK_RC(fake_paradee().live_models.load(), 0);
