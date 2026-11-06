@@ -1,6 +1,8 @@
 # tools/paradee/tests/CMakeLists.txt
 #
 # test-paradee-phase-lock   self-contained (committed fixture), always runs.
+# test-paradee-region       region files (APK assets); the model checks
+#                           need the Paradee GGUF.
 # test-paradee-api          needs the Paradee GGUF.
 # test-paradee-parity       needs the GGUF and a reference dump from
 #                           tools/dump_paradee_reference.py.
@@ -18,6 +20,11 @@ add_executable(test-paradee-phase-lock test_paradee_phase_lock.cpp)
 target_link_libraries(test-paradee-phase-lock PRIVATE paradee_lib)
 target_compile_definitions(test-paradee-phase-lock PRIVATE PARADEE_FIXTURE_DIR="${PARADEE_FIXTURE_DIR}")
 add_test(NAME test-paradee-phase-lock COMMAND test-paradee-phase-lock)
+
+add_executable(test-paradee-region test_paradee_region.cpp)
+target_link_libraries(test-paradee-region PRIVATE paradee_lib)
+target_include_directories(test-paradee-region PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../file-region)
+add_test(NAME test-paradee-region COMMAND test-paradee-region)
 
 add_executable(test-paradee-api test_paradee_api.cpp)
 find_package(Threads REQUIRED)
@@ -37,7 +44,7 @@ endif()
 if (PARADEE_REF_DIR)
     list(APPEND _paradee_env "PARADEE_REF_DIR=${PARADEE_REF_DIR}")
 endif()
-foreach(t test-paradee-api test-paradee-parity)
+foreach(t test-paradee-api test-paradee-parity test-paradee-region)
     set_tests_properties(${t} PROPERTIES SKIP_RETURN_CODE 77)
     if (_paradee_env)
         set_tests_properties(${t} PROPERTIES ENVIRONMENT "${_paradee_env}")
@@ -48,3 +55,4 @@ set_tests_properties(test-paradee-parity PROPERTIES TIMEOUT 900)
 # "main" is the label CI runs (ctest -L main); unlabelled tests are built but
 # never executed there. Only the self-contained, weight-free, offline tests.
 set_tests_properties(test-paradee-phase-lock PROPERTIES LABELS main)
+set_tests_properties(test-paradee-region PROPERTIES LABELS main)

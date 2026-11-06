@@ -88,7 +88,7 @@ class LexFile {
     long find(const uint8_t * entries, uint32_t n, const std::string & key) const;
     const uint8_t * base_ = nullptr;
     size_t size_ = 0;
-    bool mapped_ = false;
+    std::shared_ptr<const void> mapping_;  // owns the mapping base_ points into
     std::vector<uint8_t> owned_;
     const uint8_t * gold_ = nullptr;
     const uint8_t * silver_ = nullptr;

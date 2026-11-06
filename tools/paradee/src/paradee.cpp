@@ -27,6 +27,7 @@
 #include "kokoro-model-internal.h"
 #include "kokoro-predictor.h"
 
+#include "eliza-file-region.h"
 #include "ggml.h"
 #include "gguf.h"
 
@@ -41,13 +42,6 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-
-#if !defined(_WIN32)
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
 
 namespace eliza_paradee {
 
@@ -90,8 +84,7 @@ struct paradee_model {
     gguf_context * gguf = nullptr;
     ggml_context * file_ctx = nullptr;   // tensors as stored
     ggml_context * ctx = nullptr;        // all-F32 view the layers read
-    void * map_addr = nullptr;           // read-only mapping of an all-F32 file (else null)
-    size_t map_size = 0;
+    eliza_file_region::mapping map;      // the file (or its region file's region) while in use
     // Learned styles, one row per voice: [n_voices * style_text_dim] and
     // [n_voices * style_decoder_dim]. v1.0 / v1.1 have one voice.
     std::vector<float> style_text, style_dec;
@@ -114,9 +107,6 @@ void paradee_model_deleter::operator()(paradee_model * m) const noexcept {
     if (m->ctx && m->ctx != m->file_ctx) ggml_free(m->ctx);
     if (m->file_ctx) ggml_free(m->file_ctx);
     if (m->gguf) gguf_free(m->gguf);
-#if !defined(_WIN32)
-    if (m->map_addr) munmap(m->map_addr, m->map_size);
-#endif
     delete m;
 }
 
@@ -132,33 +122,25 @@ bool paradee_use_mmap() {
 // context from gguf_init_from_file) at its bytes in the mapping. The layers
 // only read the weights, so the pages stay clean and the kernel can drop and
 // re-read them under memory pressure instead of swapping a private copy.
-bool map_f32_tensors(paradee_model * m, const std::string & path, std::string & err) {
+// `where` is the file, or the region a region file names (an APK asset).
+bool map_f32_tensors(paradee_model * m, const eliza_file_region::region & where, std::string & err) {
 #if defined(_WIN32)
-    (void) m; (void) path; (void) err;
-    return false;
-#else
-    const int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0) { err = "cannot open '" + path + "'"; return false; }
-    struct stat st {};
-    if (fstat(fd, &st) != 0 || st.st_size <= 0) { ::close(fd); err = "cannot stat '" + path + "'"; return false; }
-    void * addr = mmap(nullptr, (size_t) st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);
-    if (addr == MAP_FAILED) { err = "mmap failed for '" + path + "'"; return false; }
-    m->map_addr = addr;
-    m->map_size = (size_t) st.st_size;
+    if (!where.indirect) return false;  // read into memory instead
+#endif
+    if (!m->map.data() && !m->map.open(where, err)) return false;
+    const uint8_t * addr = m->map.data();
     const size_t base = gguf_get_data_offset(m->gguf);
     for (int64_t i = 0; i < gguf_get_n_tensors(m->gguf); ++i) {
         ggml_tensor * t = ggml_get_tensor(m->file_ctx, gguf_get_tensor_name(m->gguf, i));
         if (!t) continue;
         const size_t off = base + gguf_get_tensor_offset(m->gguf, i);
-        if (off + ggml_nbytes(t) > m->map_size) {
+        if (off + ggml_nbytes(t) > m->map.size()) {
             err = std::string("tensor '") + ggml_get_name(t) + "' runs past the end of the file";
             return false;
         }
-        t->data = (char *) addr + off;
+        t->data = (void *) (addr + off);
     }
     return true;
-#endif
 }
 
 bool read_i32(gguf_context * g, const char * key, int & out, std::string & err) {
@@ -277,11 +259,20 @@ paradee_model_ptr paradee_load_model(const std::string & gguf_path, std::string 
     err.clear();
     try {
         paradee_model_ptr m(new paradee_model());
+        // A region file names the model's bytes inside another file (an
+        // uncompressed APK asset); its metadata is parsed from the mapping.
+        eliza_file_region::region where;
+        if (!eliza_file_region::resolve(gguf_path, where, err)) return nullptr;
+        if (where.indirect && !m->map.open(where, err)) return nullptr;
+        auto init_gguf = [&](gguf_init_params params) {
+            return where.indirect ? gguf_init_from_buffer(m->map.data(), m->map.size(), params)
+                                  : gguf_init_from_file(gguf_path.c_str(), params);
+        };
         // Metadata first. An all-F32 file (the converter's default) is then
         // mapped and used in place; anything else is read into memory and
         // widened below.
         gguf_init_params meta = { /* no_alloc = */ true, /* ctx = */ &m->file_ctx };
-        m->gguf = gguf_init_from_file(gguf_path.c_str(), meta);
+        m->gguf = init_gguf(meta);
         if (!m->gguf || !m->file_ctx) {
             err = "gguf_init_from_file failed for '" + gguf_path + "'";
             return nullptr;
@@ -293,7 +284,7 @@ paradee_model_ptr paradee_load_model(const std::string & gguf_path, std::string 
                 f32_only = f32_only && gguf_get_tensor_type(m->gguf, i) == GGML_TYPE_F32;
             }
             if (f32_only) {
-                mapped = map_f32_tensors(m.get(), gguf_path, err);
+                mapped = map_f32_tensors(m.get(), where, err);
                 if (!mapped && !err.empty()) return nullptr;
             }
         }
@@ -302,11 +293,12 @@ paradee_model_ptr paradee_load_model(const std::string & gguf_path, std::string 
             m->file_ctx = nullptr;
             gguf_free(m->gguf);
             gguf_init_params params = { /* no_alloc = */ false, /* ctx = */ &m->file_ctx };
-            m->gguf = gguf_init_from_file(gguf_path.c_str(), params);
+            m->gguf = init_gguf(params);
             if (!m->gguf || !m->file_ctx) {
                 err = "gguf_init_from_file failed for '" + gguf_path + "'";
                 return nullptr;
             }
+            m->map.reset();  // the tensors were copied out
         }
         gguf_context * g = m->gguf;
         {

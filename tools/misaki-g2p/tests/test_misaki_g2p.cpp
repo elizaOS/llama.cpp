@@ -8,8 +8,10 @@
 #include "misaki-g2p.h"
 #include "misaki-internal.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -260,6 +262,28 @@ static void test_cpp_api(const std::string & lex) {
     CHECK(!eliza_misaki::misaki_phonemize(nullptr, "x", ps, err));
 }
 
+// The lexicon inside a larger file (an APK asset), named by a region file.
+static void test_region_lexicon(const std::string & lex) {
+    std::ifstream in(lex, std::ios::binary);
+    const std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const std::string dir = std::filesystem::temp_directory_path().string() + "/misaki-region-" +
+                            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    std::filesystem::create_directories(dir);
+    const std::string outer = dir + "/app.apk", link = dir + "/misaki-en-us.lex";
+    const size_t offset = 4096 + 400;
+    std::ofstream(outer, std::ios::binary) << std::string(offset, 'x') << bytes << "tail";
+    std::ofstream(link) << "eliza-file-region v1\noffset=" << offset << "\nlength=" << bytes.size() << "\npath=" << outer << "\n";
+    char * err = nullptr;
+    misaki_g2p * plain = misaki_g2p_open(lex.c_str(), nullptr, &err);
+    misaki_g2p * region = misaki_g2p_open(link.c_str(), nullptr, &err);
+    CHECK(plain != nullptr && region != nullptr);
+    if (plain && region) check_eq(phonemize(region, "Hello world."), phonemize(plain, "Hello world."), "region lexicon");
+    misaki_g2p_close(plain);
+    misaki_g2p_close(region);
+    misaki_g2p_free(err);
+    std::filesystem::remove_all(dir);
+}
+
 static void test_bad_lexicon(const std::string & data) {
     std::string err;
     CHECK(LexFile::open(data + "/mini_gold.json", err) == nullptr && err.find("magic") != std::string::npos);
@@ -275,6 +299,7 @@ int main(int argc, char ** argv) {
     test_tables(argv[2]);
     test_api(argv[1]);
     test_cpp_api(argv[1]);
+    test_region_lexicon(argv[1]);
     test_bad_lexicon(argv[2]);
     std::printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
