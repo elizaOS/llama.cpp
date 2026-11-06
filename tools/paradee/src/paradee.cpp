@@ -138,7 +138,7 @@ bool map_f32_tensors(paradee_model * m, const eliza_file_region::region & where,
             err = std::string("tensor '") + ggml_get_name(t) + "' runs past the end of the file";
             return false;
         }
-        t->data = (void *) (addr + off);
+        t->data = const_cast<uint8_t *>(addr + off);
     }
     return true;
 }

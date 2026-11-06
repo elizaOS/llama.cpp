@@ -112,8 +112,8 @@ int main(int argc, char ** argv) {
         std::ofstream(link) << "eliza-file-region v1\noffset=" << offset << "\nlength=" << bytes.size()
                             << "\npath=" << outer.string() << "\n";
 
-        CHECK(pk_gguf_is_parakeet(link.c_str()) == 1, "region at %zu not recognised as parakeet-tdt", offset);
-        CHECK(pk_gguf_is_parakeet(outer.c_str()) == 0, "container recognised as parakeet-tdt");
+        CHECK(pk_gguf_is_parakeet(link.string().c_str()) == 1, "region at %zu not recognised as parakeet-tdt", offset);
+        CHECK(pk_gguf_is_parakeet(outer.string().c_str()) == 0, "container recognised as parakeet-tdt");
         for (int use_mmap : { 1, 0 }) {
             result got;
             CHECK(transcribe(link.string(), use_mmap, pcm, got) && got.ids == want.ids && got.text == want.text,
