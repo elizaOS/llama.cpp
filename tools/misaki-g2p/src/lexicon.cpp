@@ -2,6 +2,8 @@
 // Reader for misaki-en-us.lex (written by convert_misaki_lexicon.py).
 #include "misaki-internal.h"
 
+#include "eliza-file-region.h"
+
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
@@ -9,11 +11,6 @@
 
 #if defined(_WIN32)
 #    define MISAKI_NO_MMAP 1
-#else
-#    include <fcntl.h>
-#    include <sys/mman.h>
-#    include <sys/stat.h>
-#    include <unistd.h>
 #endif
 
 namespace misaki {
@@ -30,50 +27,32 @@ uint16_t rd16(const uint8_t * p) { return (uint16_t) (p[0] | (p[1] << 8)); }
 
 std::unique_ptr<LexFile> LexFile::open(const std::string & path, std::string & err) {
     std::unique_ptr<LexFile> lf(new LexFile());
+    // A region file names the lexicon's bytes inside another file (an APK asset).
+    eliza_file_region::region where;
+    if (!eliza_file_region::resolve(path, where, err)) {
+        err = "cannot open lexicon " + path + ": " + err;
+        return nullptr;
+    }
+    if (where.length < kHeader) {
+        err = "lexicon " + path + " is too small";
+        return nullptr;
+    }
 #if !defined(MISAKI_NO_MMAP)
-    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        err = "cannot open lexicon " + path + ": " + std::strerror(errno);
+    auto map = std::make_shared<eliza_file_region::mapping>();
+    if (!map->open(where, err)) {
+        err = "cannot mmap lexicon " + path + ": " + err;
         return nullptr;
     }
-    struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size < (off_t) kHeader) {
-        ::close(fd);
-        err = "lexicon " + path + " is too small";
-        return nullptr;
-    }
-    void * p = mmap(nullptr, (size_t) st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);
-    if (p == MAP_FAILED) {
-        err = "cannot mmap lexicon " + path + ": " + std::strerror(errno);
-        return nullptr;
-    }
-    lf->base_ = (const uint8_t *) p;
-    lf->size_ = (size_t) st.st_size;
-    lf->mapped_ = true;
+    lf->base_ = map->data();
+    lf->size_ = map->size();
+    lf->mapping_ = map;
 #else
-    FILE * f = std::fopen(path.c_str(), "rb");
-    if (!f) {
-        err = "cannot open lexicon " + path;
-        return nullptr;
-    }
-    std::fseek(f, 0, SEEK_END);
-    long n = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
-    if (n < (long) kHeader) {
-        std::fclose(f);
-        err = "lexicon " + path + " is too small";
-        return nullptr;
-    }
-    lf->owned_.resize((size_t) n);
-    size_t got = std::fread(lf->owned_.data(), 1, (size_t) n, f);
-    std::fclose(f);
-    if (got != (size_t) n) {
-        err = "short read on lexicon " + path;
+    if (!eliza_file_region::read(where, lf->owned_, err)) {
+        err = "cannot read lexicon " + path + ": " + err;
         return nullptr;
     }
     lf->base_ = lf->owned_.data();
-    lf->size_ = (size_t) n;
+    lf->size_ = lf->owned_.size();
 #endif
     const uint8_t * h = lf->base_;
     if (std::memcmp(h, "MISAKILX", 8) != 0) {
@@ -123,11 +102,7 @@ std::unique_ptr<LexFile> LexFile::open(const std::string & path, std::string & e
     return lf;
 }
 
-LexFile::~LexFile() {
-#if !defined(MISAKI_NO_MMAP)
-    if (mapped_ && base_) munmap(const_cast<uint8_t *>(base_), size_);
-#endif
-}
+LexFile::~LexFile() = default;
 
 long LexFile::find(const uint8_t * entries, uint32_t n, const std::string & key) const {
     long lo = 0, hi = (long) n;

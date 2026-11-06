@@ -33,7 +33,8 @@ add_library(parakeet_lib STATIC
 set_target_properties(parakeet_lib PROPERTIES POSITION_INDEPENDENT_CODE ON
                                               CXX_VISIBILITY_PRESET hidden)
 target_include_directories(parakeet_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
-                                        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+                                        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                                                ${CMAKE_CURRENT_SOURCE_DIR}/../file-region)
 target_link_libraries(parakeet_lib PUBLIC ggml)
 if (TARGET ggml-base)
     target_link_libraries(parakeet_lib PUBLIC ggml-base)

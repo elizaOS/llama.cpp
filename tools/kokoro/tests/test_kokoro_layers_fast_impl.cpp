@@ -61,4 +61,54 @@ int fast_thread_count() {
     return eliza_kokoro_portable_fast::detail::kokoro_thread_count();
 }
 
+int fast_core_count() {
+    return (int) eliza_kokoro_portable_fast::detail::kokoro_fast_cpus().size();
+}
+
+// The scope binds the calling thread to exactly the fast cores (when there
+// are any) and leaves it on every CPU the cpuset allows after.
+bool fast_core_scope_ok() {
+#if defined(__linux__)
+    cpu_set_t before, inside, after;
+    if (sched_getaffinity(0, sizeof(before), &before) != 0) return false;
+    {
+        eliza_kokoro_portable_fast::detail::KokoroFastCoreScope scope;
+        if (sched_getaffinity(0, sizeof(inside), &inside) != 0) return false;
+    }
+    if (sched_getaffinity(0, sizeof(after), &after) != 0) return false;
+    const auto & cpus = eliza_kokoro_portable_fast::detail::kokoro_fast_cpus();
+    if (cpus.empty()) return CPU_EQUAL(&before, &inside) && CPU_EQUAL(&before, &after);
+    // Every CPU it had before is allowed again.
+    for (int c = 0; c < CPU_SETSIZE; ++c) {
+        if (CPU_ISSET(c, &before) && !CPU_ISSET(c, &after)) return false;
+    }
+    if (CPU_COUNT(&inside) != (int) cpus.size()) return false;
+    for (int c : cpus) {
+        if (!CPU_ISSET(c, &inside)) return false;
+    }
+#endif
+    return true;
+}
+
+// Selection on a synthetic 2 x 2.6 GHz + 6 x 2.0 GHz topology, and the opt-in.
+bool fast_core_selection_ok() {
+    namespace d = eliza_kokoro_portable_fast::detail;
+    std::vector<std::pair<int, long>> big_little;
+    for (int c = 0; c < 6; ++c) big_little.emplace_back(c, 2000000);
+    big_little.emplace_back(6, 2600000);
+    big_little.emplace_back(7, 2600000);
+    if (d::kokoro_select_fast_cpus(big_little, 2) != std::vector<int>{ 6, 7 }) return false;
+    // More threads than fast cores: no pinning.
+    if (!d::kokoro_select_fast_cpus(big_little, 3).empty()) return false;
+    // Uniform cores, and no cpufreq data: no pinning.
+    std::vector<std::pair<int, long>> uniform{ { 0, 2000000 }, { 1, 2000000 } };
+    if (!d::kokoro_select_fast_cpus(uniform, 1).empty()) return false;
+    if (!d::kokoro_select_fast_cpus({}, 1).empty()) return false;
+    // Within 20% of the fastest counts as fast.
+    std::vector<std::pair<int, long>> close{ { 0, 2080000 }, { 1, 2600000 }, { 2, 1000000 } };
+    if (d::kokoro_select_fast_cpus(close, 2) != std::vector<int>{ 0, 1 }) return false;
+    return d::kokoro_pin_requested("1") && !d::kokoro_pin_requested(nullptr) && !d::kokoro_pin_requested("0")
+        && !d::kokoro_pin_requested("");
+}
+
 } // namespace kokoro_layer_test

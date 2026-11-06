@@ -23,7 +23,8 @@ add_library(paradee_lib STATIC
     src/paradee-head.h
     include/paradee.h)
 set_target_properties(paradee_lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_include_directories(paradee_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(paradee_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                       PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../file-region)
 target_link_libraries(paradee_lib PUBLIC kokoro_lib ggml)
 if (TARGET ggml-base)
     target_link_libraries(paradee_lib PUBLIC ggml-base)

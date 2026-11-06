@@ -47,7 +47,8 @@ add_library(misaki_g2p STATIC
     src/unicode.cpp
 )
 target_include_directories(misaki_g2p PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-                                      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+                                      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                                              ${CMAKE_CURRENT_SOURCE_DIR}/../file-region)
 target_compile_features(misaki_g2p PUBLIC cxx_std_17)
 set_target_properties(misaki_g2p PROPERTIES POSITION_INDEPENDENT_CODE ON CXX_EXTENSIONS OFF)
 target_compile_definitions(misaki_g2p PRIVATE MISAKI_G2P_BUILD)

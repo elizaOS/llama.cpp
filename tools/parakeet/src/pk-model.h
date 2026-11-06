@@ -2,6 +2,7 @@
 // parakeet.cpp (load, encoder, decoder) and pk-stream.cpp.
 #pragma once
 
+#include "eliza-file-region.h"
 #include "parakeet.h"
 #include "pk-kernels.h"
 #include "pk-ops.h"
@@ -36,13 +37,13 @@ struct layer {
     const float * dw_b = nullptr;
 };
 
+// The model file, or the region a region file names (an APK asset).
 struct mapped_file {
-    void * addr = nullptr;
+    eliza_file_region::mapping map;
     size_t size = 0;
     std::vector<uint8_t> heap;  // fallback when mmap is unavailable
-    ~mapped_file();
     bool open(const std::string & path, bool use_mmap, std::string & err);
-    const uint8_t * data() const { return addr ? (const uint8_t *) addr : heap.data(); }
+    const uint8_t * data() const { return map.data() ? map.data() : heap.data(); }
 };
 
 // scratch buffers reused across calls on one model (calls are serialised)

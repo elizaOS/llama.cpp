@@ -24,13 +24,6 @@
 #include <cstdlib>
 #include <cstring>
 
-#if !defined(_WIN32)
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
-
 #if (defined(__ARM_NEON) || defined(__aarch64__)) && !defined(_MSC_VER)
 #include <arm_neon.h>
 #define PK_NEON 1
@@ -71,57 +64,27 @@ namespace pk {
 
 // ------------------------------------------------------------- file map
 
-mapped_file::~mapped_file() {
-#if !defined(_WIN32)
-    if (addr) {
-        munmap(addr, size);
-    }
-#endif
-}
-
 bool mapped_file::open(const std::string & path, bool use_mmap, std::string & err) {
-#if !defined(_WIN32)
-    if (use_mmap) {
-        const int fd = ::open(path.c_str(), O_RDONLY);
-        if (fd < 0) {
-            err = "cannot open " + path;
-            return false;
-        }
-        struct stat st {};
-        if (fstat(fd, &st) != 0) {
-            ::close(fd);
-            err = "cannot stat " + path;
-            return false;
-        }
-        size = (size_t) st.st_size;
-        void * p = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
-        ::close(fd);
-        if (p == MAP_FAILED) {
-            err = "mmap failed for " + path;
-            size = 0;
-            return false;
-        }
-        addr = p;
-        return true;
-    }
-#else
-    (void) use_mmap;
-#endif
-    FILE * f = std::fopen(path.c_str(), "rb");
-    if (!f) {
-        err = "cannot open " + path;
+    eliza_file_region::region where;
+    if (!eliza_file_region::resolve(path, where, err)) {
         return false;
     }
-    std::fseek(f, 0, SEEK_END);
-    size = (size_t) std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
-    heap.resize(size);
-    const bool ok = std::fread(heap.data(), 1, size, f) == size;
-    std::fclose(f);
-    if (!ok) {
-        err = "short read on " + path;
+#if defined(_WIN32)
+    use_mmap = false;
+#endif
+    if (use_mmap) {
+        if (!map.open(where, err)) {
+            return false;
+        }
+        size = map.size();
+        return true;
     }
-    return ok;
+    if (!eliza_file_region::read(where, heap, err)) {
+        heap.clear();
+        return false;
+    }
+    size = heap.size();
+    return true;
 }
 
 int subsampled_length(int n) {
@@ -270,7 +233,13 @@ extern "C" pk_params pk_default_params(void) {
 
 extern "C" int pk_gguf_is_parakeet(const char * path) {
     gguf_init_params ip = { /*no_alloc*/ true, /*ctx*/ nullptr };
-    gguf_context * g = gguf_init_from_file(path, ip);
+    eliza_file_region::region where;
+    eliza_file_region::mapping map;
+    std::string err;
+    if (!path || !eliza_file_region::resolve(path, where, err) || (where.indirect && !map.open(where, err))) {
+        return 0;
+    }
+    gguf_context * g = where.indirect ? gguf_init_from_buffer(map.data(), map.size(), ip) : gguf_init_from_file(path, ip);
     if (!g) {
         return 0;
     }
@@ -295,7 +264,7 @@ extern "C" pk_model * pk_model_load(const char * path, pk_params params, char * 
         return nullptr;
     }
     gguf_init_params ip = { /*no_alloc*/ true, /*ctx*/ &m->meta };
-    m->gg = gguf_init_from_file(path, ip);
+    m->gg = gguf_init_from_buffer(m->file.data(), m->file.size, ip);
     if (!m->gg) {
         set_err(err, err_len, std::string("not a GGUF file: ") + path);
         return nullptr;

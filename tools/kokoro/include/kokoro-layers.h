@@ -59,7 +59,14 @@
 #include <condition_variable>
 #include <functional>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <utility>
+#if defined(__linux__)
+#include <cstdio>
+#include <sched.h>
+#include <unistd.h>
+#endif
 #if defined(__aarch64__) || defined(_M_ARM64)
 #define KOKORO_USE_NEON 1
 #include <arm_neon.h>
@@ -248,6 +255,95 @@ inline int kokoro_thread_count() {
     return n;
 }
 
+// Pinning is opt-in with KOKORO_PIN_THREADS=1. Parakeet's pool already binds
+// to the same fast cores and spins while it waits, so on a 2-big-core phone
+// synthesis during streaming ASR (barge-in) would queue behind it; enable this
+// only where a device run shows it helps.
+inline bool kokoro_pin_requested(const char * value) {
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+// The fast cores from (cpu, max frequency) pairs: within 20% of the fastest,
+// the rule tools/parakeet pk::fast_cpus uses. Empty when every CPU qualifies
+// or when the pool has more threads than fast cores (they would queue).
+inline std::vector<int> kokoro_select_fast_cpus(const std::vector<std::pair<int, long>> & freq, int n_threads) {
+    std::vector<int> out;
+    long top = 0;
+    for (const auto & f : freq) top = std::max(top, f.second);
+    for (const auto & f : freq) {
+        if (top > 0 && f.second * 10 >= top * 8) out.push_back(f.first);
+    }
+    if (out.size() == freq.size() || (int) out.size() < n_threads) out.clear();
+    return out;
+}
+
+// The fast cores this process pins to; empty (no affinity) off Linux or
+// without KOKORO_PIN_THREADS=1.
+inline const std::vector<int> & kokoro_fast_cpus() {
+    static const std::vector<int> cpus = [] {
+        std::vector<int> out;
+#if defined(__linux__)
+        if (!kokoro_pin_requested(std::getenv("KOKORO_PIN_THREADS"))) return out;
+        std::vector<std::pair<int, long>> freq;
+        for (int c = 0; c < 64; ++c) {
+            const std::string p = "/sys/devices/system/cpu/cpu" + std::to_string(c) + "/cpufreq/cpuinfo_max_freq";
+            FILE * fp = std::fopen(p.c_str(), "r");
+            if (!fp) continue;
+            long v = 0;
+            if (std::fscanf(fp, "%ld", &v) == 1) freq.emplace_back(c, v);
+            std::fclose(fp);
+        }
+        out = kokoro_select_fast_cpus(freq, kokoro_thread_count());
+#endif
+        return out;
+    }();
+    return cpus;
+}
+
+// Binds the calling thread to the fast cores; returns false when there are none.
+inline bool kokoro_bind_fast_cpus() {
+#if defined(__linux__)
+    const std::vector<int> & cpus = kokoro_fast_cpus();
+    if (cpus.empty()) return false;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (int c : cpus) CPU_SET(c, &set);
+    return sched_setaffinity(0, sizeof(set), &set) == 0;
+#else
+    return false;
+#endif
+}
+
+// The synthesis thread runs pool work too, so it moves to the fast cores for
+// one synthesis call. Afterwards it gets every possible CPU back, not the mask
+// it read before: that mask was already narrowed by the current cpuset, and
+// writing it back would keep the thread narrowed after the cpuset widens
+// (kernels that keep the user's mask). The cpuset still narrows the full set.
+// This assumes the caller had no CPU mask of its own.
+class KokoroFastCoreScope {
+public:
+    KokoroFastCoreScope() {
+#if defined(__linux__)
+        active_ = kokoro_bind_fast_cpus();
+#endif
+    }
+    ~KokoroFastCoreScope() {
+#if defined(__linux__)
+        if (!active_) return;
+        cpu_set_t all;
+        CPU_ZERO(&all);
+        const long n = sysconf(_SC_NPROCESSORS_CONF);
+        for (long c = 0; c < n && c < CPU_SETSIZE; ++c) CPU_SET((int) c, &all);
+        sched_setaffinity(0, sizeof(all), &all);
+#endif
+    }
+    KokoroFastCoreScope(const KokoroFastCoreScope &) = delete;
+    KokoroFastCoreScope & operator=(const KokoroFastCoreScope &) = delete;
+
+private:
+    bool active_ = false;
+};
+
 // Tiny persistent thread pool. One pool per process (lazy singleton), no
 // nested parallelism (callers below are all top-level layer forwards).
 // Work items are claimed with an atomic counter; the calling thread
@@ -284,7 +380,10 @@ public:
 private:
     explicit KokoroThreadPool(int n_workers) {
         for (int i = 0; i < n_workers; ++i) {
-            workers_.emplace_back([this] { worker_loop(); });
+            workers_.emplace_back([this] {
+                kokoro_bind_fast_cpus();
+                worker_loop();
+            });
         }
     }
     ~KokoroThreadPool() {
