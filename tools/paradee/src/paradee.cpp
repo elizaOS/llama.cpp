@@ -867,6 +867,9 @@ paradee_status synthesize_impl(
     try {
         std::lock_guard<std::mutex> lk(const_cast<paradee_model *>(model)->mu);
         eliza_kokoro::detail::KokoroLayerOptionsScope layer_scope(fast_layers());
+#if defined(KOKORO_USE_PORTABLE_FAST)
+        eliza_kokoro::detail::KokoroFastCoreScope core_scope;
+#endif
         cancel_state cs{ cancel, user };
         if (cancel && cancel(user)) { err = "cancelled"; return PARADEE_CANCELLED; }
 

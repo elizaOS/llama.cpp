@@ -12,4 +12,6 @@ void fast_convtranspose1d(const float *, int, int, const float *, const float *,
 void fast_lstm_cell_step(const float *, int, int, const float *, const float *, const float *, const float *, const float *, const float *, float *, float *, float *);
 bool fast_is_neon();
 int  fast_thread_count();
+int  fast_core_count();
+bool fast_core_scope_ok();
 } // namespace kokoro_layer_test

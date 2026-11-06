@@ -204,7 +204,12 @@ static void bench_lstm(const char * label, int I, int H, int steps) {
 }
 
 int main() {
-    std::printf("portable-fast path: NEON=%d threads=%d\n\n", (int) fast_is_neon(), fast_thread_count());
+    std::printf("portable-fast path: NEON=%d threads=%d fast cores=%d\n\n", (int) fast_is_neon(), fast_thread_count(),
+                fast_core_count());
+    if (!fast_core_scope_ok()) {
+        std::printf("FAIL fast-core scope did not bind to the fast cores and restore the caller's CPU set\n");
+        ++g_failures;
+    }
 
     std::printf("== parity (fast vs scalar reference, tol %.0e) ==\n", (double) TOL);
     // conv1d — generator resblock shapes (stride 1, dilated) + noise_convs

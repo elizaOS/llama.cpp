@@ -61,4 +61,29 @@ int fast_thread_count() {
     return eliza_kokoro_portable_fast::detail::kokoro_thread_count();
 }
 
+int fast_core_count() {
+    return (int) eliza_kokoro_portable_fast::detail::kokoro_fast_cpus().size();
+}
+
+// The scope binds the calling thread to exactly the fast cores (when there
+// are any) and gives it its previous CPU set back.
+bool fast_core_scope_ok() {
+#if defined(__linux__)
+    cpu_set_t before, inside, after;
+    if (sched_getaffinity(0, sizeof(before), &before) != 0) return false;
+    {
+        eliza_kokoro_portable_fast::detail::KokoroFastCoreScope scope;
+        if (sched_getaffinity(0, sizeof(inside), &inside) != 0) return false;
+    }
+    if (sched_getaffinity(0, sizeof(after), &after) != 0 || !CPU_EQUAL(&before, &after)) return false;
+    const auto & cpus = eliza_kokoro_portable_fast::detail::kokoro_fast_cpus();
+    if (cpus.empty()) return CPU_EQUAL(&before, &inside);
+    if (CPU_COUNT(&inside) != (int) cpus.size()) return false;
+    for (int c : cpus) {
+        if (!CPU_ISSET(c, &inside)) return false;
+    }
+#endif
+    return true;
+}
+
 } // namespace kokoro_layer_test
