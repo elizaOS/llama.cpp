@@ -97,25 +97,29 @@ int main(int argc, char ** argv) {
     const fs::path dir = fs::temp_directory_path() / ("test-parakeet-region-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     fs::create_directories(dir);
     const std::string bytes = read_file(gguf);
-    const size_t offset = 2 * 4096 + 32;
-    const fs::path outer = fs::absolute(dir / "app.apk");
-    {
-        std::ofstream o(outer, std::ios::binary);
-        o << std::string(offset, 'z') << bytes << std::string(77, 'q');
-    }
-    const fs::path link = dir / "phonon-2.gguf";
-    std::ofstream(link) << "eliza-file-region v1\noffset=" << offset << "\nlength=" << bytes.size()
-                        << "\npath=" << outer.string() << "\n";
-
-    CHECK(pk_gguf_is_parakeet(link.c_str()) == 1, "region not recognised as parakeet-tdt");
-    CHECK(pk_gguf_is_parakeet(outer.c_str()) == 0, "container recognised as parakeet-tdt");
 
     result want;
     CHECK(transcribe(gguf, 1, pcm, want), "plain transcription");
-    for (int use_mmap : { 1, 0 }) {
-        result got;
-        CHECK(transcribe(link.string(), use_mmap, pcm, got) && got.ids == want.ids && got.text == want.text,
-              "region (mmap %d) gave '%s', plain gave '%s'", use_mmap, got.text.c_str(), want.text.c_str());
+    // An even and an odd multiple of 16: an APK aligned to 16 bytes gives both,
+    // and the odd one leaves the mapped tensors 16 bytes off a 32-byte boundary.
+    for (const size_t offset : { (size_t) 2 * 4096 + 32, (size_t) 2 * 4096 + 48 }) {
+        const fs::path outer = fs::absolute(dir / ("app-" + std::to_string(offset) + ".apk"));
+        {
+            std::ofstream o(outer, std::ios::binary);
+            o << std::string(offset, 'z') << bytes << std::string(77, 'q');
+        }
+        const fs::path link = dir / ("phonon-2-" + std::to_string(offset) + ".gguf");
+        std::ofstream(link) << "eliza-file-region v1\noffset=" << offset << "\nlength=" << bytes.size()
+                            << "\npath=" << outer.string() << "\n";
+
+        CHECK(pk_gguf_is_parakeet(link.c_str()) == 1, "region at %zu not recognised as parakeet-tdt", offset);
+        CHECK(pk_gguf_is_parakeet(outer.c_str()) == 0, "container recognised as parakeet-tdt");
+        for (int use_mmap : { 1, 0 }) {
+            result got;
+            CHECK(transcribe(link.string(), use_mmap, pcm, got) && got.ids == want.ids && got.text == want.text,
+                  "region at %zu (mmap %d) gave '%s', plain gave '%s'", offset, use_mmap, got.text.c_str(),
+                  want.text.c_str());
+        }
     }
     std::printf("test-parakeet-region: transcript '%s' (%zu tokens)\n", want.text.c_str(), want.ids.size());
     fs::remove_all(dir);

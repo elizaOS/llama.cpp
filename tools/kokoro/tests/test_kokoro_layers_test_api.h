@@ -14,4 +14,5 @@ bool fast_is_neon();
 int  fast_thread_count();
 int  fast_core_count();
 bool fast_core_scope_ok();
+bool fast_core_selection_ok();
 } // namespace kokoro_layer_test

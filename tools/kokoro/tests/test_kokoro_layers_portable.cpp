@@ -207,7 +207,11 @@ int main() {
     std::printf("portable-fast path: NEON=%d threads=%d fast cores=%d\n\n", (int) fast_is_neon(), fast_thread_count(),
                 fast_core_count());
     if (!fast_core_scope_ok()) {
-        std::printf("FAIL fast-core scope did not bind to the fast cores and restore the caller's CPU set\n");
+        std::printf("FAIL fast-core scope did not bind to the fast cores and give the caller its CPUs back\n");
+        ++g_failures;
+    }
+    if (!fast_core_selection_ok()) {
+        std::printf("FAIL fast-core selection or the KOKORO_PIN_THREADS opt-in\n");
         ++g_failures;
     }
 
