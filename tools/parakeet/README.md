@@ -125,6 +125,11 @@ a **pause-delimited segment**, from the segment start to the newest sample.
   - `--verify` re-reads the GGUF and checks that all 264 five-value records and 11 int tables expand
     bit-identically to the container, that all 723 records are consumed, and that the mel filterbank equals
     librosa's.
+  - Mel zeros are stored as positive zero on all hosts. Signed zeros compare equal numerically but have
+    different file hashes; `python tools/parakeet/tests/test_convert_phonon2.py` checks the pinned mel bytes
+    without downloading a model, selecting the qualified NumPy dispatch before import on Linux x86.
+    A converter change also changes its blob SHA in the GGUF metadata, so
+    both layout hashes in `pins.json` must be regenerated with the source change.
 - `include/parakeet.h` is the C API: load, transcribe, word times, and stream open/feed/partial/finish.
 - `tools/dump_parakeet_reference.py` writes fixtures from Fermion's `reference_transformers.py`, the dense
   fp32 `transformers.ParakeetForTDT`. The fixtures hold the PCM, the normalised mel, the subsampling, layer-0
