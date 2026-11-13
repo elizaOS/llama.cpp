@@ -261,6 +261,8 @@ def mel_filterbank(sr: int, n_fft: int, n_mels: int) -> np.ndarray:
         w[i] = np.maximum(0, np.minimum(lower, upper))
     enorm = 2.0 / (mel_f[2: n_mels + 2] - mel_f[:n_mels])
     w *= enorm[:, np.newaxis]
+    # NumPy maximum can retain -0.0 on x86; GGUF hashes must agree with AArch64.
+    w[w == 0] = np.float32(0.0)
     return w
 
 
